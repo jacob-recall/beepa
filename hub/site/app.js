@@ -40,11 +40,15 @@ const SOURCES = [
   { id: 'instagram', label: 'Instagram', kind: 'source', botMxid: '@instagrambot:localhost',
     spaceName: 'Instagram', canStartChat: true, icon: '📷',
     blurb: 'Bridge your Instagram DMs: log in on instagram.com, then paste your session; chats appear as rooms in Element.' },
+  { id: 'linkedin', label: 'LinkedIn', kind: 'source', botMxid: '@linkedinbot:localhost',
+    spaceName: 'LinkedIn', canStartChat: false, icon: '💼',
+    blurb: 'Bridge your LinkedIn messages: log in on linkedin.com, then paste your session; chats appear as rooms in Element.' },
 ];
 const WA = SOURCES.find(s => s.id === 'whatsapp');
 const IMSG = SOURCES.find(s => s.id === 'imessage');
 const GMSG = SOURCES.find(s => s.id === 'gmessages');
 const IG = SOURCES.find(s => s.id === 'instagram');
+const LI = SOURCES.find(s => s.id === 'linkedin');
 // The ONLY sender whose com.jkali.from_me marker is trusted (anti-spoof): our
 // own iMessage appservice bot. Never a ghost (@imessage_*) or a remote contact.
 const IMSG_BOT_MXID = IMSG.botMxid;                // '@imessagebot:localhost'
@@ -134,10 +138,37 @@ const IG_COMMAND_GROUPS = [
     { cmd: 'search', label: 'Search by username', desc: 'Find an Instagram user by username to start a new chat.', arg: 'username' },
   ]},
 ];
+// ---- LinkedIn command surface (mirrors Instagram's session-paste shape) ----
+const LI_COMMAND_GROUPS = [
+  { title: 'General', cmds: [
+    { cmd: 'help', label: 'Help', desc: "Show the bridge's own list of every command." },
+    { cmd: 'version', label: 'Version', desc: 'Show which bridge version is running.' },
+  ]},
+  { title: 'Account', cmds: [
+    { cmd: 'list-logins', label: 'List logins', desc: 'List the LinkedIn accounts linked to the bridge and their connection state.' },
+    { cmd: 'login cookies', label: 'Connect LinkedIn', desc: 'Start linking your LinkedIn account; then paste your linkedin.com session (Copy as cURL) as the next message.' },
+    { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked LinkedIn account from the bridge.', arg: 'login ID', confirm: 'click' },
+    { cmd: 'set-preferred-login', label: 'Preferred account', desc: 'Choose which account sends your messages when more than one is linked.', arg: 'login ID' },
+  ]},
+  { title: 'Chats & contacts', cmds: [
+    { cmd: 'search', label: 'Search contacts', desc: 'Search your LinkedIn contacts by name.', arg: 'name' },
+    { cmd: 'start-chat', label: 'Start a chat', desc: 'Open a new direct chat with a LinkedIn contact.', arg: 'identifier' },
+    { cmd: 'resolve-identifier', label: 'Check an identifier', desc: 'Check whether an identifier is on LinkedIn without starting a chat.', arg: 'identifier' },
+    { cmd: 'sync', label: 'Sync now', desc: 'Refresh chats and contacts from LinkedIn.' },
+  ]},
+  { title: 'Relay', cmds: [
+    { cmd: 'set-relay', label: 'Enable relay', desc: 'Let other Matrix users in a room send messages through your LinkedIn account.', confirm: 'click' },
+    { cmd: 'unset-relay', label: 'Disable relay', desc: "Stop relaying other users' messages through your account." },
+  ]},
+  { title: 'Danger zone', cmds: [
+    { cmd: 'delete-all-portals', label: 'Delete all bridged rooms', desc: 'Permanently delete every bridged chat room on the Matrix side (nothing is deleted on LinkedIn itself).', confirm: 'type' },
+  ]},
+];
 function groupsFor(sourceId) {
   if (sourceId === 'imessage') return IMSG_COMMAND_GROUPS;
   if (sourceId === 'gmessages') return GMSG_COMMAND_GROUPS;
   if (sourceId === 'instagram') return IG_COMMAND_GROUPS;
+  if (sourceId === 'linkedin') return LI_COMMAND_GROUPS;
   return COMMAND_GROUPS;
 }
 
@@ -168,7 +199,7 @@ let busy = false;
 let activeSettingsSource = 'whatsapp';
 let joinedSet = new Set();
 const convosBySource = {};                 // sourceId -> [convo]
-const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null } };
+const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null }, linkedin: { mgmtRoomId: null } };
 
 // ---- Home feed state (HF-2): fully independent of the command sync loop.
 // These are NEVER the command loop's syncSince/syncRunning; the two /sync loops
@@ -249,7 +280,7 @@ async function api(method, path, body) {
 // ---- session ----
 function forgetSession() {
   token = null; userId = null;
-  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null;
+  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null;
   syncRunning = false;
   feedRunning = false;                              // HF-2: stop the feed loop with the session
   feedSince = null;
@@ -300,12 +331,12 @@ async function signOut() {
 
 // ---- management-room resolution + verification (C-1) ----
 async function resolveMgmt(source) {
-  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') return await findBotDmMgmt(source);
+  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram' || source.id === 'linkedin') return await findBotDmMgmt(source);
   if (source.id === 'imessage') return await resolveImsgMgmt();
   return null;
 }
 async function verifyMgmt(source, roomId) {
-  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') return await isBotDmMgmt(source, roomId);
+  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram' || source.id === 'linkedin') return await isBotDmMgmt(source, roomId);
   if (source.id === 'imessage') return await verifyImsgMgmt(roomId);
   return false;
 }
@@ -420,7 +451,7 @@ async function startSync() {
   syncSince = null;
   while (syncRunning && token) {
     try {
-      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId, runtime.instagram.mgmtRoomId].filter(Boolean);
+      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId, runtime.instagram.mgmtRoomId, runtime.linkedin.mgmtRoomId].filter(Boolean);
       const filter = encodeURIComponent(JSON.stringify(
         { room: { rooms: ids, timeline: { limit: 30 } }, presence: { types: [] } }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -448,10 +479,12 @@ function routeMgmtEvent(roomId, ev) {
   const im = runtime.imessage.mgmtRoomId;
   const gm = runtime.gmessages.mgmtRoomId;
   const ig = runtime.instagram.mgmtRoomId;
+  const li = runtime.linkedin.mgmtRoomId;
   if (wa && roomId === wa) { handleMgmtEvent(WA, ev); return; }
   if (im && roomId === im) { handleMgmtEvent(IMSG, ev); return; }
   if (gm && roomId === gm) { handleMgmtEvent(GMSG, ev); return; }
   if (ig && roomId === ig) { handleMgmtEvent(IG, ev); return; }
+  if (li && roomId === li) { handleMgmtEvent(LI, ev); return; }
   return; // not a management room -> ignore entirely
 }
 
@@ -479,7 +512,7 @@ function handleMgmtEvent(source, ev) {
   if (fromBot && typeof content.body === 'string') {
     const body = sanitize(content.body.replace(/^\* /, ''));
     logConsole('bot', body, source.id);
-    if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') reactToBotReply(body, source);
+    if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram' || source.id === 'linkedin') reactToBotReply(body, source);
     else if (source.id === 'imessage') updateImsgCard(content.body);
   } else if (fromMe && typeof content.body === 'string' &&
              !String(ev.unsigned && ev.unsigned.transaction_id || '').startsWith('hub-')) {
@@ -490,8 +523,10 @@ function handleMgmtEvent(source, ev) {
 // WhatsApp / Google Messages status parsing for their Connections cards.
 function reactToBotReply(body, source) {
   const pillId = source.id === 'gmessages' ? 'gmsg-status'
-               : source.id === 'instagram' ? 'ig-status' : 'wa-status';
+               : source.id === 'instagram' ? 'ig-status'
+               : source.id === 'linkedin' ? 'li-status' : 'wa-status';
   const discId = source.id === 'instagram' ? 'btn-ig-disconnect'
+               : source.id === 'linkedin' ? 'btn-li-disconnect'
                : source.id === 'gmessages' ? null : 'btn-disconnect';
   if (/You're not logged in/i.test(body)) updateCardStatus([], pillId, discId);
   const logins = [...body.matchAll(/^\* `([^`\n]+)` \(([^)\n]*)\) - `([A-Z_]+)`/gm)]
@@ -1288,7 +1323,8 @@ async function sendConvoMessage() {
   if (roomId === runtime.whatsapp.mgmtRoomId ||
       roomId === runtime.imessage.mgmtRoomId ||
       roomId === runtime.gmessages.mgmtRoomId ||
-      roomId === runtime.instagram.mgmtRoomId) {
+      roomId === runtime.instagram.mgmtRoomId ||
+      roomId === runtime.linkedin.mgmtRoomId) {
     convoSetStatus('Cannot send a message here.');
     return;
   }
@@ -1855,6 +1891,118 @@ function buildConnections() {
   ig.appendChild(igPaste);
   holder.appendChild(ig);
 
+  // LinkedIn card (mirrors the Instagram card exactly: a session PASTE flow,
+  // not a QR — the "Copy as cURL" carries the X-LI-Track / X-LI-Page-Instance
+  // headers as well as the cookies). The pasted value is a bearer credential:
+  // it is sent through the C-1 mgmt guard, redacted immediately, and never
+  // logged, sanitize-rendered, persisted, or turned into a URL.
+  const li = el('div', 'card bridge-card');
+  const liHead = el('div', 'bridge-head');
+  liHead.appendChild(el('span', 'bridge-name', LI.label));
+  const liPill = el('span', 'status-pill', 'Checking…');
+  liPill.id = 'li-status';
+  liHead.appendChild(liPill);
+  li.appendChild(liHead);
+  li.appendChild(el('p', 'muted', LI.blurb));
+
+  // Paste UI (built up front, revealed by Connect). textContent-only; no
+  // innerHTML. The textarea value is treated like a password: never echoed.
+  const liPaste = el('div', 'li-paste hidden');
+  liPaste.style.cssText = 'margin-top:10px;';
+  liPaste.appendChild(el('p', 'muted',
+    'On linkedin.com: DevTools → Network → filter graphql (voyager) → right-click a request → Copy as cURL, then paste here.'));
+  const liArea = el('textarea');
+  liArea.placeholder = 'Paste your LinkedIn session (Copy as cURL) here';
+  liArea.rows = 4;
+  liArea.autocomplete = 'off';
+  liArea.spellcheck = false;
+  liArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  liPaste.appendChild(liArea);
+  const liWarn = el('p', 'error hidden');           // visible warnings (never the secret)
+  liWarn.style.cssText = 'margin:6px 0 0;';
+  const liSubmit = el('button', 'primary', 'Submit session');
+  liSubmit.style.width = 'auto';
+  const liSubmitRow = el('div', 'bridge-actions');
+  liSubmitRow.appendChild(liSubmit);
+  liPaste.appendChild(liSubmitRow);
+  liPaste.appendChild(liWarn);
+
+  const liActions = el('div', 'bridge-actions');
+  const liConnect = el('button', 'primary', 'Connect LinkedIn');
+  liConnect.style.width = 'auto';
+  liConnect.addEventListener('click', async () => {
+    liWarn.classList.add('hidden');
+    liWarn.textContent = '';
+    await sendCmd('linkedin', 'login cookies');      // C-1 guarded
+    liPaste.classList.remove('hidden');
+    liArea.focus();
+    window.open('https://www.linkedin.com/', '_blank', 'noopener');
+  });
+  liActions.appendChild(liConnect);
+
+  const liDisc = el('button', 'danger', 'Disconnect');
+  liDisc.id = 'btn-li-disconnect';
+  liDisc.classList.add('hidden');
+  liDisc.addEventListener('click', async () => {
+    const id = liDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect LinkedIn?',
+      'This unlinks the bridge from your LinkedIn account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('linkedin', 'logout ' + id);
+      sendCmd('linkedin', 'list-logins');
+    }
+  });
+  liActions.appendChild(liDisc);
+
+  const liRefresh = el('button', '', 'Refresh status');
+  liRefresh.addEventListener('click', () => sendCmd('linkedin', 'list-logins'));
+  liActions.appendChild(liRefresh);
+  li.appendChild(liActions);
+
+  // Submit: send the pasted secret through the C-1 guard, capture the event_id,
+  // and redact it immediately. The value lives ONLY in this handler's scope; the
+  // textarea is cleared before the network call and the value is dropped after.
+  liSubmit.addEventListener('click', async () => {
+    if (busy) return;
+    liWarn.classList.add('hidden');
+    liWarn.textContent = '';
+    let secret = liArea.value;                       // read once; never logged
+    liArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      liWarn.textContent = 'Paste your LinkedIn session before submitting.';
+      liWarn.classList.remove('hidden');
+      return;
+    }
+    busy = true; setButtonsDisabled(true); liSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('linkedin', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        liWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        liWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          liPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          liWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
+          liWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      liWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      liWarn.classList.remove('hidden');
+    } finally {
+      busy = false; setButtonsDisabled(false); liSubmit.disabled = false;
+      sendCmd('linkedin', 'list-logins');            // refresh the pill
+    }
+  });
+
+  li.appendChild(liPaste);
+  holder.appendChild(li);
+
   // Planned sources (inert placeholders).
   const more = el('div', 'card src-placeholder');
   more.appendChild(el('h3', '', 'More sources'));
@@ -1960,12 +2108,15 @@ async function enterApp() {
   catch (e) { logConsole('error', 'Google Messages management room: ' + String(e.message || e)); }
   try { runtime.instagram.mgmtRoomId = await resolveMgmt(IG); }
   catch (e) { logConsole('error', 'Instagram management room: ' + String(e.message || e)); }
+  try { runtime.linkedin.mgmtRoomId = await resolveMgmt(LI); }
+  catch (e) { logConsole('error', 'LinkedIn management room: ' + String(e.message || e)); }
   startSync();
   await sendStatusRefresh();                        // WhatsApp list-logins
   if (runtime.imessage.mgmtRoomId) await sendCmd('imessage', 'status');
   else { const pill = $('imsg-status'); if (pill) pill.textContent = 'Not set up'; }
   await sendCmd('gmessages', 'list-logins');
   await sendCmd('instagram', 'list-logins');
+  await sendCmd('linkedin', 'list-logins');
 }
 
 // ---- wiring ----

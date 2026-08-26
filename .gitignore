@@ -4,6 +4,7 @@ synapse/
 whatsapp/
 meta/
 gmessages/
+linkedin/
 element/config.json
 *.backup
 *.bak

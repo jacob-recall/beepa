@@ -68,6 +68,22 @@ services:
     profiles: ["bridge"]
     # No host ports: appservice listens on the compose network only (29319).
 
+  mautrix-linkedin:
+    image: dock.mau.dev/mautrix/linkedin:v0.2608.0@sha256:c10f4e6ed9484ff8053a4e84788d2cc5f9f9c519c91e087afa5179be0ad34d03
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./linkedin:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+    # No host ports: appservice on the compose network only (29319).
+
   hub:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     restart: unless-stopped

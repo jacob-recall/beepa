@@ -11,7 +11,8 @@ review, and dispositions.
 | Synapse | `127.0.0.1:8008` | homeserver, `server_name: localhost` |
 | Element Web | `http://127.0.0.1:8009` | your chats live here |
 | mautrix-whatsapp | compose network only | bridge bot: `@whatsappbot:localhost` |
-| PostgreSQL 16 | compose network only | DBs: `synapse`, `mautrix_whatsapp` |
+| mautrix-linkedin | compose network only | bridge bot: `@linkedinbot:localhost` |
+| PostgreSQL 16 | compose network only | DBs: `synapse`, `mautrix_whatsapp`, `mautrix_linkedin` |
 
 ## Bridge Hub
 `hub/` is a static page (no backend) that signs into Synapse as you and drives
@@ -170,3 +171,63 @@ invalidates the `sessionid` stored locally. Then `logout` to the bot.
 Same warning as WhatsApp: after login, **`docker compose down -v` deletes the
 Instagram session + bridged history**. Send `logout` to the bot (or remove the
 device in Instagram) and `pg_dump` first if you care.
+
+## LinkedIn bridge (mautrix-linkedin)
+Compose service `mautrix-linkedin` (digest-pinned, no host ports, own DB
+`mautrix_linkedin`). Bot `@linkedinbot:localhost`; chats appear in the
+**LinkedIn** space. Like Instagram, this is a **session-paste** login: you log
+in as a human on linkedin.com and hand the bridge the resulting session — there
+is no automated login on LinkedIn's page (that's the classic bot-detection
+trigger).
+
+### Log in (you do this — no automation, on purpose)
+1. In your everyday Chrome, go to linkedin.com and log in normally.
+2. Open DevTools → **Network** tab → type `graphql` in the filter (LinkedIn's
+   web app calls its **voyager** graphql API). Click around LinkedIn so a
+   `graphql`/voyager request appears.
+3. Right-click a `graphql` request → **Copy → Copy as cURL**.
+4. From the Hub → **Connections → LinkedIn** card, click **Connect LinkedIn**
+   (this sends `login cookies` to the bot and opens linkedin.com), then **paste
+   the cURL** into the box and **Submit session**. The Hub sends it to the bot
+   through the management-room guard and **auto-redacts** the pasted message
+   immediately. (Alternatively, DM `@linkedinbot:localhost` and send
+   `login cookies`, then paste the cURL yourself and delete that message.)
+
+Unlike a cookies-only bridge, LinkedIn needs the **cURL** (not just cookies):
+the request carries the `X-LI-Track` and `X-LI-Page-Instance` headers that
+LinkedIn's voyager API expects alongside the `li_at` cookie. A trimmed,
+fake-valued example of what you'd paste (real values redacted):
+
+```
+curl 'https://www.linkedin.com/voyager/api/...' \
+  -H 'csrf-token: <REDACTED>' \
+  -H 'x-li-track: {"clientVersion":"<REDACTED>"}' \
+  -H 'x-li-page-instance: urn:li:page:<REDACTED>' \
+  -b 'li_at=<REDACTED>; JSESSIONID=<REDACTED>'
+```
+
+Never paste a real cURL into a file, a ticket, or a chat log — it is a **bearer
+credential** (anyone with `li_at` is you).
+
+### At-rest / redaction note
+The cURL is a bearer credential. The Hub sends it **only** to the LinkedIn
+management room and redacts the carrier event right away; the bridge log is
+deliberately `info`-level and does **not** record the cookie. Until redacted,
+a pasted credential rests in the Matrix events DB — if the auto-redact ever
+fails, delete the message in Element (hover → **Remove**). At-rest protection
+for the local archive is FileVault (verified on).
+
+### ToS caveat
+Using an unofficial LinkedIn client violates LinkedIn's Terms of Service.
+Personal single-user bridging is the low-risk end, but a restriction or ban,
+while unlikely, is possible. Runs on **localhost / your home IP** — don't move
+this to a VPS/datacenter IP. Keep it to your one account.
+
+### Commands (DM the bot)
+`help`, `version`, `login cookies`, `list-logins`, `logout <login ID>`,
+`set-preferred-login`, `search`, `start-chat`, `resolve-identifier`, `sync`.
+
+### Don't destroy your session
+Same warning as WhatsApp: after login, **`docker compose down -v` deletes the
+LinkedIn session + bridged history**. Send `logout` to the bot and `pg_dump`
+first if you care.

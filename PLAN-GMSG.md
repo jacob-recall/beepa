@@ -69,6 +69,32 @@ browser-assisted flow.
 - Adds another local plaintext message archive; FileVault is the at-rest control.
 - Unofficial client (Google ToS); low risk for personal single-user use.
 
+## Double puppeting (auto-join → centralized Home feed)
+
+For Google Messages conversations to appear in the Hub's Home feed / sidebar, the
+user must be JOINED to the bridge's personal space *"Google Messages (<account>)"*
+and its child portal rooms (the feed lists joined children of a space whose name
+starts with the source's `spaceName`). mautrix invites but does not auto-join, so
+**double puppeting** was enabled so the bridge auto-joins `@jkali` to portals
+(now and for future chats):
+
+1. `synapse/gmessages-registration.yaml` — added a **non-exclusive** namespace
+   `- regex: ^@jkali:localhost$  exclusive: false` (lets the appservice as_token
+   act as `@jkali`). Restart Synapse to load it.
+2. `gmessages/config.yaml` → `double_puppet.secrets: { localhost: as_token:<gmessages as_token> }`.
+   Restart the bridge.
+3. On restart the bridge auto-joins `@jkali` to all portals; join the space room
+   itself once via the as_token if it stays "invite":
+   `curl -XPOST "http://127.0.0.1:8008/_matrix/client/v3/join/<space>?user_id=@jkali:localhost" -H "Authorization: Bearer <as_token>" -d '{}'`.
+
+**SECURITY**: this grants the gmessages appservice the ability to act as `@jkali`
+on the local homeserver (standard mautrix double-puppeting; bounded to this
+single-user localhost stack, where the bridge is already trusted with all the
+user's Google messages). Both edits live in gitignored runtime files
+(`synapse/`, `gmessages/`) so they are NOT committed — re-apply via these steps if
+the stack is rebuilt. WhatsApp/iMessage do not have double puppeting; their chats
+arrive as invites to accept.
+
 ## Rollback
 
 `docker compose stop mautrix-gmessages`; remove the compose service + the

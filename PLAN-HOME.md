@@ -161,3 +161,34 @@ feed logic by pilotfish:security-executor (Opus); verified by Fable.
   populates from both platforms sorted by recency.
 Browser-visual (feed renders, live bubble on new msg, search filter, badge
 colors) is user-checklist (Chrome ext unavailable — accepted deviation).
+
+### Bug fixes (2026-08-26, post-deploy)
+- **iMessage missing from feed** (Fable, functional): parseSnapshot read
+  m.space.child only from the sync `state` block; the newer iMessage space
+  keeps those in its `timeline` window, so state-only found 0 iMessage
+  children. Fixed to scan state+timeline (deduped). D-5 unchanged (children
+  still ROOMID_RE ∩ joinedSet gated). Verified: iMessage 0→3 children resolve.
+- **"Element is not supported by the browser" on opening a conversation**:
+  NOT our code — Element 1.12.26's own checkBrowserFeatures gate (bundle:
+  "Browser is missing required features" + mx_accepts_unsupported_browser
+  localStorage bypass). Tests recent features (Promise.withResolvers,
+  Intl.Segmenter, secure-context, wasm). It offers a "continue anyway" link
+  that sets the bypass flag (persists per-origin on 127.0.0.1). Diagnosis
+  pending user's browser; options if it recurs: click-through (one-time on
+  127.0.0.1), or pin an older/less-strict Element image.
+
+### Home global-sort + declutter (2026-08-26)
+- Global sort: bug-2 fix (parseSnapshot state+timeline) makes iMessage + WhatsApp
+  (+ gmessages/meta once linked) merge into ONE Home list sorted by last message
+  ts, sender-agnostic (sent OR received) — the user's ask. Sort logic unchanged.
+- Declutter (Opus-built, Fable-verified): the feed now EXCLUDES rooms that are
+  m.lowpriority-tagged (archived/low-priority), muted (a room push rule with no
+  notify action), or manually hidden. Per-row "Hide"/"Unhide" sets/clears the
+  m.lowpriority tag (validated roomId ∈ feedModel only); a "Show hidden" chip
+  reveals them. Feed sync stays isolated (no command-path refs); node --check +
+  0 sinks; CSP unchanged. WhatsApp config changed (archive_tag: m.lowpriority,
+  mute_only_on_create:false, tag_only_on_create:false) so FUTURE mutes/archives
+  auto-sync → auto-hide; existing state did NOT backfill (network doesn't push
+  it retroactively), so existing archived/muted need one manual Hide (or a bridge
+  re-sync). Live-verified: hiding "Oak Investment" set m.lowpriority → excluded.
+  (Oak Investment left hidden per the user's explicit example.)

@@ -50,10 +50,11 @@ and `docker compose restart mautrix-whatsapp` — do this *before* logging in if
 you want initial history.
 
 ## Read before deleting anything
-- **`docker compose down -v` is destructive after WhatsApp login**: it deletes
-  the Postgres volume = your WhatsApp session *and* all bridged history.
-  First send `logout` to the bot (or unlink in WhatsApp → Linked devices),
-  and take a backup if you care:
+- **`docker compose down -v` is destructive after WhatsApp (or Google
+  Messages) login**: it deletes the Postgres volume = your WhatsApp/Google
+  Messages sessions *and* all bridged history for both. First send `logout`
+  to each bot (or unlink in WhatsApp → Linked devices / Google Messages →
+  Device pairing), and take a backup if you care:
   `docker compose exec postgres pg_dumpall -U matrix > pg_dump.sql`
 - **Stolen/lost laptop kill switch**: WhatsApp → Settings → Linked devices →
   unlink the bridge device. That immediately invalidates the session keys
@@ -93,3 +94,79 @@ are best-effort. New chats arrive as invites (accept in Element).
 - macOS permissions are granted to `imessage/bin/imessage-cli` specifically;
   a rebuilt binary re-prompts (that's a feature). Test messages
   (`pmmng-test-*`) in your self-chat are safe to delete from Messages.app.
+
+## Google Messages bridge
+Compose service `mautrix-gmessages` (digest-pinned, no host ports, internal
+appservice port 29336). Bot `@gmessagesbot:localhost`; chats appear in the
+**Google Messages** space. Uses the same management-room model as WhatsApp: a
+2-member DM with the bot, driven from the Hub.
+
+### Connect — 3 steps
+Google Messages links with a quick **Google account sign-in** (no cookie pasting;
+credentials never become a Matrix message). From the Hub → **Connections → Google
+Messages** card, or from a terminal:
+
+1. **Open Google sign-in** (the card's button, or
+   `https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config`)
+   and sign into your Google account in Chrome.
+2. **Run the connect helper:** `python3 gmessages-connect/connect.py`
+   (approve the one-time macOS Keychain prompt). It reads your Google session
+   from Chrome and submits it to the bridge.
+3. **Tap the emoji** it prints, in the Google Messages app on your phone.
+
+The card then shows **Connected**; your ~25 recent chats + contacts sync into the
+**Google Messages** space (new chats arrive as Element invites, like WhatsApp).
+Backfill is **on**. Commands (list-logins, logout, sync, start-chat, …) live in
+the Hub's **Settings → Google Messages** tab.
+
+- **Your phone must stay continuously online** — Google Messages proxies every
+  message through the phone; if it goes offline, messages pause until it's back.
+- **Re-linking / testing:** just run `gmessages-connect/connect.py` again.
+  `logout` (Hub Settings) or the provisioning `logout` endpoint clears the login;
+  "Delete all bridged rooms" clears the synced rooms.
+
+## Instagram bridge (mautrix-meta)
+Compose service `mautrix-meta` (Instagram DM bridge, digest-pinned, no host
+ports, own DB `mautrix_meta`). Bot `@instagrambot:localhost`; chats appear in
+the **Instagram** space. Design + security dispositions: `PLAN-META.md`.
+Backfill is **off** — only messages from login onward are bridged.
+
+### Log in (you do this — no automation, on purpose)
+Automated input on Instagram's login page is the classic bot-detection trigger,
+so **you** log in as a human and hand the bridge the resulting session:
+1. In your **everyday Chrome** (the one Instagram already trusts), with **2FA
+   enabled** on your account, go to instagram.com and log in normally.
+2. Open DevTools → **Network** tab → filter **XHR** → type `graphql` in the
+   filter. Click around Instagram so a `graphql` request appears.
+3. Right-click a `graphql` request → **Copy → Copy as cURL** (POSIX on Windows).
+4. In Element, open a DM with `@instagrambot:localhost`, send `login instagram`,
+   and paste the cURL when prompted. (Alternatively paste the cookies
+   `sessionid, csrftoken, mid, ig_did, ds_user_id` as a JSON object.)
+5. **Immediately delete that message.** The cURL/cookies are a *bearer
+   credential* (anyone with `sessionid` is you): unless deleted, it rests in the
+   Matrix events DB. Element: hover the message → **Remove** (redact). The
+   bridge log is deliberately `info`-level and does **not** record the cookie.
+
+Chats appear as rooms in the Instagram space within a minute or two.
+
+### Staying un-flagged (single personal account)
+- Runs on **localhost / your home IP** — do **not** move this to a VPS/datacenter
+  IP (the single biggest flag for a bridged Instagram session).
+- **2FA on**; backfill off; the bridge only syncs your DM inbox participants
+  (no follower/following scrape). Keep it to your one account.
+- This is a unified Meta bridge: this image has **no `network.mode` field** —
+  the network is chosen when you run `login instagram`. Only run
+  `login instagram`; `login facebook`/`login messenger` would bridge those too.
+
+### Kill switch (if the laptop is lost, or you want to cut the session)
+Instagram → Settings → **Accounts Center → Password & security → Where you're
+logged in** → remove the bridge device (or reset your password). That
+invalidates the `sessionid` stored locally. Then `logout` to the bot.
+
+### Commands (DM the bot)
+`help`, `version`, `login instagram`, `list-logins`, `logout <login ID>`.
+
+### Don't destroy your session
+Same warning as WhatsApp: after login, **`docker compose down -v` deletes the
+Instagram session + bridged history**. Send `logout` to the bot (or remove the
+device in Instagram) and `pg_dump` first if you care.

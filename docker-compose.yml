@@ -50,6 +50,24 @@ services:
     profiles: ["bridge"]
     # No host ports: appservice listens on the compose network only (29318).
 
+  mautrix-meta:
+    # Instagram DM bridge — unified mautrix-meta; network is chosen at login
+    # (`login instagram`), not by config (no network.mode field). Pinned 2026-08-26.
+    image: dock.mau.dev/mautrix/meta:latest@sha256:61d684f9e385c6150cabe1a49555a409a97a154f2466b45626298de51f1c3f40
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./meta:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+    # No host ports: appservice listens on the compose network only (29319).
+
   hub:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     restart: unless-stopped

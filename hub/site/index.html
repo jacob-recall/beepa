@@ -43,18 +43,35 @@
   </aside>
 
   <main id="content">
-    <!-- Home: unified recent conversations across all platforms -->
+    <!-- Home: two-pane messenger — conversation list (left) + open chat (right) -->
     <section id="view-home" class="view hidden">
-      <header class="view-head">
-        <h2>Home</h2>
-        <p class="muted">Your most recent conversations across every service. Click one to open and reply.</p>
-        <input id="home-search" placeholder="Search your conversations" spellcheck="false" autocomplete="off">
-      </header>
-      <div id="home-list" class="convo-list"></div>
+      <div id="msgr">
+        <div id="msgr-list">
+          <div id="msgr-list-head">
+            <input id="home-search" placeholder="Search conversations" spellcheck="false" autocomplete="off">
+          </div>
+          <div id="home-list" class="convo-list"></div>
+        </div>
+        <div id="msgr-convo" class="no-selection">
+          <header id="convo-head">
+            <button id="convo-back" type="button" title="Back to list">&#8592;</button>
+            <span id="convo-badge" class="plat-badge"></span>
+            <span id="convo-title"></span>
+            <span class="spacer"></span>
+            <a id="convo-element-link" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Open in Element &#8599;</a>
+          </header>
+          <div id="convo-messages"></div>
+          <div id="convo-placeholder">Select a conversation to start chatting.</div>
+          <div id="convo-compose">
+            <input id="convo-input" placeholder="Message" spellcheck="true" autocomplete="off">
+            <button id="convo-send" type="button" class="primary">Send</button>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <!-- The persistent embedded Element pane (reading / replying) -->
-    <section id="view-chats" class="view">
+    <!-- The embedded Element pane (full-feature escape hatch only) -->
+    <section id="view-chats" class="view hidden">
       <div id="chats-container"></div>
     </section>
 

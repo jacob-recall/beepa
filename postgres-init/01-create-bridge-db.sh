@@ -5,4 +5,8 @@ set -eu
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     CREATE DATABASE mautrix_whatsapp OWNER matrix TEMPLATE template0
         ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
+    CREATE DATABASE mautrix_meta OWNER matrix TEMPLATE template0
+        ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
+    CREATE DATABASE mautrix_gmessages OWNER matrix TEMPLATE template0
+        ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
 EOSQL

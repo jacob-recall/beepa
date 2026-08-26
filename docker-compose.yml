@@ -1,0 +1,80 @@
+name: matrix-wa
+
+services:
+  postgres:
+    image: postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: synapse
+      # Cluster-wide C locale + UTF8: Synapse requires LC_COLLATE=C, LC_CTYPE=C
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix -d synapse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host ports: reachable only on the compose network.
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./synapse:/data
+    ports:
+      - "127.0.0.1:8008:8008"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mautrix-whatsapp:
+    image: dock.mau.dev/mautrix/whatsapp:v26.08@sha256:86237c4d0d33a1e08910b1f820e6c561f9b8e21dc26943caf266e01021087002
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./whatsapp:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+    # No host ports: appservice listens on the compose network only (29318).
+
+  hub:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    volumes:
+      - ./hub/site:/usr/share/nginx/html:ro
+      - ./hub/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8010:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["client"]
+
+  element:
+    image: vectorim/element-web:v1.12.26@sha256:a9be04cef41ed94cba0dcaeca5a81f89826d4f8be3d57ba5a6fa988f34eda703
+    restart: unless-stopped
+    volumes:
+      - ./element/config.json:/app/config.json:ro
+      - ./element/nginx-default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "127.0.0.1:8009:80"
+    profiles: ["client"]
+
+volumes:
+  postgres-data:

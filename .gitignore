@@ -1,0 +1,12 @@
+# Secrets and generated state — never commit
+.env
+synapse/
+whatsapp/
+element/config.json
+*.backup
+*.bak
+pg_dump*
+imessage/
+
+# Harness state and worktrees
+.claude/

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bridge Hub</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="signout-note-wrap" class="hidden">
+  <p id="signout-note" class="muted">Signed out of the Hub. Your chats session is separate — to sign out of it too, open <a href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">127.0.0.1:8009</a>.</p>
+</div>
+
+<section id="view-signin">
+  <div class="card narrow">
+    <h1>Bridge Hub</h1>
+    <p class="muted">One place for every messaging account. Sign in to your local Matrix homeserver.</p>
+    <label for="in-user">Matrix username</label>
+    <input id="in-user" autocomplete="username" spellcheck="false" placeholder="jkali">
+    <label for="in-pass">Password</label>
+    <input id="in-pass" type="password" autocomplete="current-password">
+    <button id="btn-signin" type="button" class="primary">Sign in</button>
+    <p id="signin-error" class="error hidden"></p>
+  </div>
+</section>
+
+<div id="shell" class="hidden">
+  <aside id="sidebar">
+    <div id="brand">Bridge Hub</div>
+    <nav id="nav-sources" aria-label="Sources"><!-- source buttons injected: All + per-source --></nav>
+    <div class="nav-sep"></div>
+    <nav id="nav-tools" aria-label="Tools">
+      <button id="nav-directory" class="navitem" type="button"><span class="ic">&#128269;</span> Directory</button>
+      <button id="nav-connections" class="navitem" type="button"><span class="ic">&#128268;</span> Connections</button>
+      <button id="nav-settings" class="navitem" type="button"><span class="ic">&#9881;</span> Settings</button>
+    </nav>
+    <div class="spacer"></div>
+    <div id="account">
+      <span id="whoami"></span>
+      <a id="open-chats" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Full tab &#8594;</a>
+      <button id="signout" type="button">Sign out of Hub</button>
+    </div>
+  </aside>
+
+  <main id="content">
+    <!-- Home: unified recent conversations across all platforms -->
+    <section id="view-home" class="view hidden">
+      <header class="view-head">
+        <h2>Home</h2>
+        <p class="muted">Your most recent conversations across every service. Click one to open and reply.</p>
+        <input id="home-search" placeholder="Search your conversations" spellcheck="false" autocomplete="off">
+      </header>
+      <div id="home-list" class="convo-list"></div>
+    </section>
+
+    <!-- The persistent embedded Element pane (reading / replying) -->
+    <section id="view-chats" class="view">
+      <div id="chats-container"></div>
+    </section>
+
+    <!-- Per-source conversation list -->
+    <section id="view-source" class="view hidden">
+      <header class="view-head">
+        <h2 id="source-title">Source</h2>
+        <p class="muted" id="source-sub">Your conversations on this service. Click one to open it.</p>
+      </header>
+      <div id="source-list" class="convo-list"></div>
+    </section>
+
+    <!-- Directory: cross-source search -->
+    <section id="view-directory" class="view hidden">
+      <header class="view-head">
+        <h2>Directory</h2>
+        <p class="muted">Search your conversations across every connected service, or start a new one.</p>
+        <input id="directory-search" placeholder="Search names and numbers across all services" spellcheck="false" autocomplete="off">
+      </header>
+      <div id="directory-results" class="convo-list"></div>
+    </section>
+
+    <section id="view-connections" class="view hidden">
+      <header class="view-head">
+        <h2>Connections</h2>
+        <p class="muted">Each card is one service. Connect it once; conversations then appear under its tab.</p>
+      </header>
+      <div id="bridge-cards"></div>
+    </section>
+
+    <section id="view-settings" class="view hidden">
+      <header class="view-head">
+        <h2>Settings</h2>
+        <p class="muted">Service commands as buttons. Replies appear in the output panel.</p>
+      </header>
+      <div id="settings-source-tabs"></div>
+      <div id="command-groups"></div>
+      <div class="card" id="console-card">
+        <h3>Service output</h3>
+        <div id="console" aria-live="polite"></div>
+        <div class="row">
+          <input id="console-input" placeholder="Reply to a multi-step flow (e.g. a phone number)" spellcheck="false">
+          <button id="console-send" type="button">Send</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modal-backdrop" class="hidden">
+  <div class="card narrow" id="modal">
+    <h3 id="modal-title"></h3>
+    <p id="modal-text"></p>
+    <input id="modal-input" class="hidden" spellcheck="false" autocomplete="off">
+    <div class="row">
+      <button id="modal-cancel" type="button">Cancel</button>
+      <button id="modal-ok" type="button" class="danger">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

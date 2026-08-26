@@ -1,0 +1,45 @@
+server {
+    listen       ${ELEMENT_WEB_PORT};
+    listen  [::]:${ELEMENT_WEB_PORT};
+    server_name  localhost;
+
+    root   /usr/share/nginx/html;
+    index  index.html;
+
+    # Frame protection (PLAN-HUB.md A1-1/A1-2): 'self'/SAMEORIGIN, never
+    # 'none' — Element frames itself (usercontent/) and the Hub shell (8010)
+    # frames Element. XFO removed: it cannot express an allowlist (A2-8).
+    # nginx add_header does not merge, so these repeat in every location
+    # block that declares its own add_header.
+    add_header Content-Security-Policy "frame-ancestors 'self' http://127.0.0.1:8010" always;
+
+    # Set no-cache for the version, config, i18n, and index.html
+    # so that browsers always check for a new copy of Element Web.
+    # NB http://your-domain/ and http://your-domain/? are also covered by this
+
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+        add_header Content-Security-Policy "frame-ancestors 'self' http://127.0.0.1:8010" always;
+        }
+    location = /version {
+        add_header Cache-Control "no-cache";
+        add_header Content-Security-Policy "frame-ancestors 'self' http://127.0.0.1:8010" always;
+        }
+    location /i18n/ {
+        add_header Cache-Control "no-cache";
+        add_header Content-Security-Policy "frame-ancestors 'self' http://127.0.0.1:8010" always;
+        }
+
+    # covers config.json and config.hostname.json requests as it is prefix.
+    location /config {
+        root /tmp/element-web-config;
+        add_header Cache-Control "no-cache";
+        add_header Content-Security-Policy "frame-ancestors 'self' http://127.0.0.1:8010" always;
+        }
+    location /modules {
+        alias /modules;
+    }
+    # redirect server error pages to the static page /50x.html
+    #
+    error_page   500 502 503 504  /50x.html;
+}

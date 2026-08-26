@@ -37,10 +37,14 @@ const SOURCES = [
   { id: 'gmessages', label: 'Google Messages', kind: 'source', botMxid: '@gmessagesbot:localhost',
     spaceName: 'Google Messages', canStartChat: true, icon: '📱',
     blurb: 'Link your Google account with a quick sign-in; your chats appear as rooms in Element.' },
+  { id: 'instagram', label: 'Instagram', kind: 'source', botMxid: '@instagrambot:localhost',
+    spaceName: 'Instagram', canStartChat: true, icon: '📷',
+    blurb: 'Bridge your Instagram DMs: log in on instagram.com, then paste your session; chats appear as rooms in Element.' },
 ];
 const WA = SOURCES.find(s => s.id === 'whatsapp');
 const IMSG = SOURCES.find(s => s.id === 'imessage');
 const GMSG = SOURCES.find(s => s.id === 'gmessages');
+const IG = SOURCES.find(s => s.id === 'instagram');
 // The ONLY sender whose com.jkali.from_me marker is trusted (anti-spoof): our
 // own iMessage appservice bot. Never a ghost (@imessage_*) or a remote contact.
 const IMSG_BOT_MXID = IMSG.botMxid;                // '@imessagebot:localhost'
@@ -113,9 +117,27 @@ const GMSG_COMMAND_GROUPS = [
     { cmd: 'delete-all-portals', label: 'Delete all bridged rooms', desc: 'Permanently delete every bridged chat room on the Matrix side (nothing is deleted on Google Messages itself).', confirm: 'type' },
   ]},
 ];
+// ---- Instagram command surface (mirrors Google Messages' shape) ----
+// No bulk follower/following enumeration command (anti-ban posture, SPEC §3/§7).
+const IG_COMMAND_GROUPS = [
+  { title: 'General', cmds: [
+    { cmd: 'help', label: 'Help', desc: "Show the bridge's own list of every command." },
+    { cmd: 'version', label: 'Version', desc: 'Show which bridge version is running.' },
+  ]},
+  { title: 'Account', cmds: [
+    { cmd: 'list-logins', label: 'List logins', desc: 'List the Instagram accounts linked to the bridge and their connection state.' },
+    { cmd: 'login instagram', label: 'Connect Instagram', desc: 'Start linking your Instagram account; then paste your instagram.com session as the next message.' },
+    { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked Instagram account from the bridge.', arg: 'login ID', confirm: 'click' },
+  ]},
+  { title: 'Chats & contacts', cmds: [
+    { cmd: 'sync', label: 'Sync now', desc: 'Refresh chats and contacts from Instagram.' },
+    { cmd: 'search', label: 'Search by username', desc: 'Find an Instagram user by username to start a new chat.', arg: 'username' },
+  ]},
+];
 function groupsFor(sourceId) {
   if (sourceId === 'imessage') return IMSG_COMMAND_GROUPS;
   if (sourceId === 'gmessages') return GMSG_COMMAND_GROUPS;
+  if (sourceId === 'instagram') return IG_COMMAND_GROUPS;
   return COMMAND_GROUPS;
 }
 
@@ -146,7 +168,7 @@ let busy = false;
 let activeSettingsSource = 'whatsapp';
 let joinedSet = new Set();
 const convosBySource = {};                 // sourceId -> [convo]
-const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null } };
+const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null } };
 
 // ---- Home feed state (HF-2): fully independent of the command sync loop.
 // These are NEVER the command loop's syncSince/syncRunning; the two /sync loops
@@ -203,7 +225,7 @@ function el(tag, cls, text) {
 // Strip C0 controls (keep \n), bidi overrides, zero-width chars; clamp length.
 function sanitize(s) {
   if (typeof s !== 'string') return '';
-  return s.replace(/[ -	-‪-‮⁦-⁩​-‏﻿]/g, '')
+  return s.replace(/[\x00-	-‪-‮⁦-⁩​-‏﻿]/g, '')
           .slice(0, 4000);
 }
 // D-7: single-line variant for rows / titles / subs / badges / previews.
@@ -227,7 +249,7 @@ async function api(method, path, body) {
 // ---- session ----
 function forgetSession() {
   token = null; userId = null;
-  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null;
+  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null;
   syncRunning = false;
   feedRunning = false;                              // HF-2: stop the feed loop with the session
   feedSince = null;
@@ -278,12 +300,12 @@ async function signOut() {
 
 // ---- management-room resolution + verification (C-1) ----
 async function resolveMgmt(source) {
-  if (source.id === 'whatsapp' || source.id === 'gmessages') return await findBotDmMgmt(source);
+  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') return await findBotDmMgmt(source);
   if (source.id === 'imessage') return await resolveImsgMgmt();
   return null;
 }
 async function verifyMgmt(source, roomId) {
-  if (source.id === 'whatsapp' || source.id === 'gmessages') return await isBotDmMgmt(source, roomId);
+  if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') return await isBotDmMgmt(source, roomId);
   if (source.id === 'imessage') return await verifyImsgMgmt(roomId);
   return false;
 }
@@ -364,6 +386,33 @@ async function sendCmd(sourceId, text) {
 }
 function sendStatusRefresh() { return sendCmd('whatsapp', 'list-logins'); }
 
+// ---- Instagram session paste (SPEC §5/§6, security review M1) ----
+// The pasted value is a BEARER CREDENTIAL. It is delivered through the SAME C-1
+// mgmt-room guard sendCmd uses (resolve + verifyMgmt before the send), but it is
+// NEVER logged, sanitize-rendered, echoed to the console, kept in any long-lived
+// variable, or used to build a URL. This dedicated path exists ONLY so the send
+// returns the event_id (sendCmd logs its body via logConsole, which is forbidden
+// for the secret). Returns { roomId, eventId } so the carrier event can be
+// redacted immediately. C-1 verification is preserved verbatim below.
+async function sendSecretToMgmt(sourceId, secret) {
+  const source = SOURCES.find(s => s.id === sourceId);
+  if (!source || !source.botMxid) throw new Error('Unknown source.');
+  const rt = runtime[sourceId];
+  if (!rt.mgmtRoomId) rt.mgmtRoomId = await resolveMgmt(source);
+  if (!rt.mgmtRoomId) throw new Error(source.label + ': management room not found.');
+  if (!(await verifyMgmt(source, rt.mgmtRoomId))) {          // C-1: verify before EVERY send
+    throw new Error('Refusing to send: ' + source.label + ' management room failed verification.');
+  }
+  const res = await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(rt.mgmtRoomId) +
+    '/send/m.room.message/' + encodeURIComponent(txn()), { msgtype: 'm.text', body: secret });
+  return { roomId: rt.mgmtRoomId, eventId: res && res.event_id };   // `secret` is never logged
+}
+// Redact (delete) the credential-carrying event with the user's own token.
+async function redactMgmtEvent(roomId, eventId) {
+  await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+    '/redact/' + encodeURIComponent(eventId) + '/' + encodeURIComponent(txn()), {});
+}
+
 // ---- command/console sync loop (D-3: isolated to the resolved mgmt rooms) --
 async function startSync() {
   if (syncRunning) return;
@@ -371,7 +420,7 @@ async function startSync() {
   syncSince = null;
   while (syncRunning && token) {
     try {
-      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId].filter(Boolean);
+      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId, runtime.instagram.mgmtRoomId].filter(Boolean);
       const filter = encodeURIComponent(JSON.stringify(
         { room: { rooms: ids, timeline: { limit: 30 } }, presence: { types: [] } }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -398,9 +447,11 @@ function routeMgmtEvent(roomId, ev) {
   const wa = runtime.whatsapp.mgmtRoomId;
   const im = runtime.imessage.mgmtRoomId;
   const gm = runtime.gmessages.mgmtRoomId;
+  const ig = runtime.instagram.mgmtRoomId;
   if (wa && roomId === wa) { handleMgmtEvent(WA, ev); return; }
   if (im && roomId === im) { handleMgmtEvent(IMSG, ev); return; }
   if (gm && roomId === gm) { handleMgmtEvent(GMSG, ev); return; }
+  if (ig && roomId === ig) { handleMgmtEvent(IG, ev); return; }
   return; // not a management room -> ignore entirely
 }
 
@@ -428,7 +479,7 @@ function handleMgmtEvent(source, ev) {
   if (fromBot && typeof content.body === 'string') {
     const body = sanitize(content.body.replace(/^\* /, ''));
     logConsole('bot', body, source.id);
-    if (source.id === 'whatsapp' || source.id === 'gmessages') reactToBotReply(body, source);
+    if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram') reactToBotReply(body, source);
     else if (source.id === 'imessage') updateImsgCard(content.body);
   } else if (fromMe && typeof content.body === 'string' &&
              !String(ev.unsigned && ev.unsigned.transaction_id || '').startsWith('hub-')) {
@@ -438,8 +489,10 @@ function handleMgmtEvent(source, ev) {
 
 // WhatsApp / Google Messages status parsing for their Connections cards.
 function reactToBotReply(body, source) {
-  const pillId = source.id === 'gmessages' ? 'gmsg-status' : 'wa-status';
-  const discId = source.id === 'gmessages' ? null : 'btn-disconnect';
+  const pillId = source.id === 'gmessages' ? 'gmsg-status'
+               : source.id === 'instagram' ? 'ig-status' : 'wa-status';
+  const discId = source.id === 'instagram' ? 'btn-ig-disconnect'
+               : source.id === 'gmessages' ? null : 'btn-disconnect';
   if (/You're not logged in/i.test(body)) updateCardStatus([], pillId, discId);
   const logins = [...body.matchAll(/^\* `([^`\n]+)` \(([^)\n]*)\) - `([A-Z_]+)`/gm)]
     .map(m => ({ id: m[1], name: m[2], state: m[3] }));
@@ -1234,7 +1287,8 @@ async function sendConvoMessage() {
   // Defense-in-depth: never send into a bridge management room from this surface.
   if (roomId === runtime.whatsapp.mgmtRoomId ||
       roomId === runtime.imessage.mgmtRoomId ||
-      roomId === runtime.gmessages.mgmtRoomId) {
+      roomId === runtime.gmessages.mgmtRoomId ||
+      roomId === runtime.instagram.mgmtRoomId) {
     convoSetStatus('Cannot send a message here.');
     return;
   }
@@ -1690,6 +1744,117 @@ function buildConnections() {
   gm.appendChild(gmSteps);
   holder.appendChild(gm);
 
+  // Instagram card (mirrors the gmessages card, but with a session PASTE flow
+  // instead of a QR — SPEC §5/§6). The pasted value is a bearer credential:
+  // it is sent through the C-1 mgmt guard, redacted immediately, and never
+  // logged, sanitize-rendered, persisted, or turned into a URL.
+  const ig = el('div', 'card bridge-card');
+  const igHead = el('div', 'bridge-head');
+  igHead.appendChild(el('span', 'bridge-name', IG.label));
+  const igPill = el('span', 'status-pill', 'Checking…');
+  igPill.id = 'ig-status';
+  igHead.appendChild(igPill);
+  ig.appendChild(igHead);
+  ig.appendChild(el('p', 'muted', IG.blurb));
+
+  // Paste UI (built up front, revealed by Connect). textContent-only; no
+  // innerHTML. The textarea value is treated like a password: never echoed.
+  const igPaste = el('div', 'ig-paste hidden');
+  igPaste.style.cssText = 'margin-top:10px;';
+  igPaste.appendChild(el('p', 'muted',
+    'On instagram.com: DevTools → Network → filter graphql → right-click a request → Copy as cURL, then paste here.'));
+  const igArea = el('textarea');
+  igArea.placeholder = 'Paste your Instagram session (Copy as cURL, or the cookies JSON) here';
+  igArea.rows = 4;
+  igArea.autocomplete = 'off';
+  igArea.spellcheck = false;
+  igArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  igPaste.appendChild(igArea);
+  const igWarn = el('p', 'error hidden');           // visible warnings (never the secret)
+  igWarn.style.cssText = 'margin:6px 0 0;';
+  const igSubmit = el('button', 'primary', 'Submit session');
+  igSubmit.style.width = 'auto';
+  const igSubmitRow = el('div', 'bridge-actions');
+  igSubmitRow.appendChild(igSubmit);
+  igPaste.appendChild(igSubmitRow);
+  igPaste.appendChild(igWarn);
+
+  const igActions = el('div', 'bridge-actions');
+  const igConnect = el('button', 'primary', 'Connect Instagram');
+  igConnect.style.width = 'auto';
+  igConnect.addEventListener('click', async () => {
+    igWarn.classList.add('hidden');
+    igWarn.textContent = '';
+    await sendCmd('instagram', 'login instagram');  // C-1 guarded
+    igPaste.classList.remove('hidden');
+    igArea.focus();
+    window.open('https://www.instagram.com/', '_blank', 'noopener');
+  });
+  igActions.appendChild(igConnect);
+
+  const igDisc = el('button', 'danger', 'Disconnect');
+  igDisc.id = 'btn-ig-disconnect';
+  igDisc.classList.add('hidden');
+  igDisc.addEventListener('click', async () => {
+    const id = igDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect Instagram?',
+      'This unlinks the bridge from your Instagram account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('instagram', 'logout ' + id);
+      sendCmd('instagram', 'list-logins');
+    }
+  });
+  igActions.appendChild(igDisc);
+
+  const igRefresh = el('button', '', 'Refresh status');
+  igRefresh.addEventListener('click', () => sendCmd('instagram', 'list-logins'));
+  igActions.appendChild(igRefresh);
+  ig.appendChild(igActions);
+
+  // Submit: send the pasted secret through the C-1 guard, capture the event_id,
+  // and redact it immediately. The value lives ONLY in this handler's scope; the
+  // textarea is cleared before the network call and the value is dropped after.
+  igSubmit.addEventListener('click', async () => {
+    if (busy) return;
+    igWarn.classList.add('hidden');
+    igWarn.textContent = '';
+    let secret = igArea.value;                       // read once; never logged
+    igArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      igWarn.textContent = 'Paste your Instagram session before submitting.';
+      igWarn.classList.remove('hidden');
+      return;
+    }
+    busy = true; setButtonsDisabled(true); igSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('instagram', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        igWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        igWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          igPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          igWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
+          igWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      igWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      igWarn.classList.remove('hidden');
+    } finally {
+      busy = false; setButtonsDisabled(false); igSubmit.disabled = false;
+      sendCmd('instagram', 'list-logins');           // refresh the pill
+    }
+  });
+
+  ig.appendChild(igPaste);
+  holder.appendChild(ig);
+
   // Planned sources (inert placeholders).
   const more = el('div', 'card src-placeholder');
   more.appendChild(el('h3', '', 'More sources'));
@@ -1793,11 +1958,14 @@ async function enterApp() {
   catch (e) { /* iMessage mgmt room may not exist yet; card stays "not set up" */ }
   try { runtime.gmessages.mgmtRoomId = await resolveMgmt(GMSG); }
   catch (e) { logConsole('error', 'Google Messages management room: ' + String(e.message || e)); }
+  try { runtime.instagram.mgmtRoomId = await resolveMgmt(IG); }
+  catch (e) { logConsole('error', 'Instagram management room: ' + String(e.message || e)); }
   startSync();
   await sendStatusRefresh();                        // WhatsApp list-logins
   if (runtime.imessage.mgmtRoomId) await sendCmd('imessage', 'status');
   else { const pill = $('imsg-status'); if (pill) pill.textContent = 'Not set up'; }
   await sendCmd('gmessages', 'list-logins');
+  await sendCmd('instagram', 'list-logins');
 }
 
 // ---- wiring ----

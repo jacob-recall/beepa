@@ -5,7 +5,8 @@
 # AND from the matrix-master stack — never merge or point tooling at matrix-wa:
 #   * compose project name:  matrix-synctest
 #   * own Postgres (NO host port — reachable only on this project's network)
-#   * own named volumes (synctest-postgres-data, synctest-synapse-media)
+#   * own Postgres named volume (synctest-postgres-data); media_store lives in
+#     the ./synapse bind mount (host-owned UID 501) so uploads don't 500
 #   * Synapse CS API on host 127.0.0.1:8028 only
 #       (matrix-wa: 8008/8009/8010, matrix-master: 8018)
 #
@@ -38,8 +39,12 @@ services:
       UID: "501"
       GID: "20"
     volumes:
+      # media_store is NOT a named volume: a named volume mountpoint is created
+      # root-owned, but Synapse runs as UID 501 (env below), so the first media
+      # upload 500s (PermissionError on /data/media_store). Instead media lives
+      # under the ./synapse bind mount, which is host-owned by UID 501 and thus
+      # writable by the container — a durable, tracked fix (no runtime chmod).
       - ./synapse:/data
-      - synctest-synapse-media:/data/media_store
     ports:
       - "127.0.0.1:8028:8008"
     healthcheck:
@@ -53,4 +58,3 @@ services:
 
 volumes:
   synctest-postgres-data:
-  synctest-synapse-media:

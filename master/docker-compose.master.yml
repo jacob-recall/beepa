@@ -2,7 +2,8 @@
 #
 # Isolation invariants (do NOT merge with the user hub's docker-compose.yml):
 #   * compose project name:  matrix-master   (matrix-wa stays untouched)
-#   * own Postgres, own named volumes (master-postgres-data, master-synapse-media)
+#   * own Postgres named volume (master-postgres-data); media_store lives in the
+#     ./synapse bind mount (host-owned UID 501) so uploads don't 500 (see below)
 #   * Synapse CS API on host 127.0.0.1:8018 only  (user hub uses 8008/8009/8010)
 #   * Postgres has NO host port — reachable only on this project's network.
 #
@@ -41,8 +42,13 @@ services:
       UID: "501"
       GID: "20"
     volumes:
+      # media_store is NOT a named volume: a named volume mountpoint is created
+      # root-owned, but Synapse runs as UID 501 (env below), so the first media
+      # upload 500s (PermissionError on /data/media_store). Instead media lives
+      # under the ./synapse bind mount, which is host-owned by UID 501 and thus
+      # writable by the container — a durable, tracked fix (no runtime chmod).
+      # master/setup.sh creates ./synapse/media_store. See TASK master-sync.
       - ./synapse:/data
-      - master-synapse-media:/data/media_store
     ports:
       # CS API only, bound to loopback on this machine.
       - "127.0.0.1:8018:8008"
@@ -58,4 +64,3 @@ services:
 
 volumes:
   master-postgres-data:
-  master-synapse-media:

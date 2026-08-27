@@ -1,7 +1,12 @@
 # PLAN-MASTER-SYNC — Master ↔ User Distributed Sync
 
-Design spec. Status: **DRAFT for review** (2026-08-26). Supersedes nothing;
-extends the existing single-user hub stack described in PLAN.md / PLAN-HUB.md.
+Design spec. Status: **COMPLETE — V1, V1.5, V2, and unified contacts (§12
+phases 1–5) are all implemented and verified** (2026-08-27; build finished
+on branch `feat/master-sync`). Supersedes nothing; extends the existing
+single-user hub stack described in PLAN.md / PLAN-HUB.md. See
+PLAN-MASTER-SYNC-IMPL.md for the phase-by-phase implementation record and
+the per-directory `CLAUDE.md` files (`shared/`, `apps/user/`, `apps/master/`,
+`agents/uplink/`, `master/`, `tests/`) for what was actually built.
 
 ---
 

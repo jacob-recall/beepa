@@ -941,20 +941,15 @@ def scenario_8_cross_user_isolation():
 
 
 def ensure_media_writable():
-    """Make both homeservers' media stores writable by the Synapse user.
+    """No-op: the media_store permission fix is now DURABLE and TRACKED.
 
-    The test + master stacks mount media_store as a NAMED volume, created
-    root-owned, while Synapse runs as UID 501 (compose UID/GID env) — so the
-    first upload 500s with PermissionError on /data/media_store/local_content.
-    The non-media scenarios never upload, so this only surfaces for v1.5. A
-    throwaway-test-appropriate, idempotent chmod unblocks it without recreating
-    the always-on containers (survives restarts; only a `down -v` resets it)."""
-    for container in ("matrix-synctest-synapse-1", "matrix-master-synapse-1"):
-        try:
-            docker(["exec", "-u", "0", container, "chmod", "0777", "/data/media_store"],
-                   check=False)
-        except Exception:
-            pass
+    Both stacks used to mount media_store as a NAMED volume (created root-owned)
+    while Synapse runs as UID 501, so the first upload 500'd with PermissionError
+    on /data/media_store — patched at runtime here with a `chmod 0777`. The fix
+    now lives in the tracked compose files: media_store is served from the
+    ./synapse bind mount (host-owned by UID 501), so the container can write it
+    with no runtime chmod. Kept as a no-op so callers/imports stay valid."""
+    return
 
 
 def scenario_9_media_reupload():

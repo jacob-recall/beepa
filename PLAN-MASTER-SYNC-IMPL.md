@@ -1,7 +1,22 @@
 # PLAN-MASTER-SYNC-IMPL — Implementation Plan
 
-Executes the design in **PLAN-MASTER-SYNC.md**. Status: **DRAFT → self-verify
-before building** (2026-08-26). Branch: `feat/master-sync`. No push.
+Executes the design in **PLAN-MASTER-SYNC.md**. Status: **COMPLETE —
+Phases 1–5 (V1 foundation, V1 master+uplink, V1.5, V2 proposal channel,
+unified contacts) all built and verified** (2026-08-27). Branch:
+`feat/master-sync`. No push (orchestrator commits after verification).
+
+Verified end state: `shared/` core (consent + contacts models, render
+whitelist, sync primitives) shared by `apps/user/` (share controls, consent
+panel, contacts UI, proposal inbox) and `apps/master/` (read-only,
+per-user/per-profile grouping, the one narrow proposal-write path);
+`agents/uplink/` mirrors consent-approved conversations up and proposals
+down with watermark/event-map exactly-once delivery, `consent.py` kept in
+byte-parity with `shared/model/consent.js`; `master/` provides the always-on
+homeserver, provisioning, and v1.5 enrollment-code flow; `tests/` covers
+consent-resolver + reconcile-logic unit tests and all 11 integration
+scenarios in `tests/integration/harness.py` (see `tests/CLAUDE.md`) plus the
+enrollment-flow test. Per-directory `CLAUDE.md` files documenting each area
+are in place per the "Cross-cutting: documentation & tests" section below.
 
 ## Ground rules (apply to every task)
 

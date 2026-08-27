@@ -28,6 +28,10 @@ master/.env
 master/.provision-state.local
 master/enrollments.local
 
+# Master enroll/admin service logs (launchd) — never commit
+master/logs/*.log
+master/logs/*.err
+
 # Uplink enrollment credentials written on the teammate side — never commit
 uplink.env.local
 *.uplink.env.local

@@ -28,6 +28,13 @@ import { S } from '../../shared/state.js';
 // as bytes with S.token and shown via an object URL (CSP allows img/media blob:).
 const MASTER_BASE = 'http://127.0.0.1:8018';
 
+// The master enroll/admin service (master/enroll.py serve). The ONLY thing
+// this app calls here is the manager-authenticated POST /admin/add-teammate —
+// an admin provisioning action, NOT a Matrix send path and NOT a proposal. The
+// service itself verifies the caller is @manager:master before doing anything.
+// CSP connect-src is extended by exactly this origin for this one call.
+const ENROLL_BASE = 'http://127.0.0.1:8019';
+
 // ---- point the shared transport at the MASTER homeserver, not the user hub's.
 // Own compose project (matrix-master), own port (127.0.0.1:8018), own
 // server_name ("master") — see master/docker-compose.master.yml + provision.sh.
@@ -708,7 +715,53 @@ function navTo(key) {
   setActiveNav(key);
   if (key === 'recent') { showSection('view-recent'); renderRecent(); }
   else if (key === 'search') { showSection('view-search'); renderSearch(); }
+  else if (key === 'addteam') { showSection('view-addteam'); resetAddTeammate(); }
   else if (key.indexOf('teammate:') === 0) { showSection('view-teammate'); renderTeammate(key.slice('teammate:'.length)); }
+}
+
+// ---- add / link a teammate (manager-only; see ENROLL_BASE above) ----
+// Reset the panel to its blank state whenever it is (re)opened, so a previous
+// code is never left visible on screen.
+function resetAddTeammate() {
+  const err = $('addteam-error'); const result = $('addteam-result');
+  if (err) { err.textContent = ''; err.classList.add('hidden'); }
+  if (result) result.classList.add('hidden');
+}
+
+async function addTeammate() {
+  const err = $('addteam-error');
+  const result = $('addteam-result');
+  const btn = $('addteam-btn');
+  if (err) { err.textContent = ''; err.classList.add('hidden'); }
+  if (result) result.classList.add('hidden');
+  const username = ($('addteam-user').value || '').trim();
+  if (!username) {
+    if (err) { err.textContent = 'Enter a username.'; err.classList.remove('hidden'); }
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    // Deliberately NOT api() (which is pointed at the master CS API on 8018);
+    // this is a direct call to the enroll/admin service on 8019 with the
+    // signed-in manager's master token. Not a Matrix send.
+    const res = await fetch(ENROLL_BASE + '/admin/add-teammate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (S.token || '') },
+      body: JSON.stringify({ username }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + res.status));
+    // textContent only — never innerHTML. sanitizeLine for the short fields,
+    // sanitize for the (longer) redeem command.
+    $('addteam-user-out').textContent = sanitizeLine(data.username || username);
+    $('addteam-code').textContent = sanitizeLine(data.code || '');
+    $('addteam-cmd').textContent = sanitize(data.redeem_cmd || '');
+    if (result) result.classList.remove('hidden');
+  } catch (e) {
+    if (err) { err.textContent = String((e && e.message) || e); err.classList.remove('hidden'); }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // ---- session ----
@@ -769,6 +822,12 @@ document.addEventListener('DOMContentLoaded', () => {
   $('nav-recent').addEventListener('click', () => navTo('recent'));
   $('nav-search').dataset.navkey = 'search';
   $('nav-search').addEventListener('click', () => navTo('search'));
+  const navAdd = $('nav-addteam');
+  if (navAdd) { navAdd.dataset.navkey = 'addteam'; navAdd.addEventListener('click', () => navTo('addteam')); }
+  const addBtn = $('addteam-btn');
+  if (addBtn) addBtn.addEventListener('click', () => { addTeammate().catch(() => {}); });
+  const addInput = $('addteam-user');
+  if (addInput) addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addTeammate().catch(() => {}); } });
   $('search-input').addEventListener('input', renderSearch);
   $('room-back').addEventListener('click', () => { stopTail(); navTo(MS.activeView === 'room' ? 'recent' : MS.activeView); });
 

@@ -31,9 +31,12 @@ STATE_FILE="${HERE}/.provision-state.local"
 SERVER="master"
 
 MANAGER_LP="manager"
-# Real teammate roster (space-separated usernames). Default: the single real
-# user. Tests override with TEAMMATES="alice bob".
-read -r -a TEAMMATES <<< "${TEAMMATES:-jkali}"
+# Real teammate roster (space-separated usernames). An explicit TEAMMATES env
+# var always wins (the integration harness passes TEAMMATES="alice bob"). We
+# capture that override BEFORE sourcing the state file below, which may carry a
+# persisted TEAMMATES roster from a prior provision OR from console
+# "Add teammate" actions — so a reprovision keeps everyone the console added.
+ENV_TEAMMATES="${TEAMMATES-}"
 
 umask 077
 touch "${STATE_FILE}"; chmod 600 "${STATE_FILE}"
@@ -43,9 +46,15 @@ fail() { printf '[provision] ERROR: %s\n' "$*" >&2; exit 1; }
 
 upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
 
-# --- passwords: read persisted values (if any), else generate ---
+# --- passwords + persisted roster: read persisted values (if any) ---
 # shellcheck disable=SC1090
 [ -s "${STATE_FILE}" ] && source "${STATE_FILE}" || true
+
+# Roster resolution: explicit env override wins; else the persisted roster the
+# last provision / console-add wrote (sourced just above as a scalar TEAMMATES);
+# else the single real user "jkali".
+read -r -a TEAMMATES <<< "${ENV_TEAMMATES:-${TEAMMATES:-jkali}}"
+
 gen_pw() { python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))'; }
 
 # The manager is the human-facing master login; default it to the simple

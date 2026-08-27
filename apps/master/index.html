@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018 http://127.0.0.1:8019; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Master Console</title>
 <link rel="stylesheet" href="style.css">
@@ -34,6 +34,7 @@
     <nav id="nav-tools" aria-label="Views">
       <button id="nav-recent" class="navitem" type="button"><span class="ic">&#128338;</span> Recent</button>
       <button id="nav-search" class="navitem" type="button"><span class="ic">&#128269;</span> Search</button>
+      <button id="nav-addteam" class="navitem" type="button"><span class="ic">&#10133;</span> Add teammate</button>
     </nav>
     <div class="nav-sep"></div>
     <nav id="nav-teammates" aria-label="Teammates"><!-- one button per teammate space, injected --></nav>
@@ -74,6 +75,34 @@
         <input id="search-input" placeholder="Search everyone" spellcheck="false" autocomplete="off">
       </header>
       <div id="search-results" class="convo-list"></div>
+    </section>
+
+    <!-- Add / link a teammate (manager-only, separate installs). The Add
+         button POSTs {username} to the master enroll service's manager-
+         authenticated /admin/add-teammate with the signed-in manager's master
+         token; the service verifies the caller is @manager:master before
+         provisioning the account + read-only space and minting a one-time
+         enrollment code. This is an admin provisioning call, NOT a Matrix send
+         path and NOT a proposal — it never posts m.room.message anywhere. The
+         returned code + redeem command are shown via textContent only. -->
+    <section id="view-addteam" class="view hidden">
+      <header class="view-head">
+        <h2>Add teammate</h2>
+        <p class="muted">Create a new teammate slot on the master and get a one-time enrollment code they run on their own install to link their hub.</p>
+      </header>
+      <div class="card narrow">
+        <label for="addteam-user">Teammate username</label>
+        <input id="addteam-user" autocomplete="off" spellcheck="false" placeholder="e.g. alex">
+        <button id="addteam-btn" type="button" class="primary">Add teammate</button>
+        <p id="addteam-error" class="error hidden"></p>
+        <div id="addteam-result" class="hidden">
+          <p class="muted">Provisioned <span id="addteam-user-out"></span>. Give this teammate their one-time enrollment code (expires shortly):</p>
+          <label>Enrollment code</label>
+          <code id="addteam-code" class="addteam-code"></code>
+          <label>They run this on their own install:</label>
+          <code id="addteam-cmd" class="addteam-cmd"></code>
+        </div>
+      </div>
     </section>
 
     <!-- Read-only conversation viewer. No input, no send button — this

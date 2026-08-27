@@ -1,0 +1,99 @@
+// Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
+// Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
+
+import { feedHideRoom, feedIsHidden, feedUnhideRoom } from './account-data.js';
+import { openConvo } from './chat.js';
+import { $, el, sanitizeLine } from './el.js';
+import { navTo, openConversation } from './nav.js';
+import { feedRelTime } from './search.js';
+import { SOURCES } from './sources.js';
+import { feedModel } from '../state.js';
+
+// Optional app-injected per-row decorator (e.g. apps/user's share controls,
+// PLAN-MASTER-SYNC §5.1). Shared code never imports from apps/; the app
+// registers a callback here instead, same pattern as setOnUnauthorized
+// (shared/matrix/client.js). Left unset, rows render exactly as before.
+let convoRowDecorator = null;
+function setConvoRowDecorator(fn) { convoRowDecorator = typeof fn === 'function' ? fn : null; }
+
+// HF-6/HF-7: badge derived ONLY from the record's sourceId (which space the
+// room is in) — never a bridged field. A CSS-classed pill carrying the source
+// icon via textContent. No <img>, no data:/remote URL (CSP byte-identical).
+function buildPlatBadge(sourceId) {
+  const cls = sourceId === 'imessage' ? 'plat-badge imessage'
+            : sourceId === 'whatsapp' ? 'plat-badge whatsapp'
+            : 'plat-badge';
+  const source = SOURCES.find(s => s.id === sourceId);
+  return el('span', cls, (source && source.icon) || '');
+}
+
+// A feed row reuses the existing .convo structure; click → openConversation
+// (the only validated nav path; it also shows the Element pane via navTo('all')).
+function buildFeedRow(r) {
+  const name = sanitizeLine(r.name || r.id);
+  const preview = sanitizeLine(r.lastBody || '');   // HF-4: single-line, clamped, textContent
+  const row = el('div', 'convo');
+  row.dataset.roomId = r.id;                         // active-row match key (layout only; not a nav/security input)
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  row.appendChild(el('div', 'avatar', (name || '?').slice(0, 1).toUpperCase()));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', name));
+  meta.appendChild(el('div', 'preview', preview));
+  row.appendChild(meta);
+  if (r.lastTs) row.appendChild(el('span', 'when', feedRelTime(r.lastTs)));
+  row.appendChild(buildPlatBadge(r.sourceId));
+  const open = () => openConvo(r.id);                 // CV.2: native hub conversation view
+  // HF-9: per-row hide/unhide. A currently-hidden row (only reachable with
+  // "Show hidden" on) offers Unhide; otherwise Hide. textContent only, built
+  // with el(); the click acts on r.id (validated ∈ feedModel inside the handler)
+  // and never opens the conversation (stopPropagation).
+  const hidden = feedIsHidden(r.id);
+  const hideBtn = el('button', 'feed-hide', hidden ? 'Unhide' : 'Hide');
+  hideBtn.type = 'button';
+  hideBtn.setAttribute('aria-label', (hidden ? 'Unhide ' : 'Hide ') + name);
+  hideBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (hidden) feedUnhideRoom(r.id); else feedHideRoom(r.id);
+  });
+  hideBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') e.stopPropagation(); });
+  row.appendChild(hideBtn);
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  if (convoRowDecorator) convoRowDecorator(row, { id: r.id, sourceId: r.sourceId });
+  return row;
+}
+
+// Layout-only helper: mark the messenger-list row for `roomId` active and clear
+// it on every other row. Matches by the row's dataset.roomId (set in
+// buildFeedRow); textContent/dataset only, no innerHTML. Passing null clears all.
+// Not a navigation or security input — it only sets a CSS highlight class.
+function setActiveConvoRow(roomId) {
+  const list = $('home-list');
+  if (!list) return;
+  for (const row of list.children) {
+    const rid = row.dataset ? row.dataset.roomId : undefined;
+    row.classList.toggle('active', roomId != null && rid === roomId);
+  }
+}
+
+// ---- conversation-row + list rendering ----
+function buildConvoRow(c, withBadge) {
+  const row = el('div', 'convo');
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  row.appendChild(el('div', 'avatar', (c.title || '?').slice(0, 1).toUpperCase()));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', c.title));
+  meta.appendChild(el('div', 'sub', c.sub || ''));
+  row.appendChild(meta);
+  if (withBadge) row.appendChild(el('span', 'badge', sanitizeLine(c.sourceLabel)));
+  const open = () => openConvo(c.id);                 // CV.2: native hub conversation view
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  if (convoRowDecorator) convoRowDecorator(row, c);
+  return row;
+}
+function elEmpty(text) { return el('div', 'list-empty', text); }
+
+export { buildPlatBadge, buildFeedRow, setActiveConvoRow, buildConvoRow, elEmpty, setConvoRowDecorator };

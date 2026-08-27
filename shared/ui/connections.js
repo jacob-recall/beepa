@@ -1,0 +1,609 @@
+// Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
+// Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
+
+import { $, el, sanitize } from './el.js';
+import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
+import { S } from '../state.js';
+
+// ---- console ----
+function logConsole(who, text, srcId) {
+  const c = $('console');
+  if (!c) return;
+  const entry = el('div', 'entry');
+  const label = who === 'you' ? 'you' : who === 'error' ? 'error' : (srcId || 'bridge');
+  entry.appendChild(el('span', 'who' + (who === 'you' ? ' you' : ''), label + '  '));
+  entry.appendChild(el('span', who === 'error' ? 'error' : '', text));
+  c.appendChild(entry);
+  while (c.childElementCount > 200) c.removeChild(c.firstElementChild);
+  c.scrollTop = c.scrollHeight;
+}
+
+function setButtonsDisabled(v) {
+  for (const b of document.querySelectorAll('#command-groups button, .bridge-actions button, .startable')) {
+    b.disabled = v;                                 // capability-disabled controls are excluded
+  }
+}
+function setLoginFlow(active) {
+  S.loginFlowActive = active;
+  const btn = $('btn-cancel-login');
+  if (btn) btn.classList.toggle('hidden', !active);
+  const gmBtn = $('btn-gmsg-cancel-login');
+  if (gmBtn) gmBtn.classList.toggle('hidden', !active);
+  if (!active) clearQR();
+}
+
+// ---- WhatsApp / Google Messages Connections card status ----
+function updateCardStatus(logins, pillId, discId) {
+  const pill = $(pillId || 'wa-status');
+  const disc = discId ? $(discId) : null;
+  if (!pill) return;
+  if (logins.length) {
+    const l = logins[0];
+    pill.textContent = 'Connected: ' + l.name + ' (' + l.state + ')';
+    pill.classList.add('ok');
+    if (disc) { disc.classList.remove('hidden'); disc.dataset.loginId = l.id; }
+  } else {
+    pill.textContent = 'Not connected';
+    pill.classList.remove('ok');
+    if (disc) disc.classList.add('hidden');
+  }
+}
+
+// ---- iMessage Connections card (Phase 2 B2 / P2.5) ----
+// Renders the bot's plain-text checklist reply via sanitize + textContent.
+function updateImsgCard(rawBody) {
+  const ul = $('imsg-checklist');
+  if (!ul) return;
+  ul.replaceChildren();
+  const clean = sanitize(rawBody);                 // keeps \n; strips controls/bidi
+  const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) ul.appendChild(el('li', '', sanitize(line)));
+  const pill = $('imsg-status');
+  if (pill) {
+    const ok = /✓/.test(clean) && !/✗/.test(clean); // all ✓, no ✗
+    pill.textContent = lines.length ? (ok ? 'Ready' : 'Setup needed') : 'No status yet';
+    pill.classList.toggle('ok', ok);
+  }
+}
+
+// Confirmation modal; type-to-confirm for the most destructive action.
+function confirmModal(title, text, typed) {
+  return new Promise((resolve) => {
+    $('modal-title').textContent = title;
+    $('modal-text').textContent = text;
+    const input = $('modal-input');
+    input.value = '';
+    input.classList.toggle('hidden', !typed);
+    $('modal-backdrop').classList.remove('hidden');
+    const done = (ok) => {
+      $('modal-backdrop').classList.add('hidden');
+      $('modal-ok').onclick = null; $('modal-cancel').onclick = null;
+      resolve(ok);
+    };
+    $('modal-ok').onclick = () => {
+      if (typed && input.value !== 'delete') return;
+      done(true);
+    };
+    $('modal-cancel').onclick = () => done(false);
+  });
+}
+
+// ---- Connections view ----
+function buildConnections() {
+  const holder = $('bridge-cards');
+  holder.replaceChildren();
+
+  // WhatsApp card
+  const wa = el('div', 'card bridge-card');
+  const waHead = el('div', 'bridge-head');
+  waHead.appendChild(el('span', 'bridge-name', WA.label));
+  const waPill = el('span', 'status-pill', 'Checking…');
+  waPill.id = 'wa-status';
+  waHead.appendChild(waPill);
+  wa.appendChild(waHead);
+  wa.appendChild(el('p', 'muted', WA.blurb));
+
+  const waActions = el('div', 'bridge-actions');
+  const connect = el('button', 'primary', 'Connect (scan QR)');
+  connect.style.width = 'auto';
+  connect.addEventListener('click', () => sendCmd('whatsapp', 'login qr'));
+  waActions.appendChild(connect);
+
+  const cancel = el('button', '', 'Cancel login');
+  cancel.id = 'btn-cancel-login';
+  cancel.classList.add('hidden');
+  cancel.addEventListener('click', () => sendCmd('whatsapp', 'cancel'));
+  waActions.appendChild(cancel);
+
+  const disc = el('button', 'danger', 'Disconnect');
+  disc.id = 'btn-disconnect';
+  disc.classList.add('hidden');
+  disc.addEventListener('click', async () => {
+    const id = disc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect WhatsApp?',
+      'This unlinks the bridge from your WhatsApp account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('whatsapp', 'logout ' + id);
+      sendStatusRefresh();
+    }
+  });
+  waActions.appendChild(disc);
+
+  const refresh = el('button', '', 'Refresh status');
+  refresh.addEventListener('click', sendStatusRefresh);
+  waActions.appendChild(refresh);
+  wa.appendChild(waActions);
+
+  const qrBox = el('div', 'qr-box hidden');
+  qrBox.id = 'qr-box';
+  wa.appendChild(qrBox);
+  holder.appendChild(wa);
+
+  // iMessage card (B2 hub-side)
+  const im = el('div', 'card bridge-card');
+  const imHead = el('div', 'bridge-head');
+  imHead.appendChild(el('span', 'bridge-name', IMSG.label));
+  const imPill = el('span', 'status-pill', 'Checking…');
+  imPill.id = 'imsg-status';
+  imHead.appendChild(imPill);
+  im.appendChild(imHead);
+  im.appendChild(el('p', 'muted', IMSG.blurb));
+
+  const imActions = el('div', 'bridge-actions');
+  const setup = el('button', 'primary', 'Set up iMessage');
+  setup.style.width = 'auto';
+  setup.addEventListener('click', () => sendCmd('imessage', 'setup'));
+  imActions.appendChild(setup);
+
+  const imStatus = el('button', '', 'Check status');
+  imStatus.addEventListener('click', () => sendCmd('imessage', 'status'));
+  imActions.appendChild(imStatus);
+  im.appendChild(imActions);
+
+  const checklist = el('ul', 'checklist');
+  checklist.id = 'imsg-checklist';
+  im.appendChild(checklist);
+  holder.appendChild(im);
+
+  // Google Messages card (mirrors the WhatsApp card)
+  const gm = el('div', 'card bridge-card');
+  const gmHead = el('div', 'bridge-head');
+  gmHead.appendChild(el('span', 'bridge-name', GMSG.label));
+  const gmPill = el('span', 'status-pill', 'Checking…');
+  gmPill.id = 'gmsg-status';
+  gmHead.appendChild(gmPill);
+  gm.appendChild(gmHead);
+  gm.appendChild(el('p', 'muted', GMSG.blurb));
+
+  const gmActions = el('div', 'bridge-actions');
+  const gmSignin = el('button', 'primary', 'Open Google sign-in ↗');
+  gmSignin.style.width = 'auto';
+  gmSignin.addEventListener('click', () => window.open(
+    'https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config',
+    '_blank', 'noopener'));
+  gmActions.appendChild(gmSignin);
+
+  const gmRefresh = el('button', '', 'Refresh status');
+  gmRefresh.addEventListener('click', () => sendCmd('gmessages', 'list-logins'));
+  gmActions.appendChild(gmRefresh);
+  gm.appendChild(gmActions);
+
+  const gmSteps = el('ol', 'connect-steps muted');
+  gmSteps.style.cssText = 'margin:10px 0 0;padding-left:22px;line-height:1.7;';
+  gmSteps.appendChild(el('li', '', 'Click "Open Google sign-in" and sign into your Google account.'));
+  gmSteps.appendChild(el('li', '', 'Run the connect helper: python3 gmessages-connect/connect.py  (or ask your assistant to connect Google Messages).'));
+  gmSteps.appendChild(el('li', '', 'Tap the emoji it shows, in the Google Messages app on your phone. Done.'));
+  gm.appendChild(gmSteps);
+  holder.appendChild(gm);
+
+  // Instagram card (mirrors the gmessages card, but with a session PASTE flow
+  // instead of a QR — SPEC §5/§6). The pasted value is a bearer credential:
+  // it is sent through the C-1 mgmt guard, redacted immediately, and never
+  // logged, sanitize-rendered, persisted, or turned into a URL.
+  const ig = el('div', 'card bridge-card');
+  const igHead = el('div', 'bridge-head');
+  igHead.appendChild(el('span', 'bridge-name', IG.label));
+  const igPill = el('span', 'status-pill', 'Checking…');
+  igPill.id = 'ig-status';
+  igHead.appendChild(igPill);
+  ig.appendChild(igHead);
+  ig.appendChild(el('p', 'muted', IG.blurb));
+
+  // Paste UI (built up front, revealed by Connect). textContent-only; no
+  // innerHTML. The textarea value is treated like a password: never echoed.
+  const igPaste = el('div', 'ig-paste hidden');
+  igPaste.style.cssText = 'margin-top:10px;';
+  igPaste.appendChild(el('p', 'muted',
+    'On instagram.com: DevTools → Network → filter graphql → right-click a request → Copy as cURL, then paste here.'));
+  const igArea = el('textarea');
+  igArea.placeholder = 'Paste your Instagram session (Copy as cURL, or the cookies JSON) here';
+  igArea.rows = 4;
+  igArea.autocomplete = 'off';
+  igArea.spellcheck = false;
+  igArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  igPaste.appendChild(igArea);
+  const igWarn = el('p', 'error hidden');           // visible warnings (never the secret)
+  igWarn.style.cssText = 'margin:6px 0 0;';
+  const igSubmit = el('button', 'primary', 'Submit session');
+  igSubmit.style.width = 'auto';
+  const igSubmitRow = el('div', 'bridge-actions');
+  igSubmitRow.appendChild(igSubmit);
+  igPaste.appendChild(igSubmitRow);
+  igPaste.appendChild(igWarn);
+
+  const igActions = el('div', 'bridge-actions');
+  const igConnect = el('button', 'primary', 'Connect Instagram');
+  igConnect.style.width = 'auto';
+  igConnect.addEventListener('click', async () => {
+    igWarn.classList.add('hidden');
+    igWarn.textContent = '';
+    await sendCmd('instagram', 'login instagram');  // C-1 guarded
+    igPaste.classList.remove('hidden');
+    igArea.focus();
+    window.open('https://www.instagram.com/', '_blank', 'noopener');
+  });
+  igActions.appendChild(igConnect);
+
+  const igDisc = el('button', 'danger', 'Disconnect');
+  igDisc.id = 'btn-ig-disconnect';
+  igDisc.classList.add('hidden');
+  igDisc.addEventListener('click', async () => {
+    const id = igDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect Instagram?',
+      'This unlinks the bridge from your Instagram account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('instagram', 'logout ' + id);
+      sendCmd('instagram', 'list-logins');
+    }
+  });
+  igActions.appendChild(igDisc);
+
+  const igRefresh = el('button', '', 'Refresh status');
+  igRefresh.addEventListener('click', () => sendCmd('instagram', 'list-logins'));
+  igActions.appendChild(igRefresh);
+  ig.appendChild(igActions);
+
+  // Submit: send the pasted secret through the C-1 guard, capture the event_id,
+  // and redact it immediately. The value lives ONLY in this handler's scope; the
+  // textarea is cleared before the network call and the value is dropped after.
+  igSubmit.addEventListener('click', async () => {
+    if (S.busy) return;
+    igWarn.classList.add('hidden');
+    igWarn.textContent = '';
+    let secret = igArea.value;                       // read once; never logged
+    igArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      igWarn.textContent = 'Paste your Instagram session before submitting.';
+      igWarn.classList.remove('hidden');
+      return;
+    }
+    S.busy = true; setButtonsDisabled(true); igSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('instagram', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        igWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        igWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          igPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          igWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
+          igWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      igWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      igWarn.classList.remove('hidden');
+    } finally {
+      S.busy = false; setButtonsDisabled(false); igSubmit.disabled = false;
+      sendCmd('instagram', 'list-logins');           // refresh the pill
+    }
+  });
+
+  ig.appendChild(igPaste);
+  holder.appendChild(ig);
+
+  // LinkedIn card (mirrors the Instagram card exactly: a session PASTE flow,
+  // not a QR — the "Copy as cURL" carries the X-LI-Track / X-LI-Page-Instance
+  // headers as well as the cookies). The pasted value is a bearer credential:
+  // it is sent through the C-1 mgmt guard, redacted immediately, and never
+  // logged, sanitize-rendered, persisted, or turned into a URL.
+  const li = el('div', 'card bridge-card');
+  const liHead = el('div', 'bridge-head');
+  liHead.appendChild(el('span', 'bridge-name', LI.label));
+  const liPill = el('span', 'status-pill', 'Checking…');
+  liPill.id = 'li-status';
+  liHead.appendChild(liPill);
+  li.appendChild(liHead);
+  li.appendChild(el('p', 'muted', LI.blurb));
+
+  // Paste UI (built up front, revealed by Connect). textContent-only; no
+  // innerHTML. The textarea value is treated like a password: never echoed.
+  const liPaste = el('div', 'li-paste hidden');
+  liPaste.style.cssText = 'margin-top:10px;';
+  liPaste.appendChild(el('p', 'muted',
+    'On linkedin.com: DevTools → Network → filter graphql (voyager) → right-click a request → Copy as cURL, then paste here.'));
+  const liArea = el('textarea');
+  liArea.placeholder = 'Paste your LinkedIn session (Copy as cURL) here';
+  liArea.rows = 4;
+  liArea.autocomplete = 'off';
+  liArea.spellcheck = false;
+  liArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  liPaste.appendChild(liArea);
+  const liWarn = el('p', 'error hidden');           // visible warnings (never the secret)
+  liWarn.style.cssText = 'margin:6px 0 0;';
+  const liSubmit = el('button', 'primary', 'Submit session');
+  liSubmit.style.width = 'auto';
+  const liSubmitRow = el('div', 'bridge-actions');
+  liSubmitRow.appendChild(liSubmit);
+  liPaste.appendChild(liSubmitRow);
+  liPaste.appendChild(liWarn);
+
+  const liActions = el('div', 'bridge-actions');
+  const liConnect = el('button', 'primary', 'Connect LinkedIn');
+  liConnect.style.width = 'auto';
+  liConnect.addEventListener('click', async () => {
+    liWarn.classList.add('hidden');
+    liWarn.textContent = '';
+    await sendCmd('linkedin', 'login cookies');      // C-1 guarded
+    liPaste.classList.remove('hidden');
+    liArea.focus();
+    window.open('https://www.linkedin.com/', '_blank', 'noopener');
+  });
+  liActions.appendChild(liConnect);
+
+  const liDisc = el('button', 'danger', 'Disconnect');
+  liDisc.id = 'btn-li-disconnect';
+  liDisc.classList.add('hidden');
+  liDisc.addEventListener('click', async () => {
+    const id = liDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect LinkedIn?',
+      'This unlinks the bridge from your LinkedIn account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('linkedin', 'logout ' + id);
+      sendCmd('linkedin', 'list-logins');
+    }
+  });
+  liActions.appendChild(liDisc);
+
+  const liRefresh = el('button', '', 'Refresh status');
+  liRefresh.addEventListener('click', () => sendCmd('linkedin', 'list-logins'));
+  liActions.appendChild(liRefresh);
+  li.appendChild(liActions);
+
+  // Submit: send the pasted secret through the C-1 guard, capture the event_id,
+  // and redact it immediately. The value lives ONLY in this handler's scope; the
+  // textarea is cleared before the network call and the value is dropped after.
+  liSubmit.addEventListener('click', async () => {
+    if (S.busy) return;
+    liWarn.classList.add('hidden');
+    liWarn.textContent = '';
+    let secret = liArea.value;                       // read once; never logged
+    liArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      liWarn.textContent = 'Paste your LinkedIn session before submitting.';
+      liWarn.classList.remove('hidden');
+      return;
+    }
+    S.busy = true; setButtonsDisabled(true); liSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('linkedin', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        liWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        liWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          liPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          liWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
+          liWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      liWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      liWarn.classList.remove('hidden');
+    } finally {
+      S.busy = false; setButtonsDisabled(false); liSubmit.disabled = false;
+      sendCmd('linkedin', 'list-logins');            // refresh the pill
+    }
+  });
+
+  li.appendChild(liPaste);
+  holder.appendChild(li);
+
+  // X (Twitter) card (mirrors the LinkedIn card exactly: a session PASTE flow,
+  // not a QR. The pasted value is a bearer credential: sent through the C-1 mgmt
+  // guard, redacted immediately, and never logged, sanitize-rendered, persisted,
+  // or turned into a URL.)
+  const tw = el('div', 'card bridge-card');
+  const twHead = el('div', 'bridge-head');
+  twHead.appendChild(el('span', 'bridge-name', TW.label));
+  const twPill = el('span', 'status-pill', 'Checking\u2026');
+  twPill.id = 'tw-status';
+  twHead.appendChild(twPill);
+  tw.appendChild(twHead);
+  tw.appendChild(el('p', 'muted', TW.blurb));
+
+  const twPaste = el('div', 'tw-paste hidden');
+  twPaste.style.cssText = 'margin-top:10px;';
+  twPaste.appendChild(el('p', 'muted',
+    'On x.com: DevTools \u2192 Network \u2192 filter a request \u2192 right-click \u2192 Copy as cURL, then paste here.'));
+  const twArea = el('textarea');
+  twArea.placeholder = 'Paste your X session (Copy as cURL) here';
+  twArea.rows = 4;
+  twArea.autocomplete = 'off';
+  twArea.spellcheck = false;
+  twArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  twPaste.appendChild(twArea);
+  const twWarn = el('p', 'error hidden');
+  twWarn.style.cssText = 'margin:6px 0 0;';
+  const twSubmit = el('button', 'primary', 'Submit session');
+  twSubmit.style.width = 'auto';
+  const twSubmitRow = el('div', 'bridge-actions');
+  twSubmitRow.appendChild(twSubmit);
+  twPaste.appendChild(twSubmitRow);
+  twPaste.appendChild(twWarn);
+
+  const twActions = el('div', 'bridge-actions');
+  const twConnect = el('button', 'primary', 'Connect X');
+  twConnect.style.width = 'auto';
+  twConnect.addEventListener('click', async () => {
+    twWarn.classList.add('hidden');
+    twWarn.textContent = '';
+    await sendCmd('twitter', 'login cookies');      // C-1 guarded
+    twPaste.classList.remove('hidden');
+    twArea.focus();
+    window.open('https://x.com/', '_blank', 'noopener');
+  });
+  twActions.appendChild(twConnect);
+
+  const twDisc = el('button', 'danger', 'Disconnect');
+  twDisc.id = 'btn-tw-disconnect';
+  twDisc.classList.add('hidden');
+  twDisc.addEventListener('click', async () => {
+    const id = twDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect X?',
+      'This unlinks the bridge from your X account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('twitter', 'logout ' + id);
+      sendCmd('twitter', 'list-logins');
+    }
+  });
+  twActions.appendChild(twDisc);
+
+  const twRefresh = el('button', '', 'Refresh status');
+  twRefresh.addEventListener('click', () => sendCmd('twitter', 'list-logins'));
+  twActions.appendChild(twRefresh);
+  tw.appendChild(twActions);
+
+  twSubmit.addEventListener('click', async () => {
+    if (S.busy) return;
+    twWarn.classList.add('hidden');
+    twWarn.textContent = '';
+    let secret = twArea.value;                       // read once; never logged
+    twArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      twWarn.textContent = 'Paste your X session before submitting.';
+      twWarn.classList.remove('hidden');
+      return;
+    }
+    S.busy = true; setButtonsDisabled(true); twSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('twitter', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        twWarn.textContent = 'Sent, but could not confirm the message id to delete it \u2014 please delete your pasted message in Element manually.';
+        twWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          twPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          twWarn.textContent = 'Session sent, but auto-deleting it failed \u2014 please delete your pasted message in Element manually.';
+          twWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      twWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      twWarn.classList.remove('hidden');
+    } finally {
+      S.busy = false; setButtonsDisabled(false); twSubmit.disabled = false;
+      sendCmd('twitter', 'list-logins');             // refresh the pill
+    }
+  });
+
+  tw.appendChild(twPaste);
+  holder.appendChild(tw);
+
+  // Planned sources (inert placeholders).
+  const more = el('div', 'card src-placeholder');
+  more.appendChild(el('h3', '', 'More sources'));
+  more.appendChild(el('p', 'muted',
+    'This hub is built to bridge every messaging account into one place. Each source below becomes a card like WhatsApp once its bridge is deployed on this stack.'));
+  for (const name of PLANNED_SOURCES) {
+    const row = el('div', 'cmd');
+    const info = el('div', 'info');
+    info.appendChild(el('div', 'name', name));
+    info.appendChild(el('div', 'desc', 'Not connected — bridge not deployed yet.'));
+    row.appendChild(info);
+    more.appendChild(row);
+  }
+  holder.appendChild(more);
+}
+
+// ---- Settings view (per-source command surface) ----
+function buildSettings() {
+  const tabs = $('settings-source-tabs');
+  tabs.replaceChildren();
+  for (const s of SOURCES) {
+    if (s.kind === 'all' || !s.botMxid) continue;
+    const b = el('button', '', s.label);
+    b.type = 'button';
+    b.dataset.src = s.id;
+    b.addEventListener('click', () => {
+      S.activeSettingsSource = s.id;
+      renderSettingsTabs();
+      renderCommandGroups(s.id);
+    });
+    tabs.appendChild(b);
+  }
+  renderSettingsTabs();
+  renderCommandGroups(S.activeSettingsSource);
+}
+function renderSettingsTabs() {
+  for (const b of $('settings-source-tabs').children) {
+    b.classList.toggle('active', b.dataset.src === S.activeSettingsSource);
+  }
+}
+function renderCommandGroups(sourceId) {
+  const holder = $('command-groups');
+  holder.replaceChildren();
+  for (const g of groupsFor(sourceId)) {
+    const groupEl = el('div', 'card cmd-group');
+    groupEl.appendChild(el('h3', '', g.title));
+    for (const c of g.cmds) {
+      const row = el('div', 'cmd');
+      const info = el('div', 'info');
+      info.appendChild(el('div', 'name', c.label));
+      info.appendChild(el('div', 'desc', c.desc));
+      row.appendChild(info);
+      let argInput = null;
+      if (c.arg) {
+        argInput = el('input');
+        argInput.placeholder = c.arg;
+        row.appendChild(argInput);
+      }
+      const btn = el('button', c.confirm === 'type' ? 'danger' : '', 'Run');
+      btn.addEventListener('click', async () => {
+        let text = c.cmd;
+        if (argInput) {
+          const v = argInput.value.trim();
+          if (!v) { logConsole('error', c.label + ': an argument is required (' + c.arg + ').'); return; }
+          text += ' ' + v;
+        }
+        if (c.confirm === 'type') {
+          if (!(await confirmModal(c.label, 'This is irreversible on the Matrix side. Type "delete" to confirm.', true))) return;
+        } else if (c.confirm === 'click') {
+          if (!(await confirmModal(c.label, c.desc + ' Continue?', false))) return;
+        }
+        await sendCmd(sourceId, text);
+        if (argInput) argInput.value = '';
+      });
+      row.appendChild(btn);
+      groupEl.appendChild(row);
+    }
+    holder.appendChild(groupEl);
+  }
+}
+
+export { logConsole, setButtonsDisabled, setLoginFlow, updateCardStatus, updateImsgCard, confirmModal, buildConnections, buildSettings, renderSettingsTabs, renderCommandGroups };

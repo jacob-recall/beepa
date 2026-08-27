@@ -1,0 +1,232 @@
+// Plain-node test for shared/model/consent.js — no framework.
+// Run: node tests/unit/consent.test.js  (or via docker, see tests/run.sh)
+// Exits 0 on all-pass, nonzero (via process.exitCode) on any failure.
+
+import {
+  resolve, effectiveShared, resolveAll,
+  normalizePolicy, normalizeOverride,
+} from '../../shared/model/consent.js';
+
+let pass = 0;
+let fail = 0;
+const failures = [];
+
+function eq(actual, expected, label) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a === e) {
+    pass++;
+  } else {
+    fail++;
+    failures.push(`${label}: expected ${e}, got ${a}`);
+  }
+}
+
+function convo(sourceId, sourceLabel) {
+  return { id: '!' + sourceId + ':local', sourceId, sourceLabel: sourceLabel || sourceId };
+}
+
+// ---------------------------------------------------------------------------
+// 1. Global default (no policy, no overrides) -> private
+// ---------------------------------------------------------------------------
+{
+  const c = convo('imessage', 'iMessage');
+  eq(resolve(c, {}, undefined), { shared: false, reason: 'private' }, 'default: no policy at all');
+  eq(resolve(c, { global: 'private', sources: {} }, undefined),
+    { shared: false, reason: 'private' }, 'default: explicit global private');
+  eq(effectiveShared(c, {}, undefined), false, 'default: effectiveShared false');
+}
+
+// ---------------------------------------------------------------------------
+// 2. Global share-all -> shared for every source, including ones with no
+//    per-source entry, with reason "all <source>"
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'share-all', sources: {} };
+  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
+    { shared: true, reason: 'all iMessage' }, 'global share-all: iMessage');
+  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
+    { shared: true, reason: 'all LinkedIn' }, 'global share-all: LinkedIn');
+  // falls back to sourceId label when no sourceLabel given
+  eq(resolve({ id: '!x:local', sourceId: 'whatsapp' }, policy, undefined),
+    { shared: true, reason: 'all whatsapp' }, 'global share-all: label falls back to sourceId');
+  // falls back to generic token when neither present
+  eq(resolve({ id: '!x:local' }, policy, undefined),
+    { shared: true, reason: 'all source' }, 'global share-all: generic fallback label');
+}
+
+// ---------------------------------------------------------------------------
+// 3. Per-source share-all shares only that source, including a conversation
+//    of that source arriving later (standing policy) — global stays private.
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'private', sources: { imessage: 'share-all' } };
+  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
+    { shared: true, reason: 'all iMessage' }, 'per-source share-all: matching source shared');
+  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
+    { shared: false, reason: 'private' }, 'per-source share-all: other source stays private (global default)');
+  // "newly arrived" conversation of the share-all source — same policy object,
+  // conversation object constructed independently -> still shared (standing policy).
+  const laterArrival = convo('imessage', 'iMessage');
+  eq(resolve(laterArrival, policy, undefined),
+    { shared: true, reason: 'all iMessage' }, 'per-source share-all: standing policy covers later-arriving convo');
+}
+
+// ---------------------------------------------------------------------------
+// 4. Per-source private-all overrides global share-all
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'share-all', sources: { linkedin: 'private-all' } };
+  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
+    { shared: false, reason: 'private' }, 'per-source private-all beats global share-all');
+  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
+    { shared: true, reason: 'all iMessage' }, 'per-source private-all: other sources still shared via global');
+}
+
+// per-source 'inherit' falls through to global (both directions)
+{
+  eq(resolve(convo('imessage'), { global: 'share-all', sources: { imessage: 'inherit' } }, undefined),
+    { shared: true, reason: 'all imessage' }, 'per-source inherit falls through to global share-all');
+  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'inherit' } }, undefined),
+    { shared: false, reason: 'private' }, 'per-source inherit falls through to global private');
+}
+
+// ---------------------------------------------------------------------------
+// 5. Per-conversation override 'private' excludes despite any higher-level
+//    share-all (global and/or per-source).
+// ---------------------------------------------------------------------------
+{
+  eq(resolve(convo('imessage'), { global: 'share-all', sources: {} }, 'private'),
+    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite global share-all');
+  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, 'private'),
+    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite per-source share-all');
+  eq(resolve(convo('imessage'), { global: 'share-all', sources: { imessage: 'share-all' } }, 'private'),
+    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite BOTH share-all levels');
+}
+
+// ---------------------------------------------------------------------------
+// 6. Per-conversation override 'share' includes despite default-private
+//    (no policy share-all anywhere, and despite per-source private-all).
+// ---------------------------------------------------------------------------
+{
+  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'share'),
+    { shared: true, reason: 'explicit' }, 'per-conv share includes despite default-private');
+  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'private-all' } }, 'share'),
+    { shared: true, reason: 'explicit' }, 'per-conv share includes despite per-source private-all');
+  eq(resolve(convo('imessage'), {}, 'share'),
+    { shared: true, reason: 'explicit' }, 'per-conv share includes despite empty policy');
+}
+
+// ---------------------------------------------------------------------------
+// "share everything except one thread": global share-all + one excluded convo
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'share-all', sources: {} };
+  const excluded = convo('imessage', 'iMessage');
+  const others = [convo('imessage', 'iMessage'), convo('linkedin', 'LinkedIn'), convo('whatsapp', 'WhatsApp')];
+  eq(resolve(excluded, policy, 'private'), { shared: false, reason: 'excluded' }, 'share-everything-except-one: excluded thread');
+  for (const c of others) {
+    eq(resolve(c, policy, undefined), { shared: true, reason: 'all ' + c.sourceLabel },
+      'share-everything-except-one: other thread ' + c.sourceId + ' still shared');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "all iMessage but not LinkedIn": per-source share-all + per-source private-all
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'private', sources: { imessage: 'share-all', linkedin: 'private-all' } };
+  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
+    { shared: true, reason: 'all iMessage' }, 'all-imessage-not-linkedin: iMessage shared');
+  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
+    { shared: false, reason: 'private' }, 'all-imessage-not-linkedin: LinkedIn private');
+  eq(resolve(convo('whatsapp', 'WhatsApp'), policy, undefined),
+    { shared: false, reason: 'private' }, 'all-imessage-not-linkedin: unrelated source stays default private');
+}
+
+// ---------------------------------------------------------------------------
+// effectiveShared mirrors resolve().shared across all four precedence levels
+// ---------------------------------------------------------------------------
+{
+  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, undefined), true, 'effectiveShared: global share-all');
+  eq(effectiveShared(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined), true, 'effectiveShared: per-source share-all');
+  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: { imessage: 'private-all' } }, undefined), false, 'effectiveShared: per-source private-all beats global');
+  eq(effectiveShared(convo('imessage'), { global: 'share-all' }, 'private'), false, 'effectiveShared: per-conv private beats global share-all');
+  eq(effectiveShared(convo('imessage'), {}, 'share'), true, 'effectiveShared: per-conv share beats default');
+}
+
+// ---------------------------------------------------------------------------
+// resolveAll: batch resolve, both plain-object and Map overrides, in input order
+// ---------------------------------------------------------------------------
+{
+  const policy = { global: 'private', sources: { imessage: 'share-all' } };
+  const convos = [
+    { id: '!a:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
+    { id: '!b:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
+    { id: '!c:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
+  ];
+  const overridesObj = { '!c:local': 'share' };
+  const resObj = resolveAll(convos, policy, overridesObj);
+  eq(resObj.map(r => r.shared), [true, false, true], 'resolveAll: plain-object overrides shape');
+  eq(resObj.map(r => r.reason), ['all iMessage', 'private', 'explicit'], 'resolveAll: plain-object overrides reasons');
+  eq(resObj.map(r => r.convo.id), ['!a:local', '!b:local', '!c:local'], 'resolveAll: preserves input order');
+
+  const overridesMap = new Map([['!c:local', 'private']]);
+  const resMap = resolveAll(convos, policy, overridesMap);
+  eq(resMap.map(r => r.shared), [true, false, false], 'resolveAll: Map overrides shape');
+  eq(resMap.map(r => r.reason), ['all iMessage', 'private', 'excluded'], 'resolveAll: Map overrides reasons');
+
+  eq(resolveAll(convos, policy, undefined).map(r => r.shared), [true, false, false], 'resolveAll: no overrides at all');
+  eq(resolveAll(null, policy, undefined), [], 'resolveAll: non-array convos -> empty list, no throw');
+}
+
+// ---------------------------------------------------------------------------
+// normalizePolicy: unknown global collapses to private; only share-all/private-all survive
+// ---------------------------------------------------------------------------
+{
+  eq(normalizePolicy(undefined), { global: 'private', sources: {} }, 'normalizePolicy: undefined input');
+  eq(normalizePolicy(null), { global: 'private', sources: {} }, 'normalizePolicy: null input');
+  eq(normalizePolicy({}), { global: 'private', sources: {} }, 'normalizePolicy: empty object');
+  eq(normalizePolicy({ global: 'share-all', sources: {} }), { global: 'share-all', sources: {} }, 'normalizePolicy: valid share-all passes through');
+  eq(normalizePolicy({ global: 'bogus', sources: {} }), { global: 'private', sources: {} }, 'normalizePolicy: unknown global collapses to private');
+  eq(normalizePolicy({ global: 'private', sources: { a: 'share-all', b: 'private-all', c: 'inherit', d: 'junk', e: 123 } }),
+    { global: 'private', sources: { a: 'share-all', b: 'private-all' } },
+    'normalizePolicy: drops inherit/junk/non-string source states');
+  eq(normalizePolicy({ global: 'share-all', sources: null }), { global: 'share-all', sources: {} }, 'normalizePolicy: null sources -> {}');
+}
+
+// ---------------------------------------------------------------------------
+// normalizeOverride: only 'share'/'private' survive; object or bare-string form
+// ---------------------------------------------------------------------------
+{
+  eq(normalizeOverride(undefined), null, 'normalizeOverride: undefined -> null');
+  eq(normalizeOverride(null), null, 'normalizeOverride: null -> null');
+  eq(normalizeOverride({}), null, 'normalizeOverride: empty object -> null');
+  eq(normalizeOverride('share'), 'share', 'normalizeOverride: bare string share');
+  eq(normalizeOverride('private'), 'private', 'normalizeOverride: bare string private');
+  eq(normalizeOverride('inherit'), null, 'normalizeOverride: bare string inherit -> null');
+  eq(normalizeOverride({ state: 'share' }), 'share', 'normalizeOverride: object form share');
+  eq(normalizeOverride({ state: 'private' }), 'private', 'normalizeOverride: object form private');
+  eq(normalizeOverride({ state: 'inherit' }), null, 'normalizeOverride: object form inherit -> null');
+  eq(normalizeOverride({ state: 'junk' }), null, 'normalizeOverride: object form junk -> null');
+}
+
+// ---------------------------------------------------------------------------
+// Reason string exhaustiveness: every branch's exact reason value
+// ---------------------------------------------------------------------------
+{
+  eq(resolve(convo('x'), {}, undefined).reason, 'private', 'reason: default private');
+  eq(resolve(convo('x'), { global: 'share-all' }, undefined).reason, 'all x', 'reason: global share-all interpolates source');
+  eq(resolve(convo('x'), { global: 'private', sources: { x: 'share-all' } }, undefined).reason, 'all x', 'reason: per-source share-all interpolates source');
+  eq(resolve(convo('x'), { global: 'share-all', sources: { x: 'private-all' } }, undefined).reason, 'private', 'reason: per-source private-all -> "private"');
+  eq(resolve(convo('x'), {}, 'share').reason, 'explicit', 'reason: per-conv share -> "explicit"');
+  eq(resolve(convo('x'), { global: 'share-all' }, 'private').reason, 'excluded', 'reason: per-conv private -> "excluded"');
+}
+
+// ---------------------------------------------------------------------------
+console.log(`\n${pass} passed, ${fail} failed`);
+if (fail > 0) {
+  console.error('\nFailures:');
+  for (const f of failures) console.error('  - ' + f);
+  process.exitCode = 1;
+}

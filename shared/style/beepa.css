@@ -1,0 +1,136 @@
+/* Beepa — shared app-shell restyle. Maps the messaging-hub shell (used by BOTH
+   apps/user and apps/master) onto the Organic design system (shared/style/organic.css).
+   CENTRALIZED: retune the look here once; both apps update. Loaded after each app's
+   own style.css so it wins on visuals; app layout/scaffolding stays in style.css. */
+
+/* ── ground ── */
+html, body { background: var(--color-bg); color: var(--color-text); font-family: var(--font-body); }
+.muted, .text-muted, .list-empty { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.error { color: var(--color-accent-700); }
+
+/* ── sign-in ── */
+#view-signin { background: var(--color-bg); }
+#view-signin .card, #view-signin .card.narrow, .card, .card.narrow {
+  background: var(--color-surface); border: 1px solid var(--color-divider);
+  border-radius: calc(var(--radius-lg) * 1.15); box-shadow: var(--shadow-md);
+}
+#view-signin h1, .card h1 { font-family: var(--font-heading); font-weight: 400; color: var(--color-text); }
+
+/* ── shell + sidebar ── */
+#shell { background: var(--color-bg); }
+#sidebar {
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-divider);
+}
+#sidebar #brand, .nav-brand {
+  font-family: var(--font-heading); font-weight: 400; font-size: 20px;
+  color: var(--color-accent); letter-spacing: -0.01em;
+}
+.nav-sep { background: var(--color-divider); }
+.navitem {
+  color: color-mix(in srgb, var(--color-text) 78%, transparent);
+  border-radius: 999px; font-size: 14px;
+}
+.navitem:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); color: var(--color-text); }
+.navitem.active { background: var(--color-accent); color: var(--color-bg); }
+.navitem .count { background: var(--color-accent-200); color: var(--color-accent-800); border-radius: 999px; }
+.navitem.active .count { background: color-mix(in srgb, #fff 25%, transparent); color: var(--color-bg); }
+#account { border-top: 1px solid var(--color-divider); }
+#account a { color: var(--color-accent); }
+#account button { color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+
+/* ── views ── */
+#content { background: var(--color-bg); }
+.view-head h2 { font-family: var(--font-heading); font-weight: 400; color: var(--color-text); }
+.view-head .muted, .view-head p { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.view-head input, .input, #home-search, #source-search, #directory-search, #console-input, #convo-input {
+  background: var(--color-surface); color: var(--color-text);
+  border: 1px solid var(--color-divider); border-radius: 999px; padding: 8px 14px;
+  caret-color: var(--color-accent);
+}
+.view-head input:focus-visible, .input:focus-visible,
+#home-search:focus-visible, #convo-input:focus-visible { border-color: var(--color-accent); outline: none; }
+
+/* ── conversation list ── */
+.convo-list { gap: var(--space-1); }
+.convo {
+  background: transparent; border-radius: var(--radius-md);
+  border-bottom: none; padding: var(--space-2) var(--space-3);
+}
+.convo:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+.convo.active { background: var(--color-accent-100); }
+.convo .avatar {
+  background: var(--color-accent-2-200); color: var(--color-accent-2-800);
+  font-family: var(--font-heading); font-weight: 400; border-radius: 50%;
+}
+.convo .avatar img { border-radius: 50%; }
+.convo .title { font-weight: 600; color: var(--color-text); }
+.convo .sub, .convo .meta .preview { color: color-mix(in srgb, var(--color-text) 52%, transparent); }
+.convo .when { color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+.convo .badge { background: var(--color-neutral-100); color: var(--color-neutral-800); border-radius: 999px; padding: 2px 9px; font-size: 11px; }
+
+/* ── platform logo badges (CSS-only, same-origin ⇒ CSP img-src 'self') ── */
+.plat-badge {
+  width: 18px; height: 18px; flex: none; border-radius: 50%;
+  background-size: cover; background-position: center; background-repeat: no-repeat;
+  box-shadow: var(--shadow-sm);
+}
+.plat-badge.whatsapp   { background-image: url(../assets/logo-whatsapp.png);  color: transparent; }
+.plat-badge.imessage   { background-image: url(../assets/logo-imessage.png);  color: transparent; }
+.plat-badge.gmessages  { background-image: url(../assets/logo-gmessages.png); color: transparent; }
+.plat-badge.instagram  { background-image: url(../assets/logo-instagram.png); color: transparent; }
+.plat-badge.linkedin   { background-image: url(../assets/logo-linkedin.png);  color: transparent; }
+.plat-badge.twitter    { background-image: url(../assets/logo-twitter.png);   color: transparent; }
+
+/* ── chat pane ── */
+#convo-head, #msgr-list-head { border-bottom: 1px solid var(--color-divider); }
+#convo-title { font-family: var(--font-heading); font-weight: 400; }
+.msg { border-radius: var(--radius-lg); }
+.msg.recv { background: var(--color-surface); color: var(--color-text); }
+.msg.sent { background: var(--color-accent); color: var(--color-bg); }
+.msg.notice, .msg.media { background: var(--color-neutral-200); color: var(--color-neutral-800); }
+#convo-compose { border-top: 1px solid var(--color-divider); background: var(--color-bg); }
+
+/* ── bridge / connection cards ── */
+#bridge-cards { gap: var(--space-3); }
+.bridge-card, .src-placeholder {
+  background: var(--color-surface); border: 1px solid var(--color-divider);
+  border-radius: calc(var(--radius-lg) * 1.05); box-shadow: var(--shadow-sm);
+}
+.bridge-name { font-family: var(--font-heading); font-weight: 400; font-size: 18px; }
+.status-pill { background: var(--color-neutral-200); color: var(--color-neutral-800); border-radius: 999px; font-size: 11px; padding: 3px 10px; }
+.status-pill.ok { background: var(--color-accent-2-200); color: var(--color-accent-2-800); }
+
+/* ── settings / command rows ── */
+.cmd-group { background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: var(--radius-lg); }
+.cmd { border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent); }
+.cmd .name { font-weight: 600; }
+.cmd .desc { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+#console { background: var(--color-neutral-900); color: var(--color-neutral-100); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; }
+#console .who.you { color: var(--color-accent-300); }
+
+/* ── buttons ── */
+button, .navitem, .cmd button { font-family: var(--font-body); }
+button.primary, .btn-primary, #btn-signin.primary, .bridge-actions .primary, .dialog-actions .primary, #modal-ok {
+  background: var(--color-accent); color: var(--color-bg);
+  border: 1px solid transparent; border-radius: 999px;
+  font-family: var(--font-heading); font-weight: 400;
+}
+button.primary:hover, .btn-primary:hover { background: var(--color-accent-600); }
+button.danger, #modal-ok.danger { background: var(--color-accent-700); color: var(--color-bg); border-radius: 999px; }
+button:not(.primary):not(.danger), .btn-secondary {
+  background: transparent; color: var(--color-text);
+  border: 1px solid var(--color-divider); border-radius: 999px;
+}
+button:not(.primary):not(.danger):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+
+/* ── modal / dialog ── */
+#modal-backdrop { background: color-mix(in srgb, var(--color-neutral-900) 50%, transparent); }
+#modal { background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); }
+#modal h3 { font-family: var(--font-heading); font-weight: 400; }
+
+/* ── sharing / consent, proposals, contacts, add-teammate (app-specific views,
+      inherit the tokens automatically; a few accents so they read as Organic) ── */
+.share-toggle, .seg { border-radius: 999px; }
+.proposal-card, .contact-card { background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: var(--radius-lg); }
+.proposal-card { border-style: dashed; border-color: var(--color-accent-400); }

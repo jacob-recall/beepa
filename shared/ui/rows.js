@@ -20,9 +20,11 @@ function setConvoRowDecorator(fn) { convoRowDecorator = typeof fn === 'function'
 // room is in) — never a bridged field. A CSS-classed pill carrying the source
 // icon via textContent. No <img>, no data:/remote URL (CSP byte-identical).
 function buildPlatBadge(sourceId) {
-  const cls = sourceId === 'imessage' ? 'plat-badge imessage'
-            : sourceId === 'whatsapp' ? 'plat-badge whatsapp'
-            : 'plat-badge';
+  // beepa.css renders a per-source logo via .plat-badge.<sourceId> background-image
+  // (shared/assets/logo-<sourceId>.png). sourceId is an internal SOURCES id
+  // (whatsapp/imessage/gmessages/instagram/linkedin/twitter), safe as a class.
+  // The source emoji stays as a fallback for any source without a logo.
+  const cls = 'plat-badge' + (sourceId ? ' ' + sourceId : '');
   const source = SOURCES.find(s => s.id === sourceId);
   return el('span', cls, (source && source.icon) || '');
 }

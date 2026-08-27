@@ -2,10 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8008; img-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src http://127.0.0.1:8009; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8008; img-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src http://127.0.0.1:8009; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bridge Hub</title>
+<title>Beepa</title>
+<link rel="stylesheet" href="../../shared/style/organic.css">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="../../shared/style/beepa.css">
 </head>
 <body>
 <div id="signout-note-wrap" class="hidden">
@@ -14,7 +16,7 @@
 
 <section id="view-signin">
   <div class="card narrow">
-    <h1>Bridge Hub</h1>
+    <h1>Beepa</h1>
     <p class="muted">One place for every messaging account. Sign in to your local Matrix homeserver.</p>
     <label for="in-user">Matrix username</label>
     <input id="in-user" autocomplete="username" spellcheck="false" placeholder="jkali">
@@ -27,7 +29,7 @@
 
 <div id="shell" class="hidden">
   <aside id="sidebar">
-    <div id="brand">Bridge Hub</div>
+    <div id="brand">Beepa</div>
     <nav id="nav-sources" aria-label="Sources"><!-- source buttons injected: All + per-source --></nav>
     <div class="nav-sep"></div>
     <nav id="nav-tools" aria-label="Tools">

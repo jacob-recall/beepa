@@ -1,0 +1,15 @@
+{
+  "hs_url": "http://127.0.0.1:8008",
+  "domain": "localhost",
+  "as_token": "REPLACE_WITH_APPSERVICE_AS_TOKEN",
+  "hs_token": "REPLACE_WITH_APPSERVICE_HS_TOKEN",
+  "port": 29350,
+  "user_id": "@youruser:localhost",
+  "bot_id": "@imessagebot:localhost",
+  "cli_path": "/Users/you/work/pm_mng/imessage/bin/imessage-cli",
+  "self_handle": "+15551234567",
+  "poll_interval": 2,
+  "attachment_allow_prefixes": ["/var/folders/", "/private/tmp/"],
+  "max_body_kb": 256,
+  "rate_per_chat_per_min": 20
+}

@@ -10,7 +10,15 @@ element/config.json
 *.backup
 *.bak
 pg_dump*
-imessage/
+# imessage bridge: track the source (daemon.py, Package.resolved.pinned,
+# daemon.json.example); ignore secrets, runtime state, build output, and the
+# external platform-imessage clone.
+imessage/daemon.json
+imessage/*.db
+imessage/logs/
+imessage/tmp/
+imessage/bin/
+imessage/platform-imessage/
 
 # Harness state and worktrees
 .claude/

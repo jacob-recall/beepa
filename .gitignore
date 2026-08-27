@@ -35,3 +35,6 @@ master/logs/*.err
 # Uplink enrollment credentials written on the teammate side — never commit
 uplink.env.local
 *.uplink.env.local
+
+# Uplink daemon logs (launchd) — never commit
+agents/uplink/logs/

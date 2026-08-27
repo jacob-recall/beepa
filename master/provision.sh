@@ -56,7 +56,10 @@ persist_state() {
   chmod 600 "${STATE_FILE}"
 }
 
-MANAGER_PW="${MANAGER_PW:-$(gen_pw)}"
+# The manager is the human-facing master login; default it to the simple
+# 'password' (overridable via env) so the operator can sign in easily. The
+# alice/bob teammate slots stay randomly generated.
+MANAGER_PW="${MANAGER_PW:-password}"
 ALICE_PW="${ALICE_PW:-$(gen_pw)}"
 BOB_PW="${BOB_PW:-$(gen_pw)}"
 

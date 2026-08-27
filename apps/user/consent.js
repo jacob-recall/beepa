@@ -133,13 +133,37 @@ function buildShareToggle(convo, badgeEl) {
 // open the conversation underneath.
 function decorateRow(row, convo) {
   if (!convo || !convo.id) return;
+  // Design 1a: sharing controls are NOT shown on every row; a kebab (⋯) on the
+  // row reveals them on demand in a small popover.
   const holder = el('span', 'share-controls');
+  const kebab = el('button', 'share-kebab', '⋯');   // ⋯
+  kebab.type = 'button';
+  kebab.title = 'Sharing';
+  kebab.setAttribute('aria-label', 'Sharing controls');
+  const menu = el('div', 'share-menu hidden');
   const badge = buildShareBadge(convo);
-  holder.appendChild(badge);
-  holder.appendChild(buildShareToggle(convo, badge));
-  holder.addEventListener('click', (e) => e.stopPropagation());
-  holder.addEventListener('keydown', (e) => e.stopPropagation());
+  menu.appendChild(badge);
+  menu.appendChild(buildShareToggle(convo, badge));
+  const stop = (e) => e.stopPropagation();
+  kebab.addEventListener('click', (e) => {
+    e.stopPropagation();                               // don't open the conversation
+    document.querySelectorAll('.share-menu:not(.hidden)')
+      .forEach((m) => { if (m !== menu) m.classList.add('hidden'); });
+    menu.classList.toggle('hidden');
+  });
+  menu.addEventListener('click', stop);
+  menu.addEventListener('keydown', stop);
+  holder.appendChild(kebab);
+  holder.appendChild(menu);
+  holder.addEventListener('click', stop);
   row.appendChild(holder);
+  // one-time: click anywhere else closes any open sharing popover
+  if (!window.__shareKebabCloser) {
+    window.__shareKebabCloser = true;
+    document.addEventListener('click', () => {
+      document.querySelectorAll('.share-menu:not(.hidden)').forEach((m) => m.classList.add('hidden'));
+    });
+  }
 }
 
 // ---- global "Share All" switch ----

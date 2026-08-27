@@ -25,7 +25,9 @@ import { loadConsentState } from './consent.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setContactsViewHook } from '../../shared/ui/nav.js';
 import { SOURCES } from '../../shared/ui/sources.js';
-import { convosBySource } from '../../shared/state.js';
+import { convosBySource, feedModel } from '../../shared/state.js';
+import { openConvo } from '../../shared/ui/chat.js';
+import { buildPlatBadge } from '../../shared/ui/rows.js';
 
 // Local cache of the one consent-storage read. Writes below replace it with
 // the normalized result writeProfiles() returns, so the view re-renders from
@@ -113,12 +115,21 @@ function buildShareToggle(profile) {
 
 function buildLinkedRow(convo) {
   const row = el('div', 'contact-linked-row');
-  row.appendChild(el('span', 'badge', sanitizeLine(convo.sourceLabel || convo.sourceId || '')));
-  row.appendChild(el('span', 'title', sanitizeLine(convo.title || convo.id)));
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  row.appendChild(buildPlatBadge(convo.sourceId));
+  const meta = el('span', 'contact-row-meta');
+  meta.appendChild(el('span', 'title', sanitizeLine(convo.title || convo.id)));
+  const preview = (feedModel.get(convo.id) || {}).lastBody;
+  if (preview) meta.appendChild(el('span', 'sub', sanitizeLine(preview)));
+  row.appendChild(meta);
   const btn = el('button', 'contact-unlink', 'Detach');
   btn.type = 'button';
-  btn.addEventListener('click', async () => { await persist(unlinkRoom(store, convo.id)); });
+  btn.addEventListener('click', async (e) => { e.stopPropagation(); await persist(unlinkRoom(store, convo.id)); });
   row.appendChild(btn);
+  const open = () => openConvo(convo.id);
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   return row;
 }
 
@@ -188,13 +199,30 @@ function buildProfileCard(profile) {
   head.appendChild(delBtn);
   card.appendChild(head);
 
+  // Conversations with this person: the LATEST is shown on top; clicking it
+  // opens that conversation in the main window AND accordion-expands the others.
   const linked = el('div', 'contact-linked');
-  if (!profile.roomIds.length) {
+  const convos = profile.roomIds
+    .map((rid) => convoById(rid) || { id: rid, title: rid, sourceLabel: '', sourceId: '' })
+    .sort((a, b) => ((feedModel.get(b.id) || {}).lastTs || 0) - ((feedModel.get(a.id) || {}).lastTs || 0));
+  if (!convos.length) {
     linked.appendChild(el('p', 'muted', 'No conversations attached yet.'));
   } else {
-    for (const rid of profile.roomIds) {
-      linked.appendChild(buildLinkedRow(convoById(rid) || { id: rid, title: rid, sourceLabel: '' }));
+    const latest = convos[0];
+    const rest = convos.slice(1);
+    const primary = buildLinkedRow(latest);
+    primary.classList.add('contact-primary');
+    const acc = el('div', 'contact-accordion hidden');
+    for (const c of rest) acc.appendChild(buildLinkedRow(c));
+    if (rest.length) {
+      const chev = el('span', 'contact-chev', '▾');
+      primary.insertBefore(chev, primary.firstChild);
+      // primary's own click (buildLinkedRow) opens the latest; this also toggles
+      // the accordion of the person's other conversations.
+      primary.addEventListener('click', () => { acc.classList.toggle('hidden'); chev.classList.toggle('open'); });
     }
+    linked.appendChild(primary);
+    linked.appendChild(acc);
   }
   card.appendChild(linked);
   card.appendChild(buildAttachSearch(profile));

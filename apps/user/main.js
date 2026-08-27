@@ -5,6 +5,7 @@ import { seedFeed, startFeedSync } from '../../shared/ui/account-data.js';
 import { initConsentUI } from './consent.js';
 import { initContactsUI } from './contacts.js';
 import { initProposalsUI } from './proposals.js';
+import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
 import { api, setOnUnauthorized } from '../../shared/matrix/client.js';
 import { buildConnections, buildSettings, logConsole } from '../../shared/ui/connections.js';
@@ -82,6 +83,7 @@ async function enterApp() {
   try { await initConsentUI(); } catch (e) { /* share controls stay at safe defaults on error */ }
   try { initProposalsUI(); } catch (e) { /* proposal inbox hook stays unregistered on error */ }
   try { initContactsUI(); } catch (e) { /* contacts hook stays unregistered on error */ }
+  try { await initOrgLinkUI(); } catch (e) { /* org-link panel stays absent on error */ }
   mountChats();                                     // Element pane exists so openConversation can target it
   showAuth(true);
   navTo('home');                                    // HF-8: default view = Home feed

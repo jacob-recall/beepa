@@ -129,11 +129,21 @@ class Config:
         self.local_hs = req("LOCAL_HS_URL").rstrip("/")
         self.local_user = req("LOCAL_USER")
         self.local_token = req("LOCAL_TOKEN")
-        self.master_hs = req("MASTER_HS_URL").rstrip("/")
-        self.master_user = req("MASTER_USER")
-        self.master_token = req("MASTER_TOKEN")
-        self.manager_mxid = req("MANAGER_MXID")
-        self.master_space = req("MASTER_SPACE")
+        # MASTER_* are OPTIONAL. They may come from env (the link.sh install path)
+        # OR from the local hub account-data com.jkali.master_link, which the user
+        # app's Settings > "Connect to organization" writes after redeeming an
+        # enrollment code. Uplink.refresh_master_config() resolves the effective
+        # values each loop; account-data wins over env when present.
+        self.master_hs = (env.get("MASTER_HS_URL") or "").rstrip("/")
+        self.master_user = env.get("MASTER_USER") or ""
+        self.master_token = env.get("MASTER_TOKEN") or ""
+        self.manager_mxid = env.get("MANAGER_MXID") or ""
+        self.master_space = env.get("MASTER_SPACE") or ""
+        self.env_master = {
+            "master_hs": self.master_hs, "master_user": self.master_user,
+            "master_token": self.master_token, "manager_mxid": self.manager_mxid,
+            "master_space": self.master_space,
+        }
         self.db_path = env.get("UPLINK_DB") or os.path.join(BASE, "state.db")
         self.backfill = max(0, min(int(env.get("UPLINK_BACKFILL", "500")), 500))
         self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "30000"))
@@ -899,11 +909,51 @@ class Uplink:
         # failure raised MasterUnreachable above).
         self.meta_set("sync_since", data.get("next_batch") or since or "")
 
+    MASTER_LINK_TYPE = "com.jkali.master_link"  # local hub account-data (set by the user app)
+
+    def refresh_master_config(self):
+        """Resolve the effective MASTER_* config. The local hub account-data
+        com.jkali.master_link (written by the user app's Settings > Connect to
+        organization, after it redeems an enrollment code) overrides the env
+        fallback. Read outbound-only from the LOCAL hub with LOCAL_TOKEN.
+        Returns True when a complete master config is available (connected)."""
+        link = None
+        try:
+            data = self.local("GET", "/_matrix/client/v3/user/%s/account_data/%s"
+                              % (urllib.parse.quote(self.cfg.local_user), self.MASTER_LINK_TYPE))
+            if isinstance(data, dict) and data.get("master_token") and data.get("master_hs_url"):
+                link = data
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log.debug("master_link read: HTTP %s", e.code)
+        except Exception as e:
+            log.debug("master_link read failed: %s", e)
+        src = link or {}
+        em = self.cfg.env_master
+        self.cfg.master_hs    = (src.get("master_hs_url") or em["master_hs"] or "").rstrip("/")
+        self.cfg.master_user  = src.get("master_user")  or em["master_user"]  or ""
+        self.cfg.master_token = src.get("master_token") or em["master_token"] or ""
+        self.cfg.manager_mxid = src.get("manager_mxid") or em["manager_mxid"] or ""
+        self.cfg.master_space = src.get("master_space") or em["master_space"] or ""
+        return bool(self.cfg.master_hs and self.cfg.master_user
+                    and self.cfg.master_token and self.cfg.master_space)
+
     def run(self):
-        log.info("uplink starting: local=%s master=%s space=%s manager=%s",
-                 self.cfg.local_hs, self.cfg.master_hs, self.cfg.master_space, self.cfg.manager_mxid)
+        log.info("uplink starting: local=%s (master resolved per-loop from env or "
+                 "com.jkali.master_link account-data)", self.cfg.local_hs)
         while True:
             try:
+                if not self.refresh_master_config():
+                    if getattr(self, "_conn_state", None) is not False:
+                        self._conn_state = False
+                        log.info("not connected to a master — connect from the user app: "
+                                 "Settings > Connect to organization")
+                    time.sleep(30)
+                    continue
+                if getattr(self, "_conn_state", None) is not True:
+                    self._conn_state = True
+                    log.info("connected to master %s (space %s)",
+                             self.cfg.master_user, self.cfg.master_space)
                 self.reconcile()
                 self.tail_once()
                 # V2 proposal channel: ensure the dedicated proposals rooms exist,

@@ -1,0 +1,61 @@
+# MASTER homeserver stack — always-on, separate from the live matrix-wa stack.
+#
+# Isolation invariants (do NOT merge with the user hub's docker-compose.yml):
+#   * compose project name:  matrix-master   (matrix-wa stays untouched)
+#   * own Postgres, own named volumes (master-postgres-data, master-synapse-media)
+#   * Synapse CS API on host 127.0.0.1:8018 only  (user hub uses 8008/8009/8010)
+#   * Postgres has NO host port — reachable only on this project's network.
+#
+# Bring up:   docker compose -p matrix-master --env-file master/.env \
+#               -f master/docker-compose.master.yml up -d
+# Provision:  master/provision.sh
+# Tear down:  docker compose -p matrix-master -f master/docker-compose.master.yml down
+#
+# Portable to a remote server unchanged; bind the published port to 0.0.0.0
+# behind a TLS reverse proxy there (see PLAN-MASTER-SYNC.md §7).
+name: matrix-master
+
+services:
+  postgres:
+    image: postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: ${MASTER_POSTGRES_PASSWORD:?set in master/.env}
+      POSTGRES_DB: synapse
+      # Synapse requires LC_COLLATE=C, LC_CTYPE=C.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - master-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix -d synapse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host ports: reachable only on the matrix-master network.
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./synapse:/data
+      - master-synapse-media:/data/media_store
+    ports:
+      # CS API only, bound to loopback on this machine.
+      - "127.0.0.1:8018:8008"
+    healthcheck:
+      # Synapse image ships Python, not curl — probe /health via urllib.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8008/health').status==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  master-postgres-data:
+  master-synapse-media:

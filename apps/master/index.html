@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018; img-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Master Console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  Read-only manager console (PLAN-MASTER-SYNC.md §6.4). This is a SEPARATE
+  build from apps/user/: it signs into the MASTER homeserver only, and there
+  is no composer anywhere in this file or in main.js — read-only is enforced
+  by the absence of send code, not by hiding a button. Do not add an input/
+  button that calls PUT .../send/m.room.message here.
+-->
+<section id="view-signin">
+  <div class="card narrow">
+    <h1>Master Console</h1>
+    <p class="muted">Read-only view of every teammate's shared conversations. Sign in as the manager.</p>
+    <label for="in-user">Matrix username</label>
+    <input id="in-user" autocomplete="username" spellcheck="false" placeholder="manager">
+    <label for="in-pass">Password</label>
+    <input id="in-pass" type="password" autocomplete="current-password">
+    <button id="btn-signin" type="button" class="primary">Sign in</button>
+    <p id="signin-error" class="error hidden"></p>
+  </div>
+</section>
+
+<div id="shell" class="hidden">
+  <aside id="sidebar">
+    <div id="brand">Master Console</div>
+    <nav id="nav-tools" aria-label="Views">
+      <button id="nav-recent" class="navitem" type="button"><span class="ic">&#128338;</span> Recent</button>
+      <button id="nav-search" class="navitem" type="button"><span class="ic">&#128269;</span> Search</button>
+    </nav>
+    <div class="nav-sep"></div>
+    <nav id="nav-teammates" aria-label="Teammates"><!-- one button per teammate space, injected --></nav>
+    <div class="spacer"></div>
+    <div id="account">
+      <span id="whoami"></span>
+      <button id="signout" type="button">Sign out</button>
+    </div>
+  </aside>
+
+  <main id="content">
+    <!-- Cross-user recent feed: every mirror room, all teammates, sorted by
+         com.jkali.origin_ts descending (PLAN-MASTER-SYNC §6.4 bullet 1). -->
+    <section id="view-recent" class="view hidden">
+      <header class="view-head">
+        <h2>Recent</h2>
+        <p class="muted">Every shared conversation across every teammate, most recent first.</p>
+      </header>
+      <div id="recent-list" class="convo-list"></div>
+    </section>
+
+    <!-- Per-teammate grouping: one section per teammate space, reusing the
+         per-source view pattern but grouped by user (§6.4 bullet 2). -->
+    <section id="view-teammate" class="view hidden">
+      <header class="view-head">
+        <h2 id="teammate-title">Teammate</h2>
+        <p class="muted" id="teammate-sub"></p>
+      </header>
+      <div id="teammate-list" class="convo-list"></div>
+    </section>
+
+    <!-- Search across everyone (§6.4 bullet 3). Pure client-side filter over
+         the in-memory flattened feed; never builds a URL or sends anything. -->
+    <section id="view-search" class="view hidden">
+      <header class="view-head">
+        <h2>Search</h2>
+        <p class="muted">Search conversation names and previews across every teammate.</p>
+        <input id="search-input" placeholder="Search everyone" spellcheck="false" autocomplete="off">
+      </header>
+      <div id="search-results" class="convo-list"></div>
+    </section>
+
+    <!-- Read-only conversation viewer. No input, no send button — this
+         element tree has no composer node at all. -->
+    <section id="view-room" class="view hidden">
+      <div id="room-pane">
+        <header id="room-head">
+          <button id="room-back" type="button" title="Back">&#8592;</button>
+          <span id="room-badge" class="plat-badge"></span>
+          <span id="room-title"></span>
+          <span id="room-owner" class="muted"></span>
+        </header>
+        <div id="room-messages"></div>
+        <div id="room-status" class="convo-status hidden"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+/* apps/master/style.css — same visual language as apps/user/style.css (a
+   subset of its tokens/classes), trimmed to what a read-only console needs:
+   no composer, bridge-connection, settings/console, or share-control rules. */
+:root {
+  --bg: #f4f5f7; --fg: #1a1d21; --card: #ffffff; --line: #d9dde3;
+  --muted: #6a7280; --accent: #2b4b8f; --accent-fg: #ffffff;
+  --danger: #b3261e;
+  --sidebar: #1f2430; --sidebar-fg: #e7ebf2; --sidebar-muted: #9aa3b2;
+  --sidebar-active: #2d3444; --sidebar-w: 230px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.error { color: var(--danger); white-space: pre-wrap; }
+.spacer { flex: 1; }
+h1 { font-size: 22px; margin: 0 0 6px; }
+h2 { font-size: 19px; margin: 0 0 4px; }
+
+#view-signin .card.narrow { max-width: 420px; margin: 12vh auto 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 14px 0; }
+label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted); }
+input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font-size: 15px; background: var(--card); color: var(--fg); }
+button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font-size: 14px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); width: 100%; margin-top: 16px; }
+
+/* shell: sidebar + content */
+#shell { display: flex; height: 100vh; width: 100%; }
+#sidebar { width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--sidebar); color: var(--sidebar-fg); display: flex; flex-direction: column; padding: 14px 10px; gap: 4px; overflow-y: auto; }
+#sidebar #brand { font-weight: 700; font-size: 16px; padding: 6px 10px 12px; }
+#sidebar nav { display: flex; flex-direction: column; gap: 2px; }
+.nav-sep { height: 1px; background: rgba(255,255,255,0.08); margin: 8px 6px; }
+.navitem { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: none; background: transparent; color: var(--sidebar-fg); padding: 9px 10px; border-radius: 8px; font-size: 14px; cursor: pointer; }
+.navitem:hover { background: rgba(255,255,255,0.06); }
+.navitem.active { background: var(--sidebar-active); font-weight: 600; }
+.navitem .ic { width: 18px; text-align: center; opacity: 0.85; }
+#account { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-top: 1px solid rgba(255,255,255,0.08); }
+#whoami { color: var(--sidebar-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#account button { font-size: 13px; background: transparent; border: 1px solid rgba(255,255,255,0.14); color: var(--sidebar-fg); }
+
+#content { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+.view { position: absolute; inset: 0; overflow-y: auto; padding: 22px 24px 40px; }
+.view-head { max-width: 760px; margin: 0 auto 12px; }
+.view-head input { margin-top: 12px; }
+
+/* conversation rows (Recent / per-teammate / Search) */
+.convo-list { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; }
+.convo { display: flex; align-items: center; gap: 12px; padding: 11px 12px; border: 1px solid var(--line); border-top: none; background: var(--card); cursor: pointer; text-align: left; width: 100%; }
+.convo:first-child { border-top: 1px solid var(--line); border-radius: 10px 10px 0 0; }
+.convo:last-child { border-radius: 0 0 10px 10px; }
+.convo:only-child { border-radius: 10px; }
+.convo:hover { background: #eef1f5; }
+.convo .avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--bg); flex: 0 0 34px; display: flex; align-items: center; justify-content: center; font-size: 14px; color: var(--muted); }
+.convo .meta { flex: 1; min-width: 0; }
+.convo .title { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo .preview { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo .when { flex: 0 0 auto; color: var(--muted); font-size: 12px; margin-left: 4px; white-space: nowrap; }
+.convo .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; white-space: nowrap; }
+.convo .plat-badge { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; background: var(--bg); border: 1px solid var(--line); }
+.list-empty { max-width: 760px; margin: 0 auto; color: var(--muted); padding: 18px 12px; }
+
+/* read-only room viewer */
+#view-room { padding: 0; }
+#room-pane { display: flex; flex-direction: column; height: 100%; }
+#room-head { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--card); flex: 0 0 auto; }
+#room-back { border: none; background: transparent; font-size: 20px; line-height: 1; padding: 4px 8px; border-radius: 8px; cursor: pointer; color: var(--fg); }
+#room-back:hover { background: var(--bg); }
+#room-title { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 50%; }
+#room-head .plat-badge { width: 20px; height: 20px; }
+#room-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; background: var(--bg); }
+.msg { max-width: 68%; padding: 7px 11px; border-radius: 14px; font-size: 14px; line-height: 1.35; word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap; }
+.msg .who { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 1px; }
+.msg .body { display: block; }
+.msg .when { display: block; font-size: 10.5px; color: var(--muted); margin-top: 2px; text-align: right; }
+.msg.recv { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.msg.sent { align-self: flex-end; background: var(--accent); color: var(--accent-fg); border-bottom-right-radius: 4px; }
+.msg.sent .who, .msg.sent .when { color: rgba(255,255,255,0.75); }
+.msg.media .body { font-style: italic; opacity: 0.85; }
+.msg.notice { align-self: center; background: transparent; border: none; color: var(--muted); font-size: 12.5px; max-width: 90%; text-align: center; }
+.convo-status { align-self: center; color: var(--danger); font-size: 12.5px; padding: 8px; }

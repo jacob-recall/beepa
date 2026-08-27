@@ -20,3 +20,9 @@ imessage/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Master (matrix-master) secrets and generated state — never commit
+master/synapse/
+master/tokens.local
+master/.env
+master/.provision-state.local

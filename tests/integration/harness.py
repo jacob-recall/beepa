@@ -250,6 +250,17 @@ def set_override(token, user_id, room_id, state):
           + "/account_data/com.jkali.share_override", content)
 
 
+def set_profiles(token, user_id, profiles):
+    """Write com.jkali.contact_profiles (§12 phase 5 unified contacts).
+
+    profiles is the full { "profiles": [ {id, displayName, roomIds, share} ] }
+    document the uplink's read_profiles() consumes (parity with
+    shared/model/contacts.js)."""
+    local(token, "PUT",
+          "/_matrix/client/v3/user/" + urllib.parse.quote(user_id, safe="")
+          + "/account_data/com.jkali.contact_profiles", profiles)
+
+
 # ------------------------------------------------------------------ uplink runner
 def start_uplink(e, extra_env=None):
     """Launch the real uplink daemon for a scenario env bundle `e`."""
@@ -359,6 +370,19 @@ def master_source_tag(room_id, token=MASTER_ALICE_TOKEN):
                    "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
                    + "/state/com.jkali.source/")
         return r.get("source")
+    except MxError:
+        return None
+
+
+def master_profile_tag(room_id, token=MASTER_ALICE_TOKEN):
+    """The com.jkali.profile state event stamped on a mirror room, or None.
+
+    Returns the content dict {id, displayName} the uplink stamps when the room
+    is a member of a SHARED contact profile (§12 phase 5)."""
+    try:
+        return master(token, "GET",
+                      "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+                      + "/state/com.jkali.profile/")
     except MxError:
         return None
 
@@ -1184,6 +1208,80 @@ def scenario_10_proposal_down():
     return ok, "; ".join(ev)
 
 
+def scenario_11_profile_span_platforms():
+    """§12 phase 5 unified contacts: a contact profile spanning TWO platforms.
+
+    Link an iMessage room + a LinkedIn room (+ a 2nd iMessage room) to ONE
+    contact profile and set the profile to `share`. Global stays private and no
+    per-source policy is set, so the ONLY thing that shares these rooms is the
+    profile level (proving the new level works and beats the default). Expect:
+      * BOTH the iMessage room and the LinkedIn room mirror up, and each mirror
+        carries the SAME com.jkali.profile {id, displayName} — so the master can
+        group this one person's threads across platforms;
+      * a per-conversation `private` override on the 3rd member keeps it OUT
+        (per-conv override still wins over the profile) and, being unmirrored,
+        it never gets a profile stamp.
+    """
+    e = fresh_env("s11")
+    imsg_space = create_space(e["tuser_tok"], "iMessage")
+    li_space = create_space(e["tuser_tok"], "LinkedIn")
+    im = make_convo(e, imsg_space, "Dana Lewis (iMessage)")
+    li = make_convo(e, li_space, "Dana Lewis (LinkedIn)")
+    excluded = make_convo(e, imsg_space, "Dana Lewis (old iMessage, excluded)")
+    for rid in (im, li, excluded):
+        post_msg(e["contact_tok"], rid, "seed for " + rid[:8])
+
+    prof_id = "cp_dana_" + uniq("id")
+    prof_name = "Dana Lewis"
+    # One profile, three linked rooms across two sources, set to SHARE.
+    set_profiles(e["tuser_tok"], e["tuser_id"], {"profiles": [{
+        "id": prof_id, "displayName": prof_name,
+        "roomIds": [im, li, excluded], "share": "share",
+    }]})
+    # Global + per-source stay at the safe default (nothing set) so the profile
+    # is the sole cause of sharing. Per-conversation private on the 3rd member.
+    set_override(e["tuser_tok"], e["tuser_id"], excluded, "private")
+
+    proc = start_uplink(e)
+    ev = []
+    ok = True
+    try:
+        im_row = wait_until(lambda: mirror_of(e["db_path"], im), timeout=45, desc="s11 iMessage mirror")
+        li_row = wait_until(lambda: mirror_of(e["db_path"], li), timeout=45, desc="s11 LinkedIn mirror")
+        time.sleep(4)  # give reconcile a chance to (not) mirror the excluded one
+        ex_row = mirror_of(e["db_path"], excluded)
+        im_master, li_master = im_row[0], li_row[0]
+
+        im_tag = wait_until(lambda: master_profile_tag(im_master), timeout=30, desc="s11 iMessage profile stamp")
+        li_tag = wait_until(lambda: master_profile_tag(li_master), timeout=30, desc="s11 LinkedIn profile stamp")
+    finally:
+        stop_uplink(proc)
+
+    # Both platforms mirrored.
+    both_up = im_row is not None and li_row is not None
+    ev.append("imessage_mirrored=%s linkedin_mirrored=%s" % (im_row is not None, li_row is not None))
+    ok = ok and both_up
+    # Excluded member (per-conv private) stayed OUT.
+    ev.append("excluded_member_out=%s" % (ex_row is None))
+    ok = ok and ex_row is None
+    # Both mirrors carry the SAME profile id + displayName.
+    im_id = (im_tag or {}).get("id")
+    li_id = (li_tag or {}).get("id")
+    same_profile = (im_id == prof_id and li_id == prof_id
+                    and (im_tag or {}).get("displayName") == prof_name
+                    and (li_tag or {}).get("displayName") == prof_name)
+    ev.append("same_profile_id=%s (im=%s li=%s want=%s)" % (im_id == li_id == prof_id, im_id, li_id, prof_id))
+    ev.append("profile_displayName=%s" % (im_tag or {}).get("displayName"))
+    ok = ok and same_profile
+    # Excluded room must NOT have been mirrored, hence no stamp to check; assert
+    # it is not a child of the manager's space grouping.
+    kids = space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
+    grouped = im_master in kids and li_master in kids
+    ev.append("both_under_space_alice=%s" % grouped)
+    ok = ok and grouped
+    return ok, "; ".join(ev)
+
+
 # ------------------------------------------------------------------ docker helpers
 def docker(args, check=True):
     env = dict(os.environ)
@@ -1226,6 +1324,7 @@ SCENARIOS = [
     ("8_cross_user_isolation", scenario_8_cross_user_isolation),
     ("9_media_reupload", scenario_9_media_reupload),
     ("10_proposal_down", scenario_10_proposal_down),
+    ("11_profile_span_platforms", scenario_11_profile_span_platforms),
 ]
 
 

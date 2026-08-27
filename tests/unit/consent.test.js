@@ -223,6 +223,98 @@ function convo(sourceId, sourceLabel) {
   eq(resolve(convo('x'), { global: 'share-all' }, 'private').reason, 'excluded', 'reason: per-conv private -> "excluded"');
 }
 
+// ===========================================================================
+// PROFILE LEVEL (§12 phase 5) — precedence: per-conv override > profile >
+// per-source > global > private. profile arg is { displayName, share }.
+// ===========================================================================
+
+// P1. A shared profile shares its members, even with global private + no source.
+{
+  const prof = { displayName: 'Dana Lewis', share: 'share' };
+  eq(resolve(convo('imessage', 'iMessage'), { global: 'private', sources: {} }, undefined, prof),
+    { shared: true, reason: 'profile: Dana Lewis' }, 'profile share: shares member despite default-private');
+  eq(resolve(convo('linkedin', 'LinkedIn'), { global: 'private', sources: {} }, undefined, prof),
+    { shared: true, reason: 'profile: Dana Lewis' }, 'profile share: shares a member on a different source too (same person, 2 platforms)');
+  eq(resolve({ id: '!x:local', sourceId: 'imessage' }, {}, undefined, { share: 'share' }),
+    { shared: true, reason: 'profile: profile' }, 'profile share: name falls back to generic "profile"');
+}
+
+// P2. Profile beats per-source (both directions).
+{
+  // profile private beats per-source share-all
+  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined,
+    { displayName: 'Dana', share: 'private' }),
+    { shared: false, reason: 'profile: Dana' }, 'profile private beats per-source share-all');
+  // profile share beats per-source private-all
+  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'private-all' } }, undefined,
+    { displayName: 'Dana', share: 'share' }),
+    { shared: true, reason: 'profile: Dana' }, 'profile share beats per-source private-all');
+  // profile private beats global share-all
+  eq(resolve(convo('imessage'), { global: 'share-all', sources: {} }, undefined,
+    { displayName: 'Dana', share: 'private' }),
+    { shared: false, reason: 'profile: Dana' }, 'profile private beats global share-all');
+}
+
+// P3. Per-conversation override still wins over the profile (both directions).
+{
+  // per-conv private excludes a member of a SHARED profile
+  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'private',
+    { displayName: 'Dana', share: 'share' }),
+    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite profile share');
+  // per-conv share includes despite a private profile
+  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'share',
+    { displayName: 'Dana', share: 'private' }),
+    { shared: true, reason: 'explicit' }, 'per-conv share includes despite profile private');
+}
+
+// P4. profile 'inherit' (or absent) falls through to source/global.
+{
+  eq(resolve(convo('imessage', 'iMessage'), { global: 'share-all', sources: {} }, undefined, { displayName: 'D', share: 'inherit' }),
+    { shared: true, reason: 'all iMessage' }, 'profile inherit falls through to global share-all');
+  eq(resolve(convo('imessage', 'iMessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined, { displayName: 'D', share: 'inherit' }),
+    { shared: true, reason: 'all iMessage' }, 'profile inherit falls through to per-source share-all');
+  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, undefined, { displayName: 'D', share: 'inherit' }),
+    { shared: false, reason: 'private' }, 'profile inherit + nothing else -> private');
+  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, undefined, null),
+    { shared: false, reason: 'private' }, 'no profile at all -> unchanged private');
+}
+
+// P5. effectiveShared threads the profile arg.
+{
+  eq(effectiveShared(convo('imessage'), { global: 'private', sources: {} }, undefined, { share: 'share' }), true, 'effectiveShared: profile share');
+  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, undefined, { share: 'private' }), false, 'effectiveShared: profile private beats global share-all');
+  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, 'private', { share: 'share' }), false, 'effectiveShared: per-conv private beats profile share');
+}
+
+// P6. resolveAll with a per-room profiles map (a profile spanning 2 platforms;
+//     one member carries a per-conversation private override and drops out).
+{
+  const policy = { global: 'private', sources: {} };
+  const convos = [
+    { id: '!im:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
+    { id: '!li:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
+    { id: '!ex:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
+    { id: '!un:local', sourceId: 'whatsapp', sourceLabel: 'WhatsApp' }, // no profile
+  ];
+  const P = { displayName: 'Dana Lewis', share: 'share' };
+  const profiles = { '!im:local': P, '!li:local': P, '!ex:local': P };
+  const overrides = { '!ex:local': 'private' }; // per-conv exclusion on one member
+  const res = resolveAll(convos, policy, overrides, profiles);
+  eq(res.map(r => r.shared), [true, true, false, false], 'resolveAll+profile: 2 platforms shared, excluded member out, non-member private');
+  eq(res.map(r => r.reason), ['profile: Dana Lewis', 'profile: Dana Lewis', 'excluded', 'private'], 'resolveAll+profile: reasons');
+  // Map form of the profiles argument works too.
+  const resMap = resolveAll(convos, policy, overrides, new Map([['!im:local', P], ['!li:local', P], ['!ex:local', P]]));
+  eq(resMap.map(r => r.shared), [true, true, false, false], 'resolveAll+profile: Map profiles argument');
+  // no profiles argument -> behaves as before (all private under this policy)
+  eq(resolveAll(convos, policy, undefined).map(r => r.shared), [false, false, false, false], 'resolveAll: no profiles arg unchanged');
+}
+
+// P7. profile reason exhaustiveness.
+{
+  eq(resolve(convo('x'), {}, undefined, { displayName: 'Ann', share: 'share' }).reason, 'profile: Ann', 'reason: profile share interpolates name');
+  eq(resolve(convo('x'), {}, undefined, { displayName: 'Ann', share: 'private' }).reason, 'profile: Ann', 'reason: profile private interpolates name');
+}
+
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) {

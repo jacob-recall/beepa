@@ -32,6 +32,7 @@
     <div class="nav-sep"></div>
     <nav id="nav-tools" aria-label="Tools">
       <button id="nav-directory" class="navitem" type="button"><span class="ic">&#128269;</span> Directory</button>
+      <button id="nav-contacts" class="navitem" type="button"><span class="ic">&#128100;</span> Contacts</button>
       <button id="nav-connections" class="navitem" type="button"><span class="ic">&#128268;</span> Connections</button>
       <button id="nav-proposals" class="navitem" type="button"><span class="ic">&#128172;</span> Proposals</button>
       <button id="nav-sharing" class="navitem" type="button"><span class="ic">&#128274;</span> Sharing</button>
@@ -97,6 +98,25 @@
         <input id="directory-search" placeholder="Search names and numbers across all services" spellcheck="false" autocomplete="off">
       </header>
       <div id="directory-results" class="convo-list"></div>
+    </section>
+
+    <!-- Contacts: unified contact profiles (PLAN-MASTER-SYNC §12 phase 5). A
+         profile groups several conversations (across sources) as one person;
+         see shared/model/contacts.js for storage + invariants. -->
+    <section id="view-contacts" class="view hidden">
+      <header class="view-head">
+        <h2>Contacts</h2>
+        <p class="muted">Group conversations that belong to the same person, view them together, and control what's shared for them as one unit.</p>
+      </header>
+      <div class="card" id="contacts-create">
+        <h3>New contact</h3>
+        <div class="row">
+          <input id="contact-new-name" placeholder="Name" spellcheck="false" autocomplete="off">
+          <button id="contact-new-btn" type="button" class="primary">Create</button>
+        </div>
+      </div>
+      <div id="contacts-suggestions"></div>
+      <div id="contacts-list"></div>
     </section>
 
     <!-- Proposals inbox (PLAN-MASTER-SYNC §2 v2 / §7): the manager can PROPOSE a

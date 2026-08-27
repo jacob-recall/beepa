@@ -76,6 +76,14 @@ SOURCE_ID_TO_LABEL = {
 }
 
 SOURCE_TAG_TYPE = "com.jkali.source"        # state event on the mirror room (badge)
+# §12 phase 5 unified contacts: a conversation may belong to a contact profile
+# (one person across sources). Profiles live in user account-data
+# com.jkali.contact_profiles (shared/model/contacts.js). When the uplink mirrors
+# a member of a SHARED profile it STAMPS the mirror room with com.jkali.profile
+# {id, displayName} so the master can group that person's threads together.
+CONTACT_PROFILES_TYPE = "com.jkali.contact_profiles"  # user account-data
+PROFILE_TAG_TYPE = "com.jkali.profile"      # state event on the mirror room
+PROFILE_SHARE_STATES = {"share", "private", "inherit"}
 FROM_ME_KEY = "com.jkali.from_me"
 ORIGIN_TS_KEY = "com.jkali.origin_ts"
 SOURCE_KEY = "com.jkali.source"
@@ -236,6 +244,49 @@ class Uplink:
         except urllib.error.HTTPError:
             return {"global": "private", "sources": {}}  # absent -> safe default
 
+    def read_profiles(self):
+        """Return {local_room_id: {'id','displayName','share'}} from account-data.
+
+        Reads com.jkali.contact_profiles and mirrors shared/model/contacts.js
+        normalizeProfiles: a room belongs to AT MOST ONE profile (first profile
+        wins), unknown share collapses to 'inherit', junk room ids dropped. A
+        room with no profile is simply absent from the map. Absent event -> {}.
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + CONTACT_PROFILES_TYPE)
+        try:
+            data = self.local("GET", path)
+        except urllib.error.HTTPError:
+            return {}  # absent -> no profiles
+        profiles = data.get("profiles") if isinstance(data, dict) else None
+        if not isinstance(profiles, list):
+            return {}
+        out = {}
+        seen_ids = set()
+        claimed = set()
+        for p in profiles:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if not isinstance(pid, str) or not pid or pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            dn = p.get("displayName")
+            dn = dn if isinstance(dn, str) else ""
+            share = p.get("share")
+            share = share if share in PROFILE_SHARE_STATES else "inherit"
+            rooms = p.get("roomIds")
+            if not isinstance(rooms, list):
+                continue
+            for rid in rooms:
+                if not isinstance(rid, str) or not ROOMID_RE.match(rid):
+                    continue
+                if rid in claimed:
+                    continue
+                claimed.add(rid)
+                out[rid] = {"id": pid, "displayName": dn, "share": share}
+        return out
+
     # -- source detection from a /sync response -----------------------------
     @staticmethod
     def sources_from_sync(sync_data):
@@ -289,10 +340,17 @@ class Uplink:
                            query={"filter": flt, "timeout": "0"}, timeout=120)
 
     def desired_shared(self, sync_data):
-        """Return (desired {local_room_id: bool}, source_of {room_id: source})."""
+        """Return (desired {room_id: bool}, source_of, join, profile_of).
+
+        profile_of maps room_id -> {'id','displayName','share'} for rooms that
+        belong to a contact profile (§12 phase 5). The profile share-state is
+        applied by the 4-level resolver (per-conv override > profile > source >
+        global > private) and also drives the master stamp in create_mirror.
+        """
         policy = self.read_policy()
         overrides = consent.overrides_from_sync(sync_data)
         source_of = self.sources_from_sync(sync_data)
+        profile_of = self.read_profiles()
         join = (((sync_data or {}).get("rooms") or {}).get("join")) or {}
         desired = {}
         for rid in join:
@@ -300,18 +358,29 @@ class Uplink:
             if not src:
                 continue  # not a bridged conversation room -> never shared
             convo = {"id": rid, "sourceId": src, "sourceLabel": SOURCE_ID_TO_LABEL.get(src, src)}
-            desired[rid] = consent.effective_shared(convo, policy, overrides.get(rid))
-        return desired, source_of, join
+            prof = profile_of.get(rid)
+            profile_arg = ({"displayName": prof["displayName"], "share": prof["share"]}
+                           if prof else None)
+            desired[rid] = consent.effective_shared(convo, policy, overrides.get(rid), profile_arg)
+        return desired, source_of, join, profile_of
 
     def reconcile(self):
         sync_data = self.full_sync()
-        desired, source_of, join = self.desired_shared(sync_data)
+        desired, source_of, join, profile_of = self.desired_shared(sync_data)
         plan = reconcile.reconcile_decisions(desired, self.existing_mirror_ids())
         log.info("reconcile: create=%d delete=%d keep=%d",
                  len(plan["create"]), len(plan["delete"]), len(plan["keep"]))
         for rid in plan["create"]:
             try:
-                self.create_mirror(rid, source_of.get(rid), self.room_name_from_sync(join.get(rid)))
+                # Stamp the mirror with the profile ONLY when the room is a member
+                # of a SHARED profile (share=='share') — that is what groups a
+                # person's threads on the master. A profile set to private/inherit
+                # never mirrors via the profile level, so it never stamps.
+                prof = profile_of.get(rid)
+                stamp = ({"id": prof["id"], "displayName": prof["displayName"]}
+                         if prof and prof.get("share") == "share" else None)
+                self.create_mirror(rid, source_of.get(rid),
+                                   self.room_name_from_sync(join.get(rid)), stamp)
             except MasterUnreachable:
                 raise
             except urllib.error.HTTPError as e:
@@ -328,19 +397,31 @@ class Uplink:
             self.sync_room(rid)
 
     # -- mirror lifecycle ---------------------------------------------------
-    def create_mirror(self, local_room_id, source, name):
-        """Create a mirror room on MASTER, add to space, tag source, invite mgr."""
+    def create_mirror(self, local_room_id, source, name, profile=None):
+        """Create a mirror room on MASTER, add to space, tag source, invite mgr.
+
+        profile (when the room is a member of a SHARED contact profile) is
+        {'id','displayName'} and is stamped as a com.jkali.profile state event so
+        the master app can group this person's threads across platforms.
+        """
         cfg = self.cfg
+        initial_state = [
+            {"type": SOURCE_TAG_TYPE, "state_key": "", "content": {"source": source or "unknown"}},
+            {"type": "m.space.parent", "state_key": cfg.master_space,
+             "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
+        ]
+        if profile:
+            initial_state.append({
+                "type": PROFILE_TAG_TYPE, "state_key": "",
+                "content": {"id": profile.get("id"),
+                            "displayName": profile.get("displayName") or ""},
+            })
         body = {
             "name": name or "conversation",
             "preset": "private_chat",
             "invite": [cfg.manager_mxid],
             "creation_content": {"com.jkali.mirror_of": local_room_id},
-            "initial_state": [
-                {"type": SOURCE_TAG_TYPE, "state_key": "", "content": {"source": source or "unknown"}},
-                {"type": "m.space.parent", "state_key": cfg.master_space,
-                 "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
-            ],
+            "initial_state": initial_state,
             # Read-only enforcement (§8.3): owner writes (100), events_default 50,
             # manager pinned to 0 -> manager can read, cannot send.
             "power_level_content_override": {

@@ -161,7 +161,8 @@ function parseSnapshot(data) {
   for (const rid of Object.keys(join)) {
     const r = join[rid];
     const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
-                   lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false };
+                   lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
+                   profileId: null, profileDisplayName: null };
     // State from BOTH the `state` block and `timeline` (a newer space's
     // create/name/child events can still be in the timeline window).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
@@ -186,6 +187,16 @@ function parseSnapshot(data) {
       // show the platform badge.
       if (e.type === 'com.jkali.source' && e.state_key === '' && e.content && typeof e.content.source === 'string') {
         info.sourceId = e.content.source;
+      }
+      // agents/uplink/uplink.py's create_mirror stamps this state event ONLY
+      // when the mirror is a member of a SHARED contact profile (§Phase 5
+      // contacts-core report): {id, displayName}. Grouping key for "one person,
+      // many platforms" below — never mutated here, read-only room state.
+      if (e.type === 'com.jkali.profile' && e.state_key === '' && e.content
+          && typeof e.content.id === 'string' && e.content.id) {
+        info.profileId = sanitizeLine(e.content.id);
+        info.profileDisplayName = typeof e.content.displayName === 'string'
+          ? sanitizeLine(e.content.displayName) : null;
       }
       if (e.type === 'm.space.child' && e.state_key && e.content && Object.keys(e.content).length) {
         if (!seenChild.has(e.state_key)) { seenChild.add(e.state_key); info.children.push(e.state_key); }
@@ -236,6 +247,8 @@ function buildByUser(rooms) {
         lastTs: r.lastTs || 0,
         sourceId: r.sourceId,
         userLabel: label,
+        profileId: r.profileId || null,
+        profileDisplayName: r.profileDisplayName || null,
       });
     }
     byUser.set(label, convos);
@@ -335,12 +348,68 @@ function buildFeedRow(c) {
   return row;
 }
 
+// Group a flat conversation list into "one person, many platforms" clusters:
+// every convo carrying the SAME com.jkali.profile id (stamped by the uplink
+// only on members of a SHARED contact profile — see parseSnapshot above)
+// collapses under one header; everything else stays a standalone row, exactly
+// as before. Pure grouping over already-fetched data — no new reads, no
+// mutation. Order preserved by most-recent activity, same as the flat feed.
+function groupByProfile(convos) {
+  const order = [];
+  const groups = new Map(); // profileId -> group item (also pushed into order once)
+  for (const c of convos) {
+    if (c.profileId) {
+      let g = groups.get(c.profileId);
+      if (!g) {
+        g = { kind: 'profile', profileId: c.profileId, displayName: c.profileId, members: [], lastTs: 0 };
+        groups.set(c.profileId, g);
+        order.push(g);
+      }
+      g.members.push(c);
+      if (c.profileDisplayName) g.displayName = c.profileDisplayName; // prefer a real name over the raw id
+      if ((c.lastTs || 0) > g.lastTs) g.lastTs = c.lastTs || 0;
+    } else {
+      order.push({ kind: 'single', convo: c, lastTs: c.lastTs || 0 });
+    }
+  }
+  for (const item of order) {
+    if (item.kind === 'profile') item.members.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+  }
+  order.sort((a, b) => b.lastTs - a.lastTs);
+  return order;
+}
+
+// A profile header shown ONCE per person, with their per-platform threads
+// nested beneath — each still built by buildFeedRow, so it keeps its own
+// source badge, teammate badge, preview and click-to-open behavior unchanged.
+// Reuses the shared row renderer; adds no new interaction (click still opens
+// the individual mirror room, same as a standalone row).
+function buildProfileGroup(g) {
+  const wrap = el('div', 'profile-group');
+  const header = el('div', 'profile-header');
+  header.appendChild(el('span', 'profile-avatar', (g.displayName || '?').slice(0, 1).toUpperCase()));
+  header.appendChild(el('span', 'profile-name', g.displayName));
+  header.appendChild(el('span', 'profile-count',
+    g.members.length + ' thread' + (g.members.length === 1 ? '' : 's')));
+  wrap.appendChild(header);
+  const members = el('div', 'profile-members');
+  for (const c of g.members) members.appendChild(buildFeedRow(c));
+  wrap.appendChild(members);
+  return wrap;
+}
+
+// Renders one list item, grouped or not — the shared entry point both
+// renderRecent and renderTeammate use below.
+function buildListItem(item) {
+  return item.kind === 'profile' ? buildProfileGroup(item) : buildFeedRow(item.convo);
+}
+
 function renderRecent() {
   const list = $('recent-list');
   if (!list) return;
   list.replaceChildren();
   if (!MS.feed.length) { list.appendChild(elEmpty('No shared conversations yet.')); return; }
-  for (const c of MS.feed.slice(0, 200)) list.appendChild(buildFeedRow(c));
+  for (const item of groupByProfile(MS.feed.slice(0, 200))) list.appendChild(buildListItem(item));
 }
 
 function renderTeammateNav() {
@@ -367,7 +436,7 @@ function renderTeammate(label) {
   const list = $('teammate-list');
   list.replaceChildren();
   if (!convos.length) { list.appendChild(elEmpty('Nothing shared yet.')); return; }
-  for (const c of convos) list.appendChild(buildFeedRow(c));
+  for (const item of groupByProfile(convos)) list.appendChild(buildListItem(item));
 }
 
 // #search-input is a pure client-side filter over the in-memory flattened

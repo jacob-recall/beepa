@@ -168,6 +168,75 @@ sync = {"rooms": {"join": {
 }}}
 eq(overrides_from_sync(sync), {"!a:local": "share", "!b:local": "private"}, "overridesFromSync: only valid overrides")
 
+# ===========================================================================
+# PROFILE LEVEL (§12 phase 5) — precedence: per-conv override > profile >
+# per-source > global > private. profile arg is {"displayName", "share"}.
+# Mirrors the P1..P7 block in tests/unit/consent.test.js.
+# ===========================================================================
+
+# P1. shared profile shares its members despite default-private
+prof = {"displayName": "Dana Lewis", "share": "share"}
+eq(resolve(convo("imessage", "iMessage"), {"global": "private", "sources": {}}, None, prof),
+   {"shared": True, "reason": "profile: Dana Lewis"}, "profile share: member despite default-private")
+eq(resolve(convo("linkedin", "LinkedIn"), {"global": "private", "sources": {}}, None, prof),
+   {"shared": True, "reason": "profile: Dana Lewis"}, "profile share: member on a 2nd platform")
+eq(resolve({"id": "!x:local", "sourceId": "imessage"}, {}, None, {"share": "share"}),
+   {"shared": True, "reason": "profile: profile"}, "profile share: generic name fallback")
+
+# P2. profile beats per-source (both directions) and global
+eq(resolve(convo("imessage"), {"global": "private", "sources": {"imessage": "share-all"}}, None,
+           {"displayName": "Dana", "share": "private"}),
+   {"shared": False, "reason": "profile: Dana"}, "profile private beats per-source share-all")
+eq(resolve(convo("imessage"), {"global": "private", "sources": {"imessage": "private-all"}}, None,
+           {"displayName": "Dana", "share": "share"}),
+   {"shared": True, "reason": "profile: Dana"}, "profile share beats per-source private-all")
+eq(resolve(convo("imessage"), {"global": "share-all", "sources": {}}, None,
+           {"displayName": "Dana", "share": "private"}),
+   {"shared": False, "reason": "profile: Dana"}, "profile private beats global share-all")
+
+# P3. per-conv override still wins over the profile (both directions)
+eq(resolve(convo("imessage"), {"global": "private", "sources": {}}, "private",
+           {"displayName": "Dana", "share": "share"}),
+   {"shared": False, "reason": "excluded"}, "per-conv private excludes despite profile share")
+eq(resolve(convo("imessage"), {"global": "private", "sources": {}}, "share",
+           {"displayName": "Dana", "share": "private"}),
+   {"shared": True, "reason": "explicit"}, "per-conv share includes despite profile private")
+
+# P4. profile 'inherit' / absent falls through
+eq(resolve(convo("imessage", "iMessage"), {"global": "share-all", "sources": {}}, None, {"displayName": "D", "share": "inherit"}),
+   {"shared": True, "reason": "all iMessage"}, "profile inherit -> global share-all")
+eq(resolve(convo("imessage", "iMessage"), {"global": "private", "sources": {"imessage": "share-all"}}, None, {"displayName": "D", "share": "inherit"}),
+   {"shared": True, "reason": "all iMessage"}, "profile inherit -> per-source share-all")
+eq(resolve(convo("imessage"), {"global": "private", "sources": {}}, None, {"displayName": "D", "share": "inherit"}),
+   {"shared": False, "reason": "private"}, "profile inherit + nothing -> private")
+eq(resolve(convo("imessage"), {"global": "private", "sources": {}}, None, None),
+   {"shared": False, "reason": "private"}, "no profile -> unchanged private")
+
+# P5. effective_shared threads the profile arg
+eq(effective_shared(convo("imessage"), {"global": "private", "sources": {}}, None, {"share": "share"}), True, "es: profile share")
+eq(effective_shared(convo("imessage"), {"global": "share-all", "sources": {}}, None, {"share": "private"}), False, "es: profile private beats global share-all")
+eq(effective_shared(convo("imessage"), {"global": "share-all", "sources": {}}, "private", {"share": "share"}), False, "es: per-conv private beats profile share")
+
+# P6. resolve_all with a per-room profiles map (2 platforms; one member excluded)
+policy = {"global": "private", "sources": {}}
+convos = [
+    {"id": "!im:local", "sourceId": "imessage", "sourceLabel": "iMessage"},
+    {"id": "!li:local", "sourceId": "linkedin", "sourceLabel": "LinkedIn"},
+    {"id": "!ex:local", "sourceId": "imessage", "sourceLabel": "iMessage"},
+    {"id": "!un:local", "sourceId": "whatsapp", "sourceLabel": "WhatsApp"},
+]
+P = {"displayName": "Dana Lewis", "share": "share"}
+profiles = {"!im:local": P, "!li:local": P, "!ex:local": P}
+overrides = {"!ex:local": "private"}
+res = resolve_all(convos, policy, overrides, profiles)
+eq([r["shared"] for r in res], [True, True, False, False], "resolve_all+profile: shape")
+eq([r["reason"] for r in res], ["profile: Dana Lewis", "profile: Dana Lewis", "excluded", "private"], "resolve_all+profile: reasons")
+eq([r["shared"] for r in resolve_all(convos, policy, None)], [False, False, False, False], "resolve_all: no profiles arg unchanged")
+
+# P7. profile reason exhaustiveness
+eq(resolve(convo("x"), {}, None, {"displayName": "Ann", "share": "share"})["reason"], "profile: Ann", "reason: profile share interpolates")
+eq(resolve(convo("x"), {}, None, {"displayName": "Ann", "share": "private"})["reason"], "profile: Ann", "reason: profile private interpolates")
+
 print("\n%d passed, %d failed" % (_pass, _fail))
 if _fail:
     sys.stderr.write("\nFailures:\n")

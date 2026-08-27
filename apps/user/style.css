@@ -241,3 +241,24 @@ button:disabled { opacity: 0.5; cursor: default; }
 .proposal-btn { font-size: 13px; }
 .proposal-send { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .proposal-dismiss { color: var(--muted); }
+
+/* Contacts (PLAN-MASTER-SYNC §12 phase 5). A contact card groups conversations
+   across sources as one person; #contacts-create/#contacts-suggestions/
+   #contacts-list live only in #view-contacts. */
+#contacts-create, #contacts-suggestions, #contacts-list { max-width: 760px; margin-left: auto; margin-right: auto; }
+.contact-card { display: flex; flex-direction: column; gap: 10px; }
+.contact-head { display: flex; align-items: center; gap: 10px; }
+.contact-name-input { flex: 1 1 auto; font-weight: 600; }
+.contact-linked { display: flex; flex-direction: column; gap: 6px; }
+.contact-linked-row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.contact-linked-row:last-child { border-bottom: none; }
+.contact-linked-row .title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact-unlink { font-size: 12px; color: var(--muted); }
+.contact-attach { border-top: 1px solid var(--line); padding-top: 10px; }
+.contact-attach-results { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.contact-attach-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.contact-attach-row .title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact-attach-row button { font-size: 12px; }
+.contact-suggestion { border-left: 4px solid var(--accent); }
+.contact-suggestion-actions { margin-top: 4px; }
+.contact-ignore { color: var(--muted); }

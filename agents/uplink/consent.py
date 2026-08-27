@@ -1,10 +1,16 @@
 """Pure consent resolver — Python port of shared/model/consent.js.
 
-PLAN-MASTER-SYNC.md §4. Layered, most-specific-wins:
+PLAN-MASTER-SYNC.md §4 + §12 phase 5. Layered, most-specific-wins:
   1. per-conversation override  : 'share' | 'private'          (absent = inherit)
-  2. per-source policy          : 'share-all' | 'private-all'  (absent = inherit)
-  3. global standing policy     : 'share-all' | 'private'      (default 'private')
+  2. profile (contact profile)  : 'share' | 'private'          ('inherit' = fall through)
+  3. per-source policy          : 'share-all' | 'private-all'  (absent = inherit)
+  4. global standing policy     : 'share-all' | 'private'      (default 'private')
 Safe default: PRIVATE. Nothing is shared unless a level explicitly says so.
+
+The profile level lets a whole contact profile (one person's conversations
+across sources) share or hide together, while a per-conversation override still
+wins over it. resolve() takes only the resolved {displayName, share} for the
+conversation's profile so it stays pure and byte-identical to consent.js.
 
 This module is PURE: no I/O, no side effects at import. Its output must match
 consent.js byte-for-byte on the same inputs — see tests/unit/consent_py.test.py,
@@ -17,6 +23,9 @@ SHARE_OVERRIDE_TYPE = "com.jkali.share_override"  # per-room account-data
 GLOBAL_STATES = {"share-all", "private"}
 SOURCE_STATES = {"share-all", "private-all", "inherit"}
 OVERRIDE_STATES = {"share", "private"}
+# Profile share-state (from a contact profile). 'inherit' means "no opinion —
+# fall through to the per-source/global levels".
+PROFILE_STATES = {"share", "private", "inherit"}
 
 
 def _source_label_of(convo):
@@ -26,12 +35,13 @@ def _source_label_of(convo):
     return convo.get("sourceLabel") or convo.get("sourceId") or "source"
 
 
-def resolve(convo, policy, override):
+def resolve(convo, policy, override, profile=None):
     """Resolve one conversation's effective shared-state AND the reason.
 
+    profile is {"displayName", "share"} for the room's contact profile, or None.
     Returns {"shared": bool, "reason": str} where reason is one of
-    'all <source>' | 'explicit' | 'excluded' | 'private'. Mirrors resolve() in
-    consent.js exactly.
+    'all <source>' | 'explicit' | 'excluded' | 'profile: <name>' | 'private'.
+    Mirrors resolve() in consent.js exactly.
     """
     pol = policy if isinstance(policy, dict) else {}
     raw_sources = pol.get("sources")
@@ -44,7 +54,17 @@ def resolve(convo, policy, override):
     if override == "private":
         return {"shared": False, "reason": "excluded"}
 
-    # 2. Per-source standing policy.
+    # 2. Profile level: a shared/private contact profile shares or hides all its
+    #    members together, but only 'share'/'private' take effect — 'inherit'
+    #    (or an absent profile) falls through to the source/global levels.
+    if profile:
+        pname = "profile: " + ((profile.get("displayName") if isinstance(profile, dict) else None) or "profile")
+        if profile.get("share") == "share":
+            return {"shared": True, "reason": pname}
+        if profile.get("share") == "private":
+            return {"shared": False, "reason": pname}
+
+    # 3. Per-source standing policy.
     src = sources.get(source_id) if source_id else None
     if src == "share-all":
         return {"shared": True, "reason": "all " + _source_label_of(convo)}
@@ -52,23 +72,24 @@ def resolve(convo, policy, override):
         return {"shared": False, "reason": "private"}
     # (src == 'inherit' or absent -> fall through to global)
 
-    # 3. Global standing policy.
+    # 4. Global standing policy.
     if pol.get("global") == "share-all":
         return {"shared": True, "reason": "all " + _source_label_of(convo)}
 
-    # 4. Safe default: private.
+    # 5. Safe default: private.
     return {"shared": False, "reason": "private"}
 
 
-def effective_shared(convo, policy, override):
+def effective_shared(convo, policy, override, profile=None):
     """The boolean the uplink asks for when deciding whether to mirror a room."""
-    return resolve(convo, policy, override)["shared"]
+    return resolve(convo, policy, override, profile)["shared"]
 
 
-def resolve_all(convos, policy, overrides):
-    """Batch resolve. overrides may be a dict keyed by room id, or None.
+def resolve_all(convos, policy, overrides, profiles=None):
+    """Batch resolve. overrides/profiles may be dicts keyed by room id, or None.
 
-    Returns a list of {"convo", "shared", "reason"} in input order.
+    profiles maps room id -> {"displayName", "share"}. Returns a list of
+    {"convo", "shared", "reason"} in input order.
     """
     if not isinstance(convos, list):
         return []
@@ -78,10 +99,15 @@ def resolve_all(convos, policy, overrides):
             return None
         return overrides.get(room_id)
 
+    def get_profile(room_id):
+        if not profiles or room_id is None:
+            return None
+        return profiles.get(room_id)
+
     out = []
     for convo in convos:
         rid = convo.get("id") if isinstance(convo, dict) else None
-        r = resolve(convo, policy, get(rid))
+        r = resolve(convo, policy, get(rid), get_profile(rid))
         out.append({"convo": convo, "shared": r["shared"], "reason": r["reason"]})
     return out
 

@@ -11,6 +11,7 @@ import {
   readSharePolicy, writeSharePolicy,
   writeShareOverride, overridesFromSync,
 } from '../../shared/model/consent.js';
+import { readProfiles, roomProfileMap } from '../../shared/model/contacts.js';
 import { api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setConvoRowDecorator } from '../../shared/ui/rows.js';
@@ -23,6 +24,11 @@ import { convosBySource } from '../../shared/state.js';
 // in place so rows/panels reflect the change immediately, with no re-fetch.
 let policy = { global: 'private', sources: {} };
 const overrides = new Map(); // roomId -> 'share' | 'private' (absent = inherit)
+// roomId -> { id, displayName, share } for the room's contact profile, if any
+// (§12 phase 5). Populated from shared/model/contacts.js account-data; a
+// profile 'share'/'private' outranks per-source/global but a per-conversation
+// override above still wins (see shared/model/consent.js §4 precedence).
+let profileMap = {};
 
 // §4.2 guard 2 (auto-share visibility): which shared rooms have already been
 // surfaced to the teammate, so only genuinely NEW auto-shares get flagged.
@@ -56,6 +62,7 @@ async function loadConsentState() {
     overrides.clear();
     for (const k of Object.keys(map)) overrides.set(k, map[k]);
   } catch (e) { /* keep previous cache */ }
+  try { profileMap = roomProfileMap(await readProfiles()); } catch (e) { /* keep previous cache */ }
 }
 
 // All known conversations across sources, deduped by room id (same
@@ -74,7 +81,9 @@ function allConvos() {
   return out;
 }
 
-function effectiveFor(convo) { return resolve(convo, policy, overrides.get(convo.id)); }
+function effectiveFor(convo) {
+  return resolve(convo, policy, overrides.get(convo.id), profileMap[convo.id]);
+}
 
 function reasonText(r) {
   if (r.shared) return r.reason === 'explicit' ? 'shared (explicit)' : 'shared (' + r.reason + ')';
@@ -217,7 +226,7 @@ function renderConsentSummary() {
   if (!host) return;
   host.replaceChildren();
 
-  const results = resolveAll(allConvos(), policy, overrides);
+  const results = resolveAll(allConvos(), policy, overrides, profileMap);
   const shared = results.filter((r) => r.shared);
   const seen = loadSeen();
   // "Newly" = currently shared, not via an explicit per-conversation share (that

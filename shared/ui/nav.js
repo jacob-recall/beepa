@@ -24,6 +24,13 @@ function setSharingViewHook(fn) { sharingViewHook = typeof fn === 'function' ? f
 let proposalsViewHook = null;
 function setProposalsViewHook(fn) { proposalsViewHook = typeof fn === 'function' ? fn : null; }
 
+// Same app-injection pattern for apps/user's contact-profile management (PLAN
+// §12 phase 5): nav.js only knows the 'contacts' key; the render logic (list
+// profiles, create/attach/detach, share toggle, merge suggestions) lives in
+// apps/user/contacts.js. no-op in apps/master, which has no #nav-contacts.
+let contactsViewHook = null;
+function setContactsViewHook(fn) { contactsViewHook = typeof fn === 'function' ? fn : null; }
+
 // ---- open a conversation (U-1 / D-4) ----
 function openConversation(roomId) {
   if (!ROOMID_RE.test(roomId)) return;             // reject ids failing the regex
@@ -80,6 +87,9 @@ async function navTo(key) {
   } else if (key === 'proposals') {
     showSection('view-proposals');
     if (proposalsViewHook) proposalsViewHook();
+  } else if (key === 'contacts') {
+    showSection('view-contacts');
+    if (contactsViewHook) contactsViewHook();
   }
 }
 function buildNav() {
@@ -113,6 +123,7 @@ function buildNav() {
   wireTool('nav-settings', 'settings');
   wireTool('nav-sharing', 'sharing');           // no-op if the app has no #nav-sharing
   wireTool('nav-proposals', 'proposals');       // no-op if the app has no #nav-proposals
+  wireTool('nav-contacts', 'contacts');         // no-op if the app has no #nav-contacts
 }
 function wireTool(id, key) {
   const b = $(id);
@@ -138,4 +149,4 @@ function unmountChats() {
   if (f) f.remove();
 }
 
-export { openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool, mountChats, unmountChats, setSharingViewHook, setProposalsViewHook };
+export { openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool, mountChats, unmountChats, setSharingViewHook, setProposalsViewHook, setContactsViewHook };

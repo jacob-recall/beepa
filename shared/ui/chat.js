@@ -115,20 +115,32 @@ function stopConvoWatch() {
   S.openRoomId = null;
 }
 
-// CV-S1 / CV-2: send the user's own typed text to the CURRENTLY-open room only,
-// re-validating that room at send time (ROOMID_RE ∩ feedModel ∩ S.joinedSet, and
-// never any management room). Fresh txn(); body length clamped. Optimistic echo
-// deduped against the server echo by transaction_id.
-async function sendConvoMessage() {
+// CV-S1 / CV-2: send text to a validated room, re-validating that room at send
+// time (ROOMID_RE ∩ feedModel ∩ S.joinedSet, and never any management room).
+// Fresh txn(); body length clamped. Optimistic echo deduped against the server
+// echo by transaction_id. Returns true only when the server accepted the send.
+//
+// V2 proposal approve/send (PLAN §2 v2 / §7): the manager can PROPOSE a message
+// but MUST NEVER cause an external send — only the teammate does, and only
+// through THIS one guarded path. So an approved proposal calls the SAME function
+// with an EXPLICIT (targetRoom, bodyOverride): the target then runs through the
+// identical guard below. A passed target NEVER falls back to S.openRoomId, so an
+// invalid or management-room target is rejected here, never silently redirected
+// to whatever chat happens to be open. No second send path exists.
+async function sendConvoMessage(targetRoom, bodyOverride) {
   const input = $('convo-input');
-  if (!input) return;
-  const text = (typeof input.value === 'string' ? input.value : '').trim();
-  if (!text) return;
-  const roomId = S.openRoomId;
-  // CV-S1: no stale-room trust — re-validate the open room at the moment of send.
+  if (!input) return false;
+  const hasTarget = (typeof targetRoom === 'string' && !!targetRoom);
+  const fromComposer = (typeof bodyOverride !== 'string');
+  const raw = fromComposer ? (typeof input.value === 'string' ? input.value : '') : bodyOverride;
+  const text = raw.trim();
+  if (!text) return false;
+  // A passed target is used verbatim; only the no-target case reads the open room.
+  const roomId = hasTarget ? targetRoom : S.openRoomId;
+  // CV-S1: no stale-room trust — re-validate the room at the moment of send.
   if (!roomId || !ROOMID_RE.test(roomId) || !feedModel.has(roomId) || !S.joinedSet.has(roomId)) {
     convoSetStatus('Cannot send: this conversation is not available.');
-    return;
+    return false;
   }
   // Defense-in-depth: never send into a bridge management room from this surface.
   if (roomId === runtime.whatsapp.mgmtRoomId ||
@@ -138,11 +150,11 @@ async function sendConvoMessage() {
       roomId === runtime.linkedin.mgmtRoomId ||
       roomId === runtime.twitter.mgmtRoomId) {
     convoSetStatus('Cannot send a message here.');
-    return;
+    return false;
   }
   const body = text.slice(0, 8000);                 // clamp length
   const t = txn();                                  // fresh random transaction id
-  input.value = '';
+  if (fromComposer) input.value = '';               // clear only the composer we read from
   convoSetStatus('');
   // Optimistic echo through the SAME shared renderer; deduped vs the server echo
   // by 'txn:'+t (renderMessageEvent). No event_id yet -> keyed by txn only.
@@ -156,8 +168,10 @@ async function sendConvoMessage() {
   try {
     await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
       '/send/m.room.message/' + encodeURIComponent(t), { msgtype: 'm.text', body });
+    return true;
   } catch (e) {
     convoSetStatus('Message failed to send: ' + String(e.message || e));  // CV-R3: status, not a bubble
+    return false;
   }
 }
 

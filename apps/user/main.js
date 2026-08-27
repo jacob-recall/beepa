@@ -3,6 +3,7 @@
 
 import { seedFeed, startFeedSync } from '../../shared/ui/account-data.js';
 import { initConsentUI } from './consent.js';
+import { initProposalsUI } from './proposals.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
 import { api, setOnUnauthorized } from '../../shared/matrix/client.js';
 import { buildConnections, buildSettings, logConsole } from '../../shared/ui/connections.js';
@@ -78,6 +79,7 @@ async function enterApp() {
   buildSettings();
   buildDirectory();
   try { await initConsentUI(); } catch (e) { /* share controls stay at safe defaults on error */ }
+  try { initProposalsUI(); } catch (e) { /* proposal inbox hook stays unregistered on error */ }
   mountChats();                                     // Element pane exists so openConversation can target it
   showAuth(true);
   navTo('home');                                    // HF-8: default view = Home feed
@@ -150,7 +152,9 @@ document.addEventListener('DOMContentLoaded', () => {
     setActiveConvoRow(null);
   });
   const convoSend = $('convo-send');
-  if (convoSend) convoSend.addEventListener('click', sendConvoMessage);
+  // Wrap so the click Event is never passed as an explicit target/body — the
+  // composer path must run with no arguments (reads S.openRoomId + #convo-input).
+  if (convoSend) convoSend.addEventListener('click', () => sendConvoMessage());
   const convoInput = $('convo-input');
   if (convoInput) convoInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); sendConvoMessage(); }

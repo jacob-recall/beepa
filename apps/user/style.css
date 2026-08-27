@@ -221,3 +221,23 @@ button:disabled { opacity: 0.5; cursor: default; }
   #msgr-convo.no-selection { display: none; }   /* show the list */
   #convo-back { display: inline-block; }         /* back returns to the list */
 }
+
+/* Proposal inbox (PLAN-MASTER-SYNC §2 v2 / §7). A proposal is a DRAFT the manager
+   suggested — deliberately styled UNLIKE a chat bubble (dashed amber frame, DRAFT
+   chip, "not sent" banner) so it can never be mistaken for a real message. These
+   cards live only in #proposals-list, never in #convo-messages. */
+#proposals-list { max-width: 760px; }
+.proposal-card { background: #fffbef; border: 1px dashed #d9a300; border-left: 4px solid #d9a300; border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+.proposal-flag { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.proposal-chip { flex: 0 0 auto; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #7a5c00; background: #ffe9a8; border: 1px solid #e2b400; border-radius: 4px; padding: 2px 7px; }
+.proposal-flag-text { font-size: 12px; color: #7a5c00; }
+.proposal-to { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 8px; }
+.proposal-to-label { color: var(--muted); flex: 0 0 auto; }
+.proposal-to-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proposal-warn { flex: 0 0 auto; color: var(--danger); font-size: 12px; }
+.proposal-body { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 15px; background: var(--card); color: var(--fg); resize: vertical; }
+.proposal-card-error { color: var(--danger); font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
+.proposal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.proposal-btn { font-size: 13px; }
+.proposal-send { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.proposal-dismiss { color: var(--muted); }

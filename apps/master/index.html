@@ -88,6 +88,34 @@
         </header>
         <div id="room-messages"></div>
         <div id="room-status" class="convo-status hidden"></div>
+        <!--
+          Compose-PROPOSAL panel (PLAN-MASTER-SYNC §2 v2 / §7). This is NOT a
+          composer that sends a message: submitting writes a single
+          com.jkali.proposal event into this teammate's dedicated proposals room
+          (marked com.jkali.proposals) for the teammate to review and send
+          themselves. There is NO m.room.message send path anywhere in this app,
+          and this panel never writes into a mirror/conversation room or reaches
+          a bridge. Hidden unless the open room has a known local target and the
+          teammate has a proposals channel (see setupProposalComposer).
+        -->
+        <div id="proposal-pane" class="hidden">
+          <div class="proposal-head">
+            <span class="proposal-kicker">Suggest a message</span>
+            <span class="proposal-note">Proposal only — your teammate reviews it and sends it from their own account. Nothing here is sent externally.</span>
+          </div>
+          <div class="proposal-row">
+            <span class="proposal-to muted">To conversation:</span>
+            <span id="proposal-target-label" class="proposal-target"></span>
+          </div>
+          <textarea id="proposal-input" rows="3" placeholder="Write a suggested message for your teammate to review and send…" spellcheck="true"></textarea>
+          <div class="proposal-controls">
+            <select id="proposal-templates" aria-label="Insert a saved template"></select>
+            <label class="proposal-tmpl"><input id="proposal-template" type="checkbox"> Save as reusable template</label>
+            <span class="spacer"></span>
+            <button id="proposal-send" type="button" class="primary proposal-btn">Suggest (proposal)</button>
+          </div>
+          <div id="proposal-status" class="proposal-status hidden"></div>
+        </div>
       </div>
     </section>
   </main>

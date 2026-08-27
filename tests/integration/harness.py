@@ -838,22 +838,22 @@ def scenario_7_read_only():
         ok = False
     ev.append("manager_send_status=%s(want 403)" % send_code)
 
-    # Build-time: apps/master must contain no send path. Strip JS comments first
-    # (the file documents the ABSENCE of a send path in comments, e.g.
-    # "// PUT .../send/m.room.message ..."), then look for a real write call.
+    # Build-time invariant. V1 shipped "no composer at all". V2 intentionally adds
+    # ONE write path — the compose-PROPOSAL panel — so the check is now the
+    # precise HARD LIMIT instead of a blanket composer ban: apps/master must have
+    # (a) NO /send/m.room.message path anywhere, and (b) the ONLY /send/<type> it
+    # performs is com.jkali.proposal (into a proposals room). Comments are stripped
+    # first (the file documents the ABSENCE of an m.room.message path in prose).
     mj = os.path.join(REPO, "apps", "master", "main.js")
-    mh = os.path.join(REPO, "apps", "master", "index.html")
     src = open(mj).read()
-    html = open(mh).read()
     code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)         # block comments
     code = re.sub(r"(?m)//.*$", "", code)                    # line comments
-    has_send_put = bool(re.search(r"/send/m\.room\.message", code)) or bool(
-        re.search(r"['\"]PUT['\"]\s*,\s*[^)]*?/send/", code))
-    has_composer = bool(re.search(r"<textarea", html)) or bool(
-        re.search(r'id="(composer|msg-input|send)"|class="[^"]*composer', html))
-    if has_send_put or has_composer:
+    has_msg_send = bool(re.search(r"/send/m\.room\.message", code))
+    send_types = set(re.findall(r"/send/([A-Za-z0-9_.]+)", code))
+    non_proposal_sends = send_types - {"com.jkali.proposal"}
+    if has_msg_send or non_proposal_sends:
         ok = False
-    ev.append("apps_master_send_put=%s composer=%s" % (has_send_put, has_composer))
+    ev.append("apps_master_msg_send=%s send_types=%s" % (has_msg_send, sorted(send_types)))
     return ok, "; ".join(ev)
 
 
@@ -1028,6 +1028,162 @@ def scenario_9_media_reupload():
     return ok, "; ".join(ev)
 
 
+def local_events_of_type(token, room_id, etype):
+    """All timeline events of a given type in a LOCAL room, newest-first chunk."""
+    r = local(token, "GET",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+              + "/messages", query={"dir": "b", "limit": "200"})
+    return [e for e in (r.get("chunk") or []) if e.get("type") == etype]
+
+
+def local_state_present(token, room_id, etype):
+    try:
+        local(token, "GET",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+              + "/state/" + urllib.parse.quote(etype, safe="") + "/")
+        return True
+    except MxError:
+        return False
+
+
+def scenario_10_proposal_down():
+    """V2 proposal channel (master -> user). The manager writes a
+    com.jkali.proposal into the teammate's DEDICATED master proposals room; the
+    uplink pulls it DOWN into the teammate's DEDICATED LOCAL proposals room
+    exactly once. Asserts: the proposal lands ONLY in the local proposals room
+    (never in the mirror room nor the real conversation), idempotent dedup on a
+    re-pull, the master-side power levels let the manager send com.jkali.proposal
+    (200) but NOT m.room.message (403), and the local proposals room is a
+    dedicated, marked, NOT-mirrored-up room."""
+    e = fresh_env("s10")
+    imsg_space = create_space(e["tuser_tok"], "iMessage")
+    rid = make_convo(e, imsg_space, "Proposal Target")
+    post_msg(e["contact_tok"], rid, "s10 seed message")
+    set_override(e["tuser_tok"], e["tuser_id"], rid, "share")
+
+    proc = start_uplink(e)
+    ev = []
+    ok = True
+    try:
+        # Mirror up + both proposals rooms created (recorded in uplink meta).
+        row = wait_until(lambda: mirror_of(e["db_path"], rid), timeout=45, desc="s10 mirror")
+        master_room = row[0]
+        mpr = wait_until(lambda: meta_get(e["db_path"], "master_proposals_room"),
+                         timeout=45, desc="s10 master proposals room")
+        lpr = wait_until(lambda: meta_get(e["db_path"], "local_proposals_room"),
+                         timeout=45, desc="s10 local proposals room")
+
+        # The manager accepts the invite (as the master app auto-joins) so it can
+        # write into the proposals room.
+        master(MASTER_MANAGER_TOKEN, "POST",
+               "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/join", {})
+
+        # Power levels: the manager may send com.jkali.proposal but NOT
+        # m.room.message (defense in depth, mirrors §8.3 read-only levels).
+        msg_code = None
+        try:
+            master(MASTER_MANAGER_TOKEN, "PUT",
+                   "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+                   + "/send/m.room.message/" + uniq("mgrmsg"),
+                   {"msgtype": "m.text", "body": "manager should not be able to message here"})
+            msg_code = 200  # must NOT happen
+        except MxError as e2:
+            msg_code = e2.code
+        if msg_code != 403:
+            ok = False
+        ev.append("manager_msg_send=%s(want 403)" % msg_code)
+
+        # The manager PROPOSES a message: target_room is the teammate's REAL local
+        # conversation room (rid) — exactly what the master app reads from the
+        # mirror room's com.jkali.mirror_of. body carries a unique marker.
+        marker = "PROPOSAL-" + uniq("p")
+        prop_content = {
+            "target_room": rid,
+            "body": marker,
+            "created_by": MASTER_MANAGER_USER,
+            "origin_ts": int(time.time() * 1000),
+        }
+        prop_code = None
+        try:
+            master(MASTER_MANAGER_TOKEN, "PUT",
+                   "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+                   + "/send/com.jkali.proposal/" + uniq("prop"), prop_content)
+            prop_code = 200
+        except MxError as e2:
+            prop_code = e2.code
+        if prop_code != 200:
+            ok = False
+        ev.append("manager_proposal_send=%s(want 200)" % prop_code)
+
+        # The uplink pulls it DOWN into the local proposals room exactly once.
+        got = wait_until(
+            lambda: [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                     if (p.get("content") or {}).get("body") == marker] or None,
+            timeout=45, desc="s10 proposal pulled down")
+        # Let the loop run more cycles; the count must stay exactly one (dedup).
+        time.sleep(6)
+        final_local = [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                       if (p.get("content") or {}).get("body") == marker]
+        once = len(final_local) == 1
+        if not once:
+            ok = False
+        ev.append("local_proposal_count=%d(want 1)" % len(final_local))
+
+        # The pulled proposal carries the target_room + created_by, marked template
+        # absent (not a template here).
+        pc = (final_local[0].get("content") or {}) if final_local else {}
+        target_ok = pc.get("target_room") == rid
+        if not target_ok:
+            ok = False
+        ev.append("target_room_ok=%s created_by=%s" % (target_ok, pc.get("created_by")))
+
+        # It landed ONLY in the local proposals room: NOT in the mirror room, and
+        # NOT in the real conversation room.
+        mirror_props = [m for m in master_messages(master_room)
+                        if m.get("body") == marker]
+        convo_props = [x for x in local_events_of_type(e["tuser_tok"], rid, "com.jkali.proposal")]
+        convo_msgs = [m for m in local_events_of_type(e["tuser_tok"], rid, "m.room.message")
+                      if (m.get("content") or {}).get("body") == marker]
+        isolated = (not mirror_props) and (not convo_props) and (not convo_msgs)
+        if not isolated:
+            ok = False
+        ev.append("isolated(not_in_mirror/convo)=%s" % isolated)
+
+        # The local proposals room is dedicated + marked + NOT mirrored up.
+        marked = local_state_present(e["tuser_tok"], lpr, "com.jkali.proposals")
+        not_mirrored = mirror_of(e["db_path"], lpr) is None
+        if not (marked and not_mirrored):
+            ok = False
+        ev.append("local_marked=%s not_mirrored_up=%s" % (marked, not_mirrored))
+
+        # The master proposals room is grouped under space:alice (manager view)
+        # and is itself marked com.jkali.proposals.
+        under_space = mpr in space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
+        if not under_space:
+            ok = False
+        ev.append("master_proposals_under_space=%s" % under_space)
+    finally:
+        stop_uplink(proc)
+
+    # Idempotency across a RESTART: bring the uplink back; the already-pulled
+    # proposal must not be re-posted (proposal_map dedup survives restart).
+    proc = start_uplink(e)
+    try:
+        time.sleep(8)
+    finally:
+        stop_uplink(proc)
+    lpr2 = meta_get(e["db_path"], "local_proposals_room")
+    after_restart = [p for p in local_events_of_type(e["tuser_tok"], lpr2, "com.jkali.proposal")
+                     if (p.get("content") or {}).get("body")
+                     and "PROPOSAL-" in (p.get("content") or {}).get("body", "")]
+    restart_once = len(after_restart) == 1
+    if not restart_once:
+        ok = False
+    ev.append("after_restart_count=%d(want 1)" % len(after_restart))
+    ev.append("master_proposals_room=%s local_proposals_room=%s" % (mpr, lpr))
+    return ok, "; ".join(ev)
+
+
 # ------------------------------------------------------------------ docker helpers
 def docker(args, check=True):
     env = dict(os.environ)
@@ -1069,6 +1225,7 @@ SCENARIOS = [
     ("7_read_only_manager", scenario_7_read_only),
     ("8_cross_user_isolation", scenario_8_cross_user_isolation),
     ("9_media_reupload", scenario_9_media_reupload),
+    ("10_proposal_down", scenario_10_proposal_down),
 ]
 
 

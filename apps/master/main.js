@@ -42,9 +42,12 @@ const MS = {
   rooms: {},           // roomId -> {id, name, isSpace, children, sourceId, lastBody, lastTs, userLabel}
   byUser: new Map(),   // teammate label -> [{id, title, preview, lastTs, sourceId, userLabel}]
   feed: [],            // flattened rows across all teammates, recency-sorted
+  proposalsByUser: new Map(),  // teammate label -> their proposals room id (write target)
+  proposalsRoomSet: new Set(), // every discovered proposals room id (send-guard allowlist)
   activeView: 'recent',
   openRoomId: null,
   openRoomUser: null,
+  openMirrorOf: null,  // the open mirror room's teammate-local room id (proposal target)
   tailRunning: false,
   tailSince: null,
   pollTimer: null,
@@ -157,7 +160,8 @@ function parseSnapshot(data) {
   const join = (data.rooms && data.rooms.join) || {};
   for (const rid of Object.keys(join)) {
     const r = join[rid];
-    const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null, lastBody: '', lastTs: 0 };
+    const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
+                   lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false };
     // State from BOTH the `state` block and `timeline` (a newer space's
     // create/name/child events can still be in the timeline window).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
@@ -165,6 +169,17 @@ function parseSnapshot(data) {
     for (const e of stateEvents) {
       if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
       if (e.type === 'm.room.create' && e.content && e.content.type === 'm.space') info.isSpace = true;
+      // The uplink stamps the teammate's REAL local room id into the mirror
+      // room's create content (creation_content.com.jkali.mirror_of). It is the
+      // target_room a proposal must carry so the teammate knows which of their
+      // own conversations the suggestion is for. Read-only value (server state).
+      if (e.type === 'm.room.create' && e.content && typeof e.content['com.jkali.mirror_of'] === 'string') {
+        info.mirrorOf = e.content['com.jkali.mirror_of'];
+      }
+      // A room marked com.jkali.proposals is this teammate's dedicated proposal
+      // room — the ONLY room this app ever writes into, and only a
+      // com.jkali.proposal event (see submitProposal). Never a mirror room.
+      if (e.type === 'com.jkali.proposals' && e.state_key === '') info.isProposals = true;
       // §8.2: the uplink tags each mirror room's platform at creation as a
       // room STATE event (not per-account_data, so it is visible to @manager
       // — a different account than the room's creator) so the master app can
@@ -195,6 +210,8 @@ function parseSnapshot(data) {
 // "space child must also be joined" gate apps/user's buildConvos uses).
 function buildByUser(rooms) {
   const byUser = new Map();
+  const proposalsByUser = new Map();
+  const proposalsRoomSet = new Set();
   const spaces = Object.values(rooms).filter(r =>
     r.isSpace && typeof r.name === 'string' && r.name.indexOf('space:') === 0);
   for (const sp of spaces) {
@@ -205,6 +222,13 @@ function buildByUser(rooms) {
       if (!r) continue;                              // not in the joined set -> excluded
       if (!ROOMID_RE.test(childId)) continue;         // malformed id -> excluded
       r.userLabel = label;                            // back-reference for the room viewer
+      // A proposals room is the write channel, not a conversation: record it as
+      // this teammate's proposal target, and NEVER list it as a readable convo.
+      if (r.isProposals) {
+        proposalsByUser.set(label, childId);
+        proposalsRoomSet.add(childId);
+        continue;
+      }
       convos.push({
         id: childId,
         title: sanitizeLine(r.name || childId),
@@ -216,11 +240,36 @@ function buildByUser(rooms) {
     }
     byUser.set(label, convos);
   }
+  MS.proposalsByUser = proposalsByUser;
+  MS.proposalsRoomSet = proposalsRoomSet;
   return byUser;
 }
 
+// The uplink INVITES the manager into each teammate's proposals room (it cannot
+// force-join another account). Auto-accept ONLY invites that carry the
+// com.jkali.proposals marker in their invite_state — so the manager can write a
+// proposal there — and nothing else. Joining is membership, not a send; the only
+// write this app ever performs is the single com.jkali.proposal in submitProposal.
+// Mirror-room membership is unchanged from V1 (accepted out of band).
+async function autoJoinProposalInvites(data) {
+  const invite = (data.rooms && data.rooms.invite) || {};
+  let joinedAny = false;
+  for (const rid of Object.keys(invite)) {
+    if (!ROOMID_RE.test(rid)) continue;
+    const evs = (invite[rid].invite_state && invite[rid].invite_state.events) || [];
+    const isProposals = evs.some(e => e.type === 'com.jkali.proposals' && e.state_key === '');
+    if (!isProposals) continue;
+    try {
+      await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/join', {});
+      joinedAny = true;
+    } catch (e) { /* leave un-joined on failure; retried next refresh */ }
+  }
+  return joinedAny;
+}
+
 async function refreshAll() {
-  const data = await fetchSnapshot();
+  let data = await fetchSnapshot();
+  if (await autoJoinProposalInvites(data)) data = await fetchSnapshot();
   const rooms = parseSnapshot(data);
   MS.rooms = rooms;
   MS.byUser = buildByUser(rooms);
@@ -394,6 +443,8 @@ async function openRoom(roomId) {
   MS.openRoomId = roomId;
   const rec = MS.rooms[roomId];
   MS.openRoomUser = rec.userLabel || null;
+  MS.openMirrorOf = typeof rec.mirrorOf === 'string' ? rec.mirrorOf : null;
+  setupProposalComposer(rec);
   $('room-title').textContent = sanitizeLine(rec.name || roomId);
   $('room-owner').textContent = rec.userLabel ? ('· ' + rec.userLabel) : '';
   const badge = $('room-badge');
@@ -456,7 +507,125 @@ async function startTail(roomId) {
     }
   }
 }
-function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; }
+function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openMirrorOf = null; }
+
+// ===========================================================================
+// Compose-proposal — the ONE place the manager can write (PLAN §2 v2 / §7).
+//
+// This is a PROPOSAL, not a send. Submitting writes a single com.jkali.proposal
+// event into THIS teammate's dedicated proposals room (marked com.jkali.proposals,
+// discovered in the snapshot). It NEVER posts m.room.message, NEVER writes into a
+// mirror/conversation room, and NEVER reaches a bridge or any external network.
+// The teammate later reviews the suggestion and sends it themselves from their
+// own guarded local send path. All send guards live in submitProposal below.
+// ===========================================================================
+function proposalTargetFor(rec) {
+  // A proposal can be composed only when: (a) we know the teammate's real local
+  // room this mirror stands for (mirrorOf), and (b) that teammate has a
+  // discovered proposals room to write into. Otherwise the composer stays hidden.
+  const label = rec && rec.userLabel;
+  const target = rec && typeof rec.mirrorOf === 'string' ? rec.mirrorOf : null;
+  const proposalsRoom = label ? MS.proposalsByUser.get(label) : null;
+  if (!target || !proposalsRoom) return null;
+  return { target, proposalsRoom, label };
+}
+
+function setupProposalComposer(rec) {
+  const pane = $('proposal-pane');
+  if (!pane) return;
+  const ctx = proposalTargetFor(rec);
+  proposalStatus('');
+  const input = $('proposal-input');
+  if (input) input.value = '';
+  const tmpl = $('proposal-template');
+  if (tmpl) tmpl.checked = false;
+  if (!ctx) { pane.classList.add('hidden'); return; }
+  pane.classList.remove('hidden');
+  $('proposal-target-label').textContent = sanitizeLine(rec.name || ctx.target);
+  loadTemplates(ctx.proposalsRoom).catch(() => {});
+}
+
+function proposalStatus(text, isError) {
+  const s = $('proposal-status');
+  if (!s) return;
+  s.textContent = text || '';
+  s.classList.toggle('hidden', !text);
+  s.classList.toggle('error', !!isError);
+}
+
+// Read existing reusable templates (com.jkali.proposal events with template:true)
+// from this teammate's proposals room and offer them in a picker. Pure read.
+async function loadTemplates(proposalsRoom) {
+  const sel = $('proposal-templates');
+  if (!sel) return;
+  sel.replaceChildren();
+  const opt0 = el('option', null, 'Insert a saved template…');
+  opt0.value = '';
+  sel.appendChild(opt0);
+  if (!ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) return;
+  try {
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom) + '/messages?dir=b&limit=100';
+    const data = await api('GET', q);
+    const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+    const seen = new Set();
+    for (const e of chunk) {
+      if (!e || e.type !== 'com.jkali.proposal' || !e.content) continue;
+      if (e.content.template !== true) continue;
+      const body = typeof e.content.body === 'string' ? e.content.body : '';
+      if (!body || seen.has(body)) continue;
+      seen.add(body);
+      const label = body.length > 60 ? body.slice(0, 57) + '…' : body;
+      const opt = el('option', null, sanitizeLine(label));
+      opt.value = body;                                 // full body via .value (not HTML)
+      sel.appendChild(opt);
+    }
+  } catch (e) { /* templates are optional; leave just the placeholder */ }
+}
+
+// The single guarded write in this app. Defense in depth:
+//  - the destination MUST be a ROOMID_RE-valid id that is in the discovered
+//    proposals-room allowlist (never a stale/typed id, never a mirror room);
+//  - the target_room is shape-checked (it is a foreign teammate-local id, so the
+//    master's server-pinned ROOMID_RE does not apply);
+//  - the event TYPE is the hardcoded literal 'com.jkali.proposal' — there is no
+//    code path here that PUTs /send/m.room.message anywhere.
+const LOCAL_ROOMID_RE = /^![^:]+:[A-Za-z0-9.\-:]+$/;   // any-server room-id shape
+async function submitProposal() {
+  const proposalsRoom = MS.openRoomUser ? MS.proposalsByUser.get(MS.openRoomUser) : null;
+  const target = MS.openMirrorOf;
+  if (!proposalsRoom || !ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) {
+    proposalStatus('No proposals channel for this teammate yet.', true); return;
+  }
+  if (!target || !LOCAL_ROOMID_RE.test(target)) {
+    proposalStatus('This conversation has no valid target room.', true); return;
+  }
+  const input = $('proposal-input');
+  const body = (input && input.value ? input.value : '').trim();
+  if (!body) { proposalStatus('Type a suggestion first.', true); return; }
+  const isTemplate = !!($('proposal-template') && $('proposal-template').checked);
+  const content = {
+    target_room: target,
+    body,
+    created_by: S.userId,
+    origin_ts: Date.now(),
+  };
+  if (isTemplate) content.template = true;
+  const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  proposalStatus('Sending suggestion…');
+  try {
+    // NOTE: event type is the literal 'com.jkali.proposal'. This is the only
+    // write endpoint in apps/master and it targets ONLY a proposals room.
+    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
+      + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
+    if (input) input.value = '';
+    if ($('proposal-template')) $('proposal-template').checked = false;
+    proposalStatus('Suggestion sent to ' + sanitizeLine(MS.openRoomUser || 'teammate')
+      + ' for review. It was not sent to anyone externally.');
+    if (isTemplate) loadTemplates(proposalsRoom).catch(() => {});
+  } catch (e) {
+    proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
+  }
+}
 
 // ---- navigation ----
 function showSection(id) {
@@ -533,6 +702,16 @@ document.addEventListener('DOMContentLoaded', () => {
   $('nav-search').addEventListener('click', () => navTo('search'));
   $('search-input').addEventListener('input', renderSearch);
   $('room-back').addEventListener('click', () => { stopTail(); navTo(MS.activeView === 'room' ? 'recent' : MS.activeView); });
+
+  // Compose-proposal wiring (the one write path — a proposal, not a send).
+  const psend = $('proposal-send');
+  if (psend) psend.addEventListener('click', () => { submitProposal().catch(() => {}); });
+  const ptpl = $('proposal-templates');
+  if (ptpl) ptpl.addEventListener('change', () => {
+    const input = $('proposal-input');
+    if (input && ptpl.value) { input.value = ptpl.value; input.focus(); }
+    ptpl.value = '';
+  });
 
   try {
     const t = sessionStorage.getItem('master_token'), u = sessionStorage.getItem('master_user');

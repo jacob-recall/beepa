@@ -17,6 +17,13 @@ import { S, runtime } from '../state.js';
 let sharingViewHook = null;
 function setSharingViewHook(fn) { sharingViewHook = typeof fn === 'function' ? fn : null; }
 
+// Same app-injection pattern for apps/user's proposal inbox (PLAN §2 v2 / §7):
+// nav.js only knows the 'proposals' key; the render logic (reading the local
+// proposals room, the approve/edit/send-through-the-guarded-path UI) lives in
+// apps/user/proposals.js. no-op in apps/master, which has no #nav-proposals.
+let proposalsViewHook = null;
+function setProposalsViewHook(fn) { proposalsViewHook = typeof fn === 'function' ? fn : null; }
+
 // ---- open a conversation (U-1 / D-4) ----
 function openConversation(roomId) {
   if (!ROOMID_RE.test(roomId)) return;             // reject ids failing the regex
@@ -70,6 +77,9 @@ async function navTo(key) {
   } else if (key === 'sharing') {
     showSection('view-sharing');
     if (sharingViewHook) sharingViewHook();
+  } else if (key === 'proposals') {
+    showSection('view-proposals');
+    if (proposalsViewHook) proposalsViewHook();
   }
 }
 function buildNav() {
@@ -102,6 +112,7 @@ function buildNav() {
   wireTool('nav-connections', 'connections');
   wireTool('nav-settings', 'settings');
   wireTool('nav-sharing', 'sharing');           // no-op if the app has no #nav-sharing
+  wireTool('nav-proposals', 'proposals');       // no-op if the app has no #nav-proposals
 }
 function wireTool(id, key) {
   const b = $(id);
@@ -127,4 +138,4 @@ function unmountChats() {
   if (f) f.remove();
 }
 
-export { openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool, mountChats, unmountChats, setSharingViewHook };
+export { openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool, mountChats, unmountChats, setSharingViewHook, setProposalsViewHook };

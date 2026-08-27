@@ -33,6 +33,7 @@
     <nav id="nav-tools" aria-label="Tools">
       <button id="nav-directory" class="navitem" type="button"><span class="ic">&#128269;</span> Directory</button>
       <button id="nav-connections" class="navitem" type="button"><span class="ic">&#128268;</span> Connections</button>
+      <button id="nav-proposals" class="navitem" type="button"><span class="ic">&#128172;</span> Proposals</button>
       <button id="nav-sharing" class="navitem" type="button"><span class="ic">&#128274;</span> Sharing</button>
       <button id="nav-settings" class="navitem" type="button"><span class="ic">&#9881;</span> Settings</button>
     </nav>
@@ -96,6 +97,17 @@
         <input id="directory-search" placeholder="Search names and numbers across all services" spellcheck="false" autocomplete="off">
       </header>
       <div id="directory-results" class="convo-list"></div>
+    </section>
+
+    <!-- Proposals inbox (PLAN-MASTER-SYNC §2 v2 / §7): the manager can PROPOSE a
+         message; only the teammate, here, sends it — through the existing guarded
+         local send path. Each item is a DRAFT, never a real message. -->
+    <section id="view-proposals" class="view hidden">
+      <header class="view-head">
+        <h2>Proposals</h2>
+        <p class="muted">Draft messages your manager suggested. Each is a suggestion only — nothing is sent until you review it and send it yourself.</p>
+      </header>
+      <div id="proposals-list" class="convo-list"></div>
     </section>
 
     <!-- Sharing / consent (PLAN-MASTER-SYNC §5.1, §4.2) -->

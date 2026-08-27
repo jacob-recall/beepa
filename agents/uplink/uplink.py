@@ -82,8 +82,23 @@ SOURCE_KEY = "com.jkali.source"
 ORIGIN_SENDER_KEY = "com.jkali.origin_sender"
 MEDIA_PLACEHOLDER_KEY = "com.jkali.media_placeholder"
 
+# V2 proposal channel (PLAN-MASTER-SYNC.md §2 v2 / §7). A DEDICATED per-teammate
+# proposal room on the master carries manager-authored com.jkali.proposal events;
+# the uplink pulls each new one DOWN into a DEDICATED LOCAL proposals room it owns
+# on the teammate hub. Both rooms are marked with the com.jkali.proposals state
+# event. Proposals NEVER live in a mirror/conversation room and are NEVER
+# auto-sent — the teammate reviews and sends from their own guarded local path.
+PROPOSAL_TYPE = "com.jkali.proposal"        # timeline event carrying a suggestion
+PROPOSALS_MARKER = "com.jkali.proposals"    # state marker on a proposals room
+
 # Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
 MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
+# Generic Matrix room-id shape (any server_name) — the proposal's target_room is
+# a teammate-LOCAL room id, so it is validated by shape, not by a server-pinned
+# regex. The uplink never SENDS to target_room; it only records it inside the
+# forwarded com.jkali.proposal event for the teammate's guarded send path to
+# re-validate later.
+ROOMID_RE = re.compile(r"^![^:]+:[A-Za-z0-9.\-:]+$")
 MEDIA_MSGTYPES = ("m.image", "m.video", "m.audio", "m.file")
 MEDIA_LABELS = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.file": "File"}
 DEFAULT_MEDIA_MAX = 25 * 1024 * 1024        # 25 MB re-upload cap (§8.2, v1.5)
@@ -168,6 +183,12 @@ class Uplink:
         db.execute(
             "CREATE TABLE IF NOT EXISTS event_map ("
             "local_event_id TEXT PRIMARY KEY, master_event_id TEXT)")
+        # V2 proposal-pull dedup: master proposal event id -> the local event id
+        # we wrote into the local proposals room. Mirrors event_map's role but for
+        # the DOWN direction, so a restart/replay never double-posts a proposal.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS proposal_map ("
+            "master_event_id TEXT PRIMARY KEY, local_event_id TEXT)")
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
         try:
@@ -579,6 +600,186 @@ class Uplink:
     def _server_name(mxid):
         return mxid.split(":", 1)[1] if ":" in mxid else mxid
 
+    # -- proposal channel (V2, master -> user, PLAN §2 v2 / §7) -------------
+    # Direction is still teammate-initiated outbound: the uplink /syncs the
+    # MASTER (as its own scoped account) for manager-authored com.jkali.proposal
+    # events and writes each new one DOWN into a DEDICATED LOCAL proposals room.
+    # HARD LIMITS enforced here:
+    #   - the ONLY local write target is the recorded local proposals room;
+    #     a mirror/conversation room is NEVER a target (checked before every PUT);
+    #   - the ONLY event type written is com.jkali.proposal — NEVER m.room.message,
+    #     so nothing here can ever look like, or become, an outgoing message;
+    #   - nothing is auto-sent to any external network or bridge. The teammate
+    #     reviews the proposal and sends it themselves via the guarded local path.
+    def ensure_proposal_rooms(self):
+        """Idempotently ensure both proposals rooms exist; record their ids.
+
+        Master proposals room: created as the teammate's own scoped account,
+        linked under the teammate's master space, marked com.jkali.proposals, and
+        power-leveled so the manager may send ONLY com.jkali.proposal (an
+        m.room.message would need events_default 100 the manager does not have) —
+        defense in depth mirroring the read-only mirror-room power levels (§8.3).
+
+        Local proposals room: created as the teammate's LOCAL account, marked
+        com.jkali.proposals. It is NOT under any bridge source space, so the
+        one-way mirror-up never considers it (desired_shared skips sourceless
+        rooms) and it is never tailed for forwarding (not in mirror_rooms)."""
+        cfg = self.cfg
+        # Trust the recorded ids once created (no per-loop aliveness probe — that
+        # is needless master/local request load every cycle). Rooms are durable;
+        # a purged room would surface as a 404 on the next write and be handled.
+        mpr = self.meta_get("master_proposals_room")
+        if not mpr:
+            body = {
+                "name": "Proposals",
+                "topic": "Manager suggestions for this teammate. Suggestions only — "
+                         "nothing here is ever sent externally.",
+                "preset": "private_chat",
+                "invite": [cfg.manager_mxid],
+                "initial_state": [
+                    {"type": PROPOSALS_MARKER, "state_key": "", "content": {}},
+                    {"type": "m.space.parent", "state_key": cfg.master_space,
+                     "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
+                ],
+                # Manager (PL 50) may send ONLY com.jkali.proposal (required 50).
+                # events_default 100 => the manager cannot send m.room.message or
+                # any other type. state_default 100 => cannot alter room state.
+                "power_level_content_override": {
+                    "users": {cfg.master_user: 100, cfg.manager_mxid: 50},
+                    "events_default": 100,
+                    "events": {PROPOSAL_TYPE: 50},
+                    "state_default": 100,
+                    "invite": 100, "kick": 100, "ban": 100, "redact": 100,
+                },
+            }
+            res = self.master("POST", "/_matrix/client/v3/createRoom", body)
+            mpr = res["room_id"]
+            self.master("PUT", "/_matrix/client/v3/rooms/"
+                        + urllib.parse.quote(cfg.master_space, safe="")
+                        + "/state/m.space.child/" + urllib.parse.quote(mpr, safe=""),
+                        {"via": [self._server_name(cfg.master_user)]})
+            self.meta_set("master_proposals_room", mpr)
+            # A fresh master room invalidates any old proposal watermark.
+            self.db.execute("DELETE FROM meta WHERE k='proposal_sync_since'")
+            self.db.commit()
+            log.info("created master proposals room %s under space %s", mpr, cfg.master_space)
+
+        lpr = self.meta_get("local_proposals_room")
+        if not lpr:
+            res = self.local("POST", "/_matrix/client/v3/createRoom", {
+                "name": "Proposals from manager",
+                "topic": "Suggested messages from the manager. Review each one and "
+                         "send it yourself — nothing here is sent automatically.",
+                "preset": "private_chat",
+                "initial_state": [{"type": PROPOSALS_MARKER, "state_key": "", "content": {}}],
+            })
+            lpr = res["room_id"]
+            self.meta_set("local_proposals_room", lpr)
+            log.info("created local proposals room %s", lpr)
+
+    def _sanitize_proposal(self, ev):
+        """Whitelist a master proposal event into the local proposal content.
+
+        Only known-safe fields are carried down; returns None for a malformed
+        proposal (missing/invalid target_room or empty body) so it is recorded as
+        handled and never retried. target_room is validated by SHAPE only (it is a
+        teammate-LOCAL room id); the uplink never sends to it — the teammate's
+        guarded local send path re-validates it against the live joined set."""
+        c = ev.get("content") if isinstance(ev.get("content"), dict) else {}
+        target = c.get("target_room")
+        body = c.get("body")
+        if not isinstance(target, str) or not ROOMID_RE.match(target):
+            return None
+        if not isinstance(body, str) or not body.strip():
+            return None
+        out = {
+            "target_room": target,
+            "body": body,
+            "created_by": (c.get("created_by") if isinstance(c.get("created_by"), str)
+                           else (ev.get("sender") or "")),
+            "origin_ts": (c.get("origin_ts") if isinstance(c.get("origin_ts"), int)
+                          else ev.get("origin_server_ts")),
+            # Provenance back to the master event (audit; also the dedup txn seed).
+            "com.jkali.proposal_source_event": ev.get("event_id"),
+        }
+        if c.get("template") is True:
+            out["template"] = True
+        return out
+
+    def forward_proposals(self, master_room_id, local_proposals_room, events):
+        """Write each NEW master proposal into the local proposals room, once.
+
+        SAFETY: the write target is asserted to be exactly the recorded local
+        proposals room (never a mirror/conversation room), and the event type is
+        hardcoded com.jkali.proposal (never m.room.message). Idempotent via
+        proposal_map. Returns the count actually posted."""
+        recorded = self.meta_get("local_proposals_room")
+        if not local_proposals_room or local_proposals_room != recorded:
+            return 0
+        # Never let the proposals target collide with a mirror room id.
+        if self.db.execute("SELECT 1 FROM mirror_rooms WHERE master_room_id=?",
+                            (local_proposals_room,)).fetchone():
+            return 0
+        mapped = {r[0] for r in self.db.execute(
+            "SELECT master_event_id FROM proposal_map").fetchall()}
+        posted = 0
+        for ev in events:
+            if not isinstance(ev, dict) or ev.get("type") != PROPOSAL_TYPE:
+                continue
+            meid = ev.get("event_id")
+            if not meid or meid in mapped:
+                continue
+            clean = self._sanitize_proposal(ev)
+            if clean is None:
+                # Record as handled so a malformed proposal is not retried forever.
+                self.db.execute("INSERT OR REPLACE INTO proposal_map "
+                                "(master_event_id, local_event_id) VALUES (?,?)", (meid, None))
+                self.db.commit()
+                mapped.add(meid)
+                continue
+            txn = urllib.parse.quote(meid, safe="")
+            res = self.local("PUT", "/_matrix/client/v3/rooms/"
+                             + urllib.parse.quote(local_proposals_room, safe="")
+                             + "/send/" + PROPOSAL_TYPE + "/proposal_" + txn, clean)
+            self.db.execute("INSERT OR REPLACE INTO proposal_map "
+                            "(master_event_id, local_event_id) VALUES (?,?)",
+                            (meid, res.get("event_id")))
+            self.db.commit()
+            mapped.add(meid)
+            posted += 1
+        return posted
+
+    def pull_proposals(self):
+        """One non-blocking master /sync of the proposals room; forward new ones.
+
+        Reads the MASTER as the teammate's own account (outbound-only preserved).
+        The proposal watermark (proposal_sync_since) advances only after the batch
+        is forwarded; a master transport failure raises MasterUnreachable and the
+        watermark is left untouched (buffer + retry, like the mirror-up path)."""
+        mpr = self.meta_get("master_proposals_room")
+        lpr = self.meta_get("local_proposals_room")
+        if not mpr or not lpr:
+            return
+        since = self.meta_get("proposal_sync_since")
+        flt = json.dumps({
+            "room": {"rooms": [mpr], "timeline": {"limit": 100},
+                     "state": {"types": []}, "ephemeral": {"types": []},
+                     "account_data": {"types": []}},
+            "presence": {"types": []}, "account_data": {"types": []},
+        })
+        query = {"timeout": "0", "filter": flt}
+        if since:
+            query["since"] = since
+        data = self.master("GET", "/_matrix/client/v3/sync", query=query, timeout=90)
+        room = (((data.get("rooms") or {}).get("join")) or {}).get(mpr) or {}
+        events = ((room.get("timeline") or {}).get("events")) or []
+        posted = self.forward_proposals(mpr, lpr, events)
+        # Advance the watermark only after forward_proposals returned (no local
+        # write raised); proposal_map still guards against any replayed overlap.
+        self.meta_set("proposal_sync_since", data.get("next_batch") or since or "")
+        if posted:
+            log.info("proposals: pulled %d new -> local room %s", posted, lpr)
+
     # -- main loop ----------------------------------------------------------
     def tail_once(self):
         """One /sync of the LOCAL hs; forward new events in shared mirror rooms."""
@@ -609,6 +810,11 @@ class Uplink:
             try:
                 self.reconcile()
                 self.tail_once()
+                # V2 proposal channel: ensure the dedicated proposals rooms exist,
+                # then pull any new manager proposals DOWN into the local one. Both
+                # steps are outbound-only and write com.jkali.proposal exclusively.
+                self.ensure_proposal_rooms()
+                self.pull_proposals()
                 self.backoff = 1.0
             except MasterUnreachable as e:
                 log.warning("master unreachable (%s); buffering, retry in %.0fs "

@@ -43,12 +43,16 @@ const SOURCES = [
   { id: 'linkedin', label: 'LinkedIn', kind: 'source', botMxid: '@linkedinbot:localhost',
     spaceName: 'LinkedIn', canStartChat: false, icon: '💼',
     blurb: 'Bridge your LinkedIn messages: log in on linkedin.com, then paste your session; chats appear as rooms in Element.' },
+  { id: 'twitter', label: 'X', kind: 'source', botMxid: '@twitterbot:localhost',
+    spaceName: 'Twitter', canStartChat: true, icon: '✖️',
+    blurb: 'Bridge your X (Twitter) DMs: log in on x.com, then paste your session; chats appear as rooms in Element.' },
 ];
 const WA = SOURCES.find(s => s.id === 'whatsapp');
 const IMSG = SOURCES.find(s => s.id === 'imessage');
 const GMSG = SOURCES.find(s => s.id === 'gmessages');
 const IG = SOURCES.find(s => s.id === 'instagram');
 const LI = SOURCES.find(s => s.id === 'linkedin');
+const TW = SOURCES.find(s => s.id === 'twitter');
 // The ONLY sender whose com.jkali.from_me marker is trusted (anti-spoof): our
 // own iMessage appservice bot. Never a ghost (@imessage_*) or a remote contact.
 const IMSG_BOT_MXID = IMSG.botMxid;                // '@imessagebot:localhost'
@@ -164,11 +168,38 @@ const LI_COMMAND_GROUPS = [
     { cmd: 'delete-all-portals', label: 'Delete all bridged rooms', desc: 'Permanently delete every bridged chat room on the Matrix side (nothing is deleted on LinkedIn itself).', confirm: 'type' },
   ]},
 ];
+
+const TW_COMMAND_GROUPS = [
+  { title: 'General', cmds: [
+    { cmd: 'help', label: 'Help', desc: "Show the bridge's own list of every command." },
+    { cmd: 'version', label: 'Version', desc: 'Show which bridge version is running.' },
+  ]},
+  { title: 'Account', cmds: [
+    { cmd: 'list-logins', label: 'List logins', desc: 'List the X accounts linked to the bridge and their connection state.' },
+    { cmd: 'login cookies', label: 'Connect X', desc: 'Start linking your X account; then paste your x.com session (Copy as cURL) as the next message.' },
+    { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked X account from the bridge.', arg: 'login ID', confirm: 'click' },
+    { cmd: 'set-preferred-login', label: 'Preferred account', desc: 'Choose which account sends your messages when more than one is linked.', arg: 'login ID' },
+  ]},
+  { title: 'Chats & contacts', cmds: [
+    { cmd: 'search', label: 'Search contacts', desc: 'Search your X contacts by name.', arg: 'name' },
+    { cmd: 'start-chat', label: 'Start a chat', desc: 'Open a new direct chat with an X user.', arg: 'identifier' },
+    { cmd: 'resolve-identifier', label: 'Check an identifier', desc: 'Check whether an identifier is on X without starting a chat.', arg: 'identifier' },
+    { cmd: 'sync', label: 'Sync now', desc: 'Refresh chats and contacts from X.' },
+  ]},
+  { title: 'Relay', cmds: [
+    { cmd: 'set-relay', label: 'Enable relay', desc: 'Let other Matrix users in a room send messages through your X account.', confirm: 'click' },
+    { cmd: 'unset-relay', label: 'Disable relay', desc: "Stop relaying other users' messages through your account." },
+  ]},
+  { title: 'Danger zone', cmds: [
+    { cmd: 'delete-all-portals', label: 'Delete all bridged rooms', desc: 'Permanently delete every bridged chat room on the Matrix side (nothing is deleted on X itself).', confirm: 'type' },
+  ]},
+];
 function groupsFor(sourceId) {
   if (sourceId === 'imessage') return IMSG_COMMAND_GROUPS;
   if (sourceId === 'gmessages') return GMSG_COMMAND_GROUPS;
   if (sourceId === 'instagram') return IG_COMMAND_GROUPS;
   if (sourceId === 'linkedin') return LI_COMMAND_GROUPS;
+  if (sourceId === 'twitter') return TW_COMMAND_GROUPS;
   return COMMAND_GROUPS;
 }
 
@@ -199,7 +230,7 @@ let busy = false;
 let activeSettingsSource = 'whatsapp';
 let joinedSet = new Set();
 const convosBySource = {};                 // sourceId -> [convo]
-const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null }, linkedin: { mgmtRoomId: null } };
+const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null }, linkedin: { mgmtRoomId: null }, twitter: { mgmtRoomId: null } };
 
 // ---- Home feed state (HF-2): fully independent of the command sync loop.
 // These are NEVER the command loop's syncSince/syncRunning; the two /sync loops
@@ -280,7 +311,7 @@ async function api(method, path, body) {
 // ---- session ----
 function forgetSession() {
   token = null; userId = null;
-  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null;
+  runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null; runtime.twitter.mgmtRoomId = null;
   syncRunning = false;
   feedRunning = false;                              // HF-2: stop the feed loop with the session
   feedSince = null;
@@ -451,7 +482,7 @@ async function startSync() {
   syncSince = null;
   while (syncRunning && token) {
     try {
-      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId, runtime.instagram.mgmtRoomId, runtime.linkedin.mgmtRoomId].filter(Boolean);
+      const ids = [runtime.whatsapp.mgmtRoomId, runtime.imessage.mgmtRoomId, runtime.gmessages.mgmtRoomId, runtime.instagram.mgmtRoomId, runtime.linkedin.mgmtRoomId, runtime.twitter.mgmtRoomId].filter(Boolean);
       const filter = encodeURIComponent(JSON.stringify(
         { room: { rooms: ids, timeline: { limit: 30 } }, presence: { types: [] } }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -480,11 +511,13 @@ function routeMgmtEvent(roomId, ev) {
   const gm = runtime.gmessages.mgmtRoomId;
   const ig = runtime.instagram.mgmtRoomId;
   const li = runtime.linkedin.mgmtRoomId;
+  const tw = runtime.twitter.mgmtRoomId;
   if (wa && roomId === wa) { handleMgmtEvent(WA, ev); return; }
   if (im && roomId === im) { handleMgmtEvent(IMSG, ev); return; }
   if (gm && roomId === gm) { handleMgmtEvent(GMSG, ev); return; }
   if (ig && roomId === ig) { handleMgmtEvent(IG, ev); return; }
   if (li && roomId === li) { handleMgmtEvent(LI, ev); return; }
+  if (tw && roomId === tw) { handleMgmtEvent(TW, ev); return; }
   return; // not a management room -> ignore entirely
 }
 
@@ -512,7 +545,7 @@ function handleMgmtEvent(source, ev) {
   if (fromBot && typeof content.body === 'string') {
     const body = sanitize(content.body.replace(/^\* /, ''));
     logConsole('bot', body, source.id);
-    if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram' || source.id === 'linkedin') reactToBotReply(body, source);
+    if (source.id === 'whatsapp' || source.id === 'gmessages' || source.id === 'instagram' || source.id === 'linkedin' || source.id === 'twitter') reactToBotReply(body, source);
     else if (source.id === 'imessage') updateImsgCard(content.body);
   } else if (fromMe && typeof content.body === 'string' &&
              !String(ev.unsigned && ev.unsigned.transaction_id || '').startsWith('hub-')) {
@@ -524,9 +557,11 @@ function handleMgmtEvent(source, ev) {
 function reactToBotReply(body, source) {
   const pillId = source.id === 'gmessages' ? 'gmsg-status'
                : source.id === 'instagram' ? 'ig-status'
-               : source.id === 'linkedin' ? 'li-status' : 'wa-status';
+               : source.id === 'linkedin' ? 'li-status'
+               : source.id === 'twitter' ? 'tw-status' : 'wa-status';
   const discId = source.id === 'instagram' ? 'btn-ig-disconnect'
                : source.id === 'linkedin' ? 'btn-li-disconnect'
+               : source.id === 'twitter' ? 'btn-tw-disconnect'
                : source.id === 'gmessages' ? null : 'btn-disconnect';
   if (/You're not logged in/i.test(body)) updateCardStatus([], pillId, discId);
   const logins = [...body.matchAll(/^\* `([^`\n]+)` \(([^)\n]*)\) - `([A-Z_]+)`/gm)]
@@ -1324,7 +1359,8 @@ async function sendConvoMessage() {
       roomId === runtime.imessage.mgmtRoomId ||
       roomId === runtime.gmessages.mgmtRoomId ||
       roomId === runtime.instagram.mgmtRoomId ||
-      roomId === runtime.linkedin.mgmtRoomId) {
+      roomId === runtime.linkedin.mgmtRoomId ||
+      roomId === runtime.twitter.mgmtRoomId) {
     convoSetStatus('Cannot send a message here.');
     return;
   }
@@ -2003,6 +2039,112 @@ function buildConnections() {
   li.appendChild(liPaste);
   holder.appendChild(li);
 
+  // X (Twitter) card (mirrors the LinkedIn card exactly: a session PASTE flow,
+  // not a QR. The pasted value is a bearer credential: sent through the C-1 mgmt
+  // guard, redacted immediately, and never logged, sanitize-rendered, persisted,
+  // or turned into a URL.)
+  const tw = el('div', 'card bridge-card');
+  const twHead = el('div', 'bridge-head');
+  twHead.appendChild(el('span', 'bridge-name', TW.label));
+  const twPill = el('span', 'status-pill', 'Checking\u2026');
+  twPill.id = 'tw-status';
+  twHead.appendChild(twPill);
+  tw.appendChild(twHead);
+  tw.appendChild(el('p', 'muted', TW.blurb));
+
+  const twPaste = el('div', 'tw-paste hidden');
+  twPaste.style.cssText = 'margin-top:10px;';
+  twPaste.appendChild(el('p', 'muted',
+    'On x.com: DevTools \u2192 Network \u2192 filter a request \u2192 right-click \u2192 Copy as cURL, then paste here.'));
+  const twArea = el('textarea');
+  twArea.placeholder = 'Paste your X session (Copy as cURL) here';
+  twArea.rows = 4;
+  twArea.autocomplete = 'off';
+  twArea.spellcheck = false;
+  twArea.style.cssText = 'width:100%;box-sizing:border-box;font-family:monospace;resize:vertical;';
+  twPaste.appendChild(twArea);
+  const twWarn = el('p', 'error hidden');
+  twWarn.style.cssText = 'margin:6px 0 0;';
+  const twSubmit = el('button', 'primary', 'Submit session');
+  twSubmit.style.width = 'auto';
+  const twSubmitRow = el('div', 'bridge-actions');
+  twSubmitRow.appendChild(twSubmit);
+  twPaste.appendChild(twSubmitRow);
+  twPaste.appendChild(twWarn);
+
+  const twActions = el('div', 'bridge-actions');
+  const twConnect = el('button', 'primary', 'Connect X');
+  twConnect.style.width = 'auto';
+  twConnect.addEventListener('click', async () => {
+    twWarn.classList.add('hidden');
+    twWarn.textContent = '';
+    await sendCmd('twitter', 'login cookies');      // C-1 guarded
+    twPaste.classList.remove('hidden');
+    twArea.focus();
+    window.open('https://x.com/', '_blank', 'noopener');
+  });
+  twActions.appendChild(twConnect);
+
+  const twDisc = el('button', 'danger', 'Disconnect');
+  twDisc.id = 'btn-tw-disconnect';
+  twDisc.classList.add('hidden');
+  twDisc.addEventListener('click', async () => {
+    const id = twDisc.dataset.loginId;
+    if (!id) return;
+    if (await confirmModal('Disconnect X?',
+      'This unlinks the bridge from your X account. Bridged rooms stay until deleted.', false)) {
+      await sendCmd('twitter', 'logout ' + id);
+      sendCmd('twitter', 'list-logins');
+    }
+  });
+  twActions.appendChild(twDisc);
+
+  const twRefresh = el('button', '', 'Refresh status');
+  twRefresh.addEventListener('click', () => sendCmd('twitter', 'list-logins'));
+  twActions.appendChild(twRefresh);
+  tw.appendChild(twActions);
+
+  twSubmit.addEventListener('click', async () => {
+    if (busy) return;
+    twWarn.classList.add('hidden');
+    twWarn.textContent = '';
+    let secret = twArea.value;                       // read once; never logged
+    twArea.value = '';                               // clear the field immediately
+    if (!secret || !secret.trim()) {
+      secret = null;
+      twWarn.textContent = 'Paste your X session before submitting.';
+      twWarn.classList.remove('hidden');
+      return;
+    }
+    busy = true; setButtonsDisabled(true); twSubmit.disabled = true;
+    try {
+      const sent = await sendSecretToMgmt('twitter', secret);
+      secret = null;                                 // drop the credential from memory
+      if (!sent || !sent.eventId) {
+        twWarn.textContent = 'Sent, but could not confirm the message id to delete it \u2014 please delete your pasted message in Element manually.';
+        twWarn.classList.remove('hidden');
+      } else {
+        try {
+          await redactMgmtEvent(sent.roomId, sent.eventId);
+          twPaste.classList.add('hidden');           // hide the paste UI on success
+        } catch (e) {
+          twWarn.textContent = 'Session sent, but auto-deleting it failed \u2014 please delete your pasted message in Element manually.';
+          twWarn.classList.remove('hidden');
+        }
+      }
+    } catch (e) {
+      secret = null;                                 // never surface the secret in errors
+      twWarn.textContent = 'Could not send the session: ' + String(e.message || e);
+      twWarn.classList.remove('hidden');
+    } finally {
+      busy = false; setButtonsDisabled(false); twSubmit.disabled = false;
+      sendCmd('twitter', 'list-logins');             // refresh the pill
+    }
+  });
+
+  tw.appendChild(twPaste);
+  holder.appendChild(tw);
+
   // Planned sources (inert placeholders).
   const more = el('div', 'card src-placeholder');
   more.appendChild(el('h3', '', 'More sources'));
@@ -2108,6 +2250,8 @@ async function enterApp() {
   catch (e) { logConsole('error', 'Google Messages management room: ' + String(e.message || e)); }
   try { runtime.instagram.mgmtRoomId = await resolveMgmt(IG); }
   catch (e) { logConsole('error', 'Instagram management room: ' + String(e.message || e)); }
+  try { runtime.twitter.mgmtRoomId = await resolveMgmt(TW); }
+  catch (e) { logConsole('error', 'X management room: ' + String(e.message || e)); }
   try { runtime.linkedin.mgmtRoomId = await resolveMgmt(LI); }
   catch (e) { logConsole('error', 'LinkedIn management room: ' + String(e.message || e)); }
   startSync();
@@ -2117,6 +2261,7 @@ async function enterApp() {
   await sendCmd('gmessages', 'list-logins');
   await sendCmd('instagram', 'list-logins');
   await sendCmd('linkedin', 'list-logins');
+  await sendCmd('twitter', 'list-logins');
 }
 
 // ---- wiring ----

@@ -84,6 +84,41 @@ services:
     profiles: ["bridge"]
     # No host ports: appservice on the compose network only (29319).
 
+  mautrix-twitter:
+    # X (Twitter) DM bridge. Cookie/session login like Instagram & LinkedIn.
+    image: dock.mau.dev/mautrix/twitter:latest@sha256:a780515de3c7fa8f410e2d6355d4c69a0c439742c40bafeec8a3d8e61a94cbc4
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./twitter:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+    # No host ports: appservice listens on the compose network only (29327).
+
+  mautrix-gmessages:
+    # Google Messages (SMS/RCS) bridge. Enables double puppeting via the
+    # @jkali namespace in gmessages/registration.yaml (exclusive: false).
+    image: dock.mau.dev/mautrix/gmessages:v26.08@sha256:cecc0b77bd4d64e6e04b7b5961749e3890daad7885b37e6cde5bb24a07735f3e
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./gmessages:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+    # No host ports: appservice listens on the compose network only (29336).
+
   hub:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     restart: unless-stopped

@@ -11,4 +11,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
         ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
     CREATE DATABASE mautrix_linkedin OWNER matrix TEMPLATE template0
         ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
+    CREATE DATABASE mautrix_twitter OWNER matrix TEMPLATE template0
+        ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
 EOSQL

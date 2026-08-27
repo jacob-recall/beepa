@@ -229,7 +229,8 @@ let loginFlowActive = false;
 let busy = false;
 let activeSettingsSource = 'whatsapp';
 let joinedSet = new Set();
-const convosBySource = {};                 // sourceId -> [convo]
+const convosBySource = {};
+let sourceViewId = null;                    // which source #view-source is showing (for #source-search)                 // sourceId -> [convo]
 const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null }, linkedin: { mgmtRoomId: null }, twitter: { mgmtRoomId: null } };
 
 // ---- Home feed state (HF-2): fully independent of the command sync loop.
@@ -1408,6 +1409,9 @@ async function loadSourceList(sourceId) {
   const list = $('source-list');
   $('source-title').textContent = source.label;
   $('source-sub').textContent = 'Your conversations on ' + source.label + '. Click one to open it.';
+  sourceViewId = sourceId;
+  const search = $('source-search');
+  if (search) { search.value = ''; search.placeholder = 'Search ' + source.label + ' conversations'; }
   list.replaceChildren();
   list.appendChild(elEmpty('Loading…'));
   try {
@@ -1416,10 +1420,28 @@ async function loadSourceList(sourceId) {
     list.replaceChildren(elEmpty('Could not load conversations: ' + String(e.message || e)));
     return;
   }
+  renderSourceList();
+}
+
+// #source-search is a pure client-side filter over the loaded per-source list,
+// mirroring #home-search: matches on the conversation title + preview only.
+function renderSourceList() {
+  const list = $('source-list');
+  if (!list || !sourceViewId) return;
+  const source = SOURCES.find(s => s.id === sourceViewId);
+  const convos = convosBySource[sourceViewId] || [];
   list.replaceChildren();
-  const convos = convosBySource[sourceId] || [];
-  if (!convos.length) { list.appendChild(elEmpty('No conversations yet on ' + source.label + '.')); return; }
-  for (const c of convos) list.appendChild(buildConvoRow(c, false));
+  if (!convos.length) {
+    list.appendChild(elEmpty('No conversations yet on ' + (source ? source.label : 'this service') + '.'));
+    return;
+  }
+  const q = (($('source-search') && $('source-search').value) || '').trim().toLowerCase();
+  const rows = q
+    ? convos.filter(c => sanitizeLine(c.title || '').toLowerCase().includes(q) ||
+                         sanitizeLine(c.sub || '').toLowerCase().includes(q))
+    : convos;
+  if (!rows.length) { list.appendChild(elEmpty('No conversations match "' + q + '".')); return; }
+  for (const c of rows) list.appendChild(buildConvoRow(c, false));
 }
 
 // ---- Directory (P3.3): cross-source local filter + gated start-chat ----
@@ -2292,6 +2314,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // model; it never builds a URL, sends a command, or navigates.
   const homeSearch = $('home-search');
   if (homeSearch) homeSearch.addEventListener('input', renderHome);
+  const sourceSearch = $('source-search');
+  if (sourceSearch) sourceSearch.addEventListener('input', renderSourceList);
 
   // CV.2: native conversation view controls. Back stops the room watch and
   // returns to the filtered Home; send/Enter deliver to the OPEN room only.

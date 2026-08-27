@@ -1,120 +1,239 @@
-/* apps/master/style.css — same visual language as apps/user/style.css (a
-   subset of its tokens/classes), trimmed to what a read-only console needs:
-   no composer, bridge-connection, settings/console, or share-control rules. */
-:root {
-  --bg: #f4f5f7; --fg: #1a1d21; --card: #ffffff; --line: #d9dde3;
-  --muted: #6a7280; --accent: #2b4b8f; --accent-fg: #ffffff;
-  --danger: #b3261e;
-  --sidebar: #1f2430; --sidebar-fg: #e7ebf2; --sidebar-muted: #9aa3b2;
-  --sidebar-active: #2d3444; --sidebar-w: 230px;
-}
+/* apps/master/style.css — app-local layout for the read-only manager console.
+   Visual tokens/components (palette, fonts, .btn/.input/.card/.tag/...) come
+   from shared/style/organic.css + shared/style/beepa.css (loaded around this
+   file); this file only lays out the master-specific shell/views to match the
+   "Beepa Artboards" mockups (screens 1f recent feed, 1g read-only viewer, 1i
+   sign-in + enrollment) and keeps a few structural rules those shared files
+   don't cover (the message list, the room viewer, the proposal panel). */
 * { box-sizing: border-box; }
 html, body { height: 100%; }
-body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+body { margin: 0; }
 .hidden { display: none !important; }
-.muted { color: var(--muted); }
-.error { color: var(--danger); white-space: pre-wrap; }
 .spacer { flex: 1; }
-h1 { font-size: 22px; margin: 0 0 6px; }
-h2 { font-size: 19px; margin: 0 0 4px; }
 
-#view-signin .card.narrow { max-width: 420px; margin: 12vh auto 0; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 14px 0; }
-label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted); }
-input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font-size: 15px; background: var(--card); color: var(--fg); }
-button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font-size: 14px; cursor: pointer; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); width: 100%; margin-top: 16px; }
+/* ── sign-in (mockup 1i, left column): a dark card on the cream page bg ── */
+#view-signin { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.signin-card {
+  width: min(360px, 100%); padding: 34px 30px; border-radius: calc(var(--radius-lg) * 1.15);
+  background: var(--color-neutral-900); color: var(--color-neutral-100);
+  box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+}
+.brand-word { font-family: var(--font-heading); font-weight: 400; font-size: 22px; color: var(--color-accent-300); }
+.tag-readonly {
+  align-self: flex-start; margin-top: 8px; padding: 5px 12px; border-radius: 999px;
+  border: 1px solid rgba(249, 244, 237, 0.28); color: var(--color-accent-2-100);
+  font: 700 9.5px var(--font-body); letter-spacing: 0.1em;
+}
+.signin-body { margin-top: 22px; display: flex; flex-direction: column; gap: 10px; }
+.signin-body h1 { font-size: 26px; color: var(--color-neutral-100); margin: 0 0 4px; }
+.signin-body label { font-size: 12px; color: var(--color-neutral-400); margin: 6px 0 0; }
+.signin-body .input {
+  background: rgba(249, 244, 237, 0.10); border-color: rgba(249, 244, 237, 0.22);
+  color: var(--color-neutral-100);
+}
+.signin-body .input::placeholder { color: var(--color-neutral-500); }
+.signin-disclaimer { margin-top: 6px; font-size: 11px; line-height: 1.55; color: var(--color-neutral-400); }
+#signin-error { color: var(--color-accent-300); }
 
-/* shell: sidebar + content */
-#shell { display: flex; height: 100vh; width: 100%; }
-#sidebar { width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--sidebar); color: var(--sidebar-fg); display: flex; flex-direction: column; padding: 14px 10px; gap: 4px; overflow-y: auto; }
-#sidebar #brand { font-weight: 700; font-size: 16px; padding: 6px 10px 12px; }
-#sidebar nav { display: flex; flex-direction: column; gap: 2px; }
-.nav-sep { height: 1px; background: rgba(255,255,255,0.08); margin: 8px 6px; }
-.navitem { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: none; background: transparent; color: var(--sidebar-fg); padding: 9px 10px; border-radius: 8px; font-size: 14px; cursor: pointer; }
-.navitem:hover { background: rgba(255,255,255,0.06); }
-.navitem.active { background: var(--sidebar-active); font-weight: 600; }
-.navitem .ic { width: 18px; text-align: center; opacity: 0.85; }
-#account { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-top: 1px solid rgba(255,255,255,0.08); }
-#whoami { color: var(--sidebar-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#account button { font-size: 13px; background: transparent; border: 1px solid rgba(255,255,255,0.14); color: var(--sidebar-fg); }
+/* ── shell: top bar + [teammates rail | content] ── */
+#shell { display: flex; flex-direction: column; height: 100vh; width: 100%; }
+#topbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 16px; height: 60px; padding: 0 24px;
+  background: var(--color-neutral-900); color: var(--color-neutral-100);
+}
+#topbar #brand { font-family: var(--font-heading); font-weight: 400; font-size: 20px; color: var(--color-accent-300); }
+.tag-readonly-bar { margin-top: 0; }
+#nav-tools { display: flex; gap: 4px; margin-left: 10px; }
+.tab {
+  padding: 6px 14px; border-radius: 999px; border: none; background: transparent;
+  color: var(--color-neutral-400); font: 500 12px var(--font-body); cursor: pointer;
+}
+.tab:hover { background: rgba(249, 244, 237, 0.08); color: var(--color-neutral-100); }
+.tab.active { background: rgba(245, 234, 216, 0.14); color: var(--color-neutral-100); font-weight: 600; }
+.tab-static { cursor: default; }
+.tab-static:hover { background: transparent; color: var(--color-neutral-400); }
+.live-indicator {
+  display: flex; align-items: center; gap: 8px; color: var(--color-neutral-400);
+  font: 500 11.5px var(--font-body);
+}
+.live-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--color-accent-2-400); }
+
+#body-row { flex: 1; min-height: 0; display: flex; }
+
+/* teammates rail (mockup 1f left column) */
+#sidebar {
+  width: 214px; flex: 0 0 214px; padding: 20px 18px; overflow-y: auto;
+  background: var(--color-neutral-100); border-right: 1px solid var(--color-divider);
+  display: flex; flex-direction: column;
+}
+#teammates-label {
+  font: 700 10.5px var(--font-body); letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--color-neutral-700);
+}
+#nav-teammates { margin-top: 12px; display: flex; flex-direction: column; gap: 4px; }
+.teammate-row {
+  display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-radius: 14px;
+  border: none; background: transparent; cursor: pointer; text-align: left; width: 100%;
+  font: inherit; color: var(--color-text);
+}
+.teammate-row:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+.teammate-row.active { background: var(--color-bg); }
+.teammate-avatar {
+  width: 26px; height: 26px; flex: none; border-radius: 999px;
+  background: var(--color-accent-2-200); color: var(--color-accent-2-800);
+  font: 700 10px/26px var(--font-body); text-align: center;
+}
+.teammate-name { flex: 1; min-width: 0; font: 600 12px var(--font-body); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.teammate-count { font: 400 10.5px var(--font-body); color: var(--color-neutral-600); }
+#account { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--color-divider); display: flex; flex-direction: column; gap: 6px; }
+#whoami { color: var(--color-neutral-600); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 #content { flex: 1; min-width: 0; position: relative; overflow: hidden; }
-.view { position: absolute; inset: 0; overflow-y: auto; padding: 22px 24px 40px; }
-.view-head { max-width: 760px; margin: 0 auto 12px; }
+.view { position: absolute; inset: 0; overflow-y: auto; padding: 24px 28px 40px; }
+.view-head { max-width: 760px; margin: 0 auto 16px; }
 .view-head input { margin-top: 12px; }
+.view-head h2 { font-size: 23px; }
+.feed-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+.feed-head h1 { font-size: 26px; margin: 0; }
+.feed-head .muted { font-size: 12px; }
+.card-kicker {
+  font: 700 10.5px var(--font-body); letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--color-neutral-700); margin: 0 0 4px;
+}
 
-/* conversation rows (Recent / per-teammate / Search) */
-.convo-list { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; }
-.convo { display: flex; align-items: center; gap: 12px; padding: 11px 12px; border: 1px solid var(--line); border-top: none; background: var(--card); cursor: pointer; text-align: left; width: 100%; }
-.convo:first-child { border-top: 1px solid var(--line); border-radius: 10px 10px 0 0; }
-.convo:last-child { border-radius: 0 0 10px 10px; }
-.convo:only-child { border-radius: 10px; }
-.convo:hover { background: #eef1f5; }
-.convo .avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--bg); flex: 0 0 34px; display: flex; align-items: center; justify-content: center; font-size: 14px; color: var(--muted); }
+/* ── conversation rows (Recent / per-teammate / Search) ── */
+.convo-list { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 9px; }
+.convo {
+  display: flex; align-items: center; gap: 13px; padding: 15px 18px; border-radius: 22px;
+  background: var(--color-neutral-100); border: 1px solid var(--color-divider); cursor: pointer;
+  text-align: left; width: 100%;
+}
+.convo:hover { background: color-mix(in srgb, var(--color-text) 5%, var(--color-neutral-100)); }
+.convo .avatar {
+  width: 34px; height: 34px; flex: 0 0 34px; border-radius: 999px;
+  background: var(--color-accent-2-200); color: var(--color-accent-2-800);
+  display: flex; align-items: center; justify-content: center;
+  font: 700 12px var(--font-body);
+}
 .convo .meta { flex: 1; min-width: 0; }
-.convo .title { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.convo .preview { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.convo .when { flex: 0 0 auto; color: var(--muted); font-size: 12px; margin-left: 4px; white-space: nowrap; }
-.convo .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; white-space: nowrap; }
-.convo .plat-badge { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; background: var(--bg); border: 1px solid var(--line); }
-.list-empty { max-width: 760px; margin: 0 auto; color: var(--muted); padding: 18px 12px; }
+.convo .title { font-weight: 700; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo .preview { margin-top: 7px; color: var(--color-text); font-size: 13px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo .when { flex: 0 0 auto; color: var(--color-neutral-500); font-size: 10.5px; margin-left: 4px; white-space: nowrap; }
+.convo .badge {
+  font-size: 11.5px; padding: 2px 0; background: transparent; border: none;
+  color: var(--color-neutral-700); flex: 0 0 auto; white-space: nowrap;
+}
+.convo .plat-badge { flex: 0 0 auto; }
+.convo-open {
+  align-self: center; flex: none; padding: 8px 15px; border-radius: 999px;
+  background: var(--color-neutral-200); color: var(--color-neutral-700);
+  font: 600 11px var(--font-body);
+}
+.list-empty { max-width: 760px; margin: 0 auto; color: var(--color-neutral-600); padding: 18px 12px; }
 
-/* One shared contact profile spanning platforms (com.jkali.profile on the
-   mirror room's state — stamped only for SHARED-profile members): the person
-   shown once, their per-platform threads (still plain .convo rows, still
-   carrying their own .plat-badge/.badge) nested beneath. Purely presentational
-   grouping over the same read-only rows; no new interaction. */
+/* One shared contact profile spanning platforms. */
 .profile-group { margin-bottom: 10px; }
-.profile-header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px 10px 0 0; }
-.profile-header .profile-avatar { width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex: 0 0 26px; }
+.profile-header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--color-neutral-200); border-radius: 14px 14px 0 0; }
+.profile-header .profile-avatar {
+  width: 26px; height: 26px; border-radius: 999px; background: var(--color-accent-2-400);
+  color: var(--color-accent-2-900); display: flex; align-items: center; justify-content: center;
+  font: 700 12px var(--font-body); flex: 0 0 26px;
+}
 .profile-header .profile-name { font-weight: 700; font-size: 13.5px; flex: 1; }
-.profile-header .profile-count { font-size: 11px; color: var(--muted); }
-.profile-members { display: flex; flex-direction: column; }
-.profile-members .convo { border-radius: 0; }
-.profile-members .convo:first-child { border-top: none; }
-.profile-members .convo:last-child { border-radius: 0 0 10px 10px; }
-.profile-members .convo:only-child { border-radius: 0 0 10px 10px; }
+.profile-header .profile-count { font-size: 11px; color: var(--color-neutral-600); }
+.profile-members { display: flex; flex-direction: column; gap: 4px; padding-top: 4px; }
+.profile-members .convo { border-radius: 14px; }
 
-/* read-only room viewer */
+/* ── read-only room viewer (mockup 1g) ── */
 #view-room { padding: 0; }
 #room-pane { display: flex; flex-direction: column; height: 100%; }
-#room-head { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--card); flex: 0 0 auto; }
-#room-back { border: none; background: transparent; font-size: 20px; line-height: 1; padding: 4px 8px; border-radius: 8px; cursor: pointer; color: var(--fg); }
-#room-back:hover { background: var(--bg); }
-#room-title { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 50%; }
-#room-head .plat-badge { width: 20px; height: 20px; }
-#room-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; background: var(--bg); }
-.msg { max-width: 68%; padding: 7px 11px; border-radius: 14px; font-size: 14px; line-height: 1.35; word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap; }
-.msg .who { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 1px; }
-.msg .body { display: block; }
-.msg .when { display: block; font-size: 10.5px; color: var(--muted); margin-top: 2px; text-align: right; }
-.msg.recv { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
-.msg.sent { align-self: flex-end; background: var(--accent); color: var(--accent-fg); border-bottom-right-radius: 4px; }
-.msg.sent .who, .msg.sent .when { color: rgba(255,255,255,0.75); }
-.msg.media .body { font-style: italic; opacity: 0.85; }
-/* v1.5: a bubble whose body was swapped for real re-uploaded media. */
-.msg.media .body:has(.media-el), .msg.media .body:has(.media-file) { font-style: normal; opacity: 1; }
-.media-el { display: block; max-width: 320px; max-height: 320px; border-radius: 8px; }
-audio.media-el { width: 260px; height: 40px; }
-.media-file { color: inherit; text-decoration: underline; }
-.msg.notice { align-self: center; background: transparent; border: none; color: var(--muted); font-size: 12.5px; max-width: 90%; text-align: center; }
-.convo-status { align-self: center; color: var(--danger); font-size: 12.5px; padding: 8px; }
+#room-head {
+  display: flex; align-items: center; gap: 14px; padding: 16px 24px;
+  background: var(--color-neutral-100); border-bottom: 1px solid var(--color-divider); flex: 0 0 auto;
+}
+#room-back {
+  width: 32px; height: 32px; flex: none; border: none; border-radius: 999px;
+  background: var(--color-neutral-200); color: var(--color-neutral-700);
+  font: 600 13px var(--font-body); cursor: pointer;
+}
+#room-back:hover { background: var(--color-neutral-300); }
+#room-heading { min-width: 0; }
+.room-title-row { display: flex; align-items: center; gap: 8px; }
+#room-title { font-weight: 700; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+.room-sub-row { display: flex; align-items: center; gap: 7px; margin-top: 3px; }
+.room-sub-row .muted { font: 500 11.5px var(--font-body); color: var(--color-neutral-700); }
+#room-head .plat-badge { width: 14px; height: 14px; }
+.live-indicator-room {
+  padding: 6px 13px; border-radius: 999px; background: var(--color-accent-2-100);
+  border: 1px solid var(--color-accent-2-300); color: var(--color-accent-2-800);
+  font: 600 11px var(--font-body);
+}
+.live-indicator-room .live-dot { background: var(--color-accent-2-600); }
 
-/* Compose-PROPOSAL panel (V2). Visually distinct from a chat composer — an
-   amber "suggestion" band — so it never reads as "send". No message is sent from
-   here; it writes one com.jkali.proposal for the teammate to review. */
-#proposal-pane { flex: 0 0 auto; border-top: 1px solid var(--line); background: #fffdf5; padding: 10px 18px 14px; }
-.proposal-head { display: flex; flex-direction: column; gap: 1px; margin-bottom: 6px; }
-.proposal-kicker { font-weight: 700; font-size: 12.5px; color: #8a5a00; letter-spacing: 0.02em; }
-.proposal-note { font-size: 11.5px; color: var(--muted); }
-.proposal-row { display: flex; align-items: baseline; gap: 6px; font-size: 12px; margin-bottom: 6px; }
+#room-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 28px; display: flex; flex-direction: column; gap: 14px; background: var(--color-bg); }
+.day-divider {
+  align-self: center; padding: 5px 14px; border-radius: 999px; background: var(--color-neutral-200);
+  color: var(--color-neutral-600); font: 600 10.5px var(--font-body);
+}
+.msg-row { max-width: 60%; display: flex; flex-direction: column; gap: 5px; }
+.msg-row.recv { align-self: flex-start; }
+.msg-row.sent { align-self: flex-end; align-items: flex-end; }
+.msg-meta { display: flex; align-items: center; gap: 6px; font: 400 10.5px var(--font-body); color: var(--color-neutral-500); padding: 0 4px; }
+.msg-row.recv .msg-meta { padding-left: 4px; }
+.msg-row.sent .msg-meta { padding-right: 4px; flex-direction: row-reverse; }
+.msg-meta .msg-badge-mini { width: 13px; height: 13px; border-radius: 4px; }
+.msg-meta .msg-sender { font: 600 10.5px var(--font-body); color: var(--color-neutral-700); }
+.msg-row.sent .msg-meta .msg-sender { color: var(--color-accent-700); }
+.msg {
+  padding: 12px 16px; border-radius: 20px 20px 20px 6px; font: 400 13.5px/1.55 var(--font-body);
+  word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.msg-row.sent .msg { border-radius: 20px 20px 6px 20px; }
+.msg-row.recv .msg { background: var(--color-neutral-100); border: 1px solid var(--color-divider); color: var(--color-text); }
+.msg-row.sent .msg { background: var(--color-accent-200); border: 1px solid var(--color-accent-300); color: var(--color-accent-900); }
+.msg.media { font-style: italic; opacity: 0.85; }
+.msg.media .body:has(.media-el), .msg.media .body:has(.media-file) { font-style: normal; opacity: 1; }
+.media-el { display: block; max-width: 260px; max-height: 260px; border-radius: 10px; }
+audio.media-el { width: 240px; height: 40px; }
+.media-file { color: inherit; text-decoration: underline; }
+.msg.notice { background: transparent; border: none; color: var(--color-neutral-600); font-size: 12.5px; text-align: center; }
+.convo-status { align-self: center; color: var(--color-accent-700); font-size: 12.5px; padding: 8px; }
+
+/* ── Compose-PROPOSAL panel (V2): a footer band ("can't send here" note +
+   Suggest a reply) that expands a collapsed compose section below it. Visually
+   distinct from a chat composer so it never reads as "send". No message is
+   sent from here; it writes one com.jkali.proposal for the teammate to
+   review. Expand/collapse is a pure CSS class toggle in main.js. ── */
+#proposal-pane { flex: 0 0 auto; border-top: 1px solid var(--color-divider); background: var(--color-neutral-100); }
+.proposal-footer { display: flex; align-items: center; gap: 16px; padding: 18px 24px 18px; }
+.proposal-note { flex: 1; margin: 0; font: 400 12px/1.55 var(--font-body); color: var(--color-neutral-700); text-wrap: pretty; }
+.proposal-toggle-btn { flex: none; }
+#proposal-compose { padding: 0 24px 18px; }
+.proposal-head { display: flex; flex-direction: column; gap: 1px; margin-bottom: 8px; }
+.proposal-kicker { font-weight: 700; font-size: 12.5px; color: var(--color-accent-700); letter-spacing: 0.02em; }
+.proposal-hint { font-size: 11.5px; color: var(--color-neutral-600); }
+.proposal-row { display: flex; align-items: baseline; gap: 6px; font-size: 12px; margin-bottom: 8px; }
 .proposal-target { font-weight: 600; }
-#proposal-input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 14px; resize: vertical; background: var(--card); color: var(--fg); }
 .proposal-controls { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
-.proposal-controls select { flex: 0 1 auto; width: auto; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; font-size: 12.5px; background: var(--card); color: var(--fg); }
-.proposal-tmpl { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12.5px; color: var(--fg); }
+.proposal-controls select { flex: 0 1 auto; width: auto; padding: 6px 8px; font-size: 12.5px; }
+.proposal-tmpl { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12.5px; color: var(--color-text); }
 .proposal-tmpl input { width: auto; }
-.proposal-btn { width: auto; margin-top: 0; }
-.proposal-status { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
-.proposal-status.error { color: var(--danger); }
+.proposal-btn { width: auto; }
+.proposal-status { margin-top: 8px; font-size: 12.5px; color: var(--color-neutral-600); }
+.proposal-status.error { color: var(--color-accent-700); }
+
+/* ── enrollment / add-teammate (mockup 1i, manager column) ── */
+.addteam-card { max-width: 420px; margin: 0 auto; }
+.code-display {
+  margin-top: 12px; padding: 22px; border-radius: 26px; background: var(--color-neutral-100);
+  border: 1px solid var(--color-divider); text-align: center;
+}
+.code-value {
+  font: 700 26px ui-monospace, Menlo, monospace; letter-spacing: 0.16em; color: var(--color-accent-700);
+}
+.code-actions { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+.addteam-cmd {
+  display: block; margin-top: 4px; padding: 10px 12px; border-radius: 10px;
+  background: var(--color-neutral-100); border: 1px solid var(--color-divider);
+  font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; word-break: break-all;
+}

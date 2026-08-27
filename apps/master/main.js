@@ -54,7 +54,9 @@ const MS = {
   activeView: 'recent',
   openRoomId: null,
   openRoomUser: null,
+  openRoomSourceId: null,  // the open mirror room's com.jkali.source, for the per-bubble mini platform badge
   openMirrorOf: null,  // the open mirror room's teammate-local room id (proposal target)
+  lastDayKey: null,    // last rendered day-divider key, reset per room open (see renderBubble)
   tailRunning: false,
   tailSince: null,
   pollTimer: null,
@@ -327,10 +329,17 @@ const PLATFORM_ICON = {
   whatsapp: '🟢', imessage: '🔵', gmessages: '📱',
   instagram: '📷', linkedin: '💼', twitter: '✖️',
 };
+const PLATFORM_LABEL = {
+  whatsapp: 'WhatsApp', imessage: 'iMessage', gmessages: 'Google Messages',
+  instagram: 'Instagram', linkedin: 'LinkedIn', twitter: 'X (Twitter)',
+};
 function buildPlatBadge(sourceId) {
   const safe = typeof sourceId === 'string' ? sourceId.replace(/[^a-z]/g, '') : '';
   const cls = 'plat-badge' + (safe ? ' ' + safe : '');
   return el('span', cls, (sourceId && PLATFORM_ICON[sourceId]) || '•');
+}
+function platformLabel(sourceId) {
+  return (sourceId && PLATFORM_LABEL[sourceId]) || '';
 }
 
 // One row = one mirror room, whichever list it appears in (Recent / a
@@ -349,6 +358,7 @@ function buildFeedRow(c) {
   if (c.lastTs) row.appendChild(el('span', 'when', relTime(c.lastTs)));
   row.appendChild(el('span', 'badge', c.userLabel || ''));
   row.appendChild(buildPlatBadge(c.sourceId));
+  row.appendChild(el('span', 'convo-open', 'Open'));  // visual affordance only; the whole row is already clickable/keyboard-activatable below
   const open = () => { openRoom(c.id).catch(() => {}); };
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
@@ -412,6 +422,11 @@ function buildListItem(item) {
 }
 
 function renderRecent() {
+  const sub = $('recent-sub');
+  if (sub) {
+    const n = MS.byUser.size;
+    sub.textContent = 'across ' + n + ' teammate' + (n === 1 ? '' : 's') + ' · shared conversations only';
+  }
   const list = $('recent-list');
   if (!list) return;
   list.replaceChildren();
@@ -419,21 +434,34 @@ function renderRecent() {
   for (const item of groupByProfile(MS.feed.slice(0, 200))) list.appendChild(buildListItem(item));
 }
 
+// Sidebar teammate rows (mockup 1f left rail): initials avatar + name + a
+// count of that teammate's shared conversations. Purely presentational over
+// already-fetched MS.byUser; the count is just that teammate's convo list length.
 function renderTeammateNav() {
   const nav = $('nav-teammates');
   if (!nav) return;
   nav.replaceChildren();
-  for (const label of MS.byUser.keys()) {
+  for (const [label, convos] of MS.byUser) {
     const key = 'teammate:' + label;
-    const btn = el('button', 'navitem');
+    const btn = el('button', 'teammate-row');
     btn.type = 'button';
     btn.dataset.navkey = key;
-    btn.appendChild(el('span', 'ic', '👤'));
-    btn.appendChild(document.createTextNode(' ' + label));
+    btn.appendChild(el('span', 'teammate-avatar', initials(label)));
+    btn.appendChild(el('span', 'teammate-name', label));
+    btn.appendChild(el('span', 'teammate-count', String(convos.length)));
     btn.addEventListener('click', () => navTo(key));
     nav.appendChild(btn);
   }
   setActiveNav(MS.activeView);
+}
+
+// Up to two initials from a teammate label, for the round avatar chip.
+function initials(label) {
+  const parts = String(label || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  const first = parts[0][0] || '';
+  const second = parts.length > 1 ? (parts[parts.length - 1][0] || '') : '';
+  return (first + second).toUpperCase();
 }
 
 function renderTeammate(label) {
@@ -483,6 +511,29 @@ function shortTime(ts) {
 // needed here: master-side power levels (§8.3) mean only @<teammate>:master
 // can ever post into that teammate's own mirror room, so the flag cannot be
 // spoofed by anyone else within that room.
+// Day-divider label ("Today"/"Yesterday"/a short date), purely presentational
+// grouping over each bubble's own already-resolved timestamp — no new reads.
+function dayKey(ts) {
+  if (typeof ts !== 'number' || !isFinite(ts) || !ts) return null;
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+}
+function dayLabel(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diffDays = Math.round((startOf(now) - startOf(d)) / 86400000);
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+function maybeInsertDayDivider(box, ts) {
+  const key = dayKey(ts);
+  if (!key || key === MS.lastDayKey) return;
+  MS.lastDayKey = key;
+  box.appendChild(el('div', 'day-divider', dayLabel(ts)));
+}
+
 function renderBubble(ev) {
   const box = $('room-messages');
   if (!box) return;
@@ -492,15 +543,28 @@ function renderBubble(ev) {
   const senderName = (ev.content && typeof ev.content['com.jkali.sender_name'] === 'string')
     ? sanitizeLine(ev.content['com.jkali.sender_name'])
     : localpart(ev.sender);
-  let cls = 'msg ' + (sent ? 'sent' : 'recv');
+  const ts = mirrorTs(ev);
+  maybeInsertDayDivider(box, ts);
+
+  const row = el('div', 'msg-row ' + (sent ? 'sent' : 'recv'));
+  // Header line: small source-platform badge + who + role/time (mockup 1g:
+  // a source logo on every bubble, not just the room header).
+  const meta = el('div', 'msg-meta');
+  const miniBadge = buildPlatBadge(MS.openRoomSourceId);
+  miniBadge.className += ' msg-badge-mini';
+  meta.appendChild(miniBadge);
+  meta.appendChild(el('span', 'msg-sender', sent ? (MS.openRoomUser || 'Teammate') : senderName));
+  meta.appendChild(el('span', 'msg-role-time', (sent ? 'teammate' : 'other party') + ' · ' + shortTime(ts)));
+  row.appendChild(meta);
+
+  let cls = 'msg';
   if (resolved.kind === 'media') cls += ' media';
   else if (resolved.kind === 'notice') cls += ' notice';
   const bubble = el('div', cls);
-  bubble.appendChild(el('div', 'who', sent ? (MS.openRoomUser || 'Teammate') : senderName));
   const bodyNode = el('div', 'body', resolved.text);
   bubble.appendChild(bodyNode);
-  bubble.appendChild(el('div', 'when', shortTime(mirrorTs(ev))));
-  box.appendChild(bubble);
+  row.appendChild(bubble);
+  box.appendChild(row);
   // v1.5: when this bubble carries a real re-uploaded master mxc, replace the
   // static label with the fetched media (falls back to the label on any error).
   if (resolved.kind === 'media' && resolved.mxc) loadMediaInto(bodyNode, resolved);
@@ -519,14 +583,19 @@ async function openRoom(roomId) {
   MS.openRoomId = roomId;
   const rec = MS.rooms[roomId];
   MS.openRoomUser = rec.userLabel || null;
+  MS.openRoomSourceId = rec.sourceId || null;
   MS.openMirrorOf = typeof rec.mirrorOf === 'string' ? rec.mirrorOf : null;
+  MS.lastDayKey = null;
   setupProposalComposer(rec);
   $('room-title').textContent = sanitizeLine(rec.name || roomId);
-  $('room-owner').textContent = rec.userLabel ? ('· ' + rec.userLabel) : '';
+  const owner = $('room-owner');
+  if (rec.userLabel) { owner.textContent = 'shared by ' + rec.userLabel; owner.classList.remove('hidden'); }
+  else { owner.textContent = ''; owner.classList.add('hidden'); }
   const badge = $('room-badge');
   const b = buildPlatBadge(rec.sourceId);
   badge.className = b.className;
   badge.textContent = b.textContent;
+  $('room-source-label').textContent = platformLabel(rec.sourceId);
   const box = $('room-messages');
   if (box) box.replaceChildren();
   roomStatus('');
@@ -583,7 +652,7 @@ async function startTail(roomId) {
     }
   }
 }
-function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openMirrorOf = null; }
+function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openRoomSourceId = null; MS.openMirrorOf = null; }
 
 // ===========================================================================
 // Compose-proposal — the ONE place the manager can write (PLAN §2 v2 / §7).
@@ -615,8 +684,17 @@ function setupProposalComposer(rec) {
   if (input) input.value = '';
   const tmpl = $('proposal-template');
   if (tmpl) tmpl.checked = false;
+  // Collapsed by default each time a room is opened (mockup 1g: a footer note
+  // + "Suggest a reply" button; the compose fields expand only on request).
+  const compose = $('proposal-compose');
+  if (compose) compose.classList.add('hidden');
   if (!ctx) { pane.classList.add('hidden'); return; }
   pane.classList.remove('hidden');
+  const note = $('proposal-note');
+  if (note) {
+    note.textContent = "You can't send in this conversation. A suggestion goes to "
+      + sanitizeLine(ctx.label) + "'s inbox as a draft — they decide whether to send it.";
+  }
   $('proposal-target-label').textContent = sanitizeLine(rec.name || ctx.target);
   loadTemplates(ctx.proposalsRoom).catch(() => {});
 }
@@ -708,7 +786,7 @@ function showSection(id) {
   for (const s of document.querySelectorAll('#content .view')) s.classList.toggle('hidden', s.id !== id);
 }
 function setActiveNav(key) {
-  for (const b of document.querySelectorAll('.navitem')) b.classList.toggle('active', b.dataset.navkey === key);
+  for (const b of document.querySelectorAll('.tab, .teammate-row')) b.classList.toggle('active', b.dataset.navkey === key);
 }
 function navTo(key) {
   MS.activeView = key;
@@ -828,8 +906,26 @@ document.addEventListener('DOMContentLoaded', () => {
   if (addBtn) addBtn.addEventListener('click', () => { addTeammate().catch(() => {}); });
   const addInput = $('addteam-user');
   if (addInput) addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addTeammate().catch(() => {}); } });
+  // Clipboard convenience only — reads nothing back, sends nothing anywhere;
+  // just copies the code text already shown on screen via textContent.
+  const copyBtn = $('addteam-copy');
+  if (copyBtn) copyBtn.addEventListener('click', () => {
+    const code = $('addteam-code');
+    const text = code ? code.textContent : '';
+    if (text && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+  });
   $('search-input').addEventListener('input', renderSearch);
   $('room-back').addEventListener('click', () => { stopTail(); navTo(MS.activeView === 'room' ? 'recent' : MS.activeView); });
+
+  // Expand/collapse the proposal compose fields (pure CSS class toggle — no
+  // write path here; the only write is submitProposal(), wired separately below).
+  const ptoggle = $('proposal-toggle');
+  if (ptoggle) ptoggle.addEventListener('click', () => {
+    const compose = $('proposal-compose');
+    if (compose) compose.classList.toggle('hidden');
+  });
 
   // Compose-proposal wiring (the one write path — a proposal, not a send).
   const psend = $('proposal-send');

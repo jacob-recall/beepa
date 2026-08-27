@@ -106,10 +106,12 @@ button:disabled { opacity: 0.5; cursor: default; }
 #modal { margin: auto; width: 380px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
 
 /* Home feed: unified recent conversations */
-.convo .plat-badge { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1; }
-.convo .plat-badge.whatsapp { background: #25d366; }
-.convo .plat-badge.imessage { background: #0a84ff; }
-.convo .plat-badge svg { width: 15px; height: 15px; display: block; }
+/* Platform logos are NOT permanently visible on conversation-list rows (they
+   used to render as solid green/blue blocks here). The real logo (shared/assets
+   via shared/style/beepa.css .plat-badge.<source>) appears ONLY in the expanded
+   contact accordion — when you click a person and see their per-app conversations. */
+.convo .plat-badge { display: none; }
+.contact-accordion .plat-badge { display: inline-flex; }
 .convo .when { flex: 0 0 auto; color: var(--muted); font-size: 12px; margin-left: 8px; white-space: nowrap; }
 .convo .meta .preview { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #home-list .convo { align-items: center; }

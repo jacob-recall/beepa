@@ -18,7 +18,8 @@ import { setConvoRowDecorator } from '../../shared/ui/rows.js';
 import { setSourceViewHook } from '../../shared/ui/search.js';
 import { setSharingViewHook } from '../../shared/ui/nav.js';
 import { SOURCES } from '../../shared/ui/sources.js';
-import { convosBySource } from '../../shared/state.js';
+import { convosBySource, feedModel } from '../../shared/state.js';
+import { feedHideRoom, feedUnhideRoom, feedIsHidden } from '../../shared/ui/account-data.js';
 
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.
@@ -144,6 +145,20 @@ function decorateRow(row, convo) {
   const badge = buildShareBadge(convo);
   menu.appendChild(badge);
   menu.appendChild(buildShareToggle(convo, badge));
+  // Hide/Unhide, in the same kebab — only for Home-feed rows, where hiding is
+  // meaningful (feedModel.has is true for every Home row). Uses the existing
+  // feed-hide account-data mechanism.
+  if (feedModel.has(convo.id)) {
+    const hideBtn = el('button', 'share-hide', feedIsHidden(convo.id) ? 'Unhide' : 'Hide');
+    hideBtn.type = 'button';
+    hideBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (feedIsHidden(convo.id)) await feedUnhideRoom(convo.id);
+      else await feedHideRoom(convo.id);
+      menu.classList.add('hidden');
+    });
+    menu.appendChild(hideBtn);
+  }
   const stop = (e) => e.stopPropagation();
   kebab.addEventListener('click', (e) => {
     e.stopPropagation();                               // don't open the conversation

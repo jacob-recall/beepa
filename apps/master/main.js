@@ -18,9 +18,15 @@
 //
 // NO composer, NO send call, anywhere in this file.
 
-import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE } from '../../shared/matrix/client.js';
+import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE, MXC_RE } from '../../shared/matrix/client.js';
 import { $, el, sanitize, sanitizeLine } from '../../shared/ui/el.js';
 import { S } from '../../shared/state.js';
+
+// The MASTER homeserver base (same origin the transport is pointed at below).
+// Authenticated media (Synapse default) cannot be fetched by a bare <img src>
+// — the token must ride in an Authorization header — so real media is fetched
+// as bytes with S.token and shown via an object URL (CSP allows img/media blob:).
+const MASTER_BASE = 'http://127.0.0.1:8018';
 
 // ---- point the shared transport at the MASTER homeserver, not the user hub's.
 // Own compose project (matrix-master), own port (127.0.0.1:8018), own
@@ -78,11 +84,55 @@ function resolveMirrorContent(ev) {
   if ((mt === 'm.text' || mt === 'm.notice') && typeof content.body === 'string') {
     return { text: sanitize(content.body), kind: mt === 'm.notice' ? 'notice' : 'text' };
   }
-  if (mt === 'm.image') return { text: '📷 Photo', kind: 'media' };
-  if (mt === 'm.video') return { text: '🎥 Video', kind: 'media' };
-  if (mt === 'm.audio') return { text: '🎵 Audio', kind: 'media' };
-  if (mt === 'm.file')  return { text: '📎 File',  kind: 'media' };
+  const MEDIA_LABEL = { 'm.image': '📷 Photo', 'm.video': '🎥 Video', 'm.audio': '🎵 Audio', 'm.file': '📎 File' };
+  if (mt in MEDIA_LABEL) {
+    // v1.5: render the real bytes when the uplink re-uploaded to the master
+    // media store (placeholder flag false/absent AND a valid master mxc). When
+    // the placeholder flag is set — or no valid mxc is present — keep the v1
+    // static label and never a filename. mxc is validated by the SHARED MXC_RE.
+    const placeholder = content['com.jkali.media_placeholder'] === true;
+    const url = typeof content.url === 'string' ? content.url : null;
+    if (!placeholder && url && MXC_RE.test(url)) {
+      return { text: MEDIA_LABEL[mt], kind: 'media', mt, mxc: url };
+    }
+    return { text: MEDIA_LABEL[mt], kind: 'media' };
+  }
   return null;
+}
+
+// Build the authenticated master media-download URL for a validated mxc. Returns
+// null for anything MXC_RE rejects (defense in depth — resolveMirrorContent
+// already validated, but never concatenate an unvalidated id into a URL).
+function mxcDownloadUrl(mxc) {
+  const m = MXC_RE.exec(mxc);
+  if (!m) return null;
+  return MASTER_BASE + '/_matrix/client/v1/media/download/'
+    + encodeURIComponent(m[1]) + '/' + encodeURIComponent(m[2]);
+}
+
+// Fetch the media bytes (Authorization: Bearer) and swap the label node for a
+// real media element via an object URL. On any failure the label stays — read
+// path only, no send. img/video/audio/anchor .src/.href take a blob: URL string
+// (not a Trusted-Types script sink); CSP grants img-src/media-src blob:.
+async function loadMediaInto(bodyNode, resolved) {
+  const url = mxcDownloadUrl(resolved.mxc);
+  if (!url) return;
+  try {
+    const res = await fetch(url, { headers: S.token ? { Authorization: 'Bearer ' + S.token } : {} });
+    if (!res.ok) return;
+    const obj = URL.createObjectURL(await res.blob());
+    let node;
+    if (resolved.mt === 'm.image') {
+      node = el('img', 'media-el'); node.src = obj; node.alt = resolved.text;
+    } else if (resolved.mt === 'm.video') {
+      node = el('video', 'media-el'); node.src = obj; node.controls = true;
+    } else if (resolved.mt === 'm.audio') {
+      node = el('audio', 'media-el'); node.src = obj; node.controls = true;
+    } else {
+      node = el('a', 'media-file', resolved.text); node.href = obj; node.download = '';
+    }
+    bodyNode.replaceChildren(node);
+  } catch (e) { /* keep the static label on any error */ }
 }
 
 // PLAN §8.2/§11: sort/display by com.jkali.origin_ts (the ORIGINAL message
@@ -322,9 +372,13 @@ function renderBubble(ev) {
   else if (resolved.kind === 'notice') cls += ' notice';
   const bubble = el('div', cls);
   bubble.appendChild(el('div', 'who', sent ? (MS.openRoomUser || 'Teammate') : senderName));
-  bubble.appendChild(el('div', 'body', resolved.text));
+  const bodyNode = el('div', 'body', resolved.text);
+  bubble.appendChild(bodyNode);
   bubble.appendChild(el('div', 'when', shortTime(mirrorTs(ev))));
   box.appendChild(bubble);
+  // v1.5: when this bubble carries a real re-uploaded master mxc, replace the
+  // static label with the fetched media (falls back to the label on any error).
+  if (resolved.kind === 'media' && resolved.mxc) loadMediaInto(bodyNode, resolved);
   while (box.childElementCount > 300) {               // bounded, drop oldest
     const first = box.firstElementChild;
     if (!first) break;

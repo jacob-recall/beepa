@@ -77,5 +77,10 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .msg.sent { align-self: flex-end; background: var(--accent); color: var(--accent-fg); border-bottom-right-radius: 4px; }
 .msg.sent .who, .msg.sent .when { color: rgba(255,255,255,0.75); }
 .msg.media .body { font-style: italic; opacity: 0.85; }
+/* v1.5: a bubble whose body was swapped for real re-uploaded media. */
+.msg.media .body:has(.media-el), .msg.media .body:has(.media-file) { font-style: normal; opacity: 1; }
+.media-el { display: block; max-width: 320px; max-height: 320px; border-radius: 8px; }
+audio.media-el { width: 260px; height: 40px; }
+.media-file { color: inherit; text-decoration: underline; }
 .msg.notice { align-self: center; background: transparent; border: none; color: var(--muted); font-size: 12.5px; max-width: 90%; text-align: center; }
 .convo-status { align-self: center; color: var(--danger); font-size: 12.5px; padding: 8px; }

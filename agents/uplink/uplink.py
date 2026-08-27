@@ -33,6 +33,7 @@ Config is via environment only (no config file, no secrets on argv):
 Optional:
   UPLINK_DB          state db path       (default: <this dir>/state.db)
   UPLINK_BACKFILL    backfill message cap (default: 500)
+  UPLINK_MEDIA_MAX   media re-upload byte cap (default: 26214400 = 25MB; over -> placeholder)
   UPLINK_SYNC_TIMEOUT  /sync long-poll ms (default: 30000)
   UPLINK_LOG_LEVEL   INFO|DEBUG           (default: INFO)
 
@@ -41,6 +42,7 @@ Python 3.9+ stdlib only (urllib + sqlite3). No pip dependencies.
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -78,6 +80,13 @@ FROM_ME_KEY = "com.jkali.from_me"
 ORIGIN_TS_KEY = "com.jkali.origin_ts"
 SOURCE_KEY = "com.jkali.source"
 ORIGIN_SENDER_KEY = "com.jkali.origin_sender"
+MEDIA_PLACEHOLDER_KEY = "com.jkali.media_placeholder"
+
+# Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
+MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
+MEDIA_MSGTYPES = ("m.image", "m.video", "m.audio", "m.file")
+MEDIA_LABELS = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.file": "File"}
+DEFAULT_MEDIA_MAX = 25 * 1024 * 1024        # 25 MB re-upload cap (§8.2, v1.5)
 
 log = logging.getLogger("uplink")
 
@@ -106,6 +115,8 @@ class Config:
         self.backfill = max(0, min(int(env.get("UPLINK_BACKFILL", "500")), 500))
         self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "30000"))
         self.log_level = env.get("UPLINK_LOG_LEVEL", "INFO")
+        # v1.5 media re-upload: skip (-> placeholder) anything above this many bytes.
+        self.media_max = max(0, int(env.get("UPLINK_MEDIA_MAX", str(DEFAULT_MEDIA_MAX))))
 
 
 # --------------------------------------------------------------------- matrix
@@ -436,6 +447,78 @@ class Uplink:
         except urllib.error.HTTPError:
             return sender
 
+    # -- media re-upload (v1.5) ---------------------------------------------
+    @staticmethod
+    def _http_bytes(base, token, method, path, query=None, data=None,
+                    content_type=None, timeout=180, max_bytes=None):
+        """A raw (non-JSON) client-server call for the media API.
+
+        Returns (body_bytes, response_content_type). When max_bytes is set and the
+        response body exceeds it, raises ValueError so the caller falls back to a
+        placeholder instead of buffering an oversized blob into memory.
+        """
+        url = base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        req = urllib.request.Request(url, method=method, data=data)
+        req.add_header("Authorization", "Bearer " + token)
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if max_bytes is not None:
+                body = r.read(max_bytes + 1)
+                if len(body) > max_bytes:
+                    raise ValueError("media body exceeds %d bytes" % max_bytes)
+            else:
+                body = r.read()
+            return body, r.headers.get("Content-Type")
+
+    def _reupload_media(self, content):
+        """Download the media in `content` from LOCAL, re-upload to MASTER.
+
+        Returns a NEW master mxc string on success, or None to signal the caller
+        to fall back to the v1 placeholder. Any failure (bad/missing/encrypted
+        mxc, over the size cap, download or upload error, or the master being
+        unreachable) returns None; on a true master outage the subsequent message
+        PUT will independently raise MasterUnreachable and roll the whole forward
+        back, so a placeholder is never durably committed in that case.
+        """
+        url = content.get("url")
+        if not isinstance(url, str):
+            return None                      # encrypted media carries `file`, not `url`
+        m = MXC_RE.match(url)
+        if not m:
+            return None
+        server, media_id = m.group(1), m.group(2)
+        info = content.get("info") if isinstance(content.get("info"), dict) else {}
+        declared = info.get("size")
+        if isinstance(declared, int) and declared > self.cfg.media_max:
+            return None                      # size guard by declared size: skip download
+        try:
+            dl_path = ("/_matrix/client/v1/media/download/"
+                       + urllib.parse.quote(server, safe="")
+                       + "/" + urllib.parse.quote(media_id, safe=""))
+            data, ctype = self._http_bytes(
+                self.cfg.local_hs, self.cfg.local_token, "GET", dl_path,
+                timeout=120, max_bytes=self.cfg.media_max)
+            if not data:
+                return None
+            up_ctype = (info.get("mimetype") if isinstance(info.get("mimetype"), str)
+                        else None) or ctype or "application/octet-stream"
+            filename = content.get("body") if isinstance(content.get("body"), str) else "file"
+            body, _ = self._http_bytes(
+                self.cfg.master_hs, self.cfg.master_token, "POST",
+                "/_matrix/media/v3/upload", query={"filename": filename},
+                data=data, content_type=up_ctype, timeout=180)
+            res = json.loads(body) if body else {}
+            new_uri = res.get("content_uri")
+            if isinstance(new_uri, str) and MXC_RE.match(new_uri):
+                return new_uri
+            return None
+        except Exception as e:                # noqa: BLE001 — any failure -> placeholder
+            log.warning("media re-upload failed (%s); falling back to placeholder", e)
+            return None
+
     def _forward_message(self, local_room_id, master_room_id, source, ev):
         content = dict(ev.get("content") or {})
         sender = ev.get("sender") or ""
@@ -452,13 +535,22 @@ class Uplink:
         content[ORIGIN_TS_KEY] = ev.get("origin_server_ts")
         content[SOURCE_KEY] = source or "unknown"
         content[ORIGIN_SENDER_KEY] = self._display_name(local_room_id, sender)
-        # Media placeholder (v1): never leak a filename/mxc; show a label.
+        # Media (v1.5): re-upload the blob from LOCAL to the MASTER media store and
+        # post the NEW master mxc + preserved info/filename metadata. On ANY failure
+        # (bad/encrypted mxc, over UPLINK_MEDIA_MAX, download/upload error) fall back
+        # to the v1 placeholder — never drop or block the message.
         mt = content.get("msgtype")
-        if mt in ("m.image", "m.video", "m.audio", "m.file"):
-            label = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.file": "File"}[mt]
-            content = {k: v for k, v in content.items() if k not in ("url", "file", "info")}
-            content["body"] = label
-            content["com.jkali.media_placeholder"] = True
+        if mt in MEDIA_MSGTYPES:
+            new_uri = self._reupload_media(content)
+            if new_uri:
+                content["url"] = new_uri            # swap local mxc -> master mxc
+                content.pop("file", None)           # never carry a local encrypted ref
+                content[MEDIA_PLACEHOLDER_KEY] = False
+                # body / info / filename preserved as-is (metadata the renderer reads).
+            else:
+                content = {k: v for k, v in content.items() if k not in ("url", "file", "info")}
+                content["body"] = MEDIA_LABELS[mt]
+                content[MEDIA_PLACEHOLDER_KEY] = True
         txn = urllib.parse.quote(ev.get("event_id"), safe="")
         res = self.master("PUT", "/_matrix/client/v3/rooms/"
                           + urllib.parse.quote(master_room_id, safe="")

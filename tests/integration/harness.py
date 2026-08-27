@@ -26,6 +26,7 @@ Pure python3 stdlib. Run:  python3 tests/integration/harness.py
 Requires the two stacks up (see the module docstring of the compose file and
 master/docker-compose.master.yml). Prints a JSON summary of all scenarios.
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -192,6 +193,44 @@ def post_msg(token, room_id, body):
     return r["event_id"]
 
 
+# ------------------------------------------------------------------ media (v1.5)
+# A real 1x1 PNG (~68 bytes). Uploaded to the TEST hub, posted as an m.image
+# event, and expected to be re-uploaded verbatim to the MASTER media store.
+TINY_PNG = base64.b64decode(
+    b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
+def upload_media(base, token, data, content_type, filename):
+    """Upload raw bytes to a homeserver's media store; return the mxc URI."""
+    url = base + "/_matrix/media/v3/upload?filename=" + urllib.parse.quote(filename)
+    req = urllib.request.Request(url, method="POST", data=data)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", content_type)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())["content_uri"]
+
+
+def download_media(base, token, mxc):
+    """Fetch bytes for an mxc via the authenticated client-v1 media endpoint."""
+    m = re.match(r"^mxc://([^/]+)/(.+)$", mxc)
+    server, mid = m.group(1), m.group(2)
+    url = (base + "/_matrix/client/v1/media/download/"
+           + urllib.parse.quote(server, safe="") + "/" + urllib.parse.quote(mid, safe=""))
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def post_media_event(token, room_id, content):
+    """PUT an m.room.message with a caller-supplied media content dict."""
+    tx = uniq("mm")
+    r = local(token, "PUT",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+              + "/send/m.room.message/" + tx, content)
+    return r["event_id"]
+
+
 def set_policy(token, user_id, policy):
     local(token, "PUT",
           "/_matrix/client/v3/user/" + urllib.parse.quote(user_id, safe="")
@@ -305,6 +344,9 @@ def master_messages(room_id, token=MASTER_ALICE_TOKEN):
             "origin_ts": c.get("com.jkali.origin_ts"),
             "source": c.get("com.jkali.source"),
             "origin_sender": c.get("com.jkali.origin_sender"),
+            "msgtype": c.get("msgtype"),               # v1.5 media assertions
+            "url": c.get("url"),
+            "media_placeholder": c.get("com.jkali.media_placeholder"),
             "redacted": redacted,
         })
     out.sort(key=lambda m: (m["origin_ts"] if m["origin_ts"] is not None else 0))
@@ -874,6 +916,118 @@ def scenario_8_cross_user_isolation():
     return ok, "; ".join(ev)
 
 
+def ensure_media_writable():
+    """Make both homeservers' media stores writable by the Synapse user.
+
+    The test + master stacks mount media_store as a NAMED volume, created
+    root-owned, while Synapse runs as UID 501 (compose UID/GID env) — so the
+    first upload 500s with PermissionError on /data/media_store/local_content.
+    The non-media scenarios never upload, so this only surfaces for v1.5. A
+    throwaway-test-appropriate, idempotent chmod unblocks it without recreating
+    the always-on containers (survives restarts; only a `down -v` resets it)."""
+    for container in ("matrix-synctest-synapse-1", "matrix-master-synapse-1"):
+        try:
+            docker(["exec", "-u", "0", container, "chmod", "0777", "/data/media_store"],
+                   check=False)
+        except Exception:
+            pass
+
+
+def scenario_9_media_reupload():
+    """v1.5 media re-upload. Post a REAL image event to a shared room; the uplink
+    must download it from LOCAL and re-upload it to the MASTER media store, posting
+    the NEW master mxc (metadata preserved, com.jkali.media_placeholder false). A
+    forced download failure (unresolvable mxc) and the size guard (tiny
+    UPLINK_MEDIA_MAX) must each fall back to the v1 placeholder instead."""
+    ensure_media_writable()
+    e = fresh_env("s9")
+    imsg_space = create_space(e["tuser_tok"], "iMessage")
+    rid = make_convo(e, imsg_space, "Media Chat")
+    post_msg(e["contact_tok"], rid, "check this photo")            # a text msg too
+    # (a) a real image on the LOCAL hub, posted as m.image "from me".
+    local_mxc = upload_media(TEST_HS, e["tuser_tok"], TINY_PNG, "image/png", "tiny.png")
+    post_media_event(e["tuser_tok"], rid, {
+        "msgtype": "m.image", "body": "tiny.png", "url": local_mxc,
+        "info": {"mimetype": "image/png", "size": len(TINY_PNG), "w": 1, "h": 1},
+    })
+    # (b) forced-failure: an m.image whose mxc does not resolve on LOCAL -> the
+    # download 404s -> the uplink must fall back to the placeholder (url stripped).
+    bogus_mxc = "mxc://localhost/" + uniq("ghost")
+    post_media_event(e["contact_tok"], rid, {
+        "msgtype": "m.image", "body": "ghost.png", "url": bogus_mxc,
+        "info": {"mimetype": "image/png", "size": 321},
+    })
+    set_override(e["tuser_tok"], e["tuser_id"], rid, "share")
+
+    proc = start_uplink(e)
+    try:
+        row = wait_until(lambda: mirror_of(e["db_path"], rid), timeout=45, desc="s9 mirror")
+        master_room = row[0]
+        imgs = wait_until(
+            lambda: (lambda i: i if len(i) >= 2 else None)(
+                [m for m in master_messages(master_room) if m.get("msgtype") == "m.image"]),
+            timeout=60, desc="s9 media mirrored")
+    finally:
+        stop_uplink(proc)
+
+    ev = []
+    ok = True
+    real = [m for m in imgs if m.get("media_placeholder") is not True and m.get("url")]
+    placeholder = [m for m in imgs if m.get("media_placeholder") is True]
+
+    # 1. real image re-uploaded to a NEW master mxc (different from the local one).
+    new_mxc = real[0]["url"] if real else None
+    new_ok = bool(new_mxc and new_mxc.startswith("mxc://master/") and new_mxc != local_mxc)
+    ok = ok and new_ok
+    ev.append("new_master_mxc=%s local=%s different=%s" % (new_mxc, local_mxc, new_ok))
+
+    # 2. bytes retrievable from the MASTER media API and byte-identical to the source.
+    got = b""
+    bytes_ok = False
+    if new_mxc:
+        try:
+            got = download_media(MASTER_HS, MASTER_ALICE_TOKEN, new_mxc)
+            bytes_ok = (got == TINY_PNG)
+        except Exception as ex:
+            ev.append("download_exc=%r" % ex)
+    ok = ok and bytes_ok
+    ev.append("bytes_retrievable=%s len=%d/%d" % (bytes_ok, len(got), len(TINY_PNG)))
+
+    # 3. forced-failure (unresolvable mxc) fell back to placeholder, url stripped.
+    ph_ok = len(placeholder) >= 1 and all(not p.get("url") for p in placeholder)
+    ok = ok and ph_ok
+    ev.append("forced_failure_placeholder=%s n=%d" % (ph_ok, len(placeholder)))
+    ev.append("real_placeholder_flag=%s" % (real[0].get("media_placeholder") if real else None))
+
+    # 4. size guard: a fresh room, tiny UPLINK_MEDIA_MAX -> the same real image
+    #    is placeholdered (re-upload skipped above the cap).
+    e2 = fresh_env("s9b")
+    sp2 = create_space(e2["tuser_tok"], "iMessage")
+    rid2 = make_convo(e2, sp2, "Media Guard")
+    mxc2 = upload_media(TEST_HS, e2["tuser_tok"], TINY_PNG, "image/png", "tiny.png")
+    post_media_event(e2["tuser_tok"], rid2, {
+        "msgtype": "m.image", "body": "tiny.png", "url": mxc2,
+        "info": {"mimetype": "image/png", "size": len(TINY_PNG)},
+    })
+    set_override(e2["tuser_tok"], e2["tuser_id"], rid2, "share")
+    proc2 = start_uplink(e2, extra_env={"UPLINK_MEDIA_MAX": "8"})
+    try:
+        row2 = wait_until(lambda: mirror_of(e2["db_path"], rid2), timeout=45, desc="s9b mirror")
+        mroom2 = row2[0]
+        guard = wait_until(
+            lambda: (lambda i: i if i else None)(
+                [m for m in master_messages(mroom2) if m.get("msgtype") == "m.image"]),
+            timeout=60, desc="s9b media mirrored")
+    finally:
+        stop_uplink(proc2)
+    guard_ok = len(guard) >= 1 and all(
+        g.get("media_placeholder") is True and not g.get("url") for g in guard)
+    ok = ok and guard_ok
+    ev.append("size_guard_placeholder=%s" % guard_ok)
+    ev.append("master_room=%s" % master_room)
+    return ok, "; ".join(ev)
+
+
 # ------------------------------------------------------------------ docker helpers
 def docker(args, check=True):
     env = dict(os.environ)
@@ -914,6 +1068,7 @@ SCENARIOS = [
     ("6_revoke_each_level", scenario_6_revoke_levels),
     ("7_read_only_manager", scenario_7_read_only),
     ("8_cross_user_isolation", scenario_8_cross_user_isolation),
+    ("9_media_reupload", scenario_9_media_reupload),
 ]
 
 

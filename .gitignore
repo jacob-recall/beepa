@@ -26,3 +26,8 @@ master/synapse/
 master/tokens.local
 master/.env
 master/.provision-state.local
+master/enrollments.local
+
+# Uplink enrollment credentials written on the teammate side — never commit
+uplink.env.local
+*.uplink.env.local

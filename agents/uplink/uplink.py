@@ -312,8 +312,23 @@ class Uplink:
                     name = (e.get("content") or {}).get("name")
                 elif t == "m.space.child" and (e.get("content") or {}).get("via"):
                     children.append(e.get("state_key"))
-            if name in SOURCE_LABEL_TO_ID:
-                space_source[rid] = SOURCE_LABEL_TO_ID[name]
+            # Prefix match to mirror shared/ui/sources.js (buildConvos uses
+            # name.startsWith(spaceName)): real bridge spaces are named e.g.
+            # "WhatsApp (+1...)" / "Google Messages (email)", not the bare label.
+            # "X" is a whole-name label, so it is matched exactly (a prefix of
+            # "X" would swallow arbitrary chat names).
+            sid = None
+            if name:
+                for label, _sid in SOURCE_LABEL_TO_ID.items():
+                    if label == "X":
+                        if name == "X":
+                            sid = _sid
+                            break
+                    elif name.startswith(label):
+                        sid = _sid
+                        break
+            if sid:
+                space_source[rid] = sid
                 for c in children:
                     child_of[c] = rid
         out = {}

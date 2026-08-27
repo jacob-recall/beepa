@@ -135,6 +135,26 @@ services:
       - no-new-privileges:true
     profiles: ["client"]
 
+  views:
+    # Serves the new single-source-of-truth apps: apps/user (points at the live
+    # hub 8008) and apps/master (points at the master 8018). shared/ is mounted
+    # so the ES-module imports (../../shared) resolve. CSP is carried in each
+    # app's index.html <meta>. hub/site (the current daily driver) is unaffected.
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    volumes:
+      - ./apps:/usr/share/nginx/html/apps:ro
+      - ./shared:/usr/share/nginx/html/shared:ro
+    ports:
+      - "127.0.0.1:8011:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["client"]
+
   element:
     image: vectorim/element-web:v1.12.26@sha256:a9be04cef41ed94cba0dcaeca5a81f89826d4f8be3d57ba5a6fa988f34eda703
     restart: unless-stopped

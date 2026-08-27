@@ -112,7 +112,10 @@ python3 tests/unit/uplink_reconcile.test.py
 # 1. matrix-master, provisioned (see master/CLAUDE.md):
 docker compose -p matrix-master --env-file master/.env \
   -f master/docker-compose.master.yml up -d
-master/provision.sh
+# the harness needs TWO teammate slots (scenario 8 = cross-user isolation),
+# so provision with the alice/bob test roster (default roster is the real
+# single user "jkali"):
+TEAMMATES="alice bob" master/provision.sh
 # 2. the throwaway test-user hub:
 docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml up -d
 

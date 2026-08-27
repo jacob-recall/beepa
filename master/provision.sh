@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # master/provision.sh — idempotent provisioning of the matrix-master homeserver.
 #
-# Creates @manager:master, @alice:master, @bob:master (server-side, via the
+# Creates @manager:master plus one account PER TEAMMATE (server-side, via the
 # registration shared secret); logs each in for an access token; creates one
-# Matrix SPACE per teammate owned by that teammate with @manager invited at a
-# read-only power level (events_default 50, teammate PL 100, manager PL 0).
+# Matrix SPACE per teammate ("space:<user>", which apps/master strips to the
+# display label) owned by that teammate with @manager invited at a read-only
+# power level (events_default 50, teammate PL 100, manager PL 0).
 #
-# Re-running is safe: existing accounts are skipped, tokens are refreshed, and
-# spaces already recorded (and still joined) are not recreated.
+# The teammate roster is the real people who sync to this master — set via the
+# TEAMMATES env var (space-separated usernames), default "jkali". The
+# integration harness, which needs two isolated teammates for the cross-user
+# isolation scenario, runs this with TEAMMATES="alice bob".
+#
+# Re-running is safe: existing accounts are skipped, tokens refreshed, and a
+# space already recorded (and still joined) is not recreated.
 #
 # Outputs:
-#   master/tokens.local   access tokens as shell-sourceable vars (mode 600)
-#   master/.provision-state.local  recorded space room ids (mode 600)
-#
-# Prereqs: the stack is up and Synapse healthy. See docker-compose.master.yml.
+#   master/tokens.local            access tokens as shell-sourceable vars (600)
+#   master/.provision-state.local  passwords + space room ids (600)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +31,9 @@ STATE_FILE="${HERE}/.provision-state.local"
 SERVER="master"
 
 MANAGER_LP="manager"
-declare -a TEAMMATES=("alice" "bob")
+# Real teammate roster (space-separated usernames). Default: the single real
+# user. Tests override with TEAMMATES="alice bob".
+read -r -a TEAMMATES <<< "${TEAMMATES:-jkali}"
 
 umask 077
 touch "${STATE_FILE}"; chmod 600 "${STATE_FILE}"
@@ -35,35 +41,18 @@ touch "${STATE_FILE}"; chmod 600 "${STATE_FILE}"
 log() { printf '[provision] %s\n' "$*" >&2; }
 fail() { printf '[provision] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# --- passwords: read from env if present, else generate + persist to state ---
-# We persist generated account passwords in the (600) state file so re-runs can
-# log in again without resetting them.
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
+
+# --- passwords: read persisted values (if any), else generate ---
 # shellcheck disable=SC1090
 [ -s "${STATE_FILE}" ] && source "${STATE_FILE}" || true
-
 gen_pw() { python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))'; }
 
-persist_state() {
-  # rewrite the state file from current shell vars
-  {
-    echo "# matrix-master provisioning state (mode 600, gitignored). Do NOT commit."
-    echo "MANAGER_PW='${MANAGER_PW}'"
-    echo "ALICE_PW='${ALICE_PW}'"
-    echo "BOB_PW='${BOB_PW}'"
-    [ -n "${SPACE_ALICE:-}" ] && echo "SPACE_ALICE='${SPACE_ALICE}'"
-    [ -n "${SPACE_BOB:-}"   ] && echo "SPACE_BOB='${SPACE_BOB}'"
-  } > "${STATE_FILE}"
-  chmod 600 "${STATE_FILE}"
-}
-
 # The manager is the human-facing master login; default it to the simple
-# 'password' (overridable via env) so the operator can sign in easily. The
-# alice/bob teammate slots stay randomly generated.
+# 'password' (overridable via env). Teammate slots (the uplink authenticates as
+# them with a token, no human login) get random passwords, persisted so re-runs
+# don't reset them.
 MANAGER_PW="${MANAGER_PW:-password}"
-ALICE_PW="${ALICE_PW:-$(gen_pw)}"
-BOB_PW="${BOB_PW:-$(gen_pw)}"
-
-pw_for() { case "$1" in manager) echo "${MANAGER_PW}";; alice) echo "${ALICE_PW}";; bob) echo "${BOB_PW}";; esac; }
 
 # --- wait for Synapse health ---
 log "waiting for Synapse CS API at ${CS_BASE} ..."
@@ -75,9 +64,8 @@ done
 
 # --- create an account (idempotent) via register_new_matrix_user ---
 register() {
-  local user="$1" pass="$2"
+  local user="$1" pass="$2" out
   log "registering @${user}:${SERVER} (skip if exists)"
-  local out
   if out=$("${COMPOSE[@]}" exec -T synapse \
         register_new_matrix_user -c "${HS_YAML}" \
         -u "${user}" -p "${pass}" --no-admin http://localhost:8008 2>&1); then
@@ -103,7 +91,7 @@ login_token() {
   printf '%s' "${token}"
 }
 
-# --- does a room still exist and have the teammate joined? (idempotency check) ---
+# --- does a recorded room still exist with the teammate joined? ---
 space_valid() {
   local token="$1" room="$2" code
   [ -z "${room}" ] && return 1
@@ -113,12 +101,11 @@ space_valid() {
   [ "${code}" = "200" ]
 }
 
-# --- create a teammate space owned by the teammate, manager invited read-only ---
+# --- create a "space:<user>" owned by the teammate, manager invited read-only --
 create_space() {
   local user="$1" token="$2" resp room
   resp=$(curl -fsS -XPOST "${CS_BASE}/_matrix/client/v3/createRoom" \
-    -H "Authorization: Bearer ${token}" \
-    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
     -d "$(cat <<JSON
 {
   "name": "space:${user}",
@@ -127,17 +114,9 @@ create_space() {
   "creation_content": { "type": "m.space" },
   "invite": ["@${MANAGER_LP}:${SERVER}"],
   "power_level_content_override": {
-    "events_default": 50,
-    "state_default": 50,
-    "invite": 50,
-    "kick": 50,
-    "ban": 50,
-    "redact": 50,
-    "users_default": 0,
-    "users": {
-      "@${user}:${SERVER}": 100,
-      "@${MANAGER_LP}:${SERVER}": 0
-    }
+    "events_default": 50, "state_default": 50, "invite": 50,
+    "kick": 50, "ban": 50, "redact": 50, "users_default": 0,
+    "users": { "@${user}:${SERVER}": 100, "@${MANAGER_LP}:${SERVER}": 0 }
   }
 }
 JSON
@@ -148,28 +127,40 @@ JSON
 }
 
 # =========================== run ===========================
-# bash 3.2 (macOS default) has no associative arrays — use plain vars.
 register "${MANAGER_LP}" "${MANAGER_PW}"
 MANAGER_TOKEN=$(login_token "${MANAGER_LP}" "${MANAGER_PW}")
 
-register "alice" "${ALICE_PW}"
-ALICE_TOKEN=$(login_token "alice" "${ALICE_PW}")
-register "bob" "${BOB_PW}"
-BOB_TOKEN=$(login_token "bob" "${BOB_PW}")
-persist_state   # save passwords now that accounts exist
+# Per-teammate: password (persisted), account, token, space. bash 3.2 has no
+# associative arrays, so dynamic var names go through eval (values are our own
+# generated tokens/ids, never external input).
+for t in "${TEAMMATES[@]}"; do
+  U=$(upper "$t")
+  eval "pw=\${PW_${U}:-}"
+  [ -z "${pw}" ] && { pw=$(gen_pw); eval "PW_${U}=\${pw}"; }
+  register "$t" "${pw}"
+  tok=$(login_token "$t" "${pw}")
+  eval "TOKEN_${U}=\${tok}"
+  eval "sp=\${SPACE_${U}:-}"
+  if space_valid "${tok}" "${sp}"; then
+    log "space:${t} already exists (${sp}) — skipping"
+  else
+    sp=$(create_space "$t" "${tok}"); log "created space:${t} = ${sp}"
+    eval "SPACE_${U}=\${sp}"
+  fi
+done
 
-# spaces (idempotent: reuse a recorded room the teammate is still in)
-if space_valid "${ALICE_TOKEN}" "${SPACE_ALICE:-}"; then
-  log "space:alice already exists (${SPACE_ALICE}) — skipping"
-else
-  SPACE_ALICE=$(create_space "alice" "${ALICE_TOKEN}"); log "created space:alice = ${SPACE_ALICE}"
-fi
-if space_valid "${BOB_TOKEN}" "${SPACE_BOB:-}"; then
-  log "space:bob already exists (${SPACE_BOB}) — skipping"
-else
-  SPACE_BOB=$(create_space "bob" "${BOB_TOKEN}"); log "created space:bob = ${SPACE_BOB}"
-fi
-persist_state   # save space ids
+# --- persist state (600): manager pw + each teammate pw + space id ---
+{
+  echo "# matrix-master provisioning state (mode 600, gitignored). Do NOT commit."
+  echo "MANAGER_PW='${MANAGER_PW}'"
+  echo "TEAMMATES='${TEAMMATES[*]}'"
+  for t in "${TEAMMATES[@]}"; do
+    U=$(upper "$t"); eval "pw=\${PW_${U}}"; eval "sp=\${SPACE_${U}:-}"
+    echo "PW_${U}='${pw}'"
+    [ -n "${sp}" ] && echo "SPACE_${U}='${sp}'"
+  done
+} > "${STATE_FILE}"
+chmod 600 "${STATE_FILE}"
 
 # --- write sourceable tokens file (600) ---
 {
@@ -178,14 +169,20 @@ persist_state   # save space ids
   echo "MASTER_CS_BASE='${CS_BASE}'"
   echo "MASTER_MANAGER_USER='@${MANAGER_LP}:${SERVER}'"
   echo "MASTER_MANAGER_TOKEN='${MANAGER_TOKEN}'"
-  echo "MASTER_ALICE_USER='@alice:${SERVER}'"
-  echo "MASTER_ALICE_TOKEN='${ALICE_TOKEN}'"
-  echo "MASTER_BOB_USER='@bob:${SERVER}'"
-  echo "MASTER_BOB_TOKEN='${BOB_TOKEN}'"
-  echo "MASTER_SPACE_ALICE='${SPACE_ALICE:-}'"
-  echo "MASTER_SPACE_BOB='${SPACE_BOB:-}'"
+  echo "MASTER_TEAMMATES='${TEAMMATES[*]}'"
+  for t in "${TEAMMATES[@]}"; do
+    U=$(upper "$t"); eval "tok=\${TOKEN_${U}}"; eval "sp=\${SPACE_${U}:-}"
+    echo "MASTER_${U}_USER='@${t}:${SERVER}'"
+    echo "MASTER_${U}_TOKEN='${tok}'"
+    echo "MASTER_SPACE_${U}='${sp}'"
+  done
+  # Convenience aliases for the FIRST teammate (the default single-user slot),
+  # so callers can source stable MASTER_TEAMMATE_* without knowing the name.
+  FT=$(upper "${TEAMMATES[0]}"); eval "ftok=\${TOKEN_${FT}}"; eval "fsp=\${SPACE_${FT}:-}"
+  echo "MASTER_TEAMMATE_USER='@${TEAMMATES[0]}:${SERVER}'"
+  echo "MASTER_TEAMMATE_TOKEN='${ftok}'"
+  echo "MASTER_SPACE_TEAMMATE='${fsp}'"
 } > "${TOKENS_FILE}"
 chmod 600 "${TOKENS_FILE}"
 log "wrote ${TOKENS_FILE} (mode 600)"
-
-log "done."
+log "done. teammates: ${TEAMMATES[*]}"

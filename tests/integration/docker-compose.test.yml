@@ -1,0 +1,56 @@
+# ISOLATED throwaway TEST-USER homeserver stack.
+#
+# Models ONE teammate's LOCAL hub (server_name: localhost) for the uplink
+# one-way-sync integration suite. FULLY SEPARATE from the live matrix-wa stack
+# AND from the matrix-master stack — never merge or point tooling at matrix-wa:
+#   * compose project name:  matrix-synctest
+#   * own Postgres (NO host port — reachable only on this project's network)
+#   * own named volumes (synctest-postgres-data, synctest-synapse-media)
+#   * Synapse CS API on host 127.0.0.1:8028 only
+#       (matrix-wa: 8008/8009/8010, matrix-master: 8018)
+#
+# Bring up:  docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml up -d
+# Tear down (destructive): docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml down -v
+name: matrix-synctest
+
+services:
+  postgres:
+    image: postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: synctest_pg_pw_do_not_use_in_prod
+      POSTGRES_DB: synapse
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - synctest-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix -d synapse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host ports: reachable only on the matrix-synctest network.
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb
+    restart: unless-stopped
+    environment:
+      UID: "501"
+      GID: "20"
+    volumes:
+      - ./synapse:/data
+      - synctest-synapse-media:/data/media_store
+    ports:
+      - "127.0.0.1:8028:8008"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8008/health').status==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  synctest-postgres-data:
+  synctest-synapse-media:

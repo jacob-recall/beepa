@@ -5,22 +5,11 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018 http://127.0.0.1:8019; img-src 'self' blob:; media-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa Console</title>
-<link rel="stylesheet" href="../../shared/style/organic.css">
-<link rel="stylesheet" href="style.css">
-<link rel="stylesheet" href="../../shared/style/beepa.css">
+<link rel="stylesheet" href="../../shared/style/organic.css?v=wa4">
+<link rel="stylesheet" href="style.css?v=wa4">
+<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa4">
 </head>
 <body>
-<!--
-  Read-only manager console (PLAN-MASTER-SYNC.md §6.4). This is a SEPARATE
-  build from apps/user/: it signs into the MASTER homeserver only, and there
-  is no composer anywhere in this file or in main.js — read-only is enforced
-  by the absence of send code, not by hiding a button. Do not add an input/
-  button that calls PUT .../send/m.room.message here.
-
-  Layout follows the "Beepa Artboards" mockups (screens 1f/1g/1i): a dark
-  top bar with the wordmark + READ-ONLY badge + view tabs + a live dot, a
-  teammates rail on the left, and per-view content on the right.
--->
 <section id="view-signin">
   <div class="signin-card">
     <div class="brand-word">beepa</div>
@@ -33,164 +22,106 @@
       <input id="in-pass" class="input" type="password" autocomplete="current-password">
       <button id="btn-signin" type="button" class="btn btn-primary btn-block">Sign in</button>
       <p id="signin-error" class="error hidden"></p>
-      <p class="signin-disclaimer">This console can read shared conversations and suggest replies. It cannot send messages.</p>
+      <p class="signin-disclaimer">Read shared conversations and suggest replies. Cannot send messages.</p>
     </div>
   </div>
 </section>
 
 <div id="shell" class="hidden">
-  <header id="topbar">
-    <div id="brand">beepa</div>
-    <span class="tag-readonly tag-readonly-bar">READ-ONLY CONSOLE</span>
-    <nav id="nav-tools" aria-label="Views">
-      <button id="nav-recent" class="tab" type="button">Feed</button>
-      <span id="nav-teammates-tab" class="tab tab-static">Teammates</span>
-      <button id="nav-search" class="tab" type="button">Search</button>
-      <button id="nav-addteam" class="tab" type="button">Enrollment</button>
+  <aside id="sidebar" class="icon-rail" aria-label="App">
+    <div id="brand" class="rail-brand" title="Beepa Console">b</div>
+    <nav id="nav-primary" aria-label="Main">
+      <button id="nav-recent" class="navitem nav-icon" type="button" title="Feed" aria-label="Feed"><span class="ic">&#127968;</span></button>
+      <button id="nav-search" class="navitem nav-icon" type="button" title="Search" aria-label="Search"><span class="ic">&#128269;</span></button>
+      <button id="nav-teammates-toggle" class="navitem nav-icon" type="button" title="Teammates" aria-label="Teammates" aria-expanded="false"><span class="ic">&#128101;</span></button>
     </nav>
     <div class="spacer"></div>
-    <div class="live-indicator" title="Refreshing every 20s"><span class="live-dot"></span>live</div>
-  </header>
+    <div class="live-indicator sidebar-live" title="Refreshing every 20s"><span class="live-dot"></span></div>
+    <button id="nav-settings-toggle" class="navitem nav-icon" type="button" title="Settings" aria-label="Settings" aria-expanded="false"><span class="ic">&#9881;</span></button>
+  </aside>
 
-  <div id="body-row">
-    <aside id="sidebar">
-      <div id="teammates-label">Teammates</div>
-      <nav id="nav-teammates" aria-label="Teammates"><!-- one row per teammate space, injected --></nav>
-      <div class="spacer"></div>
-      <div id="account">
-        <span id="whoami"></span>
-        <button id="signout" type="button">Sign out</button>
-      </div>
-    </aside>
+  <nav id="teammates-popover" class="settings-popover teammates-popover hidden" aria-label="Teammates"></nav>
 
-    <main id="content">
-      <!-- Cross-user recent feed: every mirror room, all teammates, sorted by
-           com.jkali.origin_ts descending (PLAN-MASTER-SYNC §6.4 bullet 1). -->
-      <section id="view-recent" class="view hidden">
-        <header class="view-head feed-head">
-          <h1>Recent activity</h1>
-          <p class="muted" id="recent-sub"></p>
-        </header>
-        <div id="recent-list" class="convo-list"></div>
-      </section>
-
-      <!-- Per-teammate grouping: one section per teammate space, reusing the
-           per-source view pattern but grouped by user (§6.4 bullet 2). -->
-      <section id="view-teammate" class="view hidden">
-        <header class="view-head">
-          <h2 id="teammate-title">Teammate</h2>
-          <p class="muted" id="teammate-sub"></p>
-        </header>
-        <div id="teammate-list" class="convo-list"></div>
-      </section>
-
-      <!-- Search across everyone (§6.4 bullet 3). Pure client-side filter over
-           the in-memory flattened feed; never builds a URL or sends anything. -->
-      <section id="view-search" class="view hidden">
-        <header class="view-head">
-          <h2>Search</h2>
-          <p class="muted">Search conversation names and previews across every teammate.</p>
-          <input id="search-input" class="input" placeholder="Search everyone" spellcheck="false" autocomplete="off">
-        </header>
-        <div id="search-results" class="convo-list"></div>
-      </section>
-
-      <!-- Add / link a teammate (manager-only, separate installs). The Add
-           button POSTs {username} to the master enroll service's manager-
-           authenticated /admin/add-teammate with the signed-in manager's master
-           token; the service verifies the caller is @manager:master before
-           provisioning the account + read-only space and minting a one-time
-           enrollment code. This is an admin provisioning call, NOT a Matrix send
-           path and NOT a proposal — it never posts m.room.message anywhere. The
-           returned code + redeem command are shown via textContent only. -->
-      <section id="view-addteam" class="view hidden">
-        <header class="view-head">
-          <p class="card-kicker">Manager · add teammate</p>
-          <h2>Enrollment code</h2>
-          <p class="muted">Create a new teammate slot on the master and get a one-time enrollment code they run on their own install to link their hub.</p>
-        </header>
-        <div class="card narrow addteam-card">
-          <label for="addteam-user">Teammate username</label>
-          <input id="addteam-user" class="input" autocomplete="off" spellcheck="false" placeholder="e.g. alex">
-          <button id="addteam-btn" type="button" class="btn btn-primary btn-block">Add teammate</button>
-          <p id="addteam-error" class="error hidden"></p>
-          <div id="addteam-result" class="hidden">
-            <p class="muted">Provisioned <span id="addteam-user-out"></span>. Give this teammate their one-time enrollment code (expires shortly):</p>
-            <div class="code-display">
-              <div id="addteam-code" class="code-value"></div>
-              <div class="code-actions">
-                <button id="addteam-copy" type="button" class="btn btn-secondary">Copy code</button>
-              </div>
-            </div>
-            <label>They run this on their own install:</label>
-            <code id="addteam-cmd" class="addteam-cmd"></code>
-          </div>
-        </div>
-      </section>
-
-      <!-- Read-only conversation viewer. No input, no send button — this
-           element tree has no composer node at all. -->
-      <section id="view-room" class="view hidden">
-        <div id="room-pane">
-          <header id="room-head">
-            <button id="room-back" type="button" title="Back">&#8592;</button>
-            <div id="room-heading">
-              <div class="room-title-row">
-                <span id="room-title"></span>
-                <span id="room-owner" class="tag tag-neutral hidden"></span>
-              </div>
-              <div class="room-sub-row">
-                <span id="room-badge" class="plat-badge"></span>
-                <span id="room-source-label" class="muted"></span>
-              </div>
-            </div>
-            <div class="spacer"></div>
-            <div class="live-indicator live-indicator-room" title="Watching for new messages"><span class="live-dot"></span>Live</div>
-          </header>
-          <div id="room-messages"></div>
-          <div id="room-status" class="convo-status hidden"></div>
-          <!--
-            Compose-PROPOSAL panel (PLAN-MASTER-SYNC §2 v2 / §7). This is NOT a
-            composer that sends a message: submitting writes a single
-            com.jkali.proposal event into this teammate's dedicated proposals room
-            (marked com.jkali.proposals) for the teammate to review and send
-            themselves. There is NO m.room.message send path anywhere in this app,
-            and this panel never writes into a mirror/conversation room or reaches
-            a bridge. Hidden unless the open room has a known local target and the
-            teammate has a proposals channel (see setupProposalComposer). The
-            outer footer band is always the same "can't send here" note + a
-            "Suggest a reply" button that expands the actual compose fields below
-            it (collapsed by default, matching the mockup) — expanding/collapsing
-            is a pure CSS class toggle, not a new write path.
-          -->
-          <div id="proposal-pane" class="hidden">
-            <div class="proposal-footer">
-              <p id="proposal-note" class="proposal-note"></p>
-              <button id="proposal-toggle" type="button" class="btn btn-primary proposal-toggle-btn">Suggest a reply</button>
-            </div>
-            <div id="proposal-compose" class="hidden">
-              <div class="proposal-head">
-                <span class="proposal-kicker">Suggest a message</span>
-                <span class="proposal-hint">Proposal only — your teammate reviews it and sends it from their own account. Nothing here is sent externally.</span>
-              </div>
-              <div class="proposal-row">
-                <span class="proposal-to muted">To conversation:</span>
-                <span id="proposal-target-label" class="proposal-target"></span>
-              </div>
-              <textarea id="proposal-input" class="input" rows="3" placeholder="Write a suggested message for your teammate to review and send…" spellcheck="true"></textarea>
-              <div class="proposal-controls">
-                <select id="proposal-templates" class="input" aria-label="Insert a saved template"></select>
-                <label class="proposal-tmpl"><input id="proposal-template" type="checkbox"> Save as reusable template</label>
-                <span class="spacer"></span>
-                <button id="proposal-send" type="button" class="btn btn-primary proposal-btn">Suggest (proposal)</button>
-              </div>
-              <div id="proposal-status" class="proposal-status hidden"></div>
-            </div>
-          </div>
-        </div>
-      </section>
-    </main>
+  <div id="settings-popover" class="settings-popover hidden" role="menu">
+    <div class="settings-user"><span id="whoami"></span></div>
+    <button id="nav-addteam" class="settings-menu-item" type="button" role="menuitem">Enrollment</button>
+    <button id="signout" class="settings-menu-item settings-signout" type="button" role="menuitem">Sign out</button>
   </div>
+
+  <main id="content">
+    <section id="view-workspace" class="view">
+      <div id="workspace">
+        <div id="list-pane">
+          <div id="list-head">
+            <input id="search-input" class="list-search hidden" placeholder="Search everyone" spellcheck="false" autocomplete="off">
+          </div>
+          <div id="list-body" class="convo-list"></div>
+        </div>
+        <div id="msgr-convo" class="no-selection">
+          <div id="detail-room">
+            <header id="room-head">
+              <button id="room-back" type="button" title="Back">&#8592;</button>
+              <div id="room-heading">
+                <div class="room-title-row">
+                  <span id="room-title"></span>
+                  <span id="room-owner" class="tag tag-neutral hidden"></span>
+                </div>
+                <div class="room-sub-row">
+                  <span id="room-badge" class="plat-badge"></span>
+                  <span id="room-source-label" class="muted"></span>
+                </div>
+              </div>
+              <div class="spacer"></div>
+              <div class="live-indicator live-indicator-room" title="Watching for new messages"><span class="live-dot"></span>Live</div>
+            </header>
+            <div id="room-messages"></div>
+            <div id="room-status" class="convo-status hidden"></div>
+            <div id="proposal-pane" class="hidden">
+              <div class="proposal-footer">
+                <p id="proposal-note" class="proposal-note"></p>
+                <button id="proposal-toggle" type="button" class="btn btn-primary proposal-toggle-btn">Suggest a reply</button>
+              </div>
+              <div id="proposal-compose" class="hidden">
+                <div class="proposal-head">
+                  <span class="proposal-kicker">Suggest a message</span>
+                  <span class="proposal-hint">Proposal only — teammate reviews and sends from their account.</span>
+                </div>
+                <div class="proposal-row">
+                  <span class="proposal-to muted">To conversation:</span>
+                  <span id="proposal-target-label" class="proposal-target"></span>
+                </div>
+                <textarea id="proposal-input" class="input" rows="3" placeholder="Write a suggested message…" spellcheck="true"></textarea>
+                <div class="proposal-controls">
+                  <select id="proposal-templates" class="input" aria-label="Insert a saved template"></select>
+                  <label class="proposal-tmpl"><input id="proposal-template" type="checkbox"> Save as template</label>
+                  <span class="spacer"></span>
+                  <button id="proposal-send" type="button" class="btn btn-primary proposal-btn">Suggest</button>
+                </div>
+                <div id="proposal-status" class="proposal-status hidden"></div>
+              </div>
+            </div>
+          </div>
+          <div id="detail-admin" class="detail-panel hidden">
+            <header class="detail-panel-head"><span>Enrollment</span></header>
+            <div class="admin-scroll">
+              <div class="card narrow addteam-card">
+                <label for="addteam-user">Teammate username</label>
+                <input id="addteam-user" class="input" autocomplete="off" spellcheck="false" placeholder="e.g. alex">
+                <button id="addteam-btn" type="button" class="btn btn-primary btn-block">Add teammate</button>
+                <p id="addteam-error" class="error hidden"></p>
+                <div id="addteam-result" class="hidden">
+                  <p class="muted">Provisioned <span id="addteam-user-out"></span>. One-time code:</p>
+                  <div class="code-display"><div id="addteam-code" class="code-value"></div></div>
+                  <code id="addteam-cmd" class="addteam-cmd"></code>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="convo-placeholder">Select a conversation.</div>
+        </div>
+      </div>
+    </section>
+  </main>
 </div>
 
 <script type="module" src="main.js"></script>

@@ -1,20 +1,4 @@
-// PLAN-MASTER-SYNC §12 phase 5 — Contact management UI (apps/user only).
-//
-// A ContactProfile (shared/model/contacts.js) links several conversations
-// (across sources/rooms) to one person, stored in the user's own account-data
-// (com.jkali.contact_profiles). This file is the ONLY place that renders that
-// data: create a profile, search-and-attach/detach conversations (reusing the
-// existing convosBySource search data), view every one of a person's threads
-// grouped in one card, a per-profile SHARE toggle (share/private/inherit) that
-// feeds the existing 4-level consent resolver (shared/model/consent.js), and
-// non-auto merge suggestions the teammate can accept or ignore.
-//
-// Wires into shared/ui/nav.js via its app-injection hook (setContactsViewHook),
-// the same pattern consent.js/proposals.js already use, so shared/ never
-// imports from apps/. textContent-only (el()/sanitizeLine), no innerHTML, no
-// CSP change. Linking/unlinking here is the ONLY mutation path for profiles —
-// suggestions() is advisory and never called except in response to the
-// teammate pressing "Create profile" below.
+// Contact profiles — list (left) + detail (right).
 
 import {
   readProfiles, writeProfiles,
@@ -23,21 +7,16 @@ import {
 } from '../../shared/model/contacts.js';
 import { loadConsentState } from './consent.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
-import { setContactsViewHook } from '../../shared/ui/nav.js';
+import { setContactsViewHook, setDetailMode } from '../../shared/ui/nav.js';
+import { appendDirectoryRows } from '../../shared/ui/search.js';
 import { SOURCES } from '../../shared/ui/sources.js';
 import { convosBySource, feedModel } from '../../shared/state.js';
 import { openConvo } from '../../shared/ui/chat.js';
 import { buildPlatBadge } from '../../shared/ui/rows.js';
 
-// Local cache of the one consent-storage read. Writes below replace it with
-// the normalized result writeProfiles() returns, so the view re-renders from
-// authoritative data with no extra round trip.
 let store = { profiles: [] };
+let activeProfileId = null;
 
-// Per-viewer "don't show this merge suggestion again" set, keyed by the
-// suggestion's grouping key. Convenience state only (never mutates/merges
-// anything itself) — plain localStorage, tolerant of failure, same pattern as
-// proposals.js's HANDLED_KEY / consent.js's SEEN_KEY.
 const IGNORE_KEY = 'com.jkali.contact_suggestions_ignored';
 function loadIgnored() {
   try { return new Set(JSON.parse(localStorage.getItem(IGNORE_KEY) || '[]')); }
@@ -47,8 +26,6 @@ function saveIgnored(set) {
   try { localStorage.setItem(IGNORE_KEY, JSON.stringify([...set])); } catch (e) { /* ignore */ }
 }
 
-// All known conversations across sources, deduped by room id (same
-// first-SOURCES-order-wins rule consent.js's allConvos() / seedFeed() use).
 function allConvos() {
   const seen = new Set();
   const out = [];
@@ -69,233 +46,273 @@ function roomToProfileId() {
   return map;
 }
 
-// Write, refresh the local cache from the normalized result, tell consent.js
-// to re-read profiles (so Sharing-view badges reflect the change immediately),
-// and re-render this view. The single mutation-and-refresh path every action
-// below goes through.
 async function persist(next) {
   store = await writeProfiles(next);
-  try { await loadConsentState(); } catch (e) { /* Sharing view refreshes on its own next visit */ }
-  renderContactsBody();
-}
-
-// ---- create ----
-
-function wireCreate() {
-  const btn = $('contact-new-btn');
-  const input = $('contact-new-name');
-  if (!btn || !input || btn.dataset.wired) return;
-  btn.dataset.wired = '1';
-  const go = async () => {
-    const name = input.value.trim();
-    if (!name) return;
-    btn.disabled = true;
-    try { await persist(upsertProfile(store, { id: newProfileId(), displayName: name, share: 'inherit' })); }
-    finally { btn.disabled = false; }
-    input.value = '';
-  };
-  btn.addEventListener('click', go);
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-}
-
-// ---- one profile card ----
-
-function buildShareToggle(profile) {
-  const wrap = el('span', 'share-toggle');
-  const opts = [['share', 'Share'], ['inherit', 'Auto'], ['private', 'Private']];
-  for (const [val, label] of opts) {
-    const b = el('button', 'share-opt' + (profile.share === val ? ' active' : ''), label);
-    b.type = 'button';
-    b.setAttribute('aria-label', label + ' ' + sanitizeLine(profile.displayName || 'this contact'));
-    b.addEventListener('click', async () => { await persist(setProfileShare(store, profile.id, val)); });
-    wrap.appendChild(b);
+  try { await loadConsentState(); } catch (e) { /* ok */ }
+  renderPeopleList();
+  if (activeProfileId && store.profiles.some(p => p.id === activeProfileId)) {
+    renderContactDetail(activeProfileId);
+  } else {
+    activeProfileId = null;
+    setDetailMode('empty');
   }
-  return wrap;
 }
 
-function buildLinkedRow(convo) {
-  const row = el('div', 'contact-linked-row');
+function profilePreview(p) {
+  const convos = p.roomIds.map((rid) => convoById(rid)).filter(Boolean);
+  convos.sort((a, b) => ((feedModel.get(b.id) || {}).lastTs || 0) - ((feedModel.get(a.id) || {}).lastTs || 0));
+  const latest = convos[0];
+  if (latest) {
+    const prev = (feedModel.get(latest.id) || {}).lastBody;
+    return prev ? sanitizeLine(prev) : sanitizeLine(latest.title || '');
+  }
+  return p.roomIds.length ? p.roomIds.length + ' linked' : 'No conversations';
+}
+
+function buildContactRow(p) {
+  const name = sanitizeLine(p.displayName || 'Unnamed');
+  const row = el('div', 'convo contact-row');
+  row.dataset.profileId = p.id;
   row.setAttribute('role', 'button');
   row.tabIndex = 0;
-  row.appendChild(buildPlatBadge(convo.sourceId));
-  const meta = el('span', 'contact-row-meta');
-  meta.appendChild(el('span', 'title', sanitizeLine(convo.title || convo.id)));
-  const preview = (feedModel.get(convo.id) || {}).lastBody;
-  if (preview) meta.appendChild(el('span', 'sub', sanitizeLine(preview)));
+  row.appendChild(el('div', 'avatar', (name || '?').slice(0, 1).toUpperCase()));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', name));
+  meta.appendChild(el('div', 'preview', profilePreview(p)));
   row.appendChild(meta);
-  const btn = el('button', 'contact-unlink', 'Detach');
-  btn.type = 'button';
-  btn.addEventListener('click', async (e) => { e.stopPropagation(); await persist(unlinkRoom(store, convo.id)); });
-  row.appendChild(btn);
-  const open = () => openConvo(convo.id);
+  row.appendChild(el('span', 'when', String(p.roomIds.length)));
+  const open = () => selectContact(p.id);
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   return row;
 }
 
-// Reuses convosBySource (the same data the Directory search filters) as a
-// local, client-side filter — no new endpoint, no command sent.
-function buildAttachSearch(profile) {
-  const wrap = el('div', 'contact-attach');
-  const input = el('input');
-  input.placeholder = 'Search conversations to attach…';
-  input.spellcheck = false;
-  input.autocomplete = 'off';
-  const results = el('div', 'contact-attach-results');
-  function render() {
-    const q = input.value.trim().toLowerCase();
-    results.replaceChildren();
-    if (!q) return;
-    const linkedByRoom = roomToProfileId();
-    const cands = allConvos().filter((c) => linkedByRoom[c.id] !== profile.id &&
-      (sanitizeLine(c.title || '').toLowerCase().includes(q) ||
-       sanitizeLine(c.sub || '').toLowerCase().includes(q))).slice(0, 20);
-    if (!cands.length) { results.appendChild(el('p', 'muted', 'No matches.')); return; }
-    for (const c of cands) {
-      const row = el('div', 'contact-attach-row');
-      row.appendChild(el('span', 'badge', sanitizeLine(c.sourceLabel || c.sourceId || '')));
-      row.appendChild(el('span', 'title', sanitizeLine(c.title || c.id)));
-      const already = linkedByRoom[c.id];
-      if (already) row.appendChild(el('span', 'muted', 'in another contact'));
-      const btn = el('button', 'primary', already ? 'Move here' : 'Attach');
-      btn.type = 'button';
-      btn.addEventListener('click', async () => {
-        await persist(linkRoom(store, profile.id, c.id));
-        input.value = '';
-        results.replaceChildren();
-      });
-      row.appendChild(btn);
-      results.appendChild(row);
-    }
-  }
-  input.addEventListener('input', render);
-  wrap.appendChild(input);
-  wrap.appendChild(results);
-  return wrap;
-}
-
-function buildProfileCard(profile) {
-  const card = el('div', 'card contact-card');
-
-  const head = el('div', 'contact-head');
-  const nameInput = el('input', 'contact-name-input');
-  nameInput.value = profile.displayName;
-  nameInput.spellcheck = false;
-  nameInput.autocomplete = 'off';
-  nameInput.setAttribute('aria-label', 'Contact name');
-  const saveName = async () => {
-    const v = nameInput.value.trim();
-    if (v === profile.displayName) return;
-    await persist(upsertProfile(store, { id: profile.id, displayName: v }));
-  };
-  nameInput.addEventListener('blur', saveName);
-  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') nameInput.blur(); });
-  head.appendChild(nameInput);
-  head.appendChild(buildShareToggle(profile));
-  const delBtn = el('button', 'danger contact-delete', 'Delete');
-  delBtn.type = 'button';
-  delBtn.setAttribute('aria-label', 'Delete contact ' + sanitizeLine(profile.displayName || ''));
-  delBtn.addEventListener('click', async () => { await persist(removeProfile(store, profile.id)); });
-  head.appendChild(delBtn);
-  card.appendChild(head);
-
-  // Conversations with this person: the LATEST is shown on top; clicking it
-  // opens that conversation in the main window AND accordion-expands the others.
-  const linked = el('div', 'contact-linked');
-  const convos = profile.roomIds
-    .map((rid) => convoById(rid) || { id: rid, title: rid, sourceLabel: '', sourceId: '' })
-    .sort((a, b) => ((feedModel.get(b.id) || {}).lastTs || 0) - ((feedModel.get(a.id) || {}).lastTs || 0));
-  if (!convos.length) {
-    linked.appendChild(el('p', 'muted', 'No conversations attached yet.'));
-  } else {
-    const latest = convos[0];
-    const rest = convos.slice(1);
-    const primary = buildLinkedRow(latest);
-    primary.classList.add('contact-primary');
-    const acc = el('div', 'contact-accordion hidden');
-    for (const c of rest) acc.appendChild(buildLinkedRow(c));
-    if (rest.length) {
-      const chev = el('span', 'contact-chev', '▾');
-      primary.insertBefore(chev, primary.firstChild);
-      // primary's own click (buildLinkedRow) opens the latest; this also toggles
-      // the accordion of the person's other conversations.
-      primary.addEventListener('click', () => { acc.classList.toggle('hidden'); chev.classList.toggle('open'); });
-    }
-    linked.appendChild(primary);
-    linked.appendChild(acc);
-  }
-  card.appendChild(linked);
-  card.appendChild(buildAttachSearch(profile));
-  return card;
-}
-
-// ---- merge suggestions (advisory only — never auto-merges) ----
-
-function buildSuggestionCard(group, ignored) {
-  const card = el('div', 'card contact-suggestion');
-  card.appendChild(el('h3', '', 'Possibly the same person'));
-  const names = group.convos.map((c) => sanitizeLine(c.title || c.id)).join(', ');
-  card.appendChild(el('p', 'muted', names));
-  const actions = el('div', 'row contact-suggestion-actions');
-  const createBtn = el('button', 'primary', 'Create contact');
-  createBtn.type = 'button';
-  createBtn.addEventListener('click', async () => {
+function buildSuggestionRow(group, ignored) {
+  const row = el('div', 'convo contact-row contact-suggestion-row');
+  const label = group.convos.map(c => sanitizeLine(c.title || c.id)).join(', ');
+  row.appendChild(el('div', 'avatar', '?'));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', 'Same person?'));
+  meta.appendChild(el('div', 'preview', label));
+  row.appendChild(meta);
+  const btn = el('button', 'contact-merge-btn', 'Link');
+  btn.type = 'button';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
     const id = newProfileId();
     let next = upsertProfile(store, { id, displayName: group.convos[0].title || group.key, share: 'inherit' });
     for (const c of group.convos) next = linkRoom(next, id, c.id);
     await persist(next);
+    selectContact(id);
   });
-  const ignoreBtn = el('button', 'contact-ignore', 'Ignore');
-  ignoreBtn.type = 'button';
-  ignoreBtn.addEventListener('click', () => {
+  row.appendChild(btn);
+  const skip = el('button', 'contact-ignore', '×');
+  skip.type = 'button';
+  skip.addEventListener('click', (e) => {
+    e.stopPropagation();
     ignored.add(group.key);
     saveIgnored(ignored);
-    renderSuggestions();
+    renderPeopleList();
   });
-  actions.appendChild(createBtn);
-  actions.appendChild(ignoreBtn);
-  card.appendChild(actions);
-  return card;
+  row.appendChild(skip);
+  return row;
 }
 
-function renderSuggestions() {
-  const host = $('contacts-suggestions');
-  if (!host) return;
+function markActiveContact(id) {
+  for (const row of document.querySelectorAll('.contact-row')) {
+    row.classList.toggle('active', row.dataset.profileId === id);
+  }
+}
+
+function buildShareToggle(profile) {
+  const wrap = el('div', 'contact-share-row');
+  wrap.appendChild(el('span', 'muted', 'Sharing'));
+  const toggle = el('span', 'share-toggle');
+  for (const [val, label] of [['share', 'Share'], ['inherit', 'Auto'], ['private', 'Private']]) {
+    const b = el('button', 'share-opt' + (profile.share === val ? ' active' : ''), label);
+    b.type = 'button';
+    b.addEventListener('click', async () => { await persist(setProfileShare(store, profile.id, val)); });
+    toggle.appendChild(b);
+  }
+  wrap.appendChild(toggle);
+  return wrap;
+}
+
+function renderContactDetail(profileId) {
+  const profile = store.profiles.find(p => p.id === profileId);
+  const host = $('contact-detail-body');
+  const nameInput = $('contact-detail-name');
+  if (!profile || !host) return;
+
+  if (nameInput) {
+    nameInput.value = profile.displayName || '';
+    if (!nameInput.dataset.wired) {
+      nameInput.dataset.wired = '1';
+      nameInput.addEventListener('blur', async () => {
+        const v = nameInput.value.trim();
+        if (!v || v === profile.displayName) return;
+        await persist(upsertProfile(store, { id: profile.id, displayName: v }));
+      });
+    }
+  }
+
   host.replaceChildren();
-  // suggestions() groups by handle/displayName/name; convos here only carry
-  // `title`, so pass it through as `name` for grouping purposes only.
+  host.appendChild(buildShareToggle(profile));
+
+  const linked = el('div', 'contact-linked-list');
+  const convos = profile.roomIds
+    .map((rid) => convoById(rid) || { id: rid, title: rid, sourceId: '' })
+    .sort((a, b) => ((feedModel.get(b.id) || {}).lastTs || 0) - ((feedModel.get(a.id) || {}).lastTs || 0));
+
+  if (!convos.length) {
+    linked.appendChild(el('p', 'muted', 'No conversations linked.'));
+  } else {
+    for (const c of convos) {
+      const row = el('div', 'contact-linked-row');
+      row.appendChild(buildPlatBadge(c.sourceId));
+      const meta = el('span', 'contact-row-meta');
+      meta.appendChild(el('span', 'title', sanitizeLine(c.title || c.id)));
+      row.appendChild(meta);
+      const unlink = el('button', 'contact-unlink', 'Remove');
+      unlink.type = 'button';
+      unlink.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await persist(unlinkRoom(store, c.id));
+      });
+      row.appendChild(unlink);
+      row.addEventListener('click', () => openConvo(c.id));
+      linked.appendChild(row);
+    }
+  }
+  host.appendChild(linked);
+
+  const attach = el('div', 'contact-attach');
+  const attachInput = el('input');
+  attachInput.placeholder = 'Search to link a conversation…';
+  attachInput.spellcheck = false;
+  const attachResults = el('div', 'contact-attach-results');
+  attachInput.addEventListener('input', () => {
+    const q = attachInput.value.trim().toLowerCase();
+    attachResults.replaceChildren();
+    if (!q) return;
+    const linkedByRoom = roomToProfileId();
+    const cands = allConvos().filter((c) =>
+      sanitizeLine(c.title || '').toLowerCase().includes(q)).slice(0, 12);
+    for (const c of cands) {
+      const row = el('div', 'contact-attach-row');
+      row.appendChild(el('span', 'title', sanitizeLine(c.title || c.id)));
+      const btn = el('button', null, linkedByRoom[c.id] === profile.id ? 'Linked' : 'Link');
+      btn.type = 'button';
+      btn.disabled = linkedByRoom[c.id] === profile.id;
+      btn.addEventListener('click', async () => {
+        await persist(linkRoom(store, profile.id, c.id));
+        attachInput.value = '';
+        attachResults.replaceChildren();
+      });
+      row.appendChild(btn);
+      attachResults.appendChild(row);
+    }
+  });
+  attach.appendChild(attachInput);
+  attach.appendChild(attachResults);
+  host.appendChild(attach);
+
+  const del = el('button', 'danger contact-delete-block', 'Delete contact');
+  del.type = 'button';
+  del.addEventListener('click', async () => {
+    await persist(removeProfile(store, profile.id));
+  });
+  host.appendChild(del);
+}
+
+function selectContact(id) {
+  activeProfileId = id;
+  markActiveContact(id);
+  setDetailMode('contact');
+  renderContactDetail(id);
+}
+
+function filterProfiles(q) {
+  if (!q) return store.profiles;
+  q = q.toLowerCase();
+  return store.profiles.filter(p =>
+    sanitizeLine(p.displayName || '').toLowerCase().includes(q));
+}
+
+function renderPeopleList() {
+  const list = $('list-body');
+  if (!list) return;
+  const q = (($('people-search') && $('people-search').value) || '').trim().toLowerCase();
+  list.replaceChildren();
+
   const withName = allConvos().map((c) => Object.assign({}, c, { name: c.title }));
   const groups = suggestions(withName, store);
   const ignored = loadIgnored();
-  const active = groups.filter((g) => !ignored.has(g.key));
-  if (!active.length) return;
-  for (const g of active) host.appendChild(buildSuggestionCard(g, ignored));
-}
-
-// ---- entry ----
-
-function renderContactsBody() {
-  wireCreate();
-  const list = $('contacts-list');
-  if (list) {
-    list.replaceChildren();
-    if (!store.profiles.length) {
-      list.appendChild(el('p', 'muted', 'No contacts yet. Create one above, or accept a suggestion below.'));
-    } else {
-      for (const p of store.profiles) list.appendChild(buildProfileCard(p));
-    }
+  for (const g of groups.filter(x => !ignored.has(x.key)).slice(0, 3)) {
+    list.appendChild(buildSuggestionRow(g, ignored));
   }
-  renderSuggestions();
+
+  const profiles = filterProfiles(q);
+  if (profiles.length) {
+    list.appendChild(el('div', 'list-section', 'Contacts'));
+    for (const p of profiles) list.appendChild(buildContactRow(p));
+  }
+
+  const dirTotal = appendDirectoryRows(list, q);
+  if (!profiles.length && !dirTotal && !list.childElementCount) {
+    list.appendChild(el('p', 'list-empty', q ? 'No matches.' : 'No people or conversations yet.'));
+  }
 }
 
-// Rendered whenever the 'contacts' nav view opens, via setContactsViewHook (nav.js).
-async function renderContactsView() {
-  wireCreate();
-  try { store = await readProfiles(); } catch (e) { /* keep previous cache on read failure */ }
-  renderContactsBody();
+function wireContactsNav() {
+  const back = $('contact-back');
+  if (back && !back.dataset.wired) {
+    back.dataset.wired = '1';
+    back.addEventListener('click', () => {
+      activeProfileId = null;
+      markActiveContact(null);
+      setDetailMode('empty');
+    });
+  }
+  const search = $('people-search');
+  if (search && !search.dataset.wiredPeople) {
+    search.dataset.wiredPeople = '1';
+    search.addEventListener('input', renderPeopleViewBody);
+  }
+  const btn = $('contact-new-btn');
+  const input = $('contact-new-name');
+  if (btn && input && !btn.dataset.wired) {
+    btn.dataset.wired = '1';
+    const go = async () => {
+      const name = input.value.trim();
+      if (!name) return;
+      btn.disabled = true;
+      try {
+        const id = newProfileId();
+        await persist(upsertProfile(store, { id, displayName: name, share: 'inherit' }));
+        selectContact(id);
+        input.value = '';
+      } finally { btn.disabled = false; }
+    };
+    btn.addEventListener('click', go);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  }
 }
 
-// Entry point — call once from apps/user/main.js after sign-in.
-function initContactsUI() { setContactsViewHook(renderContactsView); }
+async function renderPeopleView() {
+  wireContactsNav();
+  try { store = await readProfiles(); } catch (e) { /* keep cache */ }
+  renderPeopleViewBody();
+}
 
-export { initContactsUI, renderContactsView };
+function renderPeopleViewBody() {
+  renderPeopleList();
+  if (activeProfileId) selectContact(activeProfileId);
+  else setDetailMode('empty');
+}
+
+function initContactsUI() {
+  setContactsViewHook(renderPeopleView);
+}
+
+export { initContactsUI, renderPeopleView };

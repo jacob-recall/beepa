@@ -3,7 +3,7 @@
 
 import { $, el, sanitize } from './el.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
-import { S } from '../state.js';
+import { S, runtime } from '../state.js';
 
 // ---- console ----
 function logConsole(who, text, srcId) {
@@ -33,7 +33,21 @@ function setLoginFlow(active) {
 }
 
 // ---- WhatsApp / Google Messages Connections card status ----
+let platformRailHook = null;
+function setPlatformRailHook(fn) { platformRailHook = typeof fn === 'function' ? fn : null; }
+function notifyPlatformRail() { if (platformRailHook) platformRailHook(); }
+
+const PILL_SOURCE = {
+  'wa-status': 'whatsapp', 'gmsg-status': 'gmessages', 'ig-status': 'instagram',
+  'li-status': 'linkedin', 'tw-status': 'twitter',
+};
+
 function updateCardStatus(logins, pillId, discId) {
+  const sourceId = PILL_SOURCE[pillId || 'wa-status'];
+  if (sourceId && runtime[sourceId]) {
+    runtime[sourceId].connected = logins.length > 0;
+    notifyPlatformRail();
+  }
   const pill = $(pillId || 'wa-status');
   const disc = discId ? $(discId) : null;
   if (!pill) return;
@@ -63,6 +77,8 @@ function updateImsgCard(rawBody) {
     const ok = /✓/.test(clean) && !/✗/.test(clean); // all ✓, no ✗
     pill.textContent = lines.length ? (ok ? 'Ready' : 'Setup needed') : 'No status yet';
     pill.classList.toggle('ok', ok);
+    runtime.imessage.connected = ok && lines.length > 0;
+    notifyPlatformRail();
   }
 }
 
@@ -88,13 +104,20 @@ function confirmModal(title, text, typed) {
   });
 }
 
+let connectionsBuilt = false;
+
+function ensureConnections() {
+  if (!connectionsBuilt) buildConnections();
+}
+
 // ---- Connections view ----
 function buildConnections() {
   const holder = $('bridge-cards');
+  if (!holder) return;
   holder.replaceChildren();
 
   // WhatsApp card
-  const wa = el('div', 'card bridge-card');
+  const wa = el('div', 'bridge-card settings-bridge');
   const waHead = el('div', 'bridge-head');
   waHead.appendChild(el('span', 'bridge-name', WA.label));
   const waPill = el('span', 'status-pill', 'Checking…');
@@ -140,7 +163,7 @@ function buildConnections() {
   holder.appendChild(wa);
 
   // iMessage card (B2 hub-side)
-  const im = el('div', 'card bridge-card');
+  const im = el('div', 'bridge-card settings-bridge');
   const imHead = el('div', 'bridge-head');
   imHead.appendChild(el('span', 'bridge-name', IMSG.label));
   const imPill = el('span', 'status-pill', 'Checking…');
@@ -166,7 +189,7 @@ function buildConnections() {
   holder.appendChild(im);
 
   // Google Messages card (mirrors the WhatsApp card)
-  const gm = el('div', 'card bridge-card');
+  const gm = el('div', 'bridge-card settings-bridge');
   const gmHead = el('div', 'bridge-head');
   gmHead.appendChild(el('span', 'bridge-name', GMSG.label));
   const gmPill = el('span', 'status-pill', 'Checking…');
@@ -200,7 +223,7 @@ function buildConnections() {
   // instead of a QR — SPEC §5/§6). The pasted value is a bearer credential:
   // it is sent through the C-1 mgmt guard, redacted immediately, and never
   // logged, sanitize-rendered, persisted, or turned into a URL.
-  const ig = el('div', 'card bridge-card');
+  const ig = el('div', 'bridge-card settings-bridge');
   const igHead = el('div', 'bridge-head');
   igHead.appendChild(el('span', 'bridge-name', IG.label));
   const igPill = el('span', 'status-pill', 'Checking…');
@@ -312,7 +335,7 @@ function buildConnections() {
   // headers as well as the cookies). The pasted value is a bearer credential:
   // it is sent through the C-1 mgmt guard, redacted immediately, and never
   // logged, sanitize-rendered, persisted, or turned into a URL.
-  const li = el('div', 'card bridge-card');
+  const li = el('div', 'bridge-card settings-bridge');
   const liHead = el('div', 'bridge-head');
   liHead.appendChild(el('span', 'bridge-name', LI.label));
   const liPill = el('span', 'status-pill', 'Checking…');
@@ -423,7 +446,7 @@ function buildConnections() {
   // not a QR. The pasted value is a bearer credential: sent through the C-1 mgmt
   // guard, redacted immediately, and never logged, sanitize-rendered, persisted,
   // or turned into a URL.)
-  const tw = el('div', 'card bridge-card');
+  const tw = el('div', 'bridge-card settings-bridge');
   const twHead = el('div', 'bridge-head');
   twHead.appendChild(el('span', 'bridge-name', TW.label));
   const twPill = el('span', 'status-pill', 'Checking\u2026');
@@ -539,17 +562,26 @@ function buildConnections() {
     more.appendChild(row);
   }
   holder.appendChild(more);
+  connectionsBuilt = true;
+}
+
+let settingsBuilt = false;
+
+function ensureSettings() {
+  if (!settingsBuilt) buildSettings();
 }
 
 // ---- Settings view (per-source command surface) ----
 function buildSettings() {
   const tabs = $('settings-source-tabs');
+  if (!tabs) return;
   tabs.replaceChildren();
   for (const s of SOURCES) {
     if (s.kind === 'all' || !s.botMxid) continue;
-    const b = el('button', '', s.label);
+    const b = el('button', 'settings-src-tab');
     b.type = 'button';
     b.dataset.src = s.id;
+    b.textContent = s.label;
     b.addEventListener('click', () => {
       S.activeSettingsSource = s.id;
       renderSettingsTabs();
@@ -559,17 +591,21 @@ function buildSettings() {
   }
   renderSettingsTabs();
   renderCommandGroups(S.activeSettingsSource);
+  settingsBuilt = true;
 }
 function renderSettingsTabs() {
-  for (const b of $('settings-source-tabs').children) {
+  const tabs = $('settings-source-tabs');
+  if (!tabs) return;
+  for (const b of tabs.children) {
     b.classList.toggle('active', b.dataset.src === S.activeSettingsSource);
   }
 }
 function renderCommandGroups(sourceId) {
   const holder = $('command-groups');
+  if (!holder) return;
   holder.replaceChildren();
   for (const g of groupsFor(sourceId)) {
-    const groupEl = el('div', 'card cmd-group');
+    const groupEl = el('div', 'settings-cmd-group');
     groupEl.appendChild(el('h3', '', g.title));
     for (const c of g.cmds) {
       const row = el('div', 'cmd');
@@ -606,4 +642,8 @@ function renderCommandGroups(sourceId) {
   }
 }
 
-export { logConsole, setButtonsDisabled, setLoginFlow, updateCardStatus, updateImsgCard, confirmModal, buildConnections, buildSettings, renderSettingsTabs, renderCommandGroups };
+export {
+  logConsole, setButtonsDisabled, setLoginFlow, updateCardStatus, updateImsgCard, confirmModal,
+  buildConnections, buildSettings, ensureConnections, ensureSettings,
+  renderSettingsTabs, renderCommandGroups, setPlatformRailHook,
+};

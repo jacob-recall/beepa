@@ -5,9 +5,10 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8008 http://127.0.0.1:8019; img-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src http://127.0.0.1:8009; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa</title>
-<link rel="stylesheet" href="../../shared/style/organic.css">
-<link rel="stylesheet" href="style.css">
-<link rel="stylesheet" href="../../shared/style/beepa.css">
+<link rel="stylesheet" href="../../shared/style/organic.css?v=wa7">
+<link rel="stylesheet" href="style.css?v=wa7">
+<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa7">
+<link rel="stylesheet" href="settings.css?v=wa7">
 </head>
 <body>
 <div id="signout-note-wrap" class="hidden">
@@ -28,150 +29,120 @@
 </section>
 
 <div id="shell" class="hidden">
-  <aside id="sidebar">
-    <div id="brand">Beepa</div>
-    <nav id="nav-sources" aria-label="Sources"><!-- source buttons injected: All + per-source --></nav>
-    <div class="nav-sep"></div>
-    <nav id="nav-tools" aria-label="Tools">
-      <button id="nav-directory" class="navitem" type="button"><span class="ic">&#128269;</span> Directory</button>
-      <button id="nav-contacts" class="navitem" type="button"><span class="ic">&#128100;</span> Contacts</button>
-      <button id="nav-connections" class="navitem" type="button"><span class="ic">&#128268;</span> Connections</button>
-      <button id="nav-proposals" class="navitem" type="button"><span class="ic">&#128172;</span> Proposals</button>
-      <button id="nav-sharing" class="navitem" type="button"><span class="ic">&#128274;</span> Sharing</button>
-      <button id="nav-settings" class="navitem" type="button"><span class="ic">&#9881;</span> Settings</button>
+  <aside id="sidebar" class="icon-rail" aria-label="App">
+    <div id="brand" class="rail-brand" title="Beepa">B</div>
+    <nav id="nav-primary" aria-label="Main">
+      <button id="nav-home" class="navitem nav-icon" type="button" title="Chats" aria-label="Chats"><span class="ic">&#127968;</span></button>
+      <button id="nav-people" class="navitem nav-icon" type="button" title="People" aria-label="People"><span class="ic">&#128101;</span></button>
     </nav>
+    <nav id="nav-platforms" class="nav-platforms" aria-label="Platforms"></nav>
     <div class="spacer"></div>
-    <div id="account">
-      <span id="whoami"></span>
-      <a id="open-chats" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Full tab &#8594;</a>
-      <button id="signout" type="button">Sign out of Hub</button>
-    </div>
+    <button id="nav-settings-toggle" class="navitem nav-icon" type="button" title="Settings" aria-label="Settings" aria-expanded="false"><span class="ic">&#9881;</span></button>
   </aside>
 
+  <div id="settings-popover" class="settings-popover hidden" role="menu">
+    <div class="settings-user" id="settings-user"><span id="whoami"></span></div>
+    <button id="settings-open-hub" class="settings-menu-item" type="button" role="menuitem">Settings</button>
+    <a id="open-chats" class="settings-menu-item" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer" role="menuitem">Element</a>
+    <button id="signout" class="settings-menu-item settings-signout" type="button" role="menuitem">Sign out</button>
+  </div>
+
   <main id="content">
-    <!-- Home: two-pane messenger — conversation list (left) + open chat (right) -->
-    <section id="view-home" class="view hidden">
-      <div id="msgr">
-        <div id="msgr-list">
-          <div id="msgr-list-head">
-            <input id="home-search" placeholder="Search conversations" spellcheck="false" autocomplete="off">
+    <section id="view-workspace" class="view">
+      <div id="workspace">
+        <div id="list-pane">
+          <div id="list-head">
+            <div id="list-mode" class="list-mode">
+              <button id="list-mode-chats" class="list-mode-btn" type="button" title="Chats" aria-label="Chats"><span class="ic">&#128172;</span></button>
+              <button id="list-mode-proposals" class="list-mode-btn list-mode-named" type="button">Proposals</button>
+            </div>
+            <input id="home-search" class="list-search" placeholder="Search conversations" spellcheck="false" autocomplete="off">
+            <input id="source-search" class="list-search hidden" placeholder="Search" spellcheck="false" autocomplete="off">
+            <input id="people-search" class="list-search hidden" placeholder="Search people and conversations" spellcheck="false" autocomplete="off">
+            <div id="source-share-switch"></div>
+            <div id="list-head-actions" class="hidden">
+              <input id="contact-new-name" placeholder="New contact name" spellcheck="false" autocomplete="off">
+              <button id="contact-new-btn" type="button">Add</button>
+            </div>
           </div>
-          <div id="home-list" class="convo-list"></div>
+          <div id="list-body" class="convo-list"></div>
         </div>
         <div id="msgr-convo" class="no-selection">
-          <header id="convo-head">
-            <button id="convo-back" type="button" title="Back to list">&#8592;</button>
-            <span id="convo-badge" class="plat-badge"></span>
-            <span id="convo-title"></span>
-            <span class="spacer"></span>
-            <a id="convo-element-link" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Open in Element &#8599;</a>
-          </header>
-          <div id="convo-messages"></div>
-          <div id="convo-placeholder">Select a conversation to start chatting.</div>
-          <div id="convo-compose">
-            <input id="convo-input" placeholder="Message" spellcheck="true" autocomplete="off">
-            <button id="convo-send" type="button" class="primary">Send</button>
+          <div id="detail-chat">
+            <header id="convo-head">
+              <button id="convo-back" type="button" title="Back to list">&#8592;</button>
+              <span id="convo-badge" class="plat-badge"></span>
+              <span id="convo-title"></span>
+              <span class="spacer"></span>
+              <a id="convo-element-link" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Element &#8599;</a>
+            </header>
+            <div id="convo-messages"></div>
+            <div id="convo-compose">
+              <input id="convo-input" placeholder="Message" spellcheck="true" autocomplete="off">
+              <button id="convo-send" type="button" class="primary">Send</button>
+            </div>
+          </div>
+          <div id="convo-placeholder">Select a conversation.</div>
+          <div id="detail-proposal" class="detail-panel hidden">
+            <header class="detail-panel-head">
+              <button id="proposal-back" type="button" title="Back">&#8592;</button>
+              <span id="proposal-detail-title">Suggestion</span>
+            </header>
+            <div id="proposal-detail-body"></div>
+          </div>
+          <div id="detail-contact" class="detail-panel hidden">
+            <header class="detail-panel-head">
+              <button id="contact-back" type="button" title="Back">&#8592;</button>
+              <input id="contact-detail-name" class="contact-detail-name" spellcheck="false" autocomplete="off">
+            </header>
+            <div id="contact-detail-body"></div>
+          </div>
+          <div id="detail-admin" class="detail-panel hidden">
+            <header class="settings-head">
+              <button id="settings-back" type="button" class="settings-back" title="Back">&#8592;</button>
+              <span class="settings-title">Settings</span>
+            </header>
+            <nav class="settings-tabs" id="settings-tabs" aria-label="Settings sections">
+              <button type="button" class="settings-tab active" data-section="platforms">Platforms</button>
+              <button type="button" class="settings-tab" data-section="connections">Connections</button>
+              <button type="button" class="settings-tab" data-section="sharing">Sharing</button>
+              <button type="button" class="settings-tab" data-section="advanced">Advanced</button>
+            </nav>
+            <div class="settings-body">
+              <section id="settings-section-platforms" class="settings-pane">
+                <p class="settings-lead">Open a platform inbox from here.</p>
+                <div id="settings-platforms-list" class="settings-list"></div>
+              </section>
+              <section id="settings-section-connections" class="settings-pane hidden">
+                <p class="settings-lead">Link messaging accounts to this hub.</p>
+                <div id="bridge-cards" class="settings-list"></div>
+              </section>
+              <section id="settings-section-sharing" class="settings-pane hidden">
+                <p class="settings-lead">Control what your manager can see.</p>
+                <div id="share-global" class="settings-block"></div>
+                <div id="share-sources" class="settings-block"></div>
+                <div id="share-summary" class="settings-block"></div>
+              </section>
+              <section id="settings-section-advanced" class="settings-pane hidden">
+                <p class="settings-lead">Bridge commands and debug output.</p>
+                <div id="settings-source-tabs" class="settings-src-tabs"></div>
+                <div id="command-groups" class="settings-list"></div>
+                <div id="console-card" class="settings-console">
+                  <div id="console" aria-live="polite"></div>
+                  <div class="settings-console-input row">
+                    <input id="console-input" placeholder="Reply to a flow" spellcheck="false">
+                    <button id="console-send" type="button">Send</button>
+                  </div>
+                </div>
+              </section>
+            </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- The embedded Element pane (full-feature escape hatch only) -->
     <section id="view-chats" class="view hidden">
       <div id="chats-container"></div>
-    </section>
-
-    <!-- Per-source conversation list -->
-    <section id="view-source" class="view hidden">
-      <header class="view-head">
-        <h2 id="source-title">Source</h2>
-        <p class="muted" id="source-sub">Your conversations on this service. Click one to open it.</p>
-        <div id="source-share-switch"></div>
-        <input id="source-search" placeholder="Search conversations" spellcheck="false" autocomplete="off">
-      </header>
-      <div id="source-list" class="convo-list"></div>
-    </section>
-
-    <!-- Directory: cross-source search -->
-    <section id="view-directory" class="view hidden">
-      <header class="view-head">
-        <h2>Directory</h2>
-        <p class="muted">Search your conversations across every connected service, or start a new one.</p>
-        <input id="directory-search" placeholder="Search names and numbers across all services" spellcheck="false" autocomplete="off">
-      </header>
-      <div id="directory-results" class="convo-list"></div>
-    </section>
-
-    <!-- Contacts: unified contact profiles (PLAN-MASTER-SYNC §12 phase 5). A
-         profile groups several conversations (across sources) as one person;
-         see shared/model/contacts.js for storage + invariants. -->
-    <section id="view-contacts" class="view hidden">
-      <header class="view-head">
-        <h2>Contacts</h2>
-        <p class="muted">Group conversations that belong to the same person, view them together, and control what's shared for them as one unit.</p>
-      </header>
-      <div class="card" id="contacts-create">
-        <h3>New contact</h3>
-        <div class="row">
-          <input id="contact-new-name" placeholder="Name" spellcheck="false" autocomplete="off">
-          <button id="contact-new-btn" type="button" class="primary">Create</button>
-        </div>
-      </div>
-      <div id="contacts-suggestions"></div>
-      <div id="contacts-list"></div>
-    </section>
-
-    <!-- Proposals inbox (PLAN-MASTER-SYNC §2 v2 / §7): the manager can PROPOSE a
-         message; only the teammate, here, sends it — through the existing guarded
-         local send path. Each item is a DRAFT, never a real message. -->
-    <section id="view-proposals" class="view hidden">
-      <header class="view-head">
-        <h2>Proposals</h2>
-        <p class="muted">Draft messages your manager suggested. Each is a suggestion only — nothing is sent until you review it and send it yourself.</p>
-      </header>
-      <div id="proposals-list" class="convo-list"></div>
-    </section>
-
-    <!-- Sharing / consent (PLAN-MASTER-SYNC §5.1, §4.2) -->
-    <section id="view-sharing" class="view hidden">
-      <header class="view-head">
-        <h2>Sharing</h2>
-        <p class="muted">Control what the manager can see. Nothing is shared unless you say so.</p>
-      </header>
-      <div class="card" id="share-global"></div>
-      <div class="card">
-        <h3>Per-source sharing</h3>
-        <div id="share-sources"></div>
-      </div>
-      <div class="card">
-        <h3>What the manager can currently see</h3>
-        <div id="share-summary"></div>
-      </div>
-    </section>
-
-    <section id="view-connections" class="view hidden">
-      <header class="view-head">
-        <h2>Connections</h2>
-        <p class="muted">Each card is one service. Connect it once; conversations then appear under its tab.</p>
-      </header>
-      <div id="bridge-cards"></div>
-    </section>
-
-    <section id="view-settings" class="view hidden">
-      <header class="view-head">
-        <h2>Settings</h2>
-        <p class="muted">Service commands as buttons. Replies appear in the output panel.</p>
-      </header>
-      <div id="settings-source-tabs"></div>
-      <div id="command-groups"></div>
-      <div class="card" id="console-card">
-        <h3>Service output</h3>
-        <div id="console" aria-live="polite"></div>
-        <div class="row">
-          <input id="console-input" placeholder="Reply to a multi-step flow (e.g. a phone number)" spellcheck="false">
-          <button id="console-send" type="button">Send</button>
-        </div>
-      </div>
     </section>
   </main>
 </div>

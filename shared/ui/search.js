@@ -38,7 +38,7 @@ function feedRelTime(ts) {
 // (sanitized name + preview); it never builds a URL, sends a command, or
 // navigates. Clearing restores the full recency-sorted list.
 function renderHome() {
-  const list = $('home-list');
+  const list = $('list-body');
   if (!list) return;
   ensureHomeHiddenToggle();                           // HF-9: "Show hidden" chip above the list
   const q = (($('home-search') && $('home-search').value) || '').trim().toLowerCase();
@@ -63,7 +63,7 @@ function renderHome() {
 // and re-renders so hidden (low-priority/muted/manual) rooms appear with an
 // Unhide action. Pure client-side state; sends no command and builds no URL.
 function ensureHomeHiddenToggle() {
-  const list = $('home-list');
+  const list = $('list-body');
   if (!list || !list.parentNode) return;
   let chip = $('home-hidden-toggle');
   if (!chip) {
@@ -80,13 +80,15 @@ function ensureHomeHiddenToggle() {
 
 async function loadSourceList(sourceId) {
   const source = SOURCES.find(s => s.id === sourceId);
-  const list = $('source-list');
-  $('source-title').textContent = source.label;
-  $('source-sub').textContent = 'Your conversations on ' + source.label + '. Click one to open it.';
+  const list = $('list-body');
+  if (!list) return;
   S.sourceViewId = sourceId;
   if (sourceViewHook) sourceViewHook(sourceId);
   const search = $('source-search');
-  if (search) { search.value = ''; search.placeholder = 'Search ' + source.label + ' conversations'; }
+  if (search) {
+    search.value = '';
+    search.placeholder = 'Search ' + (source ? source.label : 'conversations');
+  }
   list.replaceChildren();
   list.appendChild(elEmpty('Loading…'));
   try {
@@ -101,7 +103,7 @@ async function loadSourceList(sourceId) {
 // #source-search is a pure client-side filter over the loaded per-source list,
 // mirroring #home-search: matches on the conversation title + preview only.
 function renderSourceList() {
-  const list = $('source-list');
+  const list = $('list-body');
   if (!list || !S.sourceViewId) return;
   const source = SOURCES.find(s => s.id === S.sourceViewId);
   const convos = convosBySource[S.sourceViewId] || [];
@@ -121,58 +123,7 @@ function renderSourceList() {
 
 // ---- Directory (P3.3): cross-source local filter + gated start-chat ----
 function buildDirectory() {
-  const results = $('directory-results');
-  const card = el('div', 'card');
-  card.id = 'directory-startchat';
-  card.appendChild(el('h3', '', 'Start a new chat'));
-  for (const s of SOURCES) {
-    if (s.kind === 'all' || !s.botMxid) continue;
-    // iMessage needs a first message (the engine cannot open an empty thread),
-    // so its Directory control is a two-field form (handle + first message).
-    const twoField = s.id === 'imessage';
-    const row = el('div', 'cmd start-chat');
-    const info = el('div', 'info');
-    info.appendChild(el('div', 'name', s.label));
-    info.appendChild(el('div', 'desc', s.canStartChat
-      ? (twoField
-          ? 'Enter a phone number (+1…) or email and a first message to open a new chat.'
-          : 'Enter a phone number (+1…) or email to open a new chat.')
-      : 'Starting a new chat here is not available yet.'));
-    row.appendChild(info);
-    const input = el('input');
-    input.spellcheck = false;
-    input.autocomplete = 'off';
-    input.placeholder = s.canStartChat ? '+14155551234 or name@example.com' : 'not available yet';
-    let msgInput = null;
-    if (twoField) {
-      msgInput = el('input');
-      msgInput.spellcheck = false;
-      msgInput.autocomplete = 'off';
-      msgInput.maxLength = 900;                     // UX clamp; daemon re-clamps to MAX_TEXT
-      msgInput.placeholder = s.canStartChat ? 'first message' : 'not available yet';
-    }
-    const btn = el('button', s.canStartChat ? 'primary' : '', 'Start chat');
-    btn.style.width = 'auto';
-    if (s.canStartChat) {
-      btn.classList.add('startable');              // toggled by setButtonsDisabled
-      const go = () => startChat(s.id, input, msgInput);
-      btn.addEventListener('click', go);
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-      if (msgInput) msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-    } else {
-      // D-1: capability-gated OFF -> inert control that issues NO bot command.
-      input.disabled = true;
-      if (msgInput) msgInput.disabled = true;
-      btn.disabled = true;
-      btn.textContent = 'Not available yet';
-    }
-    row.appendChild(input);
-    if (msgInput) row.appendChild(msgInput);
-    row.appendChild(btn);
-    card.appendChild(row);
-  }
-  results.parentNode.insertBefore(card, results);
-  $('directory-search').addEventListener('input', renderDirectory);
+  /* people-search wired in contacts.js initContactsUI */
 }
 // D-1/D-2: only a USER-TYPED handle, strictly validated, is ever sent; search
 // results are display-only and never become a destination handle.
@@ -207,10 +158,7 @@ async function startChat(sourceId, input, msgInput) {
   await sendCmd(sourceId, 'start-chat ' + h);      // C-1 verifies mgmt room before send
   input.value = '';
 }
-function renderDirectory() {
-  const q = ($('directory-search').value || '').trim().toLowerCase();
-  const out = $('directory-results');
-  out.replaceChildren();
+function appendDirectoryRows(out, q) {
   let total = 0;
   for (const s of SOURCES) {
     if (s.kind === 'all') continue;
@@ -222,7 +170,20 @@ function renderDirectory() {
     for (const c of convos) { wrap.appendChild(buildConvoRow(c, true)); total++; }
     out.appendChild(wrap);
   }
+  return total;
+}
+
+function renderDirectory() {
+  const q = (($('people-search') && $('people-search').value) || '').trim().toLowerCase();
+  const out = $('list-body');
+  if (!out) return;
+  out.replaceChildren();
+  const total = appendDirectoryRows(out, q);
   if (!total) out.appendChild(elEmpty(q ? 'No conversations match your search.' : 'No conversations yet.'));
 }
 
-export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, buildDirectory, startChat, renderDirectory, setSourceViewHook };
+function renderPeople() {
+  renderDirectory();
+}
+
+export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, buildDirectory, startChat, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook };

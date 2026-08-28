@@ -3,7 +3,7 @@
 
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { $, el, sanitizeLine, txn } from './el.js';
-import { openConversation, setActiveNav, showSection } from './nav.js';
+import { openConversation, setActiveNav, showSection, setDetailMode } from './nav.js';
 import { renderMessageEvent } from './render.js';
 import { buildPlatBadge, setActiveConvoRow } from './rows.js';
 import { S, convoSeen, feedModel, runtime } from '../state.js';
@@ -38,7 +38,8 @@ async function openConvo(roomId) {
   convoSetStatus('');
 
   const rec = feedModel.get(roomId);
-  $('convo-title').textContent = sanitizeLine((rec && rec.name) || roomId);
+  const titleEl = $('convo-title');
+  if (titleEl) titleEl.textContent = sanitizeLine((rec && rec.name) || roomId);
   const badge = $('convo-badge');
   if (badge) {
     const b = buildPlatBadge(rec && rec.sourceId); // derived from record sourceId only
@@ -55,8 +56,9 @@ async function openConvo(roomId) {
   // Show the same Home section the Home nav shows, WITHOUT re-rendering the list
   // (which would drop the active highlight); then reveal #msgr-convo by removing
   // the no-selection class and mark the clicked row active.
-  showSection('view-home');
+  showSection('view-workspace');
   setActiveNav('home');
+  setDetailMode('chat');
   const convoPane = $('msgr-convo');
   if (convoPane) convoPane.classList.remove('no-selection');
   setActiveConvoRow(roomId);

@@ -1,53 +1,56 @@
 /* Organic — design-system tokens and component classes.
-   CENTRALIZED design artifact: this file is the single source of truth for the
-   Beepa look, imported by BOTH apps/user and apps/master (per the design project
-   "Beepa Artboards"). Retune here and both apps update. Plain CSS on plain HTML:
-   no JavaScript, no build step. */
-@import url('https://fonts.googleapis.com/css2?family=Caprasimo:wght@400&family=Figtree:wght@400;600;700&display=swap');
+   CENTRALIZED: retune tokens here; both apps inherit via beepa.css. */
 
 :root {
-  --color-bg: #f5ead8;
-  --color-surface: #ebddc5;
-  --color-text: #201e1d;
-  --color-accent: #c67139;
-  --color-accent-2: #7a8a5e;
-  --color-divider: color-mix(in srgb, #201e1d 16%, transparent);
+  /* WhatsApp Web–inspired palette (shared by user + master apps). */
+  --color-bg: #efeae2;
+  --color-surface: #ffffff;
+  --color-text: #111b21;
+  --color-accent: #00a884;
+  --color-accent-2: #25d366;
+  --color-divider: #e9edef;
+  --color-muted: #667781;
 
-  /* Tonal ramps — one shared lightness scale so the same step of any role
-     matches the others in visual value. */
-  --color-neutral-100: #f9f4ed;
-  --color-neutral-200: #eee7db;
-  --color-neutral-300: #dcd3c4;
-  --color-neutral-400: #c0b6a5;
-  --color-neutral-500: #a19786;
-  --color-neutral-600: #82796a;
-  --color-neutral-700: #645c50;
-  --color-neutral-800: #474238;
-  --color-neutral-900: #2e2b25;
+  --color-panel-dark: #111b21;
+  --color-panel-header: #202c33;
+  --color-bubble-sent: #d9fdd3;
+  --color-bubble-recv: #ffffff;
+  --color-list-hover: #f5f6f6;
+  --color-list-active: #f0f2f5;
 
-  --color-accent-100: #fff2eb;
-  --color-accent-200: #ffe1d0;
-  --color-accent-300: #ffc6a5;
-  --color-accent-400: #f6a06b;
-  --color-accent-500: #d67f48;
-  --color-accent-600: #b2622d;
-  --color-accent-700: #8c491a;
-  --color-accent-800: #643312;
-  --color-accent-900: #402310;
+  --color-neutral-100: #ffffff;
+  --color-neutral-200: #f0f2f5;
+  --color-neutral-300: #e9edef;
+  --color-neutral-400: #d1d7db;
+  --color-neutral-500: #8696a0;
+  --color-neutral-600: #667781;
+  --color-neutral-700: #54656f;
+  --color-neutral-800: #3b4a54;
+  --color-neutral-900: #111b21;
 
-  --color-accent-2-100: #f0fae1;
-  --color-accent-2-200: #e1eecc;
-  --color-accent-2-300: #ccdbb2;
-  --color-accent-2-400: #aebf92;
-  --color-accent-2-500: #8fa073;
-  --color-accent-2-600: #728157;
-  --color-accent-2-700: #56633f;
-  --color-accent-2-800: #3d472b;
-  --color-accent-2-900: #272e1b;
+  --color-accent-100: #e7f8f3;
+  --color-accent-200: #d9fdd3;
+  --color-accent-300: #72d4b8;
+  --color-accent-400: #25d366;
+  --color-accent-500: #00a884;
+  --color-accent-600: #008069;
+  --color-accent-700: #006b57;
+  --color-accent-800: #005647;
+  --color-accent-900: #003d32;
 
-  --font-heading: "Caprasimo", system-ui, sans-serif;
-  --font-heading-weight: 400;
-  --font-body: "Figtree", system-ui, sans-serif;
+  --color-accent-2-100: #e7f8f3;
+  --color-accent-2-200: #d9fdd3;
+  --color-accent-2-300: #72d4b8;
+  --color-accent-2-400: #25d366;
+  --color-accent-2-500: #00a884;
+  --color-accent-2-600: #008069;
+  --color-accent-2-700: #006b57;
+  --color-accent-2-800: #005647;
+  --color-accent-2-900: #003d32;
+
+  --font-heading: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-heading-weight: 600;
+  --font-body: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 
   --space-1: 4.4px;
   --space-2: 8.8px;

@@ -1,79 +1,166 @@
-/* Beepa — shared app-shell restyle. Maps the messaging-hub shell (used by BOTH
-   apps/user and apps/master) onto the Organic design system (shared/style/organic.css).
-   CENTRALIZED: retune the look here once; both apps update. Loaded after each app's
-   own style.css so it wins on visuals; app layout/scaffolding stays in style.css. */
+/* Beepa — shared visual layer for apps/user and apps/master.
+   WhatsApp Web–inspired colors and components. Loaded after each app's
+   layout-only style.css so these rules win on appearance. */
 
 /* ── ground ── */
 html, body { background: var(--color-bg); color: var(--color-text); font-family: var(--font-body); }
-.muted, .text-muted, .list-empty { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
-.error { color: var(--color-accent-700); }
+.muted, .text-muted, .list-empty { color: var(--color-muted); }
+.error { color: #ea0038; }
 
-/* ── sign-in ── */
-#view-signin { background: var(--color-bg); }
-#view-signin .card, #view-signin .card.narrow, .card, .card.narrow {
+/* ── sign-in (same light card on both apps) ── */
+#view-signin {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: var(--color-neutral-200);
+}
+#view-signin .card, #view-signin .card.narrow, .signin-card {
+  width: min(400px, 100%); margin: 0; padding: 28px 26px;
   background: var(--color-surface); border: 1px solid var(--color-divider);
-  border-radius: calc(var(--radius-lg) * 1.15); box-shadow: var(--shadow-md);
+  border-radius: 8px; box-shadow: 0 2px 8px rgba(11, 20, 26, 0.08);
+  display: flex; flex-direction: column; gap: 4px;
 }
-#view-signin h1, .card h1 { font-family: var(--font-heading); font-weight: 400; color: var(--color-text); }
-
-/* ── shell + sidebar ── */
-#shell { background: var(--color-bg); }
-#sidebar {
-  background: var(--color-surface);
-  border-right: 1px solid var(--color-divider);
+#view-signin h1, .signin-body h1, .card h1, .brand-word {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 22px; color: var(--color-text); margin: 0 0 6px;
 }
-#sidebar #brand, .nav-brand {
-  font-family: var(--font-heading); font-weight: 400; font-size: 20px;
-  color: var(--color-accent); letter-spacing: -0.01em;
+.brand-word { color: var(--color-accent); }
+.tag-readonly {
+  align-self: flex-start; margin: 0 0 8px; padding: 4px 10px; border-radius: 4px;
+  border: 1px solid var(--color-divider); color: var(--color-muted);
+  font: 600 10px var(--font-body); letter-spacing: 0.06em; text-transform: uppercase;
 }
-.nav-sep { background: var(--color-divider); }
-.navitem {
-  color: color-mix(in srgb, var(--color-text) 78%, transparent);
-  border-radius: 999px; font-size: 14px;
+.signin-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.signin-disclaimer { margin-top: 4px; font-size: 12px; line-height: 1.5; color: var(--color-muted); }
+#signin-error { color: #ea0038; }
+label, .signin-body label, .field > label {
+  display: block; margin: 10px 0 4px; font-size: 13px; color: var(--color-muted);
 }
-.navitem:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); color: var(--color-text); }
-.navitem.active { background: var(--color-accent); color: var(--color-bg); }
-.navitem .count { background: var(--color-accent-200); color: var(--color-accent-800); border-radius: 999px; }
-.navitem.active .count { background: color-mix(in srgb, #fff 25%, transparent); color: var(--color-bg); }
-#account { border-top: 1px solid var(--color-divider); }
-#account a { color: var(--color-accent); }
-#account button { color: color-mix(in srgb, var(--color-text) 65%, transparent); }
-
-/* ── views ── */
-#content { background: var(--color-bg); }
-.view-head h2 { font-family: var(--font-heading); font-weight: 400; color: var(--color-text); }
-.view-head .muted, .view-head p { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
-.view-head input, .input, #home-search, #source-search, #directory-search, #console-input, #convo-input {
+input, .input, textarea.input {
+  width: 100%; padding: 10px 12px; font: inherit; font-size: 15px;
   background: var(--color-surface); color: var(--color-text);
-  border: 1px solid var(--color-divider); border-radius: 999px; padding: 8px 14px;
+  border: 1px solid var(--color-divider); border-radius: 8px;
   caret-color: var(--color-accent);
 }
-.view-head input:focus-visible, .input:focus-visible,
-#home-search:focus-visible, #convo-input:focus-visible { border-color: var(--color-accent); outline: none; }
+input:focus-visible, .input:focus-visible { border-color: var(--color-accent); outline: none; }
 
-/* ── conversation list ── */
-.convo-list { gap: var(--space-1); }
+/* ── dark chrome (sidebar + master topbar) ── */
+#sidebar, #topbar {
+  background: var(--color-panel-dark); color: #aebac1;
+  border-color: color-mix(in srgb, #fff 8%, transparent);
+}
+#sidebar #brand, #topbar #brand, .nav-brand {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 18px; color: #e9edef;
+}
+.nav-sep { background: color-mix(in srgb, #fff 10%, transparent); margin: 8px 6px; }
+.navitem, .tab {
+  color: #aebac1; border-radius: 8px; font-size: 14px;
+  border: none; background: transparent;
+}
+.navitem:hover, .tab:hover { background: var(--color-panel-header); color: #e9edef; }
+.navitem.active { background: var(--color-panel-header); color: #e9edef; font-weight: 600; }
+.nav-icon { font-size: 0; }
+.nav-icon .ic { font-size: 20px; line-height: 1; }
+.rail-brand { color: var(--color-accent); }
+.settings-popover {
+  background: var(--color-panel-header); color: #e9edef;
+  border: 1px solid color-mix(in srgb, #fff 10%, transparent);
+}
+.settings-user { color: #8696a0; border-bottom: 1px solid color-mix(in srgb, #fff 8%, transparent); }
+.settings-menu-item { color: #e9edef; }
+.settings-menu-item:hover { background: color-mix(in srgb, #fff 6%, transparent); }
+.settings-signout { color: #8696a0 !important; }
+.list-mode-btn { color: var(--color-muted); }
+.list-mode-btn:hover { background: var(--color-list-hover); color: var(--color-text); }
+.list-mode-btn.active { background: var(--color-list-active); color: var(--color-text); }
+.list-mode-named.active { color: var(--color-accent-700); font-weight: 600; }
+.navitem .count { background: var(--color-panel-header); color: #aebac1; border-radius: 4px; font-size: 11px; }
+.tab.active { background: var(--color-panel-header); color: #e9edef; font-weight: 600; }
+.tab-static { cursor: default; color: #667781; }
+.tab-static:hover { background: transparent; color: #667781; }
+#account { border-top: 1px solid color-mix(in srgb, #fff 10%, transparent); }
+#whoami { color: #8696a0; font-size: 12px; }
+#account a { color: #8696a0; text-decoration: none; }
+#account a:hover { color: #aebac1; }
+#account button {
+  background: transparent; border: 1px solid color-mix(in srgb, #fff 14%, transparent);
+  color: #aebac1; border-radius: 6px;
+}
+.live-indicator { color: #8696a0; }
+.live-dot { background: var(--color-accent); }
+
+/* master teammates rail — light list panel like WA chat list */
+#body-row #sidebar {
+  background: var(--color-surface); color: var(--color-text);
+  border-right: 1px solid var(--color-divider);
+}
+#teammates-label { color: var(--color-muted); }
+.teammate-row { color: var(--color-text); border-radius: 0; }
+.teammate-row:hover { background: var(--color-list-hover); }
+.teammate-row.active { background: var(--color-list-active); }
+.teammate-avatar {
+  background: var(--color-neutral-300); color: var(--color-neutral-700);
+}
+#body-row #account { border-top-color: var(--color-divider); }
+#body-row #whoami { color: var(--color-muted); }
+
+/* ── shell + content areas ── */
+#shell { background: var(--color-bg); }
+#content { background: var(--color-bg); }
+.view-head h1, .view-head h2, .feed-head h1 {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  color: var(--color-text);
+}
+.view-head .muted, .view-head p, .feed-head .muted { color: var(--color-muted); }
+.view-head input, #home-search, #source-search, #directory-search, #search-input,
+#console-input, #convo-input {
+  background: var(--color-neutral-200); color: var(--color-text);
+  border: none; border-radius: 8px; padding: 8px 14px;
+}
+.view-head input:focus-visible, #home-search:focus-visible, #convo-input:focus-visible {
+  outline: 2px solid var(--color-accent); outline-offset: 0;
+}
+
+.card {
+  background: var(--color-surface); border: 1px solid var(--color-divider);
+  border-radius: 8px; padding: 16px; margin: 12px 0;
+}
+
+/* ── conversation list (flat WhatsApp-style rows) ── */
+.convo-list { gap: 0; display: flex; flex-direction: column; }
 .convo {
-  background: transparent; border-radius: var(--radius-md);
-  border-bottom: none; padding: var(--space-2) var(--space-3);
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; margin: 0;
+  background: var(--color-surface); border: none;
+  border-bottom: 1px solid var(--color-divider); border-radius: 0;
+  cursor: pointer; text-align: left; width: 100%;
 }
-.convo:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-.convo.active { background: var(--color-accent-100); }
+.convo:first-child, .convo:last-child, .convo:only-child { border-radius: 0; }
+.convo:hover { background: var(--color-list-hover); }
+.convo.active { background: var(--color-list-active); }
 .convo .avatar {
-  background: var(--color-accent-2-200); color: var(--color-accent-2-800);
-  font-family: var(--font-heading); font-weight: 400; border-radius: 50%;
+  width: 49px; height: 49px; flex: 0 0 49px; border-radius: 50%;
+  background: var(--color-neutral-300); color: var(--color-neutral-700);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 600; overflow: hidden;
 }
-.convo .avatar img { border-radius: 50%; }
-.convo .title { font-weight: 600; color: var(--color-text); }
-.convo .sub, .convo .meta .preview { color: color-mix(in srgb, var(--color-text) 52%, transparent); }
-.convo .when { color: color-mix(in srgb, var(--color-text) 45%, transparent); }
-.convo .badge { background: var(--color-neutral-100); color: var(--color-neutral-800); border-radius: 999px; padding: 2px 9px; font-size: 11px; }
+.convo .avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+.convo .meta { flex: 1; min-width: 0; }
+.convo .title { font-weight: 500; font-size: 16px; color: var(--color-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo .sub, .convo .preview, .convo .meta .preview {
+  color: var(--color-muted); font-size: 13px; margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.convo .when { flex: 0 0 auto; color: var(--color-muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+.convo .badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  background: var(--color-neutral-200); color: var(--color-muted); border: none;
+}
+.convo .plat-badge { display: inline-flex; flex: 0 0 auto; }
 
-/* ── platform logo badges (CSS-only, same-origin ⇒ CSP img-src 'self') ── */
+/* platform logo badges */
 .plat-badge {
   width: 18px; height: 18px; flex: none; border-radius: 50%;
   background-size: cover; background-position: center; background-repeat: no-repeat;
-  box-shadow: var(--shadow-sm);
 }
 .plat-badge.whatsapp   { background-image: url(../assets/logo-whatsapp.png);  color: transparent; }
 .plat-badge.imessage   { background-image: url(../assets/logo-imessage.png);  color: transparent; }
@@ -82,86 +169,171 @@ html, body { background: var(--color-bg); color: var(--color-text); font-family:
 .plat-badge.linkedin   { background-image: url(../assets/logo-linkedin.png);  color: transparent; }
 .plat-badge.twitter    { background-image: url(../assets/logo-twitter.png);   color: transparent; }
 
-/* ── chat pane ── */
-#convo-head, #msgr-list-head { border-bottom: 1px solid var(--color-divider); }
-#convo-title { font-family: var(--font-heading); font-weight: 400; }
-.msg { border-radius: var(--radius-lg); }
-.msg.recv { background: var(--color-surface); color: var(--color-text); }
-.msg.sent { background: var(--color-accent); color: var(--color-bg); }
-.msg.notice, .msg.media { background: var(--color-neutral-200); color: var(--color-neutral-800); }
-#convo-compose { border-top: 1px solid var(--color-divider); background: var(--color-bg); }
-
-/* ── bridge / connection cards ── */
-#bridge-cards { gap: var(--space-3); }
-.bridge-card, .src-placeholder {
-  background: var(--color-surface); border: 1px solid var(--color-divider);
-  border-radius: calc(var(--radius-lg) * 1.05); box-shadow: var(--shadow-sm);
+.convo-open {
+  flex: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  background: var(--color-neutral-200); color: var(--color-muted); border: none;
 }
-.bridge-name { font-family: var(--font-heading); font-weight: 400; font-size: 18px; }
-.status-pill { background: var(--color-neutral-200); color: var(--color-neutral-800); border-radius: 999px; font-size: 11px; padding: 3px 10px; }
-.status-pill.ok { background: var(--color-accent-2-200); color: var(--color-accent-2-800); }
 
-/* ── settings / command rows ── */
-.cmd-group { background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: var(--radius-lg); }
-.cmd { border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent); }
-.cmd .name { font-weight: 600; }
-.cmd .desc { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
-#console { background: var(--color-neutral-900); color: var(--color-neutral-100); border-radius: var(--radius-md); font-family: ui-monospace, Menlo, monospace; }
+/* ── chat headers ── */
+#convo-head, #room-head, #msgr-list-head {
+  background: var(--color-panel-header); color: #e9edef;
+  border-bottom: 1px solid color-mix(in srgb, #fff 8%, transparent);
+}
+#convo-title, #room-title { font-weight: 500; font-size: 16px; color: #e9edef; }
+#convo-back, #room-back {
+  border: none; background: transparent; color: #aebac1; border-radius: 50%;
+  cursor: pointer; font-size: 18px;
+}
+#convo-back:hover, #room-back:hover { background: color-mix(in srgb, #fff 8%, transparent); }
+#convo-element-link { color: #8696a0; font-size: 12px; }
+#convo-head .plat-badge, #room-head .plat-badge { width: 20px; height: 20px; }
+.room-sub-row .muted { color: #8696a0; }
+.live-indicator-room {
+  background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+  border: 1px solid var(--color-accent); color: var(--color-accent-200);
+  border-radius: 999px; padding: 4px 10px; font-size: 11px;
+}
+
+/* ── message bubbles (user .msg + master .msg-row .msg) ── */
+#convo-messages, #room-messages {
+  background: var(--color-bg); padding: 12px 16px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.msg, .msg-row .msg {
+  padding: 6px 9px 8px;
+  border-radius: 8px; font-size: 14px; line-height: 1.4;
+  word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
+  box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
+}
+.msg.recv, .msg-row.recv .msg {
+  align-self: flex-start;
+  background: var(--color-bubble-recv); color: var(--color-text); border: none;
+  border-top-left-radius: 0;
+}
+.msg.sent, .msg-row.sent .msg {
+  align-self: flex-end;
+  background: var(--color-bubble-sent); color: var(--color-text); border: none;
+  border-top-right-radius: 0;
+}
+.msg .who { display: block; font-size: 12px; font-weight: 600; color: var(--color-accent-600); margin-bottom: 2px; }
+.msg .when { display: block; font-size: 11px; color: var(--color-muted); margin-top: 2px; text-align: right; }
+.msg.sent .who, .msg.sent .when, .msg-row.sent .msg .when { color: var(--color-muted); }
+.msg.notice, .msg-row .msg.notice {
+  align-self: center; max-width: 90%; background: rgba(255,255,255,0.85);
+  box-shadow: none; font-size: 12px; color: var(--color-muted); text-align: center;
+  border-radius: 8px;
+}
+.msg.media .body, .msg-row .msg.media .body { font-style: italic; color: var(--color-muted); }
+#convo-day, .day-divider {
+  align-self: center; padding: 4px 12px; border-radius: 8px;
+  background: rgba(255,255,255,0.9); color: var(--color-muted);
+  font-size: 12px; box-shadow: 0 1px 0.5px rgba(11,20,26,.08);
+}
+
+#msgr-list {
+  background: var(--color-surface); border-right: 1px solid var(--color-divider);
+}
+#msgr-convo { background: var(--color-bg); }
+
+/* user: .msg is the flex row item; master: .msg-row is */
+.msg.recv, .msg.sent { max-width: 65%; }
+.msg-row { max-width: 65%; display: flex; flex-direction: column; gap: 2px; }
+.msg-row .msg { max-width: 100%; width: 100%; }
+.msg-row.recv { align-self: flex-start; }
+.msg-row.sent { align-self: flex-end; align-items: flex-end; }
+.msg-meta {
+  display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--color-muted);
+  padding: 0 4px;
+}
+.msg-row.sent .msg-meta { flex-direction: row-reverse; }
+.msg-meta .msg-badge-mini { width: 14px; height: 14px; border-radius: 50%; }
+.msg-meta .msg-sender { font-weight: 600; color: var(--color-accent-600); }
+.msg-row.sent .msg-meta .msg-sender { color: var(--color-muted); }
+
+#convo-compose {
+  background: var(--color-neutral-200); border-top: 1px solid var(--color-divider);
+  padding: 10px 16px; gap: 8px;
+}
+#convo-compose input {
+  background: var(--color-surface); border-radius: 8px; border: none;
+}
+#convo-placeholder { color: var(--color-muted); }
+
+/* ── bridge / settings ── */
+.bridge-card, .src-placeholder, .cmd-group {
+  background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: 8px;
+}
+.bridge-name { font-weight: 600; font-size: 16px; }
+.status-pill { background: var(--color-neutral-200); color: var(--color-muted); border-radius: 4px; font-size: 11px; }
+.status-pill.ok { background: var(--color-accent-100); color: var(--color-accent-700); }
+#console {
+  background: var(--color-panel-dark); color: #e9edef; border-radius: 8px;
+  font-family: ui-monospace, Menlo, monospace;
+}
 #console .who.you { color: var(--color-accent-300); }
 
 /* ── buttons ── */
-button, .navitem, .cmd button { font-family: var(--font-body); }
-button.primary, .btn-primary, #btn-signin.primary, .bridge-actions .primary, .dialog-actions .primary, #modal-ok {
-  background: var(--color-accent); color: var(--color-bg);
-  border: 1px solid transparent; border-radius: 999px;
-  font-family: var(--font-heading); font-weight: 400;
+button { font-family: var(--font-body); cursor: pointer; }
+button.primary, .btn-primary, #btn-signin.primary, .bridge-actions .primary, #modal-ok {
+  background: var(--color-accent); color: #fff;
+  border: none; border-radius: 8px; font-weight: 600;
 }
 button.primary:hover, .btn-primary:hover { background: var(--color-accent-600); }
-button.danger, #modal-ok.danger { background: var(--color-accent-700); color: var(--color-bg); border-radius: 999px; }
-button:not(.primary):not(.danger), .btn-secondary {
-  background: transparent; color: var(--color-text);
-  border: 1px solid var(--color-divider); border-radius: 999px;
+button.danger, #modal-ok.danger { background: #ea0038; color: #fff; border: none; }
+button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(.share-opt):not(.hide-btn), .btn-secondary {
+  background: var(--color-surface); color: var(--color-text);
+  border: 1px solid var(--color-divider); border-radius: 8px;
 }
-button:not(.primary):not(.danger):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+#btn-signin.primary, .btn-block { width: 100%; margin-top: 12px; }
 
-/* ── modal / dialog ── */
-#modal-backdrop { background: color-mix(in srgb, var(--color-neutral-900) 50%, transparent); }
-#modal { background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); }
-#modal h3 { font-family: var(--font-heading); font-weight: 400; }
+/* ── modal ── */
+#modal-backdrop { background: rgba(11, 20, 26, 0.4); }
+#modal { background: var(--color-surface); border-radius: 8px; box-shadow: 0 4px 16px rgba(11,20,26,.15); }
 
-/* ── sharing / consent, proposals, contacts, add-teammate (app-specific views,
-      inherit the tokens automatically; a few accents so they read as Organic) ── */
-.share-toggle, .seg { border-radius: 999px; }
-
-/* sharing kebab (⋯) on a conversation row + its popover (design 1a) */
+/* ── sharing / consent ── */
+.share-badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--color-neutral-200); color: var(--color-muted); }
+.share-badge.shared { background: var(--color-accent-100); color: var(--color-accent-700); }
+.share-opt {
+  padding: 4px 8px; font-size: 11px; border-radius: 6px;
+  border: 1px solid var(--color-divider); background: var(--color-surface); color: var(--color-muted);
+}
+.share-opt.active { background: var(--color-accent); border-color: var(--color-accent); color: #fff; }
+.switch.on { background: var(--color-accent); border-color: var(--color-accent); }
 .share-controls { position: relative; margin-left: auto; display: inline-flex; }
 .share-kebab {
-  border: 0; background: transparent; cursor: pointer; line-height: 1;
-  font-size: 18px; padding: 2px 7px; border-radius: 999px;
-  color: color-mix(in srgb, var(--color-text) 45%, transparent);
+  border: 0; background: transparent; cursor: pointer; font-size: 18px; padding: 2px 7px;
+  border-radius: 50%; color: var(--color-muted);
 }
-.share-kebab:hover { background: color-mix(in srgb, var(--color-text) 9%, transparent); color: var(--color-text); }
+.share-kebab:hover { background: var(--color-list-hover); color: var(--color-text); }
 .share-menu {
-  position: absolute; right: 0; top: calc(100% + 5px); z-index: 30;
-  min-width: 190px; display: flex; flex-direction: column; gap: var(--space-2);
-  padding: var(--space-3); background: var(--color-surface);
-  border: 1px solid var(--color-divider); border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
+  min-width: 190px; padding: 12px; background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(11,20,26,.12);
 }
 .share-menu.hidden { display: none; }
-.proposal-card, .contact-card { background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: var(--radius-lg); }
-.proposal-card { border-style: dashed; border-color: var(--color-accent-400); }
 
-/* contact grouping: latest conversation on top, click expands an accordion */
-.contact-linked-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-md); cursor: pointer; }
-.contact-linked-row:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
-.contact-row-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.contact-linked-row .title { font-weight: 600; }
-.contact-linked-row .sub { font-size: 12px; color: color-mix(in srgb, var(--color-text) 52%, transparent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.contact-primary { background: var(--color-accent-100); }
-.contact-primary:hover { background: color-mix(in srgb, var(--color-accent) 15%, transparent); }
-.contact-chev { transition: transform 0.15s ease; color: color-mix(in srgb, var(--color-text) 45%, transparent); }
-.contact-chev.open { transform: rotate(180deg); }
-.contact-accordion { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 2px 14px; border-left: 2px solid var(--color-divider); padding-left: 8px; }
-.contact-accordion.hidden { display: none; }
-.contact-unlink { margin-left: auto; }
+/* proposals + contacts */
+.proposal-card { background: var(--color-surface); border: 1px dashed var(--color-accent-400); border-radius: 8px; }
+.contact-linked-row:hover { background: var(--color-list-hover); }
+.contact-primary { background: var(--color-list-active); }
+
+.profile-group { margin-bottom: 0; border-bottom: 1px solid var(--color-divider); }
+.profile-header {
+  background: var(--color-neutral-200); padding: 8px 16px; border-radius: 0;
+}
+.profile-members .convo { padding-left: 24px; }
+
+/* list-panel views use white bg (WA chat list) */
+#list-pane,
+#view-recent, #view-teammate, #view-search, #view-directory, #view-source {
+  background: var(--color-surface);
+}
+.feed-showhidden {
+  display: block; width: 100%; padding: 8px 16px; margin: 0;
+  border: none; border-bottom: 1px solid var(--color-divider);
+  background: var(--color-surface); color: var(--color-muted);
+  font-size: 13px; text-align: left; cursor: pointer;
+}
+.feed-showhidden:hover { background: var(--color-list-hover); }
+.feed-showhidden.active { background: var(--color-list-active); color: var(--color-text); font-weight: 600; }

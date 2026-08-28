@@ -34,7 +34,7 @@ async function readLink() {
 }
 
 export async function initOrgLinkUI() {
-  const settings = $('view-settings');
+  const settings = $('settings-section-advanced');
   if (!settings || $('orglink-card')) return;
 
   const card = el('div', 'card');
@@ -89,7 +89,8 @@ export async function initOrgLinkUI() {
   note.appendChild(cmd);
   card.appendChild(note);
 
-  settings.insertBefore(card, settings.firstChild);
+  const mount = $('command-groups') || settings;
+  mount.insertBefore(card, mount.firstChild);
 
   function showWarn(msg) { warn.textContent = msg; warn.classList.remove('hidden'); }
   function clearWarn() { warn.textContent = ''; warn.classList.add('hidden'); }

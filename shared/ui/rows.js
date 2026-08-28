@@ -71,7 +71,7 @@ function buildFeedRow(r) {
 // buildFeedRow); textContent/dataset only, no innerHTML. Passing null clears all.
 // Not a navigation or security input — it only sets a CSS highlight class.
 function setActiveConvoRow(roomId) {
-  const list = $('home-list');
+  const list = $('list-body');
   if (!list) return;
   for (const row of list.children) {
     const rid = row.dataset ? row.dataset.roomId : undefined;

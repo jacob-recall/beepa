@@ -26,7 +26,14 @@ export const S = {
   selfMxids: new Set(),
 };
 export const convosBySource = {};
-export const runtime = { whatsapp: { mgmtRoomId: null }, imessage: { mgmtRoomId: null }, gmessages: { mgmtRoomId: null }, instagram: { mgmtRoomId: null }, linkedin: { mgmtRoomId: null }, twitter: { mgmtRoomId: null } };
+export const runtime = {
+  whatsapp: { mgmtRoomId: null, connected: false },
+  imessage: { mgmtRoomId: null, connected: false },
+  gmessages: { mgmtRoomId: null, connected: false },
+  instagram: { mgmtRoomId: null, connected: false },
+  linkedin: { mgmtRoomId: null, connected: false },
+  twitter: { mgmtRoomId: null, connected: false },
+};
 export const feedModel = new Map();
 export const feedManualHidden = new Set();
 export const convoSeen = new Set();

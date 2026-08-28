@@ -8,9 +8,9 @@ import { initProposalsUI } from './proposals.js';
 import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
 import { api, setOnUnauthorized } from '../../shared/matrix/client.js';
-import { buildConnections, buildSettings, logConsole } from '../../shared/ui/connections.js';
+import { ensureConnections, ensureSettings, logConsole, setPlatformRailHook } from '../../shared/ui/connections.js';
 import { $ } from '../../shared/ui/el.js';
-import { buildNav, mountChats, navTo, openConversation, showAuth, unmountChats } from '../../shared/ui/nav.js';
+import { buildNav, mountChats, navTo, openConversation, refreshPlatformRail, showAuth, unmountChats } from '../../shared/ui/nav.js';
 import { setActiveConvoRow } from '../../shared/ui/rows.js';
 import { buildDirectory, renderHome, renderSourceList } from '../../shared/ui/search.js';
 import { GMSG, IG, LI, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
@@ -23,6 +23,7 @@ setOnUnauthorized(forgetSession);
 function forgetSession() {
   S.token = null; S.userId = null;
   runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null; runtime.twitter.mgmtRoomId = null;
+  for (const k of Object.keys(runtime)) runtime[k].connected = false;
   S.syncRunning = false;
   S.feedRunning = false;                              // HF-2: stop the feed loop with the session
   S.feedSince = null;
@@ -77,9 +78,10 @@ async function enterApp() {
   const wrap = $('signout-note-wrap');
   if (wrap) wrap.classList.add('hidden');
   buildNav();
-  buildConnections();
-  buildSettings();
+  setPlatformRailHook(refreshPlatformRail);
   buildDirectory();
+  ensureConnections();
+  ensureSettings();
   try { await initConsentUI(); } catch (e) { /* share controls stay at safe defaults on error */ }
   try { initProposalsUI(); } catch (e) { /* proposal inbox hook stays unregistered on error */ }
   try { initContactsUI(); } catch (e) { /* contacts hook stays unregistered on error */ }
@@ -111,6 +113,7 @@ async function enterApp() {
   await sendCmd('instagram', 'list-logins');
   await sendCmd('linkedin', 'list-logins');
   await sendCmd('twitter', 'list-logins');
+  refreshPlatformRail();
 }
 
 // ---- wiring ----

@@ -1,130 +1,347 @@
-// Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
-// Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
+// Shared navigation + unified two-pane workspace shell.
 
 import { refreshConvos } from './account-data.js';
 import { stopConvoWatch } from './chat.js';
 import { CHATS_URL, ROOMID_RE } from '../matrix/client.js';
 import { $, el } from './el.js';
 import { setActiveConvoRow } from './rows.js';
-import { loadSourceList, renderDirectory, renderHome } from './search.js';
+import { ensureConnections, ensureSettings } from './connections.js';
+import { loadSourceList, renderHome, renderPeople } from './search.js';
 import { SOURCES, sendCmd } from './sources.js';
 import { S, runtime } from '../state.js';
 
-// Optional app-injected hook: called (with no args) whenever the 'sharing' nav
-// key is opened, so apps/user can (re)render its consent/share-controls view
-// (PLAN-MASTER-SYNC §5.1/§4.2) without shared/ importing from apps/ (same hook
-// pattern as setConvoRowDecorator / setSourceViewHook).
 let sharingViewHook = null;
 function setSharingViewHook(fn) { sharingViewHook = typeof fn === 'function' ? fn : null; }
 
-// Same app-injection pattern for apps/user's proposal inbox (PLAN §2 v2 / §7):
-// nav.js only knows the 'proposals' key; the render logic (reading the local
-// proposals room, the approve/edit/send-through-the-guarded-path UI) lives in
-// apps/user/proposals.js. no-op in apps/master, which has no #nav-proposals.
 let proposalsViewHook = null;
 function setProposalsViewHook(fn) { proposalsViewHook = typeof fn === 'function' ? fn : null; }
 
-// Same app-injection pattern for apps/user's contact-profile management (PLAN
-// §12 phase 5): nav.js only knows the 'contacts' key; the render logic (list
-// profiles, create/attach/detach, share toggle, merge suggestions) lives in
-// apps/user/contacts.js. no-op in apps/master, which has no #nav-contacts.
 let contactsViewHook = null;
 function setContactsViewHook(fn) { contactsViewHook = typeof fn === 'function' ? fn : null; }
 
-// ---- open a conversation (U-1 / D-4) ----
+let listMode = 'chats'; // 'chats' | 'proposals' — conversation-layer toggle on Home
+
+const LIST_SEARCH = {
+  home: 'home-search',
+  people: 'people-search',
+};
+for (const s of SOURCES) {
+  if (s.kind !== 'all') LIST_SEARCH['source:' + s.id] = 'source-search';
+}
+
+const PILL_BY_SOURCE = {
+  whatsapp: 'wa-status', imessage: 'imsg-status', gmessages: 'gmsg-status',
+  instagram: 'ig-status', linkedin: 'li-status', twitter: 'tw-status',
+};
+
+function platformLogoBadge(sourceId) {
+  return el('span', 'plat-badge' + (sourceId ? ' ' + sourceId : ''), '');
+}
+
+function sourceConnected(sourceId) {
+  const rt = sourceId && runtime[sourceId];
+  if (rt && rt.connected) return true;
+  const pillId = PILL_BY_SOURCE[sourceId];
+  if (pillId) {
+    const pill = $(pillId);
+    if (pill && pill.classList.contains('ok')) return true;
+  }
+  return false;
+}
+
+function listBody() { return $('list-body'); }
+
+function showListMode(show) {
+  const lm = $('list-mode');
+  if (lm) lm.classList.toggle('hidden', !show);
+}
+
+function setListMode(mode) {
+  listMode = mode === 'proposals' ? 'proposals' : 'chats';
+  const chatsBtn = $('list-mode-chats');
+  const propBtn = $('list-mode-proposals');
+  if (chatsBtn) chatsBtn.classList.toggle('active', listMode === 'chats');
+  if (propBtn) propBtn.classList.toggle('active', listMode === 'proposals');
+  renderHomeLayer();
+}
+
+function renderHomeLayer() {
+  if (listMode === 'proposals') {
+    showListSearch(null);
+    showListMode(true);
+    setDetailMode('empty');
+    if (proposalsViewHook) proposalsViewHook();
+    return;
+  }
+  showListSearch('home');
+  showListMode(true);
+  setDetailMode(S.openRoomId ? 'chat' : 'empty');
+  renderHome();
+  const convoPane = $('msgr-convo');
+  if (S.openRoomId) {
+    if (convoPane) convoPane.classList.remove('no-selection');
+    setActiveConvoRow(S.openRoomId);
+  } else {
+    if (convoPane) convoPane.classList.add('no-selection');
+    setActiveConvoRow(null);
+  }
+}
+
+function showListSearch(key) {
+  for (const input of document.querySelectorAll('.list-search')) input.classList.add('hidden');
+  if (key) {
+    const id = LIST_SEARCH[key];
+    if (id) { const node = $(id); if (node) node.classList.remove('hidden'); }
+  }
+  const actions = $('list-head-actions');
+  if (actions) actions.classList.toggle('hidden', key !== 'people');
+  const shareSlot = $('source-share-switch');
+  if (shareSlot) shareSlot.classList.toggle('hidden', !(key && key.indexOf('source:') === 0));
+}
+
+function setDetailMode(mode) {
+  const pane = $('msgr-convo');
+  const chat = $('detail-chat');
+  const proposal = $('detail-proposal');
+  const contact = $('detail-contact');
+  const admin = $('detail-admin');
+  if (chat) chat.classList.toggle('hidden', mode !== 'chat');
+  if (proposal) proposal.classList.toggle('hidden', mode !== 'proposal');
+  if (contact) contact.classList.toggle('hidden', mode !== 'contact');
+  if (admin) admin.classList.toggle('hidden', mode !== 'admin');
+  if (pane) {
+    const empty = mode === 'empty' || mode === 'admin';
+    pane.classList.toggle('no-selection', empty);
+  }
+}
+
+function setWorkspaceLayout(twoPane) {
+  const listPane = $('list-pane');
+  if (listPane) listPane.classList.toggle('hidden', !twoPane);
+  const ws = $('workspace');
+  if (ws) ws.classList.toggle('admin-only', !twoPane);
+}
+
+function showSettingsSection(section) {
+  const id = section || 'platforms';
+  for (const b of document.querySelectorAll('.settings-tab')) {
+    b.classList.toggle('active', b.dataset.section === id);
+  }
+  for (const name of ['platforms', 'connections', 'sharing', 'advanced']) {
+    const pane = $('settings-section-' + name);
+    if (pane) pane.classList.toggle('hidden', name !== id);
+  }
+}
+
+function wireSettingsHub() {
+  const tabs = $('settings-tabs');
+  if (tabs && !tabs.dataset.wired) {
+    tabs.dataset.wired = '1';
+    for (const b of tabs.querySelectorAll('.settings-tab')) {
+      b.addEventListener('click', () => showSettingsSection(b.dataset.section));
+    }
+  }
+  const back = $('settings-back');
+  if (back && !back.dataset.wired) {
+    back.dataset.wired = '1';
+    back.addEventListener('click', () => navTo('home'));
+  }
+}
+
+function showSettingsHub() {
+  closeSettingsPopover();
+  setWorkspaceLayout(false);
+  setDetailMode('admin');
+  wireSettingsHub();
+  showSettingsSection('platforms');
+  ensureConnections();
+  ensureSettings();
+  if (sharingViewHook) sharingViewHook();
+}
+
 function openConversation(roomId) {
-  if (!ROOMID_RE.test(roomId)) return;             // reject ids failing the regex
-  if (!S.joinedSet.has(roomId)) return;              // D-5: must be a joined room
+  if (!ROOMID_RE.test(roomId)) return;
+  if (!S.joinedSet.has(roomId)) return;
   const f = $('chats-container') && $('chats-container').querySelector('iframe');
-  if (f) f.src = CHATS_URL + '/#/room/' + roomId;  // constant prefix + validated RAW id
+  if (f) f.src = CHATS_URL + '/#/room/' + roomId;
   navTo('all');
 }
 
-// ---- navigation / views ----
 function showAuth(signedIn) {
   $('shell').classList.toggle('hidden', !signedIn);
   $('view-signin').classList.toggle('hidden', signedIn);
+  closeSettingsPopover();
 }
+
+let activeNavKey = 'home';
+
 function setActiveNav(key) {
-  for (const b of document.querySelectorAll('.navitem')) b.classList.toggle('active', b.dataset.navkey === key);
+  activeNavKey = key;
+  for (const b of document.querySelectorAll('.navitem')) {
+    b.classList.toggle('active', b.dataset.navkey === key);
+  }
 }
+
 function showSection(id) {
   for (const s of document.querySelectorAll('#content .view')) s.classList.toggle('hidden', s.id !== id);
 }
-async function navTo(key) {
-  if (S.openRoomId && key !== 'home') stopConvoWatch(); // CV.2: leaving the messenger stops its watch; Home keeps an open chat
-  setActiveNav(key);
-  if (key === 'home') {
-    showSection('view-home');                        // unified two-pane messenger
-    renderHome();
-    // Right pane: if a chat is open (S.openRoomId), keep it shown and re-mark its
-    // row active (renderHome rebuilt the rows); otherwise show the placeholder.
-    const convoPane = $('msgr-convo');
-    if (S.openRoomId) {
-      if (convoPane) convoPane.classList.remove('no-selection');
-      setActiveConvoRow(S.openRoomId);
-    } else {
-      if (convoPane) convoPane.classList.add('no-selection');
-      setActiveConvoRow(null);
-    }
-  } else if (key === 'all') {
-    showSection('view-chats');                      // Element pane stays mounted
-  } else if (key.indexOf('source:') === 0) {
-    showSection('view-source');
-    await loadSourceList(key.slice(7));
-  } else if (key === 'directory') {
-    showSection('view-directory');
-    try { await refreshConvos(); } catch (e) {}
-    renderDirectory();
-  } else if (key === 'connections') {
-    showSection('view-connections');
-    if (runtime.imessage.mgmtRoomId) sendCmd('imessage', 'status'); // refresh checklist
-  } else if (key === 'settings') {
-    showSection('view-settings');
-  } else if (key === 'sharing') {
-    showSection('view-sharing');
-    if (sharingViewHook) sharingViewHook();
-  } else if (key === 'proposals') {
-    showSection('view-proposals');
-    if (proposalsViewHook) proposalsViewHook();
-  } else if (key === 'contacts') {
-    showSection('view-contacts');
-    if (contactsViewHook) contactsViewHook();
-  }
+
+function closeSettingsPopover() {
+  const pop = $('settings-popover');
+  const btn = $('nav-settings-toggle');
+  if (pop) pop.classList.add('hidden');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
 }
-function buildNav() {
-  const nav = $('nav-sources');
-  nav.replaceChildren();
+
+function toggleSettingsPopover() {
+  const pop = $('settings-popover');
+  const btn = $('nav-settings-toggle');
+  if (!pop || !btn) return;
+  const open = pop.classList.toggle('hidden');
+  btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+}
+
+function buildPlatformList() {
+  const host = $('settings-platforms-list');
+  if (!host) return;
+  host.replaceChildren();
   for (const s of SOURCES) {
-    // The former "All chats" Element tab becomes Home — the default landing
-    // feed. The Element pane (view-chats) has no nav item; it is shown when a
-    // feed/list row is opened via openConversation.
-    if (s.kind === 'all') {
-      const home = el('button', 'navitem');
-      home.type = 'button';
-      home.dataset.navkey = 'home';
-      home.appendChild(el('span', 'ic', '🏠'));
-      home.appendChild(document.createTextNode(' Home'));
-      home.addEventListener('click', () => navTo('home'));
-      nav.appendChild(home);
-      continue;
-    }
+    if (s.kind === 'all') continue;
     const key = 'source:' + s.id;
-    const btn = el('button', 'navitem');
+    const btn = el('button', 'settings-row');
     btn.type = 'button';
     btn.dataset.navkey = key;
-    btn.appendChild(el('span', 'ic', s.icon || '•'));
-    btn.appendChild(document.createTextNode(' ' + s.label));
+    const ic = platformLogoBadge(s.id);
+    ic.classList.add('settings-row-ic');
+    btn.appendChild(ic);
+    const meta = el('span', 'settings-row-meta');
+    meta.appendChild(el('span', 'settings-row-title', s.label));
+    btn.appendChild(meta);
+    btn.appendChild(el('span', 'settings-row-chev', '›'));
     btn.addEventListener('click', () => navTo(key));
-    nav.appendChild(btn);
+    host.appendChild(btn);
   }
-  wireTool('nav-directory', 'directory');
-  wireTool('nav-connections', 'connections');
-  wireTool('nav-settings', 'settings');
-  wireTool('nav-sharing', 'sharing');           // no-op if the app has no #nav-sharing
-  wireTool('nav-proposals', 'proposals');       // no-op if the app has no #nav-proposals
-  wireTool('nav-contacts', 'contacts');         // no-op if the app has no #nav-contacts
 }
+
+async function navTo(key) {
+  closeSettingsPopover();
+  const chatKeys = new Set(['home', 'people']);
+  for (const s of SOURCES) if (s.kind !== 'all') chatKeys.add('source:' + s.id);
+
+  if (S.openRoomId && !chatKeys.has(key) && key !== 'all' && key !== 'settings') stopConvoWatch();
+
+  if (key === 'settings') {
+    setActiveNav('settings');
+    showSection('view-workspace');
+    showSettingsHub();
+    return;
+  }
+
+  setActiveNav(key);
+  showSection(key === 'all' ? 'view-chats' : 'view-workspace');
+
+  if (key === 'all') return;
+
+  if (key === 'home') {
+    listMode = 'chats';
+    setWorkspaceLayout(true);
+    setListMode('chats');
+  } else if (key.indexOf('source:') === 0) {
+    setWorkspaceLayout(true);
+    showListMode(false);
+    showListSearch(key);
+    setDetailMode(S.openRoomId ? 'chat' : 'empty');
+    await loadSourceList(key.slice(7));
+  } else if (key === 'people') {
+    setWorkspaceLayout(true);
+    showListMode(false);
+    showListSearch('people');
+    setDetailMode('empty');
+    try { await refreshConvos(); } catch (e) {}
+    if (contactsViewHook) contactsViewHook();
+    else renderPeople();
+  }
+}
+
+function wireListMode() {
+  const chatsBtn = $('list-mode-chats');
+  const propBtn = $('list-mode-proposals');
+  if (chatsBtn && !chatsBtn.dataset.wired) {
+    chatsBtn.dataset.wired = '1';
+    chatsBtn.addEventListener('click', () => setListMode('chats'));
+  }
+  if (propBtn && !propBtn.dataset.wired) {
+    propBtn.dataset.wired = '1';
+    propBtn.addEventListener('click', () => setListMode('proposals'));
+  }
+}
+
+function wireSettingsMenu() {
+  const toggle = $('nav-settings-toggle');
+  if (toggle && !toggle.dataset.wired) {
+    toggle.dataset.wired = '1';
+    toggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleSettingsPopover();
+    });
+  }
+  const openHub = $('settings-open-hub');
+  if (openHub && !openHub.dataset.wired) {
+    openHub.dataset.wired = '1';
+    openHub.addEventListener('click', () => navTo('settings'));
+  }
+  if (!window.__settingsPopoverCloser) {
+    window.__settingsPopoverCloser = true;
+    document.addEventListener('click', (e) => {
+      const pop = $('settings-popover');
+      const btn = $('nav-settings-toggle');
+      if (!pop || pop.classList.contains('hidden')) return;
+      if (pop.contains(e.target) || (btn && btn.contains(e.target))) return;
+      closeSettingsPopover();
+    });
+  }
+}
+
+function buildPlatformRail() {
+  const rail = $('nav-platforms');
+  if (!rail) return;
+  rail.replaceChildren();
+  for (const s of SOURCES) {
+    if (s.kind === 'all') continue;
+    const key = 'source:' + s.id;
+    const btn = el('button', 'navitem nav-icon platform-rail-btn platform-off');
+    btn.type = 'button';
+    btn.dataset.navkey = key;
+    btn.dataset.sourceId = s.id;
+    btn.title = s.label + ' (not connected)';
+    btn.setAttribute('aria-label', s.label);
+    btn.appendChild(platformLogoBadge(s.id));
+    btn.addEventListener('click', () => navTo(key));
+    rail.appendChild(btn);
+  }
+  refreshPlatformRail();
+}
+
+function refreshPlatformRail() {
+  for (const btn of document.querySelectorAll('.platform-rail-btn')) {
+    const id = btn.dataset.sourceId;
+    const on = sourceConnected(id);
+    btn.classList.toggle('platform-off', !on);
+    const source = SOURCES.find(s => s.id === id);
+    const label = source ? source.label : id;
+    btn.title = on ? label : label + ' (not connected)';
+  }
+}
+
+function buildNav() {
+  buildPlatformRail();
+  buildPlatformList();
+  wireListMode();
+  wireSettingsMenu();
+  wireTool('nav-home', 'home');
+  wireTool('nav-people', 'people');
+}
+
 function wireTool(id, key) {
   const b = $(id);
   if (!b) return;
@@ -132,21 +349,24 @@ function wireTool(id, key) {
   b.addEventListener('click', () => navTo(key));
 }
 
-// A2-4: the Element iframe exists only while the hub is signed in, and stays
-// mounted across view switches (its src is a constant, never derived from data
-// except via the validated openConversation() path).
 function mountChats() {
   const holder = $('chats-container');
-  if (holder.querySelector('iframe')) return;
+  if (!holder || holder.querySelector('iframe')) return;
   const f = el('iframe');
   f.src = CHATS_URL;
   f.allow = 'clipboard-write; fullscreen';
   f.title = 'Chats (Element)';
   holder.appendChild(f);
 }
+
 function unmountChats() {
   const f = $('chats-container') && $('chats-container').querySelector('iframe');
   if (f) f.remove();
 }
 
-export { openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool, mountChats, unmountChats, setSharingViewHook, setProposalsViewHook, setContactsViewHook };
+export {
+  openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
+  mountChats, unmountChats, setSharingViewHook, setProposalsViewHook, setContactsViewHook,
+  listBody, setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
+  refreshPlatformRail,
+};

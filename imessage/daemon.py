@@ -904,10 +904,16 @@ def cmd_status(room_id):
 def cmd_setup(room_id):
     grants = probe_grants()
     text = _status_text(grants)
-    first_missing = next(((label, key) for label, key, st in grants if st != "ok"), None)
+    # Only auto-open a pane for a grant we can PROVE is missing ("no"). Contacts /
+    # Accessibility / Automation probe as "unknown" (they can't be checked without
+    # a side effect), and "unknown" is not "missing": auto-opening the Contacts
+    # pane just because it sorts first among the unknowns was the reported
+    # "it opens into Contacts" bug when Full Disk Access is already granted.
+    # Unknowns stay listed with "grant it if sending fails" guidance instead.
+    first_missing = next(((label, key) for label, key, st in grants if st == "no"), None)
     if first_missing:
         label, key = first_missing
-        cmd_open(key)                    # opens ONE pane (the first missing grant)
+        cmd_open(key)                    # opens ONE pane (the first PROVEN-missing grant)
         text += "\nOpening System Settings for: %s." % label
     text += ("\nManual path: System Settings > Privacy & Security, "
              "then the relevant pane (Accessibility / Contacts / Automation / Full Disk Access).")

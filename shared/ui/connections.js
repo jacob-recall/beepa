@@ -145,10 +145,18 @@ function updateImsgCard(rawBody) {
   for (const line of lines) ul.appendChild(el('li', '', sanitize(line)));
   const pill = $('imsg-status');
   if (pill) {
-    const ok = /✓/.test(clean) && !/✗/.test(clean); // all ✓, no ✗
-    pill.textContent = lines.length ? (ok ? 'Ready' : 'Setup needed') : 'No status yet';
+    // The daemon marks each permission [ok] / [--] (definitely missing) / [??]
+    // (can't probe). Full Disk Access is the one that must be [ok] for the
+    // bridge to read Messages; Accessibility/Automation are unprobeable ([??])
+    // and only matter for SENDING, so "unknown" is NOT "not set up". Ready =
+    // at least one [ok] and no definite [--] failure. (The daemon emits these
+    // markers, never the ✓/✗ this used to look for — hence the pill never lit.)
+    const hasStatus = /\[(ok|--|\?\?)\]/.test(clean);
+    const failed = /\[--\]/.test(clean);
+    const ok = /\[ok\]/.test(clean) && !failed;
+    pill.textContent = !hasStatus ? 'No status yet' : (ok ? 'Ready' : 'Setup needed');
     pill.classList.toggle('ok', ok);
-    runtime.imessage.connected = ok && lines.length > 0;
+    runtime.imessage.connected = ok;
     notifyPlatformRail();
   }
 }

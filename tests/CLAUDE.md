@@ -11,6 +11,7 @@ tests/
   run.sh                          convenience wrapper (JS unit test only — see below)
   unit/
     consent.test.js               shared/model/consent.js — every precedence case
+    master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
     uplink_reconcile.test.py       agents/uplink/reconcile.py — reconcile/idempotency/watermark
   integration/
@@ -29,6 +30,15 @@ tests/
   global, per-source `share-all`/`private-all`, global `share-all` as a
   *standing* policy that also covers a conversation arriving later, and the
   safe default (`private`) when nothing says otherwise.
+- `unit/master_invites.test.js` — plain-node test for `apps/master/invites.js`,
+  the manager console's identity gate. Fixtures are copied from the REAL
+  stripped `invite_state` (create/name/join_rules/member only, no custom
+  types): the space is joined only when its name matches its own creator's
+  localpart, children only when they are known children of a verified space
+  AND their own creator matches, plus the refusals (cross-teammate spoof,
+  missing sender, zero-width-char label, space via the child rule),
+  the join caps, and malformed room ids. A failure here means the console
+  would join or render something it must not.
 - `unit/consent_py.test.py` — the same case list against
   `agents/uplink/consent.py`. **These two files must assert the same
   cases with the same expected results.** If you add a case to one, add
@@ -103,8 +113,9 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh only wraps the JS consent test — run the other two directly:
+# tests/run.sh wraps the two JS tests — run the python ones directly:
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/consent.test.js
+docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/master_invites.test.js
 python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_reconcile.test.py
 
@@ -135,11 +146,11 @@ docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml d
 (`SYNCTEST_STATE_DIR` env var, defaulting under the session scratchpad) —
 safe to delete between runs.
 
-**Note:** `tests/run.sh`'s docstring says "Run unit tests" but it currently
-runs only `consent.test.js`. If you touch this file, either update it to
-run all three unit tests, or leave it as-is and keep telling people (as
-this file does) to run `consent_py.test.py` / `uplink_reconcile.test.py`
-directly — don't assume `tests/run.sh` alone is full unit coverage.
+**Note:** `tests/run.sh` runs the two node tests (`consent.test.js`,
+`master_invites.test.js`) only — the two python unit tests are still not in
+it. Keep telling people (as this file does) to run `consent_py.test.py` /
+`uplink_reconcile.test.py` directly; don't assume `tests/run.sh` alone is
+full unit coverage.
 
 ## How to change this safely
 

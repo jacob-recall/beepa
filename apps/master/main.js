@@ -16,11 +16,19 @@
 // patterns those modules use (content whitelist, recency sort, a tailing
 // long-poll) locally instead. See apps/master/CLAUDE.md for the full account.
 //
+// The one app-local module it does import is ./invites.js — a pure, zero-import
+// leaf holding the identity/trust predicates (create-sender ≡ space label) that
+// gate BOTH auto-join and rendering. Trust decisions live there so a unit test
+// can hold them still; this file only performs what that leaf decides.
+//
 // NO composer, NO send call, anywhere in this file.
 
 import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE, MXC_RE } from '../../shared/matrix/client.js';
 import { $, el, sanitize, sanitizeLine } from '../../shared/ui/el.js';
 import { S } from '../../shared/state.js';
+import {
+  localpart, spaceLabelFor, invitesToJoin, acceptedSpaces, verifiedChildIds, ROOM_SHAPE_RE,
+} from './invites.js';
 
 // The MASTER homeserver base (same origin the transport is pointed at below).
 // Authenticated media (Synapse default) cannot be fetched by a bare <img src>
@@ -56,10 +64,22 @@ const MS = {
   openRoomUser: null,
   openRoomSourceId: null,  // the open mirror room's com.jkali.source, for the per-bubble mini platform badge
   openMirrorOf: null,  // the open mirror room's teammate-local room id (proposal target)
+  // The {mirror room, teammate label, proposals room, target room} tuple PINNED
+  // when a room was opened. submitProposal re-asserts all four against the
+  // current snapshot instead of re-resolving them, so a mid-session revocation
+  // or label change refuses the write rather than silently redirecting it.
+  openProposalCtx: null,
   lastDayKey: null,    // last rendered day-divider key, reset per room open (see renderBubble)
   tailRunning: false,
   tailSince: null,
   pollTimer: null,
+  // Join backpressure: room ids whose /join returned a hard (non-429 4xx)
+  // failure this session are never retried — a permanently-refused invite must
+  // not turn the 20s refresh into an unbounded request loop.
+  joinFailed: new Set(),
+  // How many items the identity gate hid on the last refresh (surfaced in the
+  // sidebar, so a verification failure is visible instead of silent data loss).
+  skippedUnverified: { spaces: 0, children: 0 },
 };
 
 setOnUnauthorized(forgetSession);
@@ -157,11 +177,12 @@ function mirrorTs(ev) {
   return ots != null ? ots : (typeof ev.origin_server_ts === 'number' ? ev.origin_server_ts : 0);
 }
 
-function localpart(mxid) {
-  const s = typeof mxid === 'string' ? mxid : '';
-  const colon = s.indexOf(':');
-  const lp = (colon > 0 ? s.slice(0, colon) : s).replace(/^@/, '');
-  return sanitizeLine(lp) || 'unknown';
+// Display-only name for an mxid. The trust predicate (./invites.js localpart)
+// returns null for anything it cannot parse — that null is NEVER papered over
+// with a sentinel on the decision paths; only here, where the value is about to
+// become text on screen, does it fall back to the raw id.
+function displayNameForMxid(mxid) {
+  return sanitizeLine(localpart(mxid) || (typeof mxid === 'string' ? mxid : ''));
 }
 
 function parseSnapshot(data) {
@@ -171,7 +192,7 @@ function parseSnapshot(data) {
     const r = join[rid];
     const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
                    lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
-                   profileId: null, profileDisplayName: null };
+                   profileId: null, profileDisplayName: null, createSender: null };
     // State from BOTH the `state` block and `timeline` (a newer space's
     // create/name/child events can still be in the timeline window).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
@@ -179,6 +200,16 @@ function parseSnapshot(data) {
     for (const e of stateEvents) {
       if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
       if (e.type === 'm.room.create' && e.content && e.content.type === 'm.space') info.isSpace = true;
+      // The create event's SERVER-STAMPED sender is this room's identity: the
+      // account that created it. It is the single source both the auto-join
+      // gate and the render gate bind a teammate label to (./invites.js).
+      // A client cannot forge it, and it is the one identity field Matrix's
+      // stripped invite state also carries — so the same predicate works
+      // before and after joining.
+      if (e.type === 'm.room.create' && e.state_key === '' && info.createSender === null
+          && typeof e.sender === 'string') {
+        info.createSender = e.sender;
+      }
       // The uplink stamps the teammate's REAL local room id into the mirror
       // room's create content (creation_content.com.jkali.mirror_of). It is the
       // target_room a proposal must carry so the teammate knows which of their
@@ -223,29 +254,52 @@ function parseSnapshot(data) {
   return rooms;
 }
 
-// Teammate spaces are named "space:<User>" (master/provision.sh). Discovered
-// dynamically from whatever the manager is actually joined to — never a
-// hardcoded roster — so a newly-provisioned teammate appears with no code
-// change. Each mirror room is listed only if it is itself a joined room (same
-// "space child must also be joined" gate apps/user's buildConvos uses).
+// Teammate spaces are named "space:<localpart>" (master/provision.sh) — but the
+// NAME alone proves nothing: any teammate can create a room and name it
+// anything. The rail is therefore built only from spaces whose label is proven
+// by their own creator (acceptedSpaces), and inside a verified space only from
+// children whose OWN creator is that same teammate. This is the render half of
+// the identity bind the auto-join gate applies to invites; enforcing it twice
+// means a mislabeled space is refused whichever way it arrived, including a
+// room the manager was already joined to before this gate existed.
+//
+// Rooms discovered but not joined yet (a pending invite) are simply not listed;
+// that is a normal transient state, not a verification failure, and is not
+// counted as "hidden" below.
 function buildByUser(rooms) {
   const byUser = new Map();
   const proposalsByUser = new Map();
   const proposalsRoomSet = new Set();
-  const spaces = Object.values(rooms).filter(r =>
-    r.isSpace && typeof r.name === 'string' && r.name.indexOf('space:') === 0);
-  for (const sp of spaces) {
-    const label = sanitizeLine(sp.name.slice('space:'.length)) || sp.id;
-    const convos = [];
-    for (const childId of sp.children) {
+  const proposalCandidates = new Map();   // label -> [roomId] (smallest id wins)
+  const accepted = acceptedSpaces(rooms);
+  const skipped = { spaces: 0, children: 0 };
+  for (const r of Object.values(rooms)) if (r.isSpace) skipped.spaces++;
+  skipped.spaces -= accepted.length;      // every space the identity gate refused
+
+  for (const { label, space } of accepted) {
+    // Same-label spaces MERGE into one rail entry (never overwrite): a second
+    // verified space for the same teammate adds its conversations rather than
+    // replacing the first one's.
+    const convos = byUser.get(label) || [];
+    for (const childId of space.children.slice().sort()) {
       const r = rooms[childId];
       if (!r) continue;                              // not in the joined set -> excluded
-      if (!ROOMID_RE.test(childId)) continue;         // malformed id -> excluded
-      r.userLabel = label;                            // back-reference for the room viewer
-      // A proposals room is the write channel, not a conversation: record it as
-      // this teammate's proposal target, and NEVER list it as a readable convo.
-      if (r.isProposals) {
-        proposalsByUser.set(label, childId);
+      if (!ROOMID_RE.test(childId)) { skipped.children++; continue; }   // malformed id
+      // IDENTITY CHECK (render side): the child must have been created by the
+      // same teammate whose label this space proved. Without it, @bob:master
+      // could space-link rooms he controls under jkali's verified space.
+      if (localpart(r.createSender) !== label) { skipped.children++; continue; }
+      if (r.isSpace) { skipped.children++; continue; } // a space is never a convo
+      if (!r.userLabel) r.userLabel = label;          // first verified claim wins
+      // A proposals room is the write channel, not a conversation. It qualifies
+      // as a write target ONLY if it is not also a mirror room: a mirror stamped
+      // with the com.jkali.proposals marker must never become the destination of
+      // the manager's proposal writes (it would put manager-authored text into a
+      // conversation mirror). Such a room stays an ordinary read-only convo.
+      if (r.isProposals && !r.mirrorOf) {
+        const list = proposalCandidates.get(label) || [];
+        list.push(childId);
+        proposalCandidates.set(label, list);
         proposalsRoomSet.add(childId);
         continue;
       }
@@ -262,41 +316,92 @@ function buildByUser(rooms) {
     }
     byUser.set(label, convos);
   }
+  // One deterministic write target per teammate: if several proposals rooms
+  // were discovered under one label, pick the lexicographically smallest id
+  // rather than "whichever the iteration happened to reach last".
+  for (const [label, list] of proposalCandidates) {
+    proposalsByUser.set(label, list.slice().sort()[0]);
+  }
   MS.proposalsByUser = proposalsByUser;
   MS.proposalsRoomSet = proposalsRoomSet;
+  MS.skippedUnverified = skipped;
   return byUser;
 }
 
-// The uplink INVITES the manager into each teammate's proposals room (it cannot
-// force-join another account). Auto-accept ONLY invites that carry the
-// com.jkali.proposals marker in their invite_state — so the manager can write a
-// proposal there — and nothing else. Joining is membership, not a send; the only
-// write this app ever performs is the single com.jkali.proposal in submitProposal.
-// Mirror-room membership is unchanged from V1 (accepted out of band).
-async function autoJoinProposalInvites(data) {
-  const invite = (data.rooms && data.rooms.invite) || {};
-  let joinedAny = false;
-  for (const rid of Object.keys(invite)) {
-    if (!ROOMID_RE.test(rid)) continue;
-    const evs = (invite[rid].invite_state && invite[rid].invite_state.events) || [];
-    const isProposals = evs.some(e => e.type === 'com.jkali.proposals' && e.state_key === '');
-    if (!isProposals) continue;
-    try {
-      await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/join', {});
-      joinedAny = true;
-    } catch (e) { /* leave un-joined on failure; retried next refresh */ }
+// Make identity-gate skips visible instead of silently dropping data: a small
+// muted count in the sidebar. textContent only, never HTML.
+function renderUnverifiedNote() {
+  const n = MS.skippedUnverified || { spaces: 0, children: 0 };
+  const total = (n.spaces || 0) + (n.children || 0);
+  let note = $('unverified-note');
+  if (!note) {
+    const anchor = $('teammates-label') || $('nav-teammates');
+    if (!anchor || !anchor.parentNode) return;
+    note = el('div', 'unverified-note muted');
+    note.id = 'unverified-note';
+    anchor.parentNode.insertBefore(note, anchor.nextSibling);
   }
-  return joinedAny;
+  note.textContent = total
+    ? total + ' unverified item' + (total === 1 ? '' : 's') + ' hidden'
+    : '';
+  note.classList.toggle('hidden', total === 0);
+}
+
+// The uplink INVITES the manager into the teammate's space, their mirror rooms
+// and their proposals room (it cannot force-join another account), so accepting
+// those invites is the last hop of the pipeline. Which invites are acceptable is
+// decided ENTIRELY by ./invites.js's identity gate — never here, and never on a
+// custom state type (stripped invite state does not carry one; that was the bug
+// this replaces). Joining is membership, not a send; the only write this app
+// ever performs is the single com.jkali.proposal in submitProposal.
+//
+// Two passes are needed by construction: pass 1 joins the teammate's space,
+// pass 2 sees its m.space.child list and can therefore verify the mirrors and
+// the proposals room. The third pass is slack; the loop stops as soon as a pass
+// joins nothing. Every pass is capped inside invitesToJoin, and an invite whose
+// join hard-fails is memoized so it is never retried this session.
+async function joinPendingInvites() {
+  let data = null;
+  for (let pass = 0; pass < 3; pass++) {
+    data = await fetchSnapshot();
+    const rooms = parseSnapshot(data);
+    const vch = verifiedChildIds(acceptedSpaces(rooms));
+    const ids = invitesToJoin((data.rooms && data.rooms.invite) || {}, vch, {})
+      .filter(id => !MS.joinFailed.has(id) && ROOMID_RE.test(id));
+    let joined = 0;
+    for (const id of ids) {
+      try {
+        await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(id) + '/join', {});
+        joined++;
+      } catch (e) {
+        // 4xx other than 429 means "this will not succeed by retrying"
+        // (withdrawn invite, forbidden, gone) -> stop asking. 429/5xx/network
+        // errors stay retryable on the next refresh.
+        const code = e && typeof e.status === 'number' ? e.status : 0;
+        if (code >= 400 && code < 500 && code !== 429) MS.joinFailed.add(id);
+      }
+    }
+    if (!joined) break;
+  }
+  return data;
 }
 
 async function refreshAll() {
-  let data = await fetchSnapshot();
-  if (await autoJoinProposalInvites(data)) data = await fetchSnapshot();
+  const data = await joinPendingInvites();
   const rooms = parseSnapshot(data);
   MS.rooms = rooms;
   MS.byUser = buildByUser(rooms);
   MS.feed = [].concat(...[...MS.byUser.values()]).sort((a, b) => b.lastTs - a.lastTs);
   renderTeammateNav();
+  renderUnverifiedNote();
+  // The open room can disappear mid-session (the teammate un-shared it, or it
+  // failed re-verification). Close the proposal path rather than leaving a
+  // composer pointed at a room that is no longer part of the verified set.
+  if (MS.openRoomId && !MS.rooms[MS.openRoomId]) {
+    const pane = $('proposal-pane');
+    if (pane) pane.classList.add('hidden');
+    roomStatus('This conversation is no longer shared.');
+  }
   if (MS.activeView === 'recent') renderRecent();
   else if (MS.activeView === 'search') renderSearch();
   else if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0) {
@@ -422,12 +527,7 @@ function buildListItem(item) {
 }
 
 function renderRecent() {
-  const sub = $('recent-sub');
-  if (sub) {
-    const n = MS.byUser.size;
-    sub.textContent = 'across ' + n + ' teammate' + (n === 1 ? '' : 's') + ' · shared conversations only';
-  }
-  const list = $('recent-list');
+  const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
   if (!MS.feed.length) { list.appendChild(elEmpty('No shared conversations yet.')); return; }
@@ -438,18 +538,18 @@ function renderRecent() {
 // count of that teammate's shared conversations. Purely presentational over
 // already-fetched MS.byUser; the count is just that teammate's convo list length.
 function renderTeammateNav() {
-  const nav = $('nav-teammates');
+  const nav = $('teammates-popover');
   if (!nav) return;
   nav.replaceChildren();
   for (const [label, convos] of MS.byUser) {
     const key = 'teammate:' + label;
-    const btn = el('button', 'teammate-row');
+    const btn = el('button', 'settings-menu-item teammate-row');
     btn.type = 'button';
     btn.dataset.navkey = key;
     btn.appendChild(el('span', 'teammate-avatar', initials(label)));
     btn.appendChild(el('span', 'teammate-name', label));
     btn.appendChild(el('span', 'teammate-count', String(convos.length)));
-    btn.addEventListener('click', () => navTo(key));
+    btn.addEventListener('click', () => { closePopovers(); navTo(key); });
     nav.appendChild(btn);
   }
   setActiveNav(MS.activeView);
@@ -465,10 +565,9 @@ function initials(label) {
 }
 
 function renderTeammate(label) {
-  $('teammate-title').textContent = label;
   const convos = (MS.byUser.get(label) || []).slice().sort((a, b) => b.lastTs - a.lastTs);
-  $('teammate-sub').textContent = convos.length + ' shared conversation' + (convos.length === 1 ? '' : 's');
-  const list = $('teammate-list');
+  const list = $('list-body');
+  if (!list) return;
   list.replaceChildren();
   if (!convos.length) { list.appendChild(elEmpty('Nothing shared yet.')); return; }
   for (const item of groupByProfile(convos)) list.appendChild(buildListItem(item));
@@ -478,12 +577,13 @@ function renderTeammate(label) {
 // feed; it never builds a URL, sends a command, or navigates.
 function renderSearch() {
   const q = (($('search-input') && $('search-input').value) || '').trim().toLowerCase();
-  const out = $('search-results');
+  const out = $('list-body');
   if (!out) return;
   out.replaceChildren();
   if (!q) { out.appendChild(elEmpty('Type to search across every teammate.')); return; }
   const rows = MS.feed.filter(c =>
-    c.title.toLowerCase().includes(q) || (c.preview || '').toLowerCase().includes(q));
+    c.title.toLowerCase().includes(q) || (c.preview || '').toLowerCase().includes(q)
+      || (c.userLabel || '').toLowerCase().includes(q));
   if (!rows.length) { out.appendChild(elEmpty('No conversations match "' + q + '".')); return; }
   for (const c of rows) out.appendChild(buildFeedRow(c));
 }
@@ -542,7 +642,7 @@ function renderBubble(ev) {
   const sent = !!(ev.content && ev.content['com.jkali.from_me'] === true);
   const senderName = (ev.content && typeof ev.content['com.jkali.sender_name'] === 'string')
     ? sanitizeLine(ev.content['com.jkali.sender_name'])
-    : localpart(ev.sender);
+    : displayNameForMxid(ev.sender);
   const ts = mirrorTs(ev);
   maybeInsertDayDivider(box, ts);
 
@@ -585,6 +685,16 @@ async function openRoom(roomId) {
   MS.openRoomUser = rec.userLabel || null;
   MS.openRoomSourceId = rec.sourceId || null;
   MS.openMirrorOf = typeof rec.mirrorOf === 'string' ? rec.mirrorOf : null;
+  // PIN the whole proposal context at open time. submitProposal re-asserts this
+  // exact tuple against the live snapshot instead of resolving the destination
+  // again, so a label change or a revoked/replaced proposals room between open
+  // and submit refuses the write rather than redirecting it somewhere new.
+  MS.openProposalCtx = {
+    mirrorRoomId: roomId,
+    label: rec.userLabel || null,
+    proposalsRoomId: (rec.userLabel && MS.proposalsByUser.get(rec.userLabel)) || null,
+    targetRoom: (typeof rec.mirrorOf === 'string' && rec.mirrorOf) || null,
+  };
   MS.lastDayKey = null;
   setupProposalComposer(rec);
   $('room-title').textContent = sanitizeLine(rec.name || roomId);
@@ -599,7 +709,8 @@ async function openRoom(roomId) {
   const box = $('room-messages');
   if (box) box.replaceChildren();
   roomStatus('');
-  showSection('view-room');
+  showWorkspace(true);
+  setDetailMode('room');
 
   try {
     const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=100';
@@ -652,7 +763,7 @@ async function startTail(roomId) {
     }
   }
 }
-function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openRoomSourceId = null; MS.openMirrorOf = null; }
+function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openRoomSourceId = null; MS.openMirrorOf = null; MS.openProposalCtx = null; }
 
 // ===========================================================================
 // Compose-proposal — the ONE place the manager can write (PLAN §2 v2 / §7).
@@ -737,20 +848,34 @@ async function loadTemplates(proposalsRoom) {
 }
 
 // The single guarded write in this app. Defense in depth:
-//  - the destination MUST be a ROOMID_RE-valid id that is in the discovered
-//    proposals-room allowlist (never a stale/typed id, never a mirror room);
-//  - the target_room is shape-checked (it is a foreign teammate-local id, so the
-//    master's server-pinned ROOMID_RE does not apply);
+//  - the destination and the target are the ones PINNED when the room was
+//    opened (MS.openProposalCtx) — never re-resolved here, so a mid-session
+//    change cannot redirect an in-flight suggestion to a different room;
+//  - every element of that pinned tuple must STILL hold in the current
+//    snapshot: the mirror room still verified under the same label, the same
+//    proposals room still that label's discovered target, ROOMID_RE-valid and
+//    in the allowlist (never a stale/typed id, never a mirror room);
+//  - the target_room is shape-checked with the generic any-server shape (it is
+//    a foreign teammate-local id, so the master's server-pinned ROOMID_RE does
+//    not apply) and is only recorded, never sent to;
 //  - the event TYPE is the hardcoded literal 'com.jkali.proposal' — there is no
 //    code path here that PUTs /send/m.room.message anywhere.
-const LOCAL_ROOMID_RE = /^![^:]+:[A-Za-z0-9.\-:]+$/;   // any-server room-id shape
 async function submitProposal() {
-  const proposalsRoom = MS.openRoomUser ? MS.proposalsByUser.get(MS.openRoomUser) : null;
-  const target = MS.openMirrorOf;
-  if (!proposalsRoom || !ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) {
+  const ctx = MS.openProposalCtx;
+  if (!ctx || !ctx.label || !ctx.mirrorRoomId) {
+    proposalStatus('No conversation is open.', true); return;
+  }
+  const rec = MS.rooms[ctx.mirrorRoomId];
+  if (!rec || rec.userLabel !== ctx.label) {
+    proposalStatus('This conversation is no longer shared.', true); return;
+  }
+  const proposalsRoom = ctx.proposalsRoomId;
+  const target = ctx.targetRoom;
+  if (!proposalsRoom || MS.proposalsByUser.get(ctx.label) !== proposalsRoom
+      || !ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) {
     proposalStatus('No proposals channel for this teammate yet.', true); return;
   }
-  if (!target || !LOCAL_ROOMID_RE.test(target)) {
+  if (!target || !ROOM_SHAPE_RE.test(target)) {
     proposalStatus('This conversation has no valid target room.', true); return;
   }
   const input = $('proposal-input');
@@ -773,7 +898,7 @@ async function submitProposal() {
       + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
     if (input) input.value = '';
     if ($('proposal-template')) $('proposal-template').checked = false;
-    proposalStatus('Suggestion sent to ' + sanitizeLine(MS.openRoomUser || 'teammate')
+    proposalStatus('Suggestion sent to ' + sanitizeLine(ctx.label || 'teammate')
       + ' for review. It was not sent to anyone externally.');
     if (isTemplate) loadTemplates(proposalsRoom).catch(() => {});
   } catch (e) {
@@ -781,20 +906,83 @@ async function submitProposal() {
   }
 }
 
-// ---- navigation ----
+// ---- navigation (same two-pane shell as apps/user) ----
 function showSection(id) {
   for (const s of document.querySelectorAll('#content .view')) s.classList.toggle('hidden', s.id !== id);
 }
 function setActiveNav(key) {
-  for (const b of document.querySelectorAll('.tab, .teammate-row')) b.classList.toggle('active', b.dataset.navkey === key);
+  for (const b of document.querySelectorAll('.navitem, .teammate-row')) {
+    b.classList.toggle('active', b.dataset.navkey === key);
+  }
+}
+function showWorkspace(twoPane) {
+  showSection('view-workspace');
+  const listPane = $('list-pane');
+  if (listPane) listPane.classList.toggle('hidden', !twoPane);
+  const ws = $('workspace');
+  if (ws) ws.classList.toggle('admin-only', !twoPane);
+}
+function setDetailMode(mode) {
+  const pane = $('msgr-convo');
+  const room = $('detail-room');
+  const admin = $('detail-admin');
+  if (room) room.classList.toggle('hidden', mode !== 'room');
+  if (admin) admin.classList.toggle('hidden', mode !== 'admin');
+  if (pane) pane.classList.toggle('no-selection', mode === 'empty' || mode === 'admin');
+}
+function showListSearch(show) {
+  const input = $('search-input');
+  if (input) input.classList.toggle('hidden', !show);
+}
+function closePopovers() {
+  for (const id of ['settings-popover', 'teammates-popover']) {
+    const n = $(id);
+    if (n) n.classList.add('hidden');
+  }
+  for (const id of ['nav-settings-toggle', 'nav-teammates-toggle']) {
+    const b = $(id);
+    if (b) b.setAttribute('aria-expanded', 'false');
+  }
+}
+function togglePopover(popId, btnId) {
+  const pop = $(popId);
+  const btn = $(btnId);
+  if (!pop || !btn) return;
+  const wasHidden = pop.classList.contains('hidden');
+  closePopovers();
+  if (wasHidden) {
+    pop.classList.remove('hidden');
+    btn.setAttribute('aria-expanded', 'true');
+  }
 }
 function navTo(key) {
+  closePopovers();
+  if (MS.openRoomId && key !== 'room') {
+    stopTail();
+    setDetailMode('empty');
+  }
   MS.activeView = key;
   setActiveNav(key);
-  if (key === 'recent') { showSection('view-recent'); renderRecent(); }
-  else if (key === 'search') { showSection('view-search'); renderSearch(); }
-  else if (key === 'addteam') { showSection('view-addteam'); resetAddTeammate(); }
-  else if (key.indexOf('teammate:') === 0) { showSection('view-teammate'); renderTeammate(key.slice('teammate:'.length)); }
+  if (key === 'recent') {
+    showWorkspace(true);
+    showListSearch(false);
+    setDetailMode('empty');
+    renderRecent();
+  } else if (key === 'search') {
+    showWorkspace(true);
+    showListSearch(true);
+    setDetailMode('empty');
+    renderSearch();
+  } else if (key === 'addteam') {
+    showWorkspace(false);
+    setDetailMode('admin');
+    resetAddTeammate();
+  } else if (key.indexOf('teammate:') === 0) {
+    showWorkspace(true);
+    showListSearch(false);
+    setDetailMode('empty');
+    renderTeammate(key.slice('teammate:'.length));
+  }
 }
 
 // ---- add / link a teammate (manager-only; see ENROLL_BASE above) ----
@@ -900,8 +1088,34 @@ document.addEventListener('DOMContentLoaded', () => {
   $('nav-recent').addEventListener('click', () => navTo('recent'));
   $('nav-search').dataset.navkey = 'search';
   $('nav-search').addEventListener('click', () => navTo('search'));
+  const tt = $('nav-teammates-toggle');
+  if (tt && !tt.dataset.wired) {
+    tt.dataset.wired = '1';
+    tt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      togglePopover('teammates-popover', 'nav-teammates-toggle');
+    });
+  }
+  const st = $('nav-settings-toggle');
+  if (st && !st.dataset.wired) {
+    st.dataset.wired = '1';
+    st.addEventListener('click', (e) => {
+      e.stopPropagation();
+      togglePopover('settings-popover', 'nav-settings-toggle');
+    });
+  }
   const navAdd = $('nav-addteam');
   if (navAdd) { navAdd.dataset.navkey = 'addteam'; navAdd.addEventListener('click', () => navTo('addteam')); }
+  if (!window.__masterPopoverCloser) {
+    window.__masterPopoverCloser = true;
+    document.addEventListener('click', (e) => {
+      const pops = ['settings-popover', 'teammates-popover'];
+      if (pops.every(id => { const n = $(id); return !n || n.classList.contains('hidden'); })) return;
+      if (pops.some(id => { const n = $(id); return n && n.contains(e.target); })) return;
+      if (['nav-settings-toggle', 'nav-teammates-toggle'].some(id => { const b = $(id); return b && b.contains(e.target); })) return;
+      closePopovers();
+    });
+  }
   const addBtn = $('addteam-btn');
   if (addBtn) addBtn.addEventListener('click', () => { addTeammate().catch(() => {}); });
   const addInput = $('addteam-user');
@@ -917,7 +1131,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
   $('search-input').addEventListener('input', renderSearch);
-  $('room-back').addEventListener('click', () => { stopTail(); navTo(MS.activeView === 'room' ? 'recent' : MS.activeView); });
+  $('room-back').addEventListener('click', () => {
+    stopTail();
+    setDetailMode('empty');
+    navTo(MS.activeView === 'room' ? 'recent' : MS.activeView);
+  });
 
   // Expand/collapse the proposal compose fields (pure CSS class toggle — no
   // write path here; the only write is submitProposal(), wired separately below).

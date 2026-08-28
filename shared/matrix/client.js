@@ -48,7 +48,14 @@ async function api(method, path, body) {
   const res = await fetch(HS + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (res.status === 401) { onUnauthorized(); throw new Error('Signed out: session expired.'); }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(sanitize(data.error || ('HTTP ' + res.status)));
+  if (!res.ok) {
+    // Additive only: the message is unchanged (sanitized, as before); `status`
+    // is attached so a caller can distinguish "will never succeed" (4xx) from
+    // "retry later" (429/5xx) — apps/master's join backpressure needs this.
+    const err = new Error(sanitize(data.error || ('HTTP ' + res.status)));
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 

@@ -3,3 +3,4 @@
 set -e
 cd "$(dirname "$0")/.."
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/consent.test.js
+docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/master_invites.test.js

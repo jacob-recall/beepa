@@ -27,6 +27,7 @@ Requires the two stacks up (see the module docstring of the compose file and
 master/docker-compose.master.yml). Prints a JSON summary of all scenarios.
 """
 import base64
+import glob
 import hashlib
 import hmac
 import json
@@ -822,6 +823,183 @@ def scenario_6_revoke_levels():
     return ok, "; ".join(ev)
 
 
+# ------------------------------------------------- apps/master build-time scan
+# The static half of scenario 7. apps/master's read-only guarantee is "absent
+# code, not a hidden button", so it is asserted against the SOURCE of EVERY .js
+# file in that directory (not main.js alone — the console gained invites.js, and
+# a second file must not be able to smuggle in a write path):
+#   * no /send/m.room.message anywhere;
+#   * the only /send/<type> performed is com.jkali.proposal;
+#   * every non-GET call goes to an ALLOWLISTED endpoint.
+#
+# The endpoint is never a single string literal in this codebase — every
+# room-scoped call is 'prefix' + encodeURIComponent(id) + 'suffix' — so the
+# allowlist is matched against the concatenation of the string LITERAL fragments
+# found inside the path expression:
+#   '/_matrix/client/v3/rooms/' + enc(id) + '/join'
+#     -> '/_matrix/client/v3/rooms//join'
+# Anything whose fragments match no entry (or whose method is not a literal)
+# fails the scenario — the check is fail-closed by construction.
+MASTER_WRITE_ALLOWLIST = {
+    "POST": [
+        r"^/_matrix/client/v3/login$",
+        r"^/_matrix/client/v3/logout$",
+        r"^/_matrix/client/v3/rooms//join$",     # auto-join of a gated invite
+        r"^/admin/add-teammate$",                # ENROLL_BASE + '/admin/add-teammate'
+    ],
+    "PUT": [
+        r"^/_matrix/client/v3/rooms//send/com\.jkali\.proposal/$",
+    ],
+    "DELETE": [],
+}
+
+
+def strip_js_comments(src):
+    """Strip // and /* */ comments WITHOUT damaging string bodies.
+
+    A naive line-comment regex mangles 'http://127.0.0.1:8018' into an
+    unterminated quote, which would then swallow the rest of the file for any
+    subsequent parse. This walks the source instead, tracking quotes.
+    """
+    out = []
+    i, n, quote = 0, len(src), None
+    while i < n:
+        c = src[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"`":
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _balanced_args(src, open_idx):
+    """Raw text between the parens opening at open_idx, quote/nesting aware."""
+    depth, i, n, quote = 0, open_idx, len(src), None
+    while i < n:
+        c = src[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return src[open_idx + 1:i]
+        i += 1
+    return None
+
+
+def _split_top_args(argtext):
+    """Split a call's argument text on TOP-LEVEL commas only."""
+    parts, buf, depth, quote = [], [], 0, None
+    for i, c in enumerate(argtext):
+        if quote:
+            buf.append(c)
+            if c == quote and argtext[i - 1] != "\\":
+                quote = None
+            continue
+        if c in "'\"`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(c)
+    parts.append("".join(buf))
+    return parts
+
+
+def _literal_fragments(expr):
+    """Concatenate every string literal inside one expression, in order."""
+    found = re.findall(r"'([^'\\]*)'|\"([^\"\\]*)\"|`([^`\\$]*)`", expr)
+    return "".join(a or b or c for a, b, c in found)
+
+
+def js_write_calls(code):
+    """[(METHOD, joined_literal_fragments, raw_expr)] for every non-GET call."""
+    calls = []
+    for m in re.finditer(r"\bapi\s*\(", code):
+        args = _balanced_args(code, m.end() - 1)
+        if args is None:
+            continue
+        parts = _split_top_args(args)
+        if len(parts) < 2:
+            continue
+        lit = re.match(r"""^\s*['"]([A-Za-z]+)['"]\s*$""", parts[0])
+        if not lit:
+            calls.append(("<non-literal-method>", "", parts[0]))   # fail closed
+            continue
+        method = lit.group(1).upper()
+        if method == "GET":
+            continue
+        calls.append((method, _literal_fragments(parts[1]), parts[1]))
+    for m in re.finditer(r"\bfetch\s*\(", code):
+        args = _balanced_args(code, m.end() - 1)
+        if args is None:
+            continue
+        parts = _split_top_args(args)
+        opts = parts[1] if len(parts) > 1 else ""
+        lit = re.search(r"""method\s*:\s*['"]([A-Za-z]+)['"]""", opts)
+        method = lit.group(1).upper() if lit else "GET"
+        if method == "GET":
+            continue
+        calls.append((method, _literal_fragments(parts[0]), parts[0]))
+    return calls
+
+
+def scan_apps_master_write_surface():
+    """(scanned_filenames, has_msg_send, send_types, violations) for apps/master."""
+    files = sorted(glob.glob(os.path.join(REPO, "apps", "master", "*.js")))
+    scanned, send_types, violations = [], set(), []
+    has_msg_send = False
+    for path in files:
+        name = os.path.basename(path)
+        scanned.append(name)
+        with open(path) as fh:
+            code = strip_js_comments(fh.read())
+        if re.search(r"/send/m\.room\.message", code):
+            has_msg_send = True
+        send_types |= set(re.findall(r"/send/([A-Za-z0-9_.]+)", code))
+        for method, joined, expr in js_write_calls(code):
+            allowed = MASTER_WRITE_ALLOWLIST.get(method, [])
+            if not any(re.match(p, joined) for p in allowed):
+                violations.append("%s:%s %s" % (name, method, joined or expr.strip()[:60]))
+    return scanned, has_msg_send, send_types, violations
+
+
 def scenario_7_read_only():
     """@manager cannot send into a mirror room (expect 403); apps/master has no
     send path."""
@@ -863,21 +1041,19 @@ def scenario_7_read_only():
     ev.append("manager_send_status=%s(want 403)" % send_code)
 
     # Build-time invariant. V1 shipped "no composer at all". V2 intentionally adds
-    # ONE write path — the compose-PROPOSAL panel — so the check is now the
-    # precise HARD LIMIT instead of a blanket composer ban: apps/master must have
-    # (a) NO /send/m.room.message path anywhere, and (b) the ONLY /send/<type> it
-    # performs is com.jkali.proposal (into a proposals room). Comments are stripped
-    # first (the file documents the ABSENCE of an m.room.message path in prose).
-    mj = os.path.join(REPO, "apps", "master", "main.js")
-    src = open(mj).read()
-    code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)         # block comments
-    code = re.sub(r"(?m)//.*$", "", code)                    # line comments
-    has_msg_send = bool(re.search(r"/send/m\.room\.message", code))
-    send_types = set(re.findall(r"/send/([A-Za-z0-9_.]+)", code))
+    # ONE write path — the compose-PROPOSAL panel — and the invite fix adds POST
+    # /join, so the check is the precise HARD LIMIT instead of a blanket composer
+    # ban: across EVERY .js file in apps/master/ there must be (a) NO
+    # /send/m.room.message path anywhere, (b) the ONLY /send/<type> performed is
+    # com.jkali.proposal (into a proposals room), and (c) every non-GET call must
+    # match the write-surface allowlist above. Comments are stripped first (the
+    # files document the ABSENCE of an m.room.message path in prose).
+    scanned, has_msg_send, send_types, write_violations = scan_apps_master_write_surface()
     non_proposal_sends = send_types - {"com.jkali.proposal"}
-    if has_msg_send or non_proposal_sends:
+    if not scanned or has_msg_send or non_proposal_sends or write_violations:
         ok = False
-    ev.append("apps_master_msg_send=%s send_types=%s" % (has_msg_send, sorted(send_types)))
+    ev.append("apps_master_scanned=%s msg_send=%s send_types=%s write_violations=%s"
+              % (scanned, has_msg_send, sorted(send_types), write_violations))
     return ok, "; ".join(ev)
 
 

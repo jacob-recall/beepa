@@ -1,113 +1,141 @@
-# Local WhatsApp↔Matrix bridge
+# Beepa — self-hosted messaging hub + manager sync
 
-Self-hosted [mautrix-whatsapp](https://github.com/mautrix/whatsapp) stack,
-localhost-only, on Docker Compose. See `PLAN.md` for the full design, security
-review, and dispositions.
+Localhost-only, self-hosted stack that pulls one person's chats from six
+networks (WhatsApp, iMessage, Google Messages, Instagram, LinkedIn, X) into a
+private Matrix homeserver, plus an opt-in **master-sync** layer: a teammate
+can share chosen conversations, read-only, to an always-on master homeserver
+where a manager reads them and can leave reply *suggestions* — never send.
 
-## Services
+**Current docs (audited 2026-08-28):**
+- `docs/ARCHITECTURE.md` — what actually exists and runs, area by area
+- `docs/SYSTEM-DESIGN.md` — the data schema & sharing model, plain-language
+- `docs/AUDIT-FINDINGS.md` — known defects/stale spots, evidence-cited
+- `docs/SIMPLIFICATION-PLAN.md` — proposed cleanups
+- Per-directory `CLAUDE.md` files — deep guides (largely accurate; trust
+  `docs/AUDIT-FINDINGS.md` where they disagree)
+- `PLAN*.md` — historical design/decision records, one per feature wave
+
+## Services (all loopback-only)
+
 | Service | Where | Notes |
 |---|---|---|
-| **Bridge Hub** | `http://127.0.0.1:8010` | **start here** — connect bridges, settings buttons, QR login |
-| Synapse | `127.0.0.1:8008` | homeserver, `server_name: localhost` |
-| Element Web | `http://127.0.0.1:8009` | your chats live here |
-| mautrix-whatsapp | compose network only | bridge bot: `@whatsappbot:localhost` |
-| mautrix-linkedin | compose network only | bridge bot: `@linkedinbot:localhost` |
-| PostgreSQL 16 | compose network only | DBs: `synapse`, `mautrix_whatsapp`, `mautrix_linkedin` |
-
-## Bridge Hub
-`hub/` is a static page (no backend) that signs into Synapse as you and drives
-the bridge bot: Connections view (per-bridge card, Connect shows the QR
-inline, Disconnect), WhatsApp settings view (every management command as an
-explained button + output console). Add future bridges to the `BRIDGES` array
-in `hub/site/app.js`. Design + security review: `PLAN-HUB.md`. Backfill is
-**enabled** (recent history: ~50 msgs/chat over the last ~3 months of chats,
-imported on link).
+| **Teammate app** | `http://127.0.0.1:8011/apps/user/index.html` | the new UI: chats, share controls, contacts, proposal inbox |
+| **Manager console** | `http://127.0.0.1:8011/apps/master/index.html` | read-only view across teammates; signs into the master (:8018) |
+| Synapse (teammate) | `127.0.0.1:8008` | homeserver, `server_name: localhost` |
+| Element Web | `http://127.0.0.1:8009` | escape-hatch full Matrix client |
+| Synapse (master) | `127.0.0.1:8018` | compose project `matrix-master` (`master/`) |
+| Enroll/admin service | `127.0.0.1:8019` | `master/enroll.py serve` (launchd) — enrollment codes, add-teammate |
+| iMessage daemon | `127.0.0.1:29350` | `imessage/daemon.py` (launchd appservice) |
+| Uplink daemon | no port (outbound-only) | `agents/uplink/uplink.py` (launchd) — mirrors consent-shared rooms up |
+| mautrix bridges ×5 | compose network only | whatsapp, meta (Instagram), linkedin, twitter, gmessages — no host ports |
+| PostgreSQL ×2 | compose network only | one per stack; no host ports |
 
 Matrix account: `@jkali:localhost` (password delivered once at setup — keep it
 in your password manager).
 
 ## Daily use
-```sh
-docker compose --profile bridge --profile client up -d    # start everything
-docker compose --profile bridge --profile client down     # stop (keeps data)
-docker compose logs -f mautrix-whatsapp                   # bridge logs
-```
-Open http://127.0.0.1:8009 → sign in as `jkali` → the room with
-`@whatsappbot:localhost` is the bridge management room.
 
-Bridge commands (in the management room): `help`, `login qr`, `logout`,
-`ping`, `sync`.
+```sh
+docker compose --profile bridge --profile client up -d    # teammate stack
+docker compose logs -f mautrix-whatsapp                   # bridge logs
+
+# master stack (separate project — see master/CLAUDE.md):
+docker compose -p matrix-master --env-file master/.env \
+  -f master/docker-compose.master.yml up -d
+```
+
+Bridge commands live in each bridge's management room (or the app's
+Settings tabs): `help`, `login …`, `logout`, `ping`, `sync`.
+
+## Backfill (imported history)
+
+Per-bridge `backfill.enabled` as configured today: WhatsApp **on**,
+Google Messages **on**, LinkedIn **on**, X/Twitter **on**, Instagram **off**
+(anti-flag posture, see `PLAN-META.md`); iMessage backfills via its own
+daemon (`backfill_count` in `imessage/daemon.json`). Toggle in each bridge's
+`config.yaml` *before* first login if you want different history behavior.
 
 ## WhatsApp login
-Send `login qr` to the bot, then on your phone: WhatsApp → Settings →
-Linked devices → Link a device → scan the QR the bot posts. Chats appear as
-rooms within ~a minute. Your phone must come online at least every ~2 weeks or
-WhatsApp unlinks the bridge.
 
-History backfill is **off** (privacy default): old messages are not imported;
-new messages bridge from login onward. To import history, set
-`backfill.enabled: true` in `whatsapp/config.yaml` (limits are alongside it)
-and `docker compose restart mautrix-whatsapp` — do this *before* logging in if
-you want initial history.
+Send `login qr` to `@whatsappbot:localhost` (or use the app's Connections
+card), then phone → WhatsApp → Settings → Linked devices → Link a device →
+scan. Your phone must come online at least every ~2 weeks or WhatsApp unlinks
+the bridge.
 
 ## Read before deleting anything
-- **`docker compose down -v` is destructive after WhatsApp (or Google
-  Messages) login**: it deletes the Postgres volume = your WhatsApp/Google
-  Messages sessions *and* all bridged history for both. First send `logout`
-  to each bot (or unlink in WhatsApp → Linked devices / Google Messages →
-  Device pairing), and take a backup if you care:
-  `docker compose exec postgres pg_dumpall -U matrix > pg_dump.sql`
-- **Stolen/lost laptop kill switch**: WhatsApp → Settings → Linked devices →
-  unlink the bridge device. That immediately invalidates the session keys
-  stored on this machine.
 
-## Security posture (accepted trade-offs — details in PLAN.md)
+- **`docker compose down -v` on the teammate stack is destructive after
+  login**: it deletes the Postgres volume = your WhatsApp/Google Messages
+  sessions *and* all bridged history. First send `logout` to each bot (or
+  unlink in the phone apps), and back up if you care:
+  `docker compose exec postgres pg_dumpall -U matrix > pg_dump.sql`
+  (`down -v` is safe for the `matrix-master` and `matrix-synctest` projects.)
+- **Stolen/lost laptop kill switch**: WhatsApp → Settings → Linked devices →
+  unlink the bridge device (equivalents exist per network — see each bridge
+  section below).
+
+## Security posture (accepted trade-offs — details in PLAN.md and docs/)
+
 - Everything binds to `127.0.0.1` only; nothing is reachable from the LAN.
 - No TLS/E2BE: fine on loopback, but this stack is a **searchable plaintext
-  copy of your WhatsApp messages** in the Postgres volume. At-rest protection
-  is FileVault (verified on). Don't put this dir or Docker's data dir in
-  unencrypted cloud backups.
-- `server_name: localhost` is permanent — migrating to a real domain later
-  means starting over with a fresh homeserver.
-- Using an unofficial WhatsApp client violates WhatsApp ToS; personal
-  single-user bridging is the low-risk end, but a ban, while unlikely, is
-  possible.
+  copy of your messages** in the Postgres volume. At-rest protection is
+  FileVault. Don't put this dir or Docker's data dir in unencrypted backups.
+- `server_name: localhost` is permanent — a real domain later means a fresh
+  homeserver.
+- Unofficial clients violate each network's ToS; personal single-user
+  bridging is the low-risk end, but bans are possible.
+- Sharing to the master is **default-private**, four-layer consent,
+  most-specific-wins; the manager is read-only by server-side power levels
+  *and* by a console with no send code. Full model: `docs/SYSTEM-DESIGN.md`.
+- Findings F1 and F2 from the 2026-08-28 audit were both fixed on 2026-08-28
+  (legacy hub retired; `:8011` now sends hardened headers). See
+  `docs/AUDIT-FINDINGS.md`.
 
 ## Updates
-Images are pinned by digest (supply-chain integrity), so nothing updates
-itself. Every month or two: bump the four image tags/digests in
-`docker-compose.yml` (Synapse for security fixes; mautrix-whatsapp *will*
-eventually break against WhatsApp protocol changes if left stale), then
-`docker compose --profile bridge --profile client up -d`.
 
-## iMessage bridge (Phase 1)
+Images are pinned by digest, so nothing updates itself. Every month or two:
+bump the image digests in `docker-compose.yml` (+ `master/docker-compose.master.yml`),
+then `docker compose --profile bridge --profile client up -d`.
+
+## Master-sync (share with your manager)
+
+1. Manager: console → **Add teammate** → gets a one-time code (10-min TTL).
+2. Teammate: app → Settings → **Connect to organization** → paste the code.
+   Credentials land in the teammate's own account-data; the uplink daemon
+   picks them up and starts mirroring whatever the consent rules allow
+   (default: nothing).
+3. Share controls: per-conversation kebab, per-contact profile, per-network,
+   or the global switch — most specific wins. Un-sharing revokes the mirror.
+4. Manager suggestions appear in the teammate's **Proposals** inbox; sending
+   one is always the teammate's own action.
+
+Details and guarantees: `docs/SYSTEM-DESIGN.md`; ops: `master/CLAUDE.md`,
+`agents/uplink/CLAUDE.md`.
+
+## iMessage bridge
+
 Host-side daemon (`imessage/daemon.py`, launchd agent
 `com.jkali.imessage-daemon`) bridges Messages.app ⇄ Matrix via Beeper's
 platform-imessage CLI (`imessage/bin/imessage-cli`, pinned build). Chats
-appear in the **iMessage** space; text works both directions; attachments
-are best-effort. New chats arrive as invites (accept in Element).
+appear in the **iMessage** space; text works both directions; attachments are
+best-effort. New chats arrive as invites.
 - Status: `launchctl print gui/501/com.jkali.imessage-daemon | grep state`
 - Logs: `imessage/logs/daemon.log` (INFO is deliberately body-free)
 - Restart: `launchctl kickstart -k gui/501/com.jkali.imessage-daemon`
-- The archive note from the WhatsApp section now also covers iMessage —
-  including SMS/RCS fallback traffic (2FA codes etc.), so the local archive's
-  sensitivity went up. FileVault remains the at-rest control.
+- The local archive includes SMS/RCS fallback traffic (2FA codes etc.);
+  FileVault remains the at-rest control.
 - macOS permissions are granted to `imessage/bin/imessage-cli` specifically;
   a rebuilt binary re-prompts (that's a feature). Test messages
   (`pmmng-test-*`) in your self-chat are safe to delete from Messages.app.
 
 ## Google Messages bridge
+
 Compose service `mautrix-gmessages` (digest-pinned, no host ports, internal
 appservice port 29336). Bot `@gmessagesbot:localhost`; chats appear in the
-**Google Messages** space. Uses the same management-room model as WhatsApp: a
-2-member DM with the bot, driven from the Hub.
+**Google Messages** space; same management-room model as WhatsApp.
 
 ### Connect — 3 steps
-Google Messages links with a quick **Google account sign-in** (no cookie pasting;
-credentials never become a Matrix message). From the Hub → **Connections → Google
-Messages** card, or from a terminal:
-
-1. **Open Google sign-in** (the card's button, or
+1. **Open Google sign-in** (the Connections card's button, or
    `https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config`)
    and sign into your Google account in Chrome.
 2. **Run the connect helper:** `python3 gmessages-connect/connect.py`
@@ -115,119 +143,63 @@ Messages** card, or from a terminal:
    from Chrome and submits it to the bridge.
 3. **Tap the emoji** it prints, in the Google Messages app on your phone.
 
-The card then shows **Connected**; your ~25 recent chats + contacts sync into the
-**Google Messages** space (new chats arrive as Element invites, like WhatsApp).
-Backfill is **on**. Commands (list-logins, logout, sync, start-chat, …) live in
-the Hub's **Settings → Google Messages** tab.
-
-- **Your phone must stay continuously online** — Google Messages proxies every
-  message through the phone; if it goes offline, messages pause until it's back.
-- **Re-linking / testing:** just run `gmessages-connect/connect.py` again.
-  `logout` (Hub Settings) or the provisioning `logout` endpoint clears the login;
-  "Delete all bridged rooms" clears the synced rooms.
+- **Your phone must stay continuously online** — Google Messages proxies
+  every message through the phone.
+- **Re-linking:** run `connect.py` again; `logout` (Settings) clears the login.
 
 ## Instagram bridge (mautrix-meta)
-Compose service `mautrix-meta` (Instagram DM bridge, digest-pinned, no host
-ports, own DB `mautrix_meta`). Bot `@instagrambot:localhost`; chats appear in
-the **Instagram** space. Design + security dispositions: `PLAN-META.md`.
-Backfill is **off** — only messages from login onward are bridged.
+
+Compose service `mautrix-meta` (digest-pinned, no host ports, own DB
+`mautrix_meta`). Bot `@instagrambot:localhost`; chats appear in the
+**Instagram** space. Design + security dispositions: `PLAN-META.md`.
+Backfill **off** — only messages from login onward.
 
 ### Log in (you do this — no automation, on purpose)
-Automated input on Instagram's login page is the classic bot-detection trigger,
-so **you** log in as a human and hand the bridge the resulting session:
-1. In your **everyday Chrome** (the one Instagram already trusts), with **2FA
-   enabled** on your account, go to instagram.com and log in normally.
-2. Open DevTools → **Network** tab → filter **XHR** → type `graphql` in the
-   filter. Click around Instagram so a `graphql` request appears.
-3. Right-click a `graphql` request → **Copy → Copy as cURL** (POSIX on Windows).
-4. In Element, open a DM with `@instagrambot:localhost`, send `login instagram`,
-   and paste the cURL when prompted. (Alternatively paste the cookies
-   `sessionid, csrftoken, mid, ig_did, ds_user_id` as a JSON object.)
-5. **Immediately delete that message.** The cURL/cookies are a *bearer
-   credential* (anyone with `sessionid` is you): unless deleted, it rests in the
-   Matrix events DB. Element: hover the message → **Remove** (redact). The
-   bridge log is deliberately `info`-level and does **not** record the cookie.
+1. In your everyday Chrome (2FA enabled), log into instagram.com normally.
+2. DevTools → Network → filter XHR → type `graphql`; click around so a
+   `graphql` request appears.
+3. Right-click it → **Copy → Copy as cURL**.
+4. DM `@instagrambot:localhost`, send `login instagram`, paste the cURL when
+   prompted (or the cookies `sessionid, csrftoken, mid, ig_did, ds_user_id`
+   as JSON).
+5. **Immediately delete that message** — it is a bearer credential. The
+   bridge log is `info`-level and does not record it.
 
-Chats appear as rooms in the Instagram space within a minute or two.
+### Staying un-flagged
+Home IP only (never a VPS), 2FA on, backfill off, one account. This is a
+unified Meta bridge with no `network.mode` field: only ever run
+`login instagram` — `login facebook`/`messenger` would bridge those too.
 
-### Staying un-flagged (single personal account)
-- Runs on **localhost / your home IP** — do **not** move this to a VPS/datacenter
-  IP (the single biggest flag for a bridged Instagram session).
-- **2FA on**; backfill off; the bridge only syncs your DM inbox participants
-  (no follower/following scrape). Keep it to your one account.
-- This is a unified Meta bridge: this image has **no `network.mode` field** —
-  the network is chosen when you run `login instagram`. Only run
-  `login instagram`; `login facebook`/`login messenger` would bridge those too.
-
-### Kill switch (if the laptop is lost, or you want to cut the session)
-Instagram → Settings → **Accounts Center → Password & security → Where you're
-logged in** → remove the bridge device (or reset your password). That
-invalidates the `sessionid` stored locally. Then `logout` to the bot.
-
-### Commands (DM the bot)
-`help`, `version`, `login instagram`, `list-logins`, `logout <login ID>`.
-
-### Don't destroy your session
-Same warning as WhatsApp: after login, **`docker compose down -v` deletes the
-Instagram session + bridged history**. Send `logout` to the bot (or remove the
-device in Instagram) and `pg_dump` first if you care.
+### Kill switch
+Instagram → Accounts Center → Password & security → Where you're logged in →
+remove the bridge device (or reset password), then `logout` to the bot.
 
 ## LinkedIn bridge (mautrix-linkedin)
+
 Compose service `mautrix-linkedin` (digest-pinned, no host ports, own DB
-`mautrix_linkedin`). Bot `@linkedinbot:localhost`; chats appear in the
-**LinkedIn** space. Like Instagram, this is a **session-paste** login: you log
-in as a human on linkedin.com and hand the bridge the resulting session — there
-is no automated login on LinkedIn's page (that's the classic bot-detection
-trigger).
+`mautrix_linkedin`). Bot `@linkedinbot:localhost`; **LinkedIn** space.
+Session-paste login, like Instagram:
 
-### Log in (you do this — no automation, on purpose)
-1. In your everyday Chrome, go to linkedin.com and log in normally.
-2. Open DevTools → **Network** tab → type `graphql` in the filter (LinkedIn's
-   web app calls its **voyager** graphql API). Click around LinkedIn so a
-   `graphql`/voyager request appears.
-3. Right-click a `graphql` request → **Copy → Copy as cURL**.
-4. From the Hub → **Connections → LinkedIn** card, click **Connect LinkedIn**
-   (this sends `login cookies` to the bot and opens linkedin.com), then **paste
-   the cURL** into the box and **Submit session**. The Hub sends it to the bot
-   through the management-room guard and **auto-redacts** the pasted message
-   immediately. (Alternatively, DM `@linkedinbot:localhost` and send
-   `login cookies`, then paste the cURL yourself and delete that message.)
+1. Log into linkedin.com normally in your everyday Chrome.
+2. DevTools → Network → filter `graphql` (voyager API); click around.
+3. Right-click a request → **Copy → Copy as cURL**.
+4. App → Connections → LinkedIn → **Connect LinkedIn**, paste the cURL,
+   **Submit session** — sent through the management-room guard and
+   **auto-redacted** immediately. (Or DM the bot `login cookies` manually and
+   delete the pasted message yourself.)
 
-Unlike a cookies-only bridge, LinkedIn needs the **cURL** (not just cookies):
-the request carries the `X-LI-Track` and `X-LI-Page-Instance` headers that
-LinkedIn's voyager API expects alongside the `li_at` cookie. A trimmed,
-fake-valued example of what you'd paste (real values redacted):
+LinkedIn needs the full cURL (not just cookies): the `X-LI-Track` /
+`X-LI-Page-Instance` headers ride alongside the `li_at` cookie. Never paste a
+real cURL anywhere else — it is a bearer credential. If auto-redact ever
+fails, delete the message in Element. ToS caveat and `down -v` warning as per
+WhatsApp. Commands: `help`, `version`, `login cookies`, `list-logins`,
+`logout <id>`, `set-preferred-login`, `search`, `start-chat`,
+`resolve-identifier`, `sync`.
 
-```
-curl 'https://www.linkedin.com/voyager/api/...' \
-  -H 'csrf-token: <REDACTED>' \
-  -H 'x-li-track: {"clientVersion":"<REDACTED>"}' \
-  -H 'x-li-page-instance: urn:li:page:<REDACTED>' \
-  -b 'li_at=<REDACTED>; JSESSIONID=<REDACTED>'
-```
+## X (Twitter) bridge (mautrix-twitter)
 
-Never paste a real cURL into a file, a ticket, or a chat log — it is a **bearer
-credential** (anyone with `li_at` is you).
-
-### At-rest / redaction note
-The cURL is a bearer credential. The Hub sends it **only** to the LinkedIn
-management room and redacts the carrier event right away; the bridge log is
-deliberately `info`-level and does **not** record the cookie. Until redacted,
-a pasted credential rests in the Matrix events DB — if the auto-redact ever
-fails, delete the message in Element (hover → **Remove**). At-rest protection
-for the local archive is FileVault (verified on).
-
-### ToS caveat
-Using an unofficial LinkedIn client violates LinkedIn's Terms of Service.
-Personal single-user bridging is the low-risk end, but a restriction or ban,
-while unlikely, is possible. Runs on **localhost / your home IP** — don't move
-this to a VPS/datacenter IP. Keep it to your one account.
-
-### Commands (DM the bot)
-`help`, `version`, `login cookies`, `list-logins`, `logout <login ID>`,
-`set-preferred-login`, `search`, `start-chat`, `resolve-identifier`, `sync`.
-
-### Don't destroy your session
-Same warning as WhatsApp: after login, **`docker compose down -v` deletes the
-LinkedIn session + bridged history**. Send `logout` to the bot and `pg_dump`
-first if you care.
+Compose service `mautrix-twitter` (digest-pinned, no host ports). Bot
+`@twitterbot:localhost`; chats appear in the **X** space. Cookie/session-paste
+login like Instagram/LinkedIn, driven from the app's Connections card (the
+paste is sent through the management-room guard and auto-redacted). Same ToS,
+home-IP, and `down -v` cautions as the other session-paste bridges.

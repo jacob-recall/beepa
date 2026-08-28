@@ -4,7 +4,6 @@
 import { feedHideRoom, feedIsHidden, feedUnhideRoom } from './account-data.js';
 import { openConvo } from './chat.js';
 import { $, el, sanitizeLine } from './el.js';
-import { navTo, openConversation } from './nav.js';
 import { feedRelTime } from './search.js';
 import { SOURCES } from './sources.js';
 import { feedModel } from '../state.js';
@@ -29,8 +28,8 @@ function buildPlatBadge(sourceId) {
   return el('span', cls, (source && source.icon) || '');
 }
 
-// A feed row reuses the existing .convo structure; click → openConversation
-// (the only validated nav path; it also shows the Element pane via navTo('all')).
+// A feed row reuses the existing .convo structure; click → openConvo
+// (the only validated nav path: the native in-app conversation view).
 function buildFeedRow(r) {
   const name = sanitizeLine(r.name || r.id);
   const preview = sanitizeLine(r.lastBody || '');   // HF-4: single-line, clamped, textContent

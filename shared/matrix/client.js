@@ -12,12 +12,11 @@ import { S } from '../state.js';
 // before this was made configurable.
 let HS = 'http://127.0.0.1:8008';
 let SERVER_NAME = 'localhost';
-const CHATS_URL = 'http://127.0.0.1:8009';
 
 // ---- validation regexes ----
-// Element route target: a room id that is URL-fragment-safe (no #,?,%,\,space,
-// controls). Validate-then-concatenate the RAW id (D-4: do NOT encode — the
-// charset is fragment-safe and encoding breaks Element's route parser).
+// A room id restricted to a URL-path/fragment-safe charset (no #,?,%,\,space,
+// controls). Validate-then-concatenate the RAW id before building any request
+// path (D-4: the charset is safe, so the id is used verbatim, never encoded).
 let ROOMID_RE = /^![A-Za-z0-9._=/+-]+:localhost$/;
 const MXC_RE = /^mxc:\/\/([A-Za-z0-9.\-:]+)\/([A-Za-z0-9_-]+)$/;
 
@@ -59,4 +58,4 @@ async function api(method, path, body) {
   return data;
 }
 
-export { HS, SERVER_NAME, CHATS_URL, ROOMID_RE, MXC_RE, api, onUnauthorized, setOnUnauthorized, configureMatrixBase };
+export { HS, SERVER_NAME, ROOMID_RE, MXC_RE, api, onUnauthorized, setOnUnauthorized, configureMatrixBase };

@@ -33,7 +33,7 @@ Three Docker Compose projects + three launchd daemons. All ports loopback-only
 | Component | Where | Project / label | Status seen |
 |---|---|---|---|
 | Teammate Synapse (homeserver) | 127.0.0.1:**8008** | `matrix-wa` | up, healthy |
-| Element Web (escape hatch UI) | 127.0.0.1:**8009** | `matrix-wa` | up |
+| Element Web (opt-in escape hatch UI) | 127.0.0.1:**8009** | `matrix-wa` (profile `escape`) | off by default — `docker compose --profile escape up -d element` |
 | **New apps server** (`apps/` + `shared/`) | 127.0.0.1:**8011** | `matrix-wa` (`views`) | up — hardened headers via views/nginx.conf (2026-08-28) |
 | 5 mautrix bridges (whatsapp, meta/IG, linkedin, twitter, gmessages) | compose network only, no host ports | `matrix-wa` | up |
 | Postgres (teammate) | compose network only | `matrix-wa` | up, healthy |

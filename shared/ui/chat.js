@@ -3,7 +3,7 @@
 
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { $, el, sanitizeLine, txn } from './el.js';
-import { openConversation, setActiveNav, showSection, setDetailMode } from './nav.js';
+import { setActiveNav, showSection, setDetailMode } from './nav.js';
 import { renderMessageEvent } from './render.js';
 import { buildPlatBadge, setActiveConvoRow } from './rows.js';
 import { S, convoSeen, feedModel, runtime } from '../state.js';
@@ -26,8 +26,8 @@ function convoSetStatus(text) {
   s.classList.toggle('hidden', !text);
 }
 
-// Open the native conversation view for a validated room (CV-6): same
-// ROOMID_RE ∩ S.joinedSet gate openConversation uses. Loads recent history via
+// Open the native conversation view for a validated room (CV-6): the
+// ROOMID_RE ∩ S.joinedSet gate re-applied at open time. Loads recent history via
 // /messages, renders through the shared renderer, then starts the room-scoped
 // live watch.
 async function openConvo(roomId) {
@@ -46,10 +46,6 @@ async function openConvo(roomId) {
     badge.className = b.className;
     badge.textContent = b.textContent;
   }
-  // "Open in Element" reuses the exact validated openConversation path (CV-E1).
-  const link = $('convo-element-link');
-  if (link) link.onclick = (e) => { e.preventDefault(); openConversation(roomId); };
-
   const box = $('convo-messages');
   if (box) box.replaceChildren();                   // #convo-messages holds ONLY bubbles (CV-R3)
   // Layout/nav only: reveal the Home messenger and open the right-hand chat pane.

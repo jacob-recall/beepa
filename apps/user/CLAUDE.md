@@ -112,11 +112,14 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   build every node with `el()`/`sanitizeLine()`/`textContent`; none of them
   loosens `apps/user/index.html`'s CSP (`script-src 'self'`,
   `require-trusted-types-for 'script'`, `object-src 'none'`,
-  `frame-ancestors 'none'`, `connect-src 'self' http://127.0.0.1:8008`, plus
-  `frame-src http://127.0.0.1:8009` for the embedded Element pane).
-  `apps/master/index.html`'s CSP is a strict subset of this one (no
-  `frame-src`, has `media-src`) — see `apps/master/CLAUDE.md`; if you ever
-  touch `apps/user/index.html`'s CSP, diff both files.
+  `frame-ancestors 'none'`, `connect-src 'self' http://127.0.0.1:8008`). The
+  policy carries **no `frame-src`**: the embedded Element pane was removed and
+  Element demoted to an opt-in escape-hatch container (docker-compose profile
+  `escape`, no longer on the daily path). `apps/master/index.html`'s CSP now
+  differs only by adding `media-src` (v1.5 media) — see `apps/master/CLAUDE.md`;
+  if you ever touch `apps/user/index.html`'s CSP, diff both files, and keep it
+  byte-identical to the copy in `views/nginx.conf`
+  (`tests/unit/csp_parity.test.js` asserts that).
 - **`localStorage` state (`SEEN_KEY` in consent.js, `IGNORE_KEY` in
   contacts.js, `HANDLED_KEY` in proposals.js) is per-viewer convenience only
   and is never trusted for authorization.** The truth is always re-derived

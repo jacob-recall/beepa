@@ -2,7 +2,6 @@
 
 import { refreshConvos } from './account-data.js';
 import { stopConvoWatch } from './chat.js';
-import { CHATS_URL, ROOMID_RE } from '../matrix/client.js';
 import { $, el } from './el.js';
 import { setActiveConvoRow } from './rows.js';
 import { ensureConnections, ensureSettings } from './connections.js';
@@ -211,14 +210,6 @@ function showSettingsHub(section, sourceId) {
   if (sharingViewHook) sharingViewHook();
 }
 
-function openConversation(roomId) {
-  if (!ROOMID_RE.test(roomId)) return;
-  if (!S.joinedSet.has(roomId)) return;
-  const f = $('chats-container') && $('chats-container').querySelector('iframe');
-  if (f) f.src = CHATS_URL + '/#/room/' + roomId;
-  navTo('all');
-}
-
 function showAuth(signedIn) {
   $('shell').classList.toggle('hidden', !signedIn);
   $('view-signin').classList.toggle('hidden', signedIn);
@@ -410,24 +401,9 @@ function wireTool(id, key) {
   b.addEventListener('click', () => navTo(key));
 }
 
-function mountChats() {
-  const holder = $('chats-container');
-  if (!holder || holder.querySelector('iframe')) return;
-  const f = el('iframe');
-  f.src = CHATS_URL;
-  f.allow = 'clipboard-write; fullscreen';
-  f.title = 'Chats (Element)';
-  holder.appendChild(f);
-}
-
-function unmountChats() {
-  const f = $('chats-container') && $('chats-container').querySelector('iframe');
-  if (f) f.remove();
-}
-
 export {
-  openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
-  mountChats, unmountChats, setSharingViewHook, setProposalsViewHook, setContactsViewHook,
+  showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
+  setSharingViewHook, setProposalsViewHook, setContactsViewHook,
   listBody, setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
   refreshPlatformRail, openPlatformConnect,
 };

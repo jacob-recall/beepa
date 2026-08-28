@@ -4,7 +4,6 @@
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { logConsole, updateImsgCard } from './connections.js';
 import { sanitizeLine } from './el.js';
-import { openConversation } from './nav.js';
 import { renderMessageEvent } from './render.js';
 import { scheduleFeedRender } from './search.js';
 import { SOURCES, handleMgmtEvent, reactToBotReply, sendCmd, startSync } from './sources.js';
@@ -93,7 +92,7 @@ async function refreshConvos() {
 // logConsole, reactToBotReply, sendCmd, updateImsgCard, or the status parser.
 // Bridged portal content (names, last-message bodies) is read only here and in
 // the existing snapshot path (parseSnapshot/buildConvos, already D-3-separate);
-// it never reaches the command/console path. Nav is only via openConversation.
+// it never reaches the command/console path. Nav is only via openConvo.
 // ===========================================================================
 
 // HF-4: compute a room's "last message" preview under a strict whitelist.

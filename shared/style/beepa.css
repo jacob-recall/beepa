@@ -185,7 +185,6 @@ input:focus-visible, .input:focus-visible { border-color: var(--color-accent); o
   cursor: pointer; font-size: 18px;
 }
 #convo-back:hover, #room-back:hover { background: color-mix(in srgb, #fff 8%, transparent); }
-#convo-element-link { color: #8696a0; font-size: 12px; }
 #convo-head .plat-badge, #room-head .plat-badge { width: 20px; height: 20px; }
 .room-sub-row .muted { color: #8696a0; }
 .live-indicator-room {

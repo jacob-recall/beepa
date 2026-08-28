@@ -72,8 +72,6 @@
 
 #content { flex: 1; min-width: 0; position: relative; overflow: hidden; }
 .view { position: absolute; inset: 0; overflow: hidden; }
-.view#view-chats { padding: 0; }
-#chats-container, #chats-container iframe { width: 100%; height: 100%; border: none; }
 
 #view-workspace { padding: 0; }
 #workspace { display: flex; height: 100%; width: 100%; }

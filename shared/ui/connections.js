@@ -18,6 +18,62 @@ function logConsole(who, text, srcId) {
   c.scrollTop = c.scrollHeight;
 }
 
+// ---- pasted-session credential cleanup -----------------------------------
+// A pasted Instagram/LinkedIn/X session is a bearer credential. It is sent
+// through the C-1 mgmt guard, then the leaked message event is redacted in-app
+// with the user's own token (redactMgmtEvent). If that auto-redaction fails, we
+// do NOT tell the user to go delete it "in Element" — Element is no longer on
+// the daily path — but instead offer a one-click IN-APP retry that re-issues the
+// redaction. Only if THAT also fails do we point at the opt-in Element escape
+// hatch as a last resort. No credential is retained here: the `secret` is nulled
+// by the caller; this only carries the room+event id of the message to delete.
+const ESCAPE_HINT = 'Bring up the opt-in Element escape hatch ' +
+  '(docker compose --profile escape up -d element) and delete your pasted message there.';
+
+// Remove any in-app redaction-retry UI previously appended after `warnEl`
+// (called when a submit handler resets its warning area).
+function clearRedactRetry(warnEl) {
+  const box = warnEl && warnEl.nextElementSibling;
+  if (box && box.classList.contains('redact-retry')) box.remove();
+}
+
+// Show the in-app "Delete it now" retry for a credential event that was sent but
+// whose auto-redaction did not confirm. On success it clears the warning and
+// calls onCleared (e.g. to hide the paste UI); on a failed retry it reveals the
+// escape-hatch last resort. Reuses a single sibling container so repeated
+// failures never stack buttons. All nodes are el()/textContent — no innerHTML.
+function showRedactFailure(warnEl, roomId, eventId, onCleared) {
+  const host = warnEl && warnEl.parentNode;
+  if (!host) return;
+  warnEl.textContent = 'Your pasted session was sent but has not yet been deleted from the bridge room.';
+  warnEl.classList.remove('hidden');
+  let box = warnEl.nextElementSibling;
+  if (!box || !box.classList.contains('redact-retry')) {
+    box = el('div', 'redact-retry');
+    host.insertBefore(box, warnEl.nextSibling);
+  }
+  box.replaceChildren();
+  const btn = el('button', 'primary', 'Delete it now');
+  btn.type = 'button';
+  btn.style.width = 'auto';
+  const last = el('p', 'muted hidden', 'Still not deleted. ' + ESCAPE_HINT);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      await redactMgmtEvent(roomId, eventId);
+      warnEl.textContent = 'Deleted. Your pasted session is no longer stored in the bridge room.';
+      warnEl.classList.remove('hidden');
+      box.remove();
+      if (typeof onCleared === 'function') onCleared();
+    } catch (e) {
+      last.classList.remove('hidden');
+      btn.disabled = false;
+    }
+  });
+  box.appendChild(btn);
+  box.appendChild(last);
+}
+
 function setButtonsDisabled(v) {
   for (const b of document.querySelectorAll('#command-groups button, .bridge-actions button, .startable')) {
     b.disabled = v;                                 // capability-disabled controls are excluded
@@ -297,6 +353,7 @@ function buildConnections() {
     if (S.busy) return;
     igWarn.classList.add('hidden');
     igWarn.textContent = '';
+    clearRedactRetry(igWarn);
     let secret = igArea.value;                       // read once; never logged
     igArea.value = '';                               // clear the field immediately
     if (!secret || !secret.trim()) {
@@ -310,15 +367,14 @@ function buildConnections() {
       const sent = await sendSecretToMgmt('instagram', secret);
       secret = null;                                 // drop the credential from memory
       if (!sent || !sent.eventId) {
-        igWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        igWarn.textContent = 'Sent, but the bridge did not return a message id, so it cannot be auto-deleted. ' + ESCAPE_HINT;
         igWarn.classList.remove('hidden');
       } else {
         try {
           await redactMgmtEvent(sent.roomId, sent.eventId);
           igPaste.classList.add('hidden');           // hide the paste UI on success
         } catch (e) {
-          igWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
-          igWarn.classList.remove('hidden');
+          showRedactFailure(igWarn, sent.roomId, sent.eventId, () => igPaste.classList.add('hidden'));
         }
       }
     } catch (e) {
@@ -410,6 +466,7 @@ function buildConnections() {
     if (S.busy) return;
     liWarn.classList.add('hidden');
     liWarn.textContent = '';
+    clearRedactRetry(liWarn);
     let secret = liArea.value;                       // read once; never logged
     liArea.value = '';                               // clear the field immediately
     if (!secret || !secret.trim()) {
@@ -423,15 +480,14 @@ function buildConnections() {
       const sent = await sendSecretToMgmt('linkedin', secret);
       secret = null;                                 // drop the credential from memory
       if (!sent || !sent.eventId) {
-        liWarn.textContent = 'Sent, but could not confirm the message id to delete it — please delete your pasted message in Element manually.';
+        liWarn.textContent = 'Sent, but the bridge did not return a message id, so it cannot be auto-deleted. ' + ESCAPE_HINT;
         liWarn.classList.remove('hidden');
       } else {
         try {
           await redactMgmtEvent(sent.roomId, sent.eventId);
           liPaste.classList.add('hidden');           // hide the paste UI on success
         } catch (e) {
-          liWarn.textContent = 'Session sent, but auto-deleting it failed — please delete your pasted message in Element manually.';
-          liWarn.classList.remove('hidden');
+          showRedactFailure(liWarn, sent.roomId, sent.eventId, () => liPaste.classList.add('hidden'));
         }
       }
     } catch (e) {
@@ -517,6 +573,7 @@ function buildConnections() {
     if (S.busy) return;
     twWarn.classList.add('hidden');
     twWarn.textContent = '';
+    clearRedactRetry(twWarn);
     let secret = twArea.value;                       // read once; never logged
     twArea.value = '';                               // clear the field immediately
     if (!secret || !secret.trim()) {
@@ -530,15 +587,14 @@ function buildConnections() {
       const sent = await sendSecretToMgmt('twitter', secret);
       secret = null;                                 // drop the credential from memory
       if (!sent || !sent.eventId) {
-        twWarn.textContent = 'Sent, but could not confirm the message id to delete it \u2014 please delete your pasted message in Element manually.';
+        twWarn.textContent = 'Sent, but the bridge did not return a message id, so it cannot be auto-deleted. ' + ESCAPE_HINT;
         twWarn.classList.remove('hidden');
       } else {
         try {
           await redactMgmtEvent(sent.roomId, sent.eventId);
           twPaste.classList.add('hidden');           // hide the paste UI on success
         } catch (e) {
-          twWarn.textContent = 'Session sent, but auto-deleting it failed \u2014 please delete your pasted message in Element manually.';
-          twWarn.classList.remove('hidden');
+          showRedactFailure(twWarn, sent.roomId, sent.eventId, () => twPaste.classList.add('hidden'));
         }
       }
     } catch (e) {

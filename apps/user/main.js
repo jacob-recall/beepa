@@ -11,7 +11,7 @@ import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
 import { ROOMID_RE, api, setOnUnauthorized } from '../../shared/matrix/client.js';
 import { confirmModal, ensureConnections, ensureSettings, logConsole, setPlatformRailHook } from '../../shared/ui/connections.js';
 import { $ } from '../../shared/ui/el.js';
-import { buildNav, mountChats, navTo, openConversation, refreshPlatformRail, showAuth, unmountChats } from '../../shared/ui/nav.js';
+import { buildNav, navTo, refreshPlatformRail, showAuth } from '../../shared/ui/nav.js';
 import { setActiveConvoRow } from '../../shared/ui/rows.js';
 import { buildDirectory, renderHome, renderSourceList, setFeedRenderHook } from '../../shared/ui/search.js';
 import { GMSG, IG, LI, SOURCES, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
@@ -49,7 +49,6 @@ function forgetSession() {
   autojoinSessionJoined = 0;
   autojoinPending = { refused: 0, overCap: 0, declined: 0 };
   renderAutojoinNote();
-  unmountChats();
   clearQR();
   try { sessionStorage.removeItem('hub_token'); sessionStorage.removeItem('hub_user'); } catch (e) {}
   showAuth(false);
@@ -111,7 +110,7 @@ function renderAutojoinNote() {
   const n = autojoinPending.refused + autojoinPending.overCap + autojoinPending.declined;
   host.textContent = n ? n + ' pending invitation(s) not accepted' : '';
   host.title = n
-    ? 'These room invitations were not from a recognized bridge bot, or were left for a later pass. Review them in Element (Settings → Element) and accept or decline them there.'
+    ? 'These room invitations were not from a recognized bridge bot, or were left for a later pass. To review them, bring up the opt-in Element escape hatch (docker compose --profile escape up -d element) and accept or decline them there.'
     : '';
   host.classList.toggle('hidden', n === 0);
 }
@@ -225,7 +224,6 @@ async function enterApp() {
   try { initProposalsUI(); } catch (e) { /* proposal inbox hook stays unregistered on error */ }
   try { initContactsUI(); } catch (e) { /* contacts hook stays unregistered on error */ }
   try { await initOrgLinkUI(); } catch (e) { /* org-link panel stays absent on error */ }
-  mountChats();                                     // Element pane exists so openConversation can target it
   showAuth(true);
   navTo('home');                                    // HF-8: default view = Home feed
   // Seed the isolated feed model from the validated snapshot, render, then start

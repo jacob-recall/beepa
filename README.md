@@ -22,7 +22,7 @@ where a manager reads them and can leave reply *suggestions* — never send.
 | **Teammate app** | `http://127.0.0.1:8011/apps/user/index.html` | the new UI: chats, share controls, contacts, proposal inbox |
 | **Manager console** | `http://127.0.0.1:8011/apps/master/index.html` | read-only view across teammates; signs into the master (:8018) |
 | Synapse (teammate) | `127.0.0.1:8008` | homeserver, `server_name: localhost` |
-| Element Web | `http://127.0.0.1:8009` | escape-hatch full Matrix client |
+| Element Web | `http://127.0.0.1:8009` | opt-in escape hatch (media/group-admin/debug) — off by default; `docker compose --profile escape up -d element`. New chats auto-accept natively, so it is not needed day to day. |
 | Synapse (master) | `127.0.0.1:8018` | compose project `matrix-master` (`master/`) |
 | Enroll/admin service | `127.0.0.1:8019` | `master/enroll.py serve` (launchd) — enrollment codes, add-teammate |
 | iMessage daemon | `127.0.0.1:29350` | `imessage/daemon.py` (launchd appservice) |
@@ -191,7 +191,9 @@ Session-paste login, like Instagram:
 LinkedIn needs the full cURL (not just cookies): the `X-LI-Track` /
 `X-LI-Page-Instance` headers ride alongside the `li_at` cookie. Never paste a
 real cURL anywhere else — it is a bearer credential. If auto-redact ever
-fails, delete the message in Element. ToS caveat and `down -v` warning as per
+fails, the card offers an in-app "Delete it now" retry; only if that also fails
+bring up the opt-in Element escape hatch (`docker compose --profile escape up -d
+element`) to delete the message there. ToS caveat and `down -v` warning as per
 WhatsApp. Commands: `help`, `version`, `login cookies`, `list-logins`,
 `logout <id>`, `set-preferred-login`, `search`, `start-chat`,
 `resolve-identifier`, `sync`.

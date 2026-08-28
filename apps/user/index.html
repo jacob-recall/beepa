@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8008 http://127.0.0.1:8019; img-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src http://127.0.0.1:8009; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8008 http://127.0.0.1:8019; img-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa</title>
 <link rel="stylesheet" href="../../shared/style/organic.css?v=wa8">
@@ -12,7 +12,7 @@
 </head>
 <body>
 <div id="signout-note-wrap" class="hidden">
-  <p id="signout-note" class="muted">Signed out of the Hub. Your chats session is separate — to sign out of it too, open <a href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">127.0.0.1:8009</a>.</p>
+  <p id="signout-note" class="muted">Signed out of the Hub. If you ever signed in to the Element escape hatch, that is a separate session — its own device and token on the same homeserver — so sign out of it there once, too.</p>
 </div>
 
 <section id="view-signin">
@@ -43,7 +43,6 @@
   <div id="settings-popover" class="settings-popover hidden" role="menu">
     <div class="settings-user" id="settings-user"><span id="whoami"></span></div>
     <button id="settings-open-hub" class="settings-menu-item" type="button" role="menuitem">Settings</button>
-    <a id="open-chats" class="settings-menu-item" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer" role="menuitem">Element</a>
     <button id="signout" class="settings-menu-item settings-signout" type="button" role="menuitem">Sign out</button>
   </div>
 
@@ -75,7 +74,6 @@
               <span id="convo-badge" class="plat-badge"></span>
               <span id="convo-title"></span>
               <span class="spacer"></span>
-              <a id="convo-element-link" href="http://127.0.0.1:8009" target="_blank" rel="noopener noreferrer">Element &#8599;</a>
             </header>
             <div id="convo-messages"></div>
             <div id="convo-compose">
@@ -140,10 +138,6 @@
           </div>
         </div>
       </div>
-    </section>
-
-    <section id="view-chats" class="view hidden">
-      <div id="chats-container"></div>
     </section>
   </main>
 </div>

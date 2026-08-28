@@ -78,6 +78,20 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   `ev.sender === IMSG_BOT_MXID` (imported from `ui/sources.js`). If you add
   a new bridge/bot whose daemon also stamps a from_me-style flag, gate it
   the same way — sender identity, not a content field, is what's trusted.
+- **A management room is a 2-member bot DM that is NOT a portal and NOT a
+  space.** `ui/sources.js`'s `isBotDmMgmt()` is what `findBotDmMgmt()` /
+  `verifyMgmt()` trust before `sendCmd()` and — critically —
+  `sendSecretToMgmt()`, which posts a **session credential** into whatever it
+  returns. Membership alone does not identify that room: a degenerate portal
+  (every ghost gone) and a bridge's own SOURCE SPACE (e.g. "WhatsApp (+1…)")
+  are both 2-member `{bot, user}` rooms. So the predicate additionally fetches
+  the room's full state and refuses anything carrying `uk.half-shot.bridge`
+  (mautrix's portal marker) or an `m.room.create` with `type: 'm.space'` —
+  the same absence-of-a-portal test `verifyImsgMgmt()` already made. If the
+  state cannot be read, the room is refused (a room we cannot prove is not a
+  portal is not a management room). Never relax this back to a membership-only
+  check, especially now that `apps/user` auto-joins bridge invites and so has
+  more candidate rooms.
 - **Room-id / mxc validation before concatenation.** `ROOMID_RE` /
   `MXC_RE` (from `matrix/client.js`) must validate any id before it is
   concatenated into a URL path. `consent.js`'s `overridePath()` and

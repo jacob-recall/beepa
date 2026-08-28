@@ -222,11 +222,30 @@ async function findBotDmMgmt(source) {
     { invite: [source.botMxid], is_direct: true, preset: 'trusted_private_chat' });
   return created.room_id;
 }
+// A mgmt room is a 2-member {bot, me} DM that is NOT a bridge portal. The
+// portal check is load-bearing: sendSecretToMgmt() posts a session credential
+// into whatever this returns first, and a degenerate portal room (every ghost
+// left, leaving bot + user) has exactly the same membership shape as the real
+// mgmt DM. mautrix stamps `uk.half-shot.bridge` state on every portal it
+// creates, so its ABSENCE — the same test verifyImsgMgmt() already makes — is
+// what separates the two. Failing to read the state refuses the room (a mgmt
+// room we cannot prove is not a portal is not a mgmt room).
 async function isBotDmMgmt(source, roomId) {
   try {
     const m = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/joined_members');
     const members = Object.keys(m.joined);
-    return members.length === 2 && members.includes(source.botMxid) && members.includes(S.userId);
+    if (!(members.length === 2 && members.includes(source.botMxid) && members.includes(S.userId))) return false;
+    const st = await roomFullState(roomId);
+    if (!Array.isArray(st)) return false;            // cannot prove "not a portal" -> refuse
+    const isPortal = st.some(e => e && e.type === 'uk.half-shot.bridge');     // any state_key
+    // ...and not a SPACE. A bridge's source space (e.g. "WhatsApp (+1...)") is
+    // ALSO a 2-member {bot, user} room with no portal marker, so without this it
+    // is indistinguishable from the mgmt DM and can win findBotDmMgmt's
+    // first-match. Verified live on this hub: both the WhatsApp and Google
+    // Messages spaces matched the old membership-only predicate.
+    const isSpace = st.some(e => e && e.type === 'm.room.create' && e.state_key === ''
+      && e.content && e.content.type === 'm.space');
+    return !isPortal && !isSpace;
   } catch (e) { return false; }
 }
 

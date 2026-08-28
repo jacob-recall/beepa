@@ -12,6 +12,7 @@ tests/
   unit/
     consent.test.js               shared/model/consent.js — every precedence case
     master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
+    user_invites.test.js          apps/user/invites.js — the hub's bridge-invite auto-join trust gate
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
     uplink_reconcile.test.py       agents/uplink/reconcile.py — reconcile/idempotency/watermark
   integration/
@@ -39,6 +40,17 @@ tests/
   missing sender, zero-width-char label, space via the child rule),
   the join caps, and malformed room ids. A failure here means the console
   would join or render something it must not.
+- `unit/user_invites.test.js` — plain-node test for `apps/user/invites.js`,
+  the teammate hub's bridge-invite gate. Three fixtures are captured
+  **verbatim from this hub's live `/sync` `rooms.invite`** (a Google Messages
+  DM portal, the Google Messages source space, a WhatsApp DM portal; only
+  contact/account display names are renamed), the rest are hand-built spoofs
+  derived from them: bridge ghost, self, unknown sender, missing
+  `m.room.create`, an invite addressed to someone else, two invite events with
+  different senders, cross-bridge laundering (created by one bot, invited by
+  another), the space name/creator bind, the per-pass caps, malformed and
+  foreign room ids, and `localpart()` edge cases. A failure here means the hub
+  would auto-join a room it must not.
 - `unit/consent_py.test.py` — the same case list against
   `agents/uplink/consent.py`. **These two files must assert the same
   cases with the same expected results.** If you add a case to one, add

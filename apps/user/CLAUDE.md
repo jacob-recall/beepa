@@ -14,6 +14,13 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   wrapped in its own `try/catch` so one feature failing to initialize
   degrades that feature only (share controls stay at safe defaults on
   error; the proposals/contacts hooks simply stay unregistered).
+- `invites.js` — the **bridge-invite trust predicate leaf**: `localpart`,
+  `bridgeInvitesToJoin`, `ROOM_SHAPE_RE`. Zero imports, no DOM, no network,
+  no side effects — importable by plain node, which is how
+  `tests/unit/user_invites.test.js` holds every trust decision still. It only
+  ever *decides*; `main.js`'s `joinBridgeInvites()` performs. Same contract as
+  `apps/master/invites.js` (see `apps/master/CLAUDE.md` and
+  `docs/SHARE-LOGIC.md` for the shared rationale).
 - `consent.js` — PLAN §5.1/§4.2. Reuses `shared/model/consent.js` for all
   resolution + storage; wires into `shared/ui/rows.js` (`setConvoRowDecorator`
   → per-row badge + tri-state Share/Auto/Private toggle), `shared/ui/search.js`
@@ -50,6 +57,46 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
 
 ## Security invariants (do not weaken)
 
+- **Bridge invites are auto-joined ONLY through `invites.js`'s identity-bound
+  gate.** The six bridges create a room per conversation and *invite* the user
+  (only Google Messages double-puppets and joins on the user's behalf), so
+  without this gate every other bridge's conversations stay invisible.
+  `joinBridgeInvites()` in `main.js` accepts an invite iff
+  `bridgeInvitesToJoin()` returns its id, and that predicate requires **two
+  independent server-stamped fields to agree**: the room's `m.room.create`
+  `sender` and the *single* sender of the `m.room.member` invite addressed to
+  this user must be the same account, and that account must be one of the six
+  code-owned `SOURCES[].botMxid` bots. Multiplicity (two different inviters),
+  a bridge **ghost** (`@gmessages_abc:localhost`), the user, or any other local
+  account fails closed. A **space** invite carries a third bind: its name must
+  start with the `spaceName` of the same source whose bot created it — without
+  it, one bridge's bot could present a space that
+  `shared/ui/account-data.js`'s `buildConvos()` (which selects a source's space
+  by name prefix alone) would read as another source's. DMs *and* groups are
+  accepted (deliberately no `is_direct` filter; stripped invite state does not
+  carry it anyway). Joins are capped per pass (30) and per session (200),
+  hard (non-429 4xx) failures are memoized in a session-scoped `Set` and never
+  retried, and joining is membership — not a send, and not a capability grant.
+- **`invites.js` stays a pure zero-import leaf and the single definition of
+  these predicates.** Never add an import, DOM access, network call, or a
+  fallback/sentinel return value to it, and never sanitize *inside* a
+  predicate. Do not re-implement any of its checks in `main.js` — where
+  `main.js` needs to know which bridge an admitted invite came from (for the
+  confirm's count), it re-runs the same predicate restricted to one bot rather
+  than parsing invite state itself.
+- **First-run consent confirm.** The first time this app would accept invites
+  (per browser profile, flag `beepa_autojoin_ack` in `localStorage`), it asks
+  first and states how many of those rooms would become **visible to the
+  manager** under the current sharing policy. That count comes from the shared
+  resolver (`consent.js`'s `countSharedNow()` → `resolveAll()`), never from a
+  hand-rolled rule; it is a prompt, never an authorization decision. Declining
+  leaves the invites pending. The `localStorage` flag is per-viewer
+  convenience only — it gates the *prompt*, never the identity gate.
+- **Refusals are visible, not silent.** Invites refused on identity grounds,
+  deferred by the per-pass cap, or left pending by a declined confirm are
+  counted and rendered as "N pending invitation(s) not accepted"
+  (`#autojoin-note`, `textContent` only), with the escape hatch (review them
+  in Element) in its `title`.
 - **`sendConvoMessage()` (in `shared/ui/chat.js`) is the ONLY external send
   path in this app — full stop.** It re-validates the target room at send
   time (`ROOMID_RE` ∩ `feedModel` ∩ `S.joinedSet`) and explicitly refuses
@@ -83,10 +130,16 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
 
 ## How to run / test
 
-There is no standalone unit-test file specific to this app (the pure logic
-it depends on — `shared/model/consent.js`, `shared/model/contacts.js` — is
-tested where it lives; see `shared/CLAUDE.md` / `tests/CLAUDE.md`). To
-exercise it live:
+The app's own pure logic — the invite trust gate — is unit-tested:
+
+```bash
+docker run --rm -v "$(pwd)":/w -w /w node:20-alpine \
+  node tests/unit/user_invites.test.js     # also wired into tests/run.sh
+```
+
+Everything else it depends on (`shared/model/consent.js`,
+`shared/model/contacts.js`) is tested where it lives; see `shared/CLAUDE.md` /
+`tests/CLAUDE.md`. To exercise the app live:
 
 ```bash
 # bring up the existing single-user hub stack (bridges + local Synapse):

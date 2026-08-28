@@ -92,8 +92,9 @@ lives where, security invariants, and how to run/test each piece:
   either app.
 - `apps/user/CLAUDE.md` — the teammate app: share controls, the consent
   summary panel, the contacts UI, and the proposal inbox, all built on
-  `shared/`. `sendConvoMessage` (in `shared/ui/chat.js`) is the *only*
-  external send path in the whole system.
+  `shared/`. `sendConvoMessage` (in `shared/ui/chat.js`) is the only path
+  that sends into a conversation; the only other message writes are
+  `sendCmd`/`sendSecretToMgmt` into verified bridge-management rooms.
 - `apps/master/CLAUDE.md` — the manager's read-only console: no composer,
   no send call anywhere except one narrow, allowlisted proposal-write path.
   Deliberately avoids importing most of `shared/ui/` so the absence of a

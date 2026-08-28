@@ -14,7 +14,7 @@ What it does:
 
 Run from the repo root:  python3 gmessages-connect/connect.py
 """
-import sqlite3, subprocess, hashlib, json, os, sys, shutil, string, re, time
+import sqlite3, subprocess, hashlib, json, os, sys, shutil, string, re, time, tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(REPO, "gmessages", "config.yaml")
@@ -25,6 +25,15 @@ STEP_ID = "fi.mau.gmessages.google_account"
 
 def die(msg):
     print("ERROR:", msg); sys.exit(1)
+
+def valid_login_id(s):
+    """F2: True only for a bridge login_id of ^[A-Za-z0-9_-]+$.
+
+    The server validates any bridge-returned login_id with this BEFORE it is
+    interpolated into a provisioning-API path, so a hostile/garbled bridge
+    response can never inject path segments or query into the URL.
+    """
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", s or ""))
 
 def shared_secret():
     with open(CONFIG) as f:
@@ -59,8 +68,6 @@ def decrypt_cookies():
         src = os.path.join(ch, "Cookies")
     if not os.path.exists(src):
         die("Chrome cookie store not found — is Chrome installed / the Default profile used?")
-    tmp = "/tmp/gm_ck_%d.db" % os.getpid()
-    shutil.copy2(src, tmp)
     try:
         pw = subprocess.check_output(
             ["security", "find-generic-password", "-w", "-s", "Chrome Safe Storage"]
@@ -91,17 +98,32 @@ def decrypt_cookies():
     targets = [(".google.com", n) for n in
                ("SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSIDTS")]
     targets.append(("messages.google.com", "OSID"))
-    con = sqlite3.connect(tmp)
+    # F3: copy the store to a PRIVATE 0600 temp file (mkstemp), and wrap
+    # copy -> query -> delete in try/finally so a crash never orphans a
+    # readable copy of the (decrypted-adjacent) cookie DB in a world-listable
+    # /tmp with a predictable, guessable name.
+    fd, tmp = tempfile.mkstemp(prefix="gm_ck_", suffix=".db")
+    os.close(fd)  # mkstemp file is already mode 0600; copyfile preserves it
     out = {}
-    for host, name in targets:
-        r = con.execute("SELECT encrypted_value FROM cookies WHERE host_key=? AND name=?",
-                        (host, name)).fetchone()
-        if r and r[0]:
-            v = dec(r[0], host)
-            if v:
-                out[name] = v
-    con.close()
-    os.remove(tmp)
+    try:
+        shutil.copyfile(src, tmp)  # content only — keeps the 0600 of the dest
+        con = sqlite3.connect(tmp)
+        try:
+            for host, name in targets:
+                r = con.execute(
+                    "SELECT encrypted_value FROM cookies WHERE host_key=? AND name=?",
+                    (host, name)).fetchone()
+                if r and r[0]:
+                    v = dec(r[0], host)
+                    if v:
+                        out[name] = v
+        finally:
+            con.close()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     missing = [n for n in ("SID", "HSID", "SSID", "APISID", "SAPISID", "OSID")
                if not out.get(n)]
     if missing:

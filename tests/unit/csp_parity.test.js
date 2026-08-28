@@ -49,6 +49,12 @@ ok(headerCsp !== null && !/frame-src/.test(headerCsp),
 ok(metaCsp !== null && metaCsp.indexOf('8009') === -1,
   '<meta> CSP no longer references :8009');
 
+// The one-click Google Messages connect helper (loopback :8020) must be an
+// allowed connect-src target so apps/user can fetch() it. Asserted on the
+// <meta>; the byte-identical check below carries it to the nginx header too.
+ok(metaCsp !== null && metaCsp.indexOf('http://127.0.0.1:8020') !== -1,
+  '<meta> CSP allows the gmessages connect helper (:8020) in connect-src');
+
 // The load-bearing assertion: the two copies are byte-identical.
 ok(metaCsp !== null && headerCsp !== null && metaCsp === headerCsp,
   'the <meta> CSP and the nginx /apps/user/ CSP header are byte-identical');

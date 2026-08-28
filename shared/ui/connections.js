@@ -1,7 +1,7 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { $, el, sanitize } from './el.js';
+import { $, el, sanitize, sanitizeLine } from './el.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
 import { S, runtime } from '../state.js';
 
@@ -183,6 +183,83 @@ function confirmModal(title, text, typed) {
   });
 }
 
+// ---- one-click Google Messages connect (loopback helper on :8020) ----------
+// The helper is a local-only service that reads Chrome cookies + drives the
+// bridge login on the browser's behalf. We reach it with fetch() (NOT api(),
+// which targets the Matrix homeserver). The custom X-Beepa-Connect header +
+// application/json content-type force a CORS preflight, and the helper only
+// echoes this app's origin — so only this local app can drive a connect.
+const GMSG_CONNECT_BASE = 'http://127.0.0.1:8020';
+const GMSG_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
+
+async function runGmessagesConnect(btn, out, fallback) {
+  btn.disabled = true;
+  fallback.classList.add('hidden');
+  out.replaceChildren();
+  // Open the Google sign-in tab first, so session cookies exist for the helper
+  // to read. noopener: the new tab gets no handle back to this window.
+  window.open('https://messages.google.com/web/', '_blank', 'noopener');
+
+  // 1. Ask the helper to start the login (reads cookies, calls the bridge).
+  let start;
+  try {
+    const r = await fetch(GMSG_CONNECT_BASE + '/connect/gmessages/start',
+      { method: 'POST', headers: GMSG_CONNECT_HEADERS, body: '{}' });
+    start = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = (start && start.error) ? String(start.error) : '';
+      if (/google session/i.test(msg)) {
+        out.appendChild(el('p', 'muted',
+          'Finish signing into Google in the tab that opened, then click Sign in & connect again.'));
+      } else {
+        out.appendChild(el('p', 'error',
+          sanitizeLine(msg) || 'Could not start Google Messages login.'));
+      }
+      btn.disabled = false;
+      return;
+    }
+  } catch (e) {
+    // The helper is not running / not reachable — offer the CLI fallback.
+    fallback.classList.remove('hidden');
+    btn.disabled = false;
+    return;
+  }
+
+  // 2. Show the emoji to tap on the phone.
+  out.replaceChildren();
+  out.appendChild(el('p', 'muted', 'On your phone, open Google Messages and tap this emoji:'));
+  const emojiEl = el('div', 'gmsg-emoji', sanitizeLine(start && start.emoji ? String(start.emoji) : ''));
+  emojiEl.style.cssText = 'font-size:32px;line-height:1.2;margin:6px 0;';
+  out.appendChild(emojiEl);
+  out.appendChild(el('p', 'muted', 'Waiting for you to tap it…'));
+
+  // 3. Wait for the tap (the helper blocks on the bridge, up to ~2 min).
+  let wait;
+  try {
+    const r = await fetch(GMSG_CONNECT_BASE + '/connect/gmessages/wait',
+      { method: 'POST', headers: GMSG_CONNECT_HEADERS, body: '{}' });
+    wait = await r.json().catch(() => ({}));
+  } catch (e) {
+    out.replaceChildren();
+    out.appendChild(el('p', 'error', 'Lost contact with the connect helper. Click Sign in & connect to retry.'));
+    btn.disabled = false;
+    return;
+  }
+
+  out.replaceChildren();
+  if (wait && wait.status === 'complete') {
+    const acct = wait.account ? (' as ' + sanitizeLine(String(wait.account))) : '';
+    out.appendChild(el('p', '', 'Connected' + acct + '. Your chats will sync shortly.'));
+    sendCmd('gmessages', 'list-logins');   // refresh the pill → CONNECTED
+  } else {
+    out.appendChild(el('p', 'muted',
+      (wait && wait.status === 'timeout')
+        ? 'Timed out waiting for the emoji tap. Click Sign in & connect to try again.'
+        : 'Login did not complete. Click Sign in & connect to try again.'));
+  }
+  btn.disabled = false;
+}
+
 let connectionsBuilt = false;
 
 function ensureConnections() {
@@ -269,7 +346,11 @@ function buildConnections() {
   im.appendChild(checklist);
   holder.appendChild(im);
 
-  // Google Messages card (mirrors the WhatsApp card)
+  // Google Messages card — ONE-CLICK connect via the loopback helper (:8020).
+  // The browser can't read Chrome cookies or `docker exec` the bridge, so the
+  // local helper (gmessages-connect/connect_server.py) does it; the only manual
+  // step is tapping the emoji it returns, on the phone. All output is built with
+  // el()/textContent/sanitizeLine — never innerHTML.
   const gm = el('div', 'bridge-card settings-bridge');
   gm.id = 'bridge-card-gmessages';
   const gmHead = el('div', 'bridge-head');
@@ -281,24 +362,26 @@ function buildConnections() {
   gm.appendChild(el('p', 'muted', GMSG.blurb));
 
   const gmActions = el('div', 'bridge-actions');
-  const gmSignin = el('button', 'primary', 'Open Google sign-in ↗');
-  gmSignin.style.width = 'auto';
-  gmSignin.addEventListener('click', () => window.open(
-    'https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/',
-    '_blank', 'noopener'));
-  gmActions.appendChild(gmSignin);
+  const gmConnect = el('button', 'primary', 'Sign in & connect');
+  gmConnect.style.width = 'auto';
+  gmActions.appendChild(gmConnect);
 
   const gmRefresh = el('button', '', 'Refresh status');
   gmRefresh.addEventListener('click', () => sendCmd('gmessages', 'list-logins'));
   gmActions.appendChild(gmRefresh);
   gm.appendChild(gmActions);
 
-  const gmSteps = el('ol', 'connect-steps muted');
-  gmSteps.style.cssText = 'margin:10px 0 0;padding-left:22px;line-height:1.7;';
-  gmSteps.appendChild(el('li', '', 'Click "Open Google sign-in" and sign into your Google account.'));
-  gmSteps.appendChild(el('li', '', 'Run the connect helper: python3 gmessages-connect/connect.py  (or ask your assistant to connect Google Messages).'));
-  gmSteps.appendChild(el('li', '', 'Tap the emoji it shows, in the Google Messages app on your phone. Done.'));
-  gm.appendChild(gmSteps);
+  // Live output region (emoji prompt / result). textContent-only.
+  const gmOut = el('div', 'gmsg-connect-out');
+  gmOut.style.cssText = 'margin:10px 0 0;';
+  gm.appendChild(gmOut);
+
+  // Muted fallback, revealed only if the loopback helper is unreachable.
+  const gmFallback = el('p', 'muted hidden', 'Or run: python3 gmessages-connect/connect.py');
+  gmFallback.style.cssText = 'margin:8px 0 0;';
+  gm.appendChild(gmFallback);
+
+  gmConnect.addEventListener('click', () => runGmessagesConnect(gmConnect, gmOut, gmFallback));
   holder.appendChild(gm);
 
   // Instagram card (mirrors the gmessages card, but with a session PASTE flow

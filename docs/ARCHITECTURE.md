@@ -40,6 +40,7 @@ Three Docker Compose projects + three launchd daemons. All ports loopback-only
 | Master Synapse | 127.0.0.1:**8018** | `matrix-master` | up, healthy |
 | Postgres (master) | compose network only | `matrix-master` | up, healthy |
 | Enrollment/admin service (`master/enroll.py serve`) | 127.0.0.1:**8019** | launchd `com.jkali.master-enroll` | running |
+| GMessages connect helper (`gmessages-connect/connect_server.py`) | 127.0.0.1:**8020** | launchd `com.jkali.gmessages-connect` | running — one-click Google Messages login for apps/user |
 | iMessage bridge daemon (`imessage/daemon.py`) | 127.0.0.1:**29350** (appservice HTTP) | launchd `com.jkali.imessage-daemon` | running |
 | Uplink daemon (`agents/uplink/uplink.py`) | no listening socket (outbound only) | launchd `com.jkali.uplink` | running, 6 mirrors, ~30s loop |
 | Throwaway test Synapse | 127.0.0.1:**8028** | `matrix-synctest` | up 31h (should be down when not testing) |
@@ -135,9 +136,17 @@ Stamps `com.jkali.from_me` on user-authored messages (the flag the render gate
 trusts only from this bot). Runtime invariants **unverified** (would require
 sending real iMessages); code inspection found no dead endpoints.
 
-### `gmessages-connect/` — a one-off login helper
-`connect.py`: manual provisioning script (reads Chrome cookies via Keychain,
-drives the gmessages bridge's provisioning API). Not a service.
+### `gmessages-connect/` — the one-click Google Messages login helper
+`connect.py`: the provisioning logic (reads Chrome cookies via Keychain,
+drives the gmessages bridge's provisioning API) — usable standalone as a CLI.
+`connect_server.py`: a loopback HTTP service (127.0.0.1:**8020**, launchd
+`com.jkali.gmessages-connect`) that wraps `connect.py` so apps/user can drive
+the login in **one click** (`Sign in & connect`). It reads cookies / calls the
+bridge only inside an authorized `POST /connect/gmessages/start`; every POST is
+gated on `Origin == http://127.0.0.1:8011` + `Content-Type: application/json` +
+`X-Beepa-Connect: 1` before any side effect; `GET /connect/health` is
+side-effect-free; cookies / the shared_secret / raw bridge bodies are never
+returned or logged. See `gmessages-connect/CLAUDE.md`.
 
 ### `tests/`
 - Unit (pure logic, no network — **all run and passing in this audit**):

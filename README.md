@@ -25,6 +25,7 @@ where a manager reads them and can leave reply *suggestions* — never send.
 | Element Web | `http://127.0.0.1:8009` | opt-in escape hatch (media/group-admin/debug) — off by default; `docker compose --profile escape up -d element`. New chats auto-accept natively, so it is not needed day to day. |
 | Synapse (master) | `127.0.0.1:8018` | compose project `matrix-master` (`master/`) |
 | Enroll/admin service | `127.0.0.1:8019` | `master/enroll.py serve` (launchd) — enrollment codes, add-teammate |
+| GMessages connect helper | `127.0.0.1:8020` | `gmessages-connect/connect_server.py` (launchd `com.jkali.gmessages-connect`) — one-click Google Messages login |
 | iMessage daemon | `127.0.0.1:29350` | `imessage/daemon.py` (launchd appservice) |
 | Uplink daemon | no port (outbound-only) | `agents/uplink/uplink.py` (launchd) — mirrors consent-shared rooms up |
 | mautrix bridges ×5 | compose network only | whatsapp, meta (Instagram), linkedin, twitter, gmessages — no host ports |
@@ -134,18 +135,24 @@ Compose service `mautrix-gmessages` (digest-pinned, no host ports, internal
 appservice port 29336). Bot `@gmessagesbot:localhost`; chats appear in the
 **Google Messages** space; same management-room model as WhatsApp.
 
-### Connect — 3 steps
-1. **Open Google sign-in** (the Connections card's button, or
-   `https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/`)
-   and sign into your Google account in Chrome.
-2. **Run the connect helper:** `python3 gmessages-connect/connect.py`
-   (approve the one-time macOS Keychain prompt). It reads your Google session
-   from Chrome and submits it to the bridge.
-3. **Tap the emoji** it prints, in the Google Messages app on your phone.
+### Connect — one click
 
+In the Connections card, click **Sign in & connect** on the Google Messages
+card. It opens the Google sign-in tab (so your session cookies exist), then the
+local connect helper (`127.0.0.1:8020`, launchd `com.jkali.gmessages-connect`)
+reads your Google session from Chrome (approve the one-time macOS Keychain
+prompt) and submits it to the bridge. The only manual step left is **tapping the
+emoji** it shows, in the Google Messages app on your phone.
+
+- The helper is loopback-only and reads cookies **only** when you click the
+  button; a page from any other origin cannot drive it (Origin +
+  `X-Beepa-Connect` gate). See `gmessages-connect/CLAUDE.md`.
+- **CLI fallback** (if the helper is not running): `python3
+  gmessages-connect/connect.py` — same flow from a terminal.
 - **Your phone must stay continuously online** — Google Messages proxies
   every message through the phone.
-- **Re-linking:** run `connect.py` again; `logout` (Settings) clears the login.
+- **Re-linking:** click **Sign in & connect** again; `logout` (Settings)
+  clears the login.
 
 ## Instagram bridge (mautrix-meta)
 

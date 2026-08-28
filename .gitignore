@@ -46,3 +46,7 @@ uplink.env.local
 
 # Uplink daemon logs (launchd) — never commit
 agents/uplink/logs/
+
+# Google Messages connect helper logs (launchd) — never commit (may transit
+# no secrets by design, but keep runtime logs out of git regardless)
+gmessages-connect/logs/

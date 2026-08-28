@@ -136,7 +136,7 @@ appservice port 29336). Bot `@gmessagesbot:localhost`; chats appear in the
 
 ### Connect — 3 steps
 1. **Open Google sign-in** (the Connections card's button, or
-   `https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config`)
+   `https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/`)
    and sign into your Google account in Chrome.
 2. **Run the connect helper:** `python3 gmessages-connect/connect.py`
    (approve the one-time macOS Keychain prompt). It reads your Google session

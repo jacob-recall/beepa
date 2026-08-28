@@ -284,7 +284,7 @@ function buildConnections() {
   const gmSignin = el('button', 'primary', 'Open Google sign-in ↗');
   gmSignin.style.width = 'auto';
   gmSignin.addEventListener('click', () => window.open(
-    'https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config',
+    'https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/',
     '_blank', 'noopener'));
   gmActions.appendChild(gmSignin);
 

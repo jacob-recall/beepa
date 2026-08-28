@@ -1,19 +1,20 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { seedFeed, startFeedSync } from '../../shared/ui/account-data.js';
-import { initConsentUI } from './consent.js';
+import { fetchSnapshot, seedFeed, startFeedSync } from '../../shared/ui/account-data.js';
+import { countSharedNow, initConsentUI } from './consent.js';
+import { bridgeInvitesToJoin } from './invites.js';
 import { initContactsUI } from './contacts.js';
 import { initProposalsUI } from './proposals.js';
 import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
-import { api, setOnUnauthorized } from '../../shared/matrix/client.js';
-import { ensureConnections, ensureSettings, logConsole, setPlatformRailHook } from '../../shared/ui/connections.js';
+import { ROOMID_RE, api, setOnUnauthorized } from '../../shared/matrix/client.js';
+import { confirmModal, ensureConnections, ensureSettings, logConsole, setPlatformRailHook } from '../../shared/ui/connections.js';
 import { $ } from '../../shared/ui/el.js';
 import { buildNav, mountChats, navTo, openConversation, refreshPlatformRail, showAuth, unmountChats } from '../../shared/ui/nav.js';
 import { setActiveConvoRow } from '../../shared/ui/rows.js';
-import { buildDirectory, renderHome, renderSourceList } from '../../shared/ui/search.js';
-import { GMSG, IG, LI, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
+import { buildDirectory, renderHome, renderSourceList, setFeedRenderHook } from '../../shared/ui/search.js';
+import { GMSG, IG, LI, SOURCES, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
 import { S, convoNamePending, convoNames, convoSeen, feedManualHidden, feedModel, runtime } from '../../shared/state.js';
 
 // Register the transport's 401 handler (see shared/matrix/client.js).
@@ -44,6 +45,10 @@ function forgetSession() {
   const convoPane = $('msgr-convo');
   if (convoPane) convoPane.classList.add('no-selection'); // reset the right pane to the placeholder
   S.joinedSet = new Set();
+  userJoinFailed.clear();                             // auto-join memo is session-scoped
+  autojoinSessionJoined = 0;
+  autojoinPending = { refused: 0, overCap: 0, declined: 0 };
+  renderAutojoinNote();
   unmountChats();
   clearQR();
   try { sessionStorage.removeItem('hub_token'); sessionStorage.removeItem('hub_user'); } catch (e) {}
@@ -72,6 +77,139 @@ async function signOut() {
   if (wrap) wrap.classList.remove('hidden');
 }
 
+// ===========================================================================
+// Bridge invite auto-join (identity-gated).
+//
+// The six bridges create a room per conversation and INVITE the user; only
+// Google Messages' double-puppeting joins on the user's behalf, so without this
+// every other bridge's new conversations stay invisible. The decision of WHICH
+// invites may be accepted lives entirely in ./invites.js (a pure zero-import
+// leaf, unit-tested in tests/unit/user_invites.test.js) — this file only
+// performs the joins it returns. Never re-implement the predicate here.
+//
+// Joining a room is membership, not a send: it grants no new capability to the
+// remote side. It does, however, make a conversation eligible for the uplink's
+// consent resolution, so the FIRST time this app would accept invites it asks,
+// stating how many would become visible to the manager under the CURRENT
+// policy (that count comes from the shared resolver via consent.js).
+// ===========================================================================
+const AUTOJOIN_ACK_KEY = 'beepa_autojoin_ack';
+const AUTOJOIN_MAX_EXAMINE = 100;   // per call
+const AUTOJOIN_MAX_JOINS = 30;      // per call
+const AUTOJOIN_MAX_SESSION = 200;   // per session, across calls (anti-join-storm)
+// Hard (non-429 4xx) join failures: withdrawn/forbidden/gone invites are never
+// retried in-session. Session-scoped, like apps/master's MS.joinFailed.
+const userJoinFailed = new Set();
+let autojoinSessionJoined = 0;
+// What was NOT accepted, for the visible count: refused on identity grounds,
+// deferred by the per-call cap, or left pending because the user declined.
+let autojoinPending = { refused: 0, overCap: 0, declined: 0 };
+
+function renderAutojoinNote() {
+  const host = $('autojoin-note');
+  if (!host) return;
+  const n = autojoinPending.refused + autojoinPending.overCap + autojoinPending.declined;
+  host.textContent = n ? n + ' pending invitation(s) not accepted' : '';
+  host.title = n
+    ? 'These room invitations were not from a recognized bridge bot, or were left for a later pass. Review them in Element (Settings → Element) and accept or decline them there.'
+    : '';
+  host.classList.toggle('hidden', n === 0);
+}
+
+// The six bridge bots + their space names, straight from the code-owned SOURCES
+// table. Nothing here is read off the wire.
+function bridgeIdentities() {
+  const sources = [];
+  for (const s of SOURCES) {
+    if (s.kind !== 'source' || typeof s.botMxid !== 'string' || !s.botMxid) continue;
+    if (typeof s.spaceName !== 'string' || !s.spaceName) continue;
+    sources.push(s);
+  }
+  return sources;
+}
+
+// Which source each admitted invite belongs to, for the confirm's honest count.
+// Derived by re-running the SAME predicate restricted to one bot at a time —
+// deliberately not by parsing the invite here, so main.js holds no copy of the
+// identity logic. Labeling only; the authoritative admit list is `joinIds`.
+function labelJoins(fresh, joinIds, sources, selfMxid) {
+  const admitted = new Set(joinIds);
+  const convos = [];
+  const seen = new Set();
+  for (const s of sources) {
+    const r = bridgeInvitesToJoin(fresh, [s.botMxid], selfMxid,
+      [{ spaceName: s.spaceName, botMxid: s.botMxid }],
+      { maxExamine: AUTOJOIN_MAX_EXAMINE, maxJoins: AUTOJOIN_MAX_JOINS });
+    for (const id of r.join) {
+      if (!admitted.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      convos.push({ id, sourceId: s.id, sourceLabel: s.label });
+    }
+  }
+  // An admitted room with no source label still counts as a conversation whose
+  // sharing must be resolved (it just has no per-source policy to match).
+  for (const id of joinIds) if (!seen.has(id)) convos.push({ id, sourceId: null, sourceLabel: null });
+  return convos;
+}
+
+// One pass: read pending invites, admit the bridge-identified ones, join them.
+async function joinBridgeInvites() {
+  const sources = bridgeIdentities();
+  if (!sources.length || !S.userId) return;
+  let data;
+  try { data = await fetchSnapshot(); } catch (e) { return; }   // same filter as the feed seed
+  const section = (data.rooms && data.rooms.invite) || {};
+  // Pre-filter BEFORE the predicate so already-joined / hard-failed rooms never
+  // consume the examine budget (anti-starvation).
+  const fresh = {};
+  for (const id of Object.keys(section)) {
+    if (S.joinedSet.has(id) || userJoinFailed.has(id)) continue;
+    fresh[id] = section[id];
+  }
+  const res = bridgeInvitesToJoin(fresh, sources.map(s => s.botMxid), S.userId,
+    sources.map(s => ({ spaceName: s.spaceName, botMxid: s.botMxid })),
+    { maxExamine: AUTOJOIN_MAX_EXAMINE, maxJoins: AUTOJOIN_MAX_JOINS });
+  autojoinPending = { refused: res.refusedNonBridge, overCap: res.overCap, declined: 0 };
+  renderAutojoinNote();
+  if (!res.join.length) return;
+
+  // First run (per browser profile): confirm before accepting anything.
+  let acked = false;
+  try { acked = localStorage.getItem(AUTOJOIN_ACK_KEY) === '1'; } catch (e) { acked = false; }
+  if (!acked) {
+    let visible = 0;
+    try { visible = countSharedNow(labelJoins(fresh, res.join, sources, S.userId)); }
+    catch (e) { visible = 0; }
+    const ok = await confirmModal('Accept pending conversations?',
+      'Accept ' + res.join.length + ' pending conversation(s)? Under your current sharing policy, '
+      + visible + ' would become visible to your manager.', false);
+    if (!ok) {
+      autojoinPending.declined = res.join.length;   // still pending, and now visible as such
+      renderAutojoinNote();
+      return;
+    }
+    try { localStorage.setItem(AUTOJOIN_ACK_KEY, '1'); } catch (e) { /* re-ask next session */ }
+  }
+
+  let joined = 0;
+  for (const id of res.join) {
+    if (autojoinSessionJoined >= AUTOJOIN_MAX_SESSION) break;
+    if (!ROOMID_RE.test(id)) continue;              // server-pinned shape, re-asserted at the call
+    try {
+      await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(id) + '/join', {});
+      joined++; autojoinSessionJoined++;
+    } catch (e) {
+      // 4xx other than 429 will not succeed by retrying (withdrawn invite,
+      // forbidden, gone) -> stop asking this session. 429/5xx/network stay retryable.
+      const code = e && typeof e.status === 'number' ? e.status : 0;
+      if (code >= 400 && code < 500 && code !== 429) userJoinFailed.add(id);
+    }
+  }
+  if (joined) {
+    try { await seedFeed(); renderHome(); refreshPlatformRail(); } catch (e) { /* next refresh picks it up */ }
+  }
+}
+
 // ---- app entry ----
 async function enterApp() {
   $('whoami').textContent = S.userId;
@@ -79,6 +217,7 @@ async function enterApp() {
   if (wrap) wrap.classList.add('hidden');
   buildNav();
   setPlatformRailHook(refreshPlatformRail);
+  setFeedRenderHook(refreshPlatformRail);
   buildDirectory();
   ensureConnections();
   ensureSettings();
@@ -105,6 +244,11 @@ async function enterApp() {
   catch (e) { logConsole('error', 'X management room: ' + String(e.message || e)); }
   try { runtime.linkedin.mgmtRoomId = await resolveMgmt(LI); }
   catch (e) { logConsole('error', 'LinkedIn management room: ' + String(e.message || e)); }
+  // AFTER mgmt-room resolution on purpose: resolveMgmt scans joined rooms with a
+  // GET per room, so accepting invites first would enlarge that scan, and the
+  // mgmt rooms are pinned before any newly joined room can be considered.
+  try { await joinBridgeInvites(); }
+  catch (e) { /* invites stay pending; the note keeps the count visible */ }
   startSync();
   await sendStatusRefresh();                        // WhatsApp list-logins
   if (runtime.imessage.mgmtRoomId) await sendCmd('imessage', 'status');

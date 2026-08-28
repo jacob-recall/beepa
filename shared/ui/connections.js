@@ -44,23 +44,23 @@ const PILL_SOURCE = {
 
 function updateCardStatus(logins, pillId, discId) {
   const sourceId = PILL_SOURCE[pillId || 'wa-status'];
-  if (sourceId && runtime[sourceId]) {
-    runtime[sourceId].connected = logins.length > 0;
-    notifyPlatformRail();
-  }
+  const connected = logins.length > 0;
+  if (sourceId && runtime[sourceId]) runtime[sourceId].connected = connected;
   const pill = $(pillId || 'wa-status');
   const disc = discId ? $(discId) : null;
-  if (!pill) return;
-  if (logins.length) {
-    const l = logins[0];
-    pill.textContent = 'Connected: ' + l.name + ' (' + l.state + ')';
-    pill.classList.add('ok');
-    if (disc) { disc.classList.remove('hidden'); disc.dataset.loginId = l.id; }
-  } else {
-    pill.textContent = 'Not connected';
-    pill.classList.remove('ok');
-    if (disc) disc.classList.add('hidden');
+  if (pill) {
+    if (connected) {
+      const l = logins[0];
+      pill.textContent = 'Connected: ' + l.name + ' (' + l.state + ')';
+      pill.classList.add('ok');
+      if (disc) { disc.classList.remove('hidden'); disc.dataset.loginId = l.id; }
+    } else {
+      pill.textContent = 'Not connected';
+      pill.classList.remove('ok');
+      if (disc) disc.classList.add('hidden');
+    }
   }
+  notifyPlatformRail();
 }
 
 // ---- iMessage Connections card (Phase 2 B2 / P2.5) ----
@@ -118,6 +118,7 @@ function buildConnections() {
 
   // WhatsApp card
   const wa = el('div', 'bridge-card settings-bridge');
+  wa.id = 'bridge-card-whatsapp';
   const waHead = el('div', 'bridge-head');
   waHead.appendChild(el('span', 'bridge-name', WA.label));
   const waPill = el('span', 'status-pill', 'Checking…');
@@ -164,6 +165,7 @@ function buildConnections() {
 
   // iMessage card (B2 hub-side)
   const im = el('div', 'bridge-card settings-bridge');
+  im.id = 'bridge-card-imessage';
   const imHead = el('div', 'bridge-head');
   imHead.appendChild(el('span', 'bridge-name', IMSG.label));
   const imPill = el('span', 'status-pill', 'Checking…');
@@ -190,6 +192,7 @@ function buildConnections() {
 
   // Google Messages card (mirrors the WhatsApp card)
   const gm = el('div', 'bridge-card settings-bridge');
+  gm.id = 'bridge-card-gmessages';
   const gmHead = el('div', 'bridge-head');
   gmHead.appendChild(el('span', 'bridge-name', GMSG.label));
   const gmPill = el('span', 'status-pill', 'Checking…');
@@ -224,6 +227,7 @@ function buildConnections() {
   // it is sent through the C-1 mgmt guard, redacted immediately, and never
   // logged, sanitize-rendered, persisted, or turned into a URL.
   const ig = el('div', 'bridge-card settings-bridge');
+  ig.id = 'bridge-card-instagram';
   const igHead = el('div', 'bridge-head');
   igHead.appendChild(el('span', 'bridge-name', IG.label));
   const igPill = el('span', 'status-pill', 'Checking…');
@@ -336,6 +340,7 @@ function buildConnections() {
   // it is sent through the C-1 mgmt guard, redacted immediately, and never
   // logged, sanitize-rendered, persisted, or turned into a URL.
   const li = el('div', 'bridge-card settings-bridge');
+  li.id = 'bridge-card-linkedin';
   const liHead = el('div', 'bridge-head');
   liHead.appendChild(el('span', 'bridge-name', LI.label));
   const liPill = el('span', 'status-pill', 'Checking…');
@@ -447,6 +452,7 @@ function buildConnections() {
   // guard, redacted immediately, and never logged, sanitize-rendered, persisted,
   // or turned into a URL.)
   const tw = el('div', 'bridge-card settings-bridge');
+  tw.id = 'bridge-card-twitter';
   const twHead = el('div', 'bridge-head');
   twHead.appendChild(el('span', 'bridge-name', TW.label));
   const twPill = el('span', 'status-pill', 'Checking\u2026');

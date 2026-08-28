@@ -15,6 +15,9 @@ import { S, convosBySource, feedModel } from '../state.js';
 let sourceViewHook = null;
 function setSourceViewHook(fn) { sourceViewHook = typeof fn === 'function' ? fn : null; }
 
+let feedRenderHook = null;
+function setFeedRenderHook(fn) { feedRenderHook = typeof fn === 'function' ? fn : null; }
+
 // HF-5: coalesce renders — one timer per batch so a burst = one re-render.
 function scheduleFeedRender() {
   if (S.feedRenderScheduled) return;
@@ -56,6 +59,7 @@ function renderHome() {
     return;
   }
   for (const r of rows) list.appendChild(buildFeedRow(r));
+  if (feedRenderHook) feedRenderHook();
 }
 
 // HF-9: a small "Show hidden" toggle chip inserted once, just above the Home
@@ -98,6 +102,7 @@ async function loadSourceList(sourceId) {
     return;
   }
   renderSourceList();
+  if (feedRenderHook) feedRenderHook();
 }
 
 // #source-search is a pure client-side filter over the loaded per-source list,
@@ -186,4 +191,4 @@ function renderPeople() {
   renderDirectory();
 }
 
-export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, buildDirectory, startChat, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook };
+export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, buildDirectory, startChat, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook, setFeedRenderHook };

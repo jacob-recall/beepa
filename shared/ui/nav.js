@@ -8,7 +8,7 @@ import { setActiveConvoRow } from './rows.js';
 import { ensureConnections, ensureSettings } from './connections.js';
 import { loadSourceList, renderHome, renderPeople } from './search.js';
 import { SOURCES, sendCmd } from './sources.js';
-import { S, runtime } from '../state.js';
+import { S, runtime, convosBySource, feedModel } from '../state.js';
 
 let sharingViewHook = null;
 function setSharingViewHook(fn) { sharingViewHook = typeof fn === 'function' ? fn : null; }
@@ -39,14 +39,64 @@ function platformLogoBadge(sourceId) {
 }
 
 function sourceConnected(sourceId) {
-  const rt = sourceId && runtime[sourceId];
+  if (!sourceId) return false;
+  if ((convosBySource[sourceId] || []).length > 0) return true;
+  for (const row of feedModel.values()) {
+    if (row.sourceId === sourceId) return true;
+  }
+  const rt = runtime[sourceId];
   if (rt && rt.connected) return true;
   const pillId = PILL_BY_SOURCE[sourceId];
   if (pillId) {
     const pill = $(pillId);
-    if (pill && pill.classList.contains('ok')) return true;
+    if (pill) {
+      if (pill.classList.contains('ok')) return true;
+      const t = (pill.textContent || '').trim();
+      if (/^Connected:/.test(t) || t === 'Ready') return true;
+    }
   }
   return false;
+}
+
+function resetConvoPlaceholder() {
+  const ph = $('convo-placeholder');
+  if (!ph) return;
+  ph.classList.remove('connect-prompt');
+  ph.replaceChildren();
+  ph.appendChild(document.createTextNode('Select a conversation.'));
+}
+
+function showConnectPrompt(sourceId) {
+  const source = SOURCES.find(s => s.id === sourceId);
+  const ph = $('convo-placeholder');
+  if (!ph || !source) return;
+  ph.classList.add('connect-prompt');
+  ph.replaceChildren();
+  ph.appendChild(el('p', 'connect-prompt-lead', source.label + ' is not connected yet.'));
+  const btn = el('button', 'primary connect-settings-btn', 'Connect in Settings');
+  btn.type = 'button';
+  btn.addEventListener('click', () => openPlatformConnect(sourceId));
+  ph.appendChild(btn);
+}
+
+function highlightBridgeCard(sourceId) {
+  const card = $('bridge-card-' + sourceId);
+  if (!card) return;
+  card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  card.classList.add('bridge-card-highlight');
+  window.setTimeout(() => card.classList.remove('bridge-card-highlight'), 2200);
+}
+
+function openPlatformConnect(sourceId) {
+  closeSettingsPopover();
+  setActiveNav('settings');
+  showSection('view-workspace');
+  showSettingsHub('connections', sourceId);
+}
+
+function platformRailClick(sourceId) {
+  if (sourceConnected(sourceId)) navTo('source:' + sourceId);
+  else openPlatformConnect(sourceId);
 }
 
 function listBody() { return $('list-body'); }
@@ -113,6 +163,7 @@ function setDetailMode(mode) {
     const empty = mode === 'empty' || mode === 'admin';
     pane.classList.toggle('no-selection', empty);
   }
+  if (mode !== 'empty') resetConvoPlaceholder();
 }
 
 function setWorkspaceLayout(twoPane) {
@@ -148,14 +199,15 @@ function wireSettingsHub() {
   }
 }
 
-function showSettingsHub() {
+function showSettingsHub(section, sourceId) {
   closeSettingsPopover();
   setWorkspaceLayout(false);
   setDetailMode('admin');
   wireSettingsHub();
-  showSettingsSection('platforms');
+  showSettingsSection(section || 'platforms');
   ensureConnections();
   ensureSettings();
+  if (sourceId) highlightBridgeCard(sourceId);
   if (sharingViewHook) sharingViewHook();
 }
 
@@ -247,11 +299,18 @@ async function navTo(key) {
     setWorkspaceLayout(true);
     setListMode('chats');
   } else if (key.indexOf('source:') === 0) {
+    const sourceId = key.slice(7);
     setWorkspaceLayout(true);
     showListMode(false);
     showListSearch(key);
+    if (!sourceConnected(sourceId)) {
+      setDetailMode('empty');
+      showConnectPrompt(sourceId);
+      await loadSourceList(sourceId);
+      return;
+    }
     setDetailMode(S.openRoomId ? 'chat' : 'empty');
-    await loadSourceList(key.slice(7));
+    await loadSourceList(sourceId);
   } else if (key === 'people') {
     setWorkspaceLayout(true);
     showListMode(false);
@@ -316,7 +375,7 @@ function buildPlatformRail() {
     btn.title = s.label + ' (not connected)';
     btn.setAttribute('aria-label', s.label);
     btn.appendChild(platformLogoBadge(s.id));
-    btn.addEventListener('click', () => navTo(key));
+    btn.addEventListener('click', () => platformRailClick(s.id));
     rail.appendChild(btn);
   }
   refreshPlatformRail();
@@ -327,9 +386,11 @@ function refreshPlatformRail() {
     const id = btn.dataset.sourceId;
     const on = sourceConnected(id);
     btn.classList.toggle('platform-off', !on);
+    btn.classList.toggle('platform-on', on);
+    btn.setAttribute('aria-disabled', on ? 'false' : 'true');
     const source = SOURCES.find(s => s.id === id);
     const label = source ? source.label : id;
-    btn.title = on ? label : label + ' (not connected)';
+    btn.title = on ? label : label + ' — tap to connect in Settings';
   }
 }
 
@@ -368,5 +429,5 @@ export {
   openConversation, showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
   mountChats, unmountChats, setSharingViewHook, setProposalsViewHook, setContactsViewHook,
   listBody, setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
-  refreshPlatformRail,
+  refreshPlatformRail, openPlatformConnect,
 };

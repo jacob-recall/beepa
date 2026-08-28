@@ -327,6 +327,16 @@ function renderConsentSummary() {
   saveSeen(new Set([...seen, ...shared.map((r) => r.convo.id)]));
 }
 
+// How many of `convos` are SHARED right now, under the cached policy/overrides/
+// profiles. Used by main.js's first-run auto-join confirm to state truthfully
+// how many rooms it is about to accept would become visible to the manager.
+// It is a COUNT for a prompt — never an authorization decision — and it still
+// goes through the shared resolver rather than re-deriving precedence here.
+// Each convo needs at least { id, sourceId } (sourceLabel only affects wording).
+function countSharedNow(convos) {
+  return resolveAll(convos, policy, overrides, profileMap).filter((r) => r.shared).length;
+}
+
 // Rendered whenever the 'sharing' nav view opens, via setSharingViewHook (nav.js).
 function renderSharingView() {
   const globalHost = $('share-global');
@@ -344,4 +354,4 @@ async function initConsentUI() {
   await loadConsentState();
 }
 
-export { initConsentUI, renderSharingView, loadConsentState };
+export { initConsentUI, renderSharingView, loadConsentState, countSharedNow };

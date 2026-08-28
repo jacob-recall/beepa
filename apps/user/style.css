@@ -33,14 +33,22 @@
   width: 40px; height: 40px; font-size: 18px;
 }
 .nav-platforms .nav-icon.platform-off {
-  opacity: 0.32;
+  opacity: 0.38;
+}
+.nav-platforms .nav-icon.platform-off .plat-badge {
   filter: grayscale(1);
 }
 .nav-platforms .nav-icon.platform-off:hover {
-  opacity: 0.5;
+  opacity: 0.55;
 }
 .nav-platforms .nav-icon.active.platform-off {
-  opacity: 0.55;
+  opacity: 0.6;
+}
+.nav-platforms .nav-icon.platform-on {
+  opacity: 1;
+}
+.nav-platforms .nav-icon.platform-on .plat-badge {
+  filter: none;
 }
 .nav-icon .ic { font-size: 20px; line-height: 1; }
 .nav-platforms .nav-icon .plat-badge { width: 22px; height: 22px; border-radius: 6px; }
@@ -78,6 +86,8 @@
 #list-head .list-search { width: 100%; }
 #list-head-actions { display: flex; gap: 8px; }
 #list-head-actions input { flex: 1; }
+/* Bridge invites the auto-join gate refused or deferred (apps/user/main.js). */
+#autojoin-note { font-size: 12px; }
 
 .list-mode { display: flex; align-items: center; gap: 6px; }
 .list-mode-btn {
@@ -98,6 +108,11 @@
 #convo-compose input { flex: 1; }
 #convo-compose button { width: auto; margin: 0; }
 #convo-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 14px; pointer-events: none; color: var(--color-muted); }
+#convo-placeholder.connect-prompt {
+  pointer-events: auto; flex-direction: column; gap: 14px; text-align: center; padding: 24px;
+}
+.connect-prompt-lead { margin: 0; max-width: 280px; line-height: 1.45; }
+.connect-settings-btn { width: auto; min-width: 180px; }
 #msgr-convo.no-selection #detail-chat { display: none; }
 #msgr-convo.no-selection #detail-proposal.hidden,
 #msgr-convo.no-selection #detail-contact.hidden { display: none !important; }

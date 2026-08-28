@@ -106,7 +106,13 @@ const PILL_SOURCE = {
 const NEEDS_RESET = new Set(['BAD_CREDENTIALS', 'LOGGED_OUT']);
 function updateCardStatus(logins, pillId, discId) {
   const sourceId = PILL_SOURCE[pillId || 'wa-status'];
-  const login = logins.length ? logins[0] : null;
+  // With more than one login for an account (e.g. a fresh re-connect left the
+  // previous dead session behind), report the HEALTHIEST: a CONNECTED login
+  // wins over a transient one, which wins over a BAD_CREDENTIALS/LOGGED_OUT one
+  // — otherwise a stale leftover would mask a working new session.
+  const login = logins.find(l => l.state === 'CONNECTED')
+             || logins.find(l => !NEEDS_RESET.has(l.state))
+             || (logins.length ? logins[0] : null);
   const state = login ? login.state : null;
   const healthy = state === 'CONNECTED';
   if (sourceId && runtime[sourceId]) runtime[sourceId].connected = healthy;
@@ -403,9 +409,9 @@ function buildConnections() {
   const igPaste = el('div', 'ig-paste hidden');
   igPaste.style.cssText = 'margin-top:10px;';
   igPaste.appendChild(el('p', 'muted',
-    'On instagram.com: DevTools → Network → filter graphql → right-click a request → Copy as cURL, then paste here.'));
+    'Sign in on Instagram (the Connect button opens it), then run  python3 session-connect/connect.py instagram  — it copies your session to the clipboard. Paste it below (Cmd-V) and Submit.'));
   const igArea = el('textarea');
-  igArea.placeholder = 'Paste your Instagram session (Copy as cURL, or the cookies JSON) here';
+  igArea.placeholder = 'Paste your Instagram session here (the connect helper puts it on your clipboard)';
   igArea.rows = 4;
   igArea.autocomplete = 'off';
   igArea.spellcheck = false;
@@ -516,9 +522,9 @@ function buildConnections() {
   const liPaste = el('div', 'li-paste hidden');
   liPaste.style.cssText = 'margin-top:10px;';
   liPaste.appendChild(el('p', 'muted',
-    'On linkedin.com: DevTools → Network → filter graphql (voyager) → right-click a request → Copy as cURL, then paste here.'));
+    'Sign in on LinkedIn (the Connect button opens it), then run  python3 session-connect/connect.py linkedin  — it connects automatically, no paste needed. Fallback: DevTools → Network → a voyager request → Copy as cURL, paste below.'));
   const liArea = el('textarea');
-  liArea.placeholder = 'Paste your LinkedIn session (Copy as cURL) here';
+  liArea.placeholder = 'Fallback only — paste a Copy-as-cURL here if the helper cannot connect';
   liArea.rows = 4;
   liArea.autocomplete = 'off';
   liArea.spellcheck = false;
@@ -626,9 +632,9 @@ function buildConnections() {
   const twPaste = el('div', 'tw-paste hidden');
   twPaste.style.cssText = 'margin-top:10px;';
   twPaste.appendChild(el('p', 'muted',
-    'On x.com: DevTools \u2192 Network \u2192 filter a request \u2192 right-click \u2192 Copy as cURL, then paste here.'));
+    'Sign in on X (the Connect button opens it), then run  python3 session-connect/connect.py twitter  \u2014 it connects automatically, no paste needed. Fallback: DevTools \u2192 Network \u2192 a request \u2192 Copy as cURL, paste below.'));
   const twArea = el('textarea');
-  twArea.placeholder = 'Paste your X session (Copy as cURL) here';
+  twArea.placeholder = 'Fallback only — paste a Copy-as-cURL here if the helper cannot connect';
   twArea.rows = 4;
   twArea.autocomplete = 'off';
   twArea.spellcheck = false;

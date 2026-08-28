@@ -24,13 +24,13 @@ const SOURCES = [
     blurb: 'Link your Google account with a quick sign-in; your chats appear as rooms in Element.' },
   { id: 'instagram', label: 'Instagram', kind: 'source', botMxid: '@instagrambot:localhost',
     spaceName: 'Instagram', canStartChat: true, icon: '📷',
-    blurb: 'Bridge your Instagram DMs: log in on instagram.com, then paste your session; chats appear as rooms in Element.' },
+    blurb: 'Bridge your Instagram DMs: sign into instagram.com, then run the connect helper (it copies your session for one paste); chats appear as rooms in Element.' },
   { id: 'linkedin', label: 'LinkedIn', kind: 'source', botMxid: '@linkedinbot:localhost',
     spaceName: 'LinkedIn', canStartChat: false, icon: '💼',
-    blurb: 'Bridge your LinkedIn messages: log in on linkedin.com, then paste your session; chats appear as rooms in Element.' },
+    blurb: 'Bridge your LinkedIn messages: sign into linkedin.com, then run the connect helper — it links automatically; chats appear as rooms in Element.' },
   { id: 'twitter', label: 'X', kind: 'source', botMxid: '@twitterbot:localhost',
     spaceName: 'Twitter', canStartChat: true, icon: '✖️',
-    blurb: 'Bridge your X (Twitter) DMs: log in on x.com, then paste your session; chats appear as rooms in Element.' },
+    blurb: 'Bridge your X (Twitter) DMs: sign into x.com, then run the connect helper — it links automatically; chats appear as rooms in Element.' },
 ];
 const WA = SOURCES.find(s => s.id === 'whatsapp');
 const IMSG = SOURCES.find(s => s.id === 'imessage');
@@ -119,7 +119,7 @@ const IG_COMMAND_GROUPS = [
   ]},
   { title: 'Account', cmds: [
     { cmd: 'list-logins', label: 'List logins', desc: 'List the Instagram accounts linked to the bridge and their connection state.' },
-    { cmd: 'login instagram', label: 'Connect Instagram', desc: 'Start linking your Instagram account; then paste your instagram.com session as the next message.' },
+    { cmd: 'login instagram', label: 'Connect Instagram', desc: 'Start linking Instagram. Easiest: run  session-connect/connect.py instagram  and paste what it copies. Fallback: paste your instagram.com session as the next message.' },
     { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked Instagram account from the bridge.', arg: 'login ID', confirm: 'click' },
   ]},
   { title: 'Chats & contacts', cmds: [
@@ -135,7 +135,7 @@ const LI_COMMAND_GROUPS = [
   ]},
   { title: 'Account', cmds: [
     { cmd: 'list-logins', label: 'List logins', desc: 'List the LinkedIn accounts linked to the bridge and their connection state.' },
-    { cmd: 'login cookies', label: 'Connect LinkedIn', desc: 'Start linking your LinkedIn account; then paste your linkedin.com session (Copy as cURL) as the next message.' },
+    { cmd: 'login cookies', label: 'Connect LinkedIn', desc: 'Start linking LinkedIn. Easiest: run  session-connect/connect.py linkedin  (links automatically). Fallback: paste a Copy-as-cURL as the next message.' },
     { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked LinkedIn account from the bridge.', arg: 'login ID', confirm: 'click' },
     { cmd: 'set-preferred-login', label: 'Preferred account', desc: 'Choose which account sends your messages when more than one is linked.', arg: 'login ID' },
   ]},
@@ -161,7 +161,7 @@ const TW_COMMAND_GROUPS = [
   ]},
   { title: 'Account', cmds: [
     { cmd: 'list-logins', label: 'List logins', desc: 'List the X accounts linked to the bridge and their connection state.' },
-    { cmd: 'login cookies', label: 'Connect X', desc: 'Start linking your X account; then paste your x.com session (Copy as cURL) as the next message.' },
+    { cmd: 'login cookies', label: 'Connect X', desc: 'Start linking X. Easiest: run  session-connect/connect.py twitter  (links automatically). Fallback: paste a Copy-as-cURL as the next message.' },
     { cmd: 'logout', label: 'Unlink account', desc: 'Disconnect a linked X account from the bridge.', arg: 'login ID', confirm: 'click' },
     { cmd: 'set-preferred-login', label: 'Preferred account', desc: 'Choose which account sends your messages when more than one is linked.', arg: 'login ID' },
   ]},

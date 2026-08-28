@@ -423,7 +423,11 @@ function reactToBotReply(body, source) {
                : source.id === 'twitter' ? 'btn-tw-disconnect'
                : source.id === 'gmessages' ? null : 'btn-disconnect';
   if (/You're not logged in/i.test(body)) updateCardStatus([], pillId, discId);
-  const logins = [...body.matchAll(/^\* `([^`\n]+)` \(([^)\n]*)\) - `([A-Z_]+)`/gm)]
+  // The reply lists each login as a markdown bullet "* `id` (name) - `STATE`".
+  // handleMgmtEvent strips the leading "* " off the first line for the console
+  // log, so the bullet is optional here — otherwise a single-login reply
+  // (the common case) parses to zero logins and the pill never updates.
+  const logins = [...body.matchAll(/^(?:\* )?`([^`\n]+)` \(([^)\n]*)\) - `([A-Z_]+)`/gm)]
     .map(m => ({ id: m[1], name: m[2], state: m[3] }));
   if (logins.length) updateCardStatus(logins, pillId, discId);
   if (/Successfully logged in/i.test(body)) {

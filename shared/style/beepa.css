@@ -265,6 +265,7 @@ input:focus-visible, .input:focus-visible { border-color: var(--color-accent); o
 .bridge-name { font-weight: 600; font-size: 16px; }
 .status-pill { background: var(--color-neutral-200); color: var(--color-muted); border-radius: 4px; font-size: 11px; }
 .status-pill.ok { background: var(--color-accent-100); color: var(--color-accent-700); }
+.status-pill.stale { background: #fdecc8; color: #8a5a00; font-weight: 600; }
 #console {
   background: var(--color-panel-dark); color: #e9edef; border-radius: 8px;
   font-family: ui-monospace, Menlo, monospace;

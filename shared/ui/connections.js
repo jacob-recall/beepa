@@ -98,22 +98,37 @@ const PILL_SOURCE = {
   'li-status': 'linkedin', 'tw-status': 'twitter',
 };
 
+// A bridge login is only healthily connected when the bridge reports CONNECTED.
+// BAD_CREDENTIALS / LOGGED_OUT mean the stored session is dead and the user must
+// re-pair (reset the sync) — surfaced distinctly so a stale login never reads as
+// "Connected". Other non-connected states (CONNECTING / TRANSIENT_DISCONNECT /
+// UNKNOWN_ERROR) are transient and shown as "reconnecting", not a reset prompt.
+const NEEDS_RESET = new Set(['BAD_CREDENTIALS', 'LOGGED_OUT']);
 function updateCardStatus(logins, pillId, discId) {
   const sourceId = PILL_SOURCE[pillId || 'wa-status'];
-  const connected = logins.length > 0;
-  if (sourceId && runtime[sourceId]) runtime[sourceId].connected = connected;
+  const login = logins.length ? logins[0] : null;
+  const state = login ? login.state : null;
+  const healthy = state === 'CONNECTED';
+  if (sourceId && runtime[sourceId]) runtime[sourceId].connected = healthy;
   const pill = $(pillId || 'wa-status');
   const disc = discId ? $(discId) : null;
   if (pill) {
-    if (connected) {
-      const l = logins[0];
-      pill.textContent = 'Connected: ' + l.name + ' (' + l.state + ')';
+    pill.classList.remove('ok', 'stale');
+    if (healthy) {
+      pill.textContent = 'Connected: ' + login.name;
       pill.classList.add('ok');
-      if (disc) { disc.classList.remove('hidden'); disc.dataset.loginId = l.id; }
+    } else if (login && NEEDS_RESET.has(state)) {
+      pill.textContent = 'Sync stale — reset needed (' + state + ')';
+      pill.classList.add('stale');           // re-pair via the steps in this card
+    } else if (login) {
+      pill.textContent = 'Reconnecting… (' + state + ')';
+      pill.classList.add('stale');
     } else {
       pill.textContent = 'Not connected';
-      pill.classList.remove('ok');
-      if (disc) disc.classList.add('hidden');
+    }
+    if (disc) {
+      if (login) { disc.classList.remove('hidden'); disc.dataset.loginId = login.id; }
+      else disc.classList.add('hidden');
     }
   }
   notifyPlatformRail();

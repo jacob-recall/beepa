@@ -47,6 +47,7 @@ function forgetSession() {
   S.joinedSet = new Set();
   userJoinFailed.clear();                             // auto-join memo is session-scoped
   autojoinSessionJoined = 0;
+  if (inviteTimer) { clearInterval(inviteTimer); inviteTimer = null; }  // stop the invite poll with the session
   autojoinPending = { refused: 0, overCap: 0, declined: 0 };
   renderAutojoinNote();
   clearQR();
@@ -100,6 +101,7 @@ const AUTOJOIN_MAX_SESSION = 200;   // per session, across calls (anti-join-stor
 // retried in-session. Session-scoped, like apps/master's MS.joinFailed.
 const userJoinFailed = new Set();
 let autojoinSessionJoined = 0;
+let inviteTimer = null;   // periodic bridge-invite poll (started in enterApp)
 // What was NOT accepted, for the visible count: refused on identity grounds,
 // deferred by the per-call cap, or left pending because the user declined.
 let autojoinPending = { refused: 0, overCap: 0, declined: 0 };
@@ -247,6 +249,14 @@ async function enterApp() {
   // mgmt rooms are pinned before any newly joined room can be considered.
   try { await joinBridgeInvites(); }
   catch (e) { /* invites stay pending; the note keeps the count visible */ }
+  // New conversations from bridges that INVITE (every bridge except Google
+  // Messages, which double-puppets and self-joins) only appear once their
+  // invite is accepted. joinBridgeInvites ran once above; keep polling so a
+  // brand-new chat syncs within ~one interval instead of waiting for the next
+  // sign-in/reload (the old behaviour — an unbounded "why is this so slow?").
+  // Cleared in forgetSession.
+  if (inviteTimer) clearInterval(inviteTimer);
+  inviteTimer = setInterval(() => { joinBridgeInvites().catch(() => {}); }, 20000);
   startSync();
   await sendStatusRefresh();                        // WhatsApp list-logins
   if (runtime.imessage.mgmtRoomId) await sendCmd('imessage', 'status');

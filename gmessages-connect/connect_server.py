@@ -53,8 +53,11 @@ import time
 import connect  # gmessages-connect/connect.py — same dir; imported side-effect-free
 
 # The teammate app's browser origin (apps/user, served by the `views` nginx).
-# The ONLY origin allowed to drive a connect; never "*", never any other.
-APP_ORIGIN = "http://127.0.0.1:8011"
+# 127.0.0.1 and localhost are the same loopback app — a viewer may open either,
+# so BOTH are allowed; nothing else is (never "*"). An off-machine or foreign
+# origin is still refused. These are aliases of the user's OWN app, not a
+# widening to any other site.
+APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8020
@@ -71,10 +74,28 @@ def _make_handler():
         def log_message(self, *a):  # F6: no access log (never risk logging a header/body)
             pass
 
-        # CORS echoed ONLY for the one allowed origin, only on the POST
-        # endpoints (health carries none — F5). Never "*".
+        # Diagnostic line: METHOD PATH origin -> status. Safe — the Origin
+        # header is not a secret and NO body/cookie/header value beyond Origin
+        # is ever written. Lets a silent 403/415 be seen when diagnosing.
+        def _diag(self, status):
+            try:
+                sys.stderr.write("[connect] %s %s origin=%r -> %d\n"
+                                 % (self.command, self.path,
+                                    self.headers.get("Origin"), status))
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+        def _origin(self):
+            """The request Origin if it is one of the allowed loopback aliases,
+            else None (fail closed)."""
+            og = self.headers.get("Origin")
+            return og if og in APP_ORIGINS else None
+
+        # CORS echoed ONLY for an allowed origin, only on the POST endpoints
+        # (health carries none — F5). Never "*".
         def _cors(self):
-            self.send_header("Access-Control-Allow-Origin", APP_ORIGIN)
+            self.send_header("Access-Control-Allow-Origin", self._origin() or APP_ORIGINS[0])
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Beepa-Connect")
@@ -106,21 +127,21 @@ def _make_handler():
         # ---- F1: the authorization gate, run at the TOP of every do_POST,
         # BEFORE any cookie read or bridge call. Fails closed on all three.
         def _authorized(self):
-            if self.headers.get("Origin") != APP_ORIGIN:  # (a) primary gate
-                self._json(403, {"error": "forbidden"}, cors=True)
+            if self._origin() is None:                     # (a) primary gate
+                self._json(403, {"error": "forbidden"}, cors=True); self._diag(403)
                 return False
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype != "application/json":               # (b)
-                self._json(415, {"error": "unsupported media type"}, cors=True)
+                self._json(415, {"error": "unsupported media type"}, cors=True); self._diag(415)
                 return False
             if self.headers.get("X-Beepa-Connect") != "1":  # (c)
-                self._json(403, {"error": "forbidden"}, cors=True)
+                self._json(403, {"error": "forbidden"}, cors=True); self._diag(403)
                 return False
             return True
 
         def do_OPTIONS(self):
             # Preflight only for the allowed origin + the POST endpoints.
-            if (self.headers.get("Origin") == APP_ORIGIN
+            if (self._origin() is not None
                     and self.path in ("/connect/gmessages/start",
                                       "/connect/gmessages/wait")):
                 self.send_response(204)
@@ -146,6 +167,7 @@ def _make_handler():
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            self._diag(-1)   # arrival (before auth) — origin visible for diagnosis
             if self.path == "/connect/gmessages/start":
                 if not self._authorized():   # F1: gate BEFORE any side effect
                     return

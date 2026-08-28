@@ -48,8 +48,11 @@ tiny loopback service does it on the browser's behalf.
 - **F1 — the authorization gate runs at the TOP of every `do_POST`, before any
   side effect** (before a single cookie is read or any bridge call is made).
   All three are required, fail-closed:
-  1. `Origin` request header == `http://127.0.0.1:8011` exactly — a missing,
-     `"null"`, or different Origin is refused `403`. This is the primary gate.
+  1. `Origin` request header ∈ {`http://127.0.0.1:8011`, `http://localhost:8011`}
+     — the two loopback aliases of the user's own app; a missing, `"null"`, or
+     any other Origin is refused `403`. This is the primary gate. (A diagnostic
+     line — `METHOD PATH origin -> status`, Origin only, never a body/cookie —
+     is written to the log so a silent rejection is visible.)
   2. `Content-Type` == `application/json`.
   3. `X-Beepa-Connect: 1` header present.
   (2)+(3) are non-simple headers, so a cross-origin page is forced into a CORS

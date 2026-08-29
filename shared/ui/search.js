@@ -43,6 +43,11 @@ function feedRelTime(ts) {
 function renderHome() {
   const list = $('list-body');
   if (!list) return;
+  // #list-body is shared by Home, the per-source lists, and People. Feed-model
+  // updates (live /sync + the periodic re-seed) call this on their own cadence,
+  // so guard against clobbering a non-Home view the user is currently looking at.
+  const k = S.activeNavKey;
+  if (k && (k.indexOf('source:') === 0 || k === 'people' || k === 'settings')) return;
   ensureHomeHiddenToggle();                           // HF-9: "Show hidden" chip above the list
   const q = (($('home-search') && $('home-search').value) || '').trim().toLowerCase();
   const all = [...feedModel.values()].sort((a, b) => b.lastTs - a.lastTs);

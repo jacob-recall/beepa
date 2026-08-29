@@ -220,6 +220,7 @@ let activeNavKey = 'home';
 
 function setActiveNav(key) {
   activeNavKey = key;
+  S.activeNavKey = key;                               // shared so the feed render can tell which view is active
   for (const b of document.querySelectorAll('.navitem')) {
     b.classList.toggle('active', b.dataset.navkey === key);
   }

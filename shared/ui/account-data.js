@@ -71,9 +71,14 @@ function buildConvos(source, rooms) {
     if (!rooms[childId]) continue;                 // not in joined set -> excluded
     if (!ROOMID_RE.test(childId)) continue;        // malformed id -> excluded
     const r = rooms[childId];
+    // mautrix bakes " (Network)" into DM room names (e.g. "Jane Doe (LinkedIn)");
+    // the platform badge already shows the source, so strip that redundant suffix.
+    let title = r.name || childId;
+    const netSuffix = ' (' + source.spaceName + ')';
+    if (title.length > netSuffix.length && title.endsWith(netSuffix)) title = title.slice(0, -netSuffix.length);
     convos.push({
       id: childId,
-      title: sanitizeLine(r.name || childId),
+      title: sanitizeLine(title),
       sub: sanitizeLine(r.lastBody || ''),
       sourceId: source.id,
       sourceLabel: source.label,

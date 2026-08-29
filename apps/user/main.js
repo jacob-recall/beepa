@@ -1,7 +1,7 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { fetchSnapshot, seedFeed, startFeedSync } from '../../shared/ui/account-data.js';
+import { fetchSnapshot, seedFeed, startFeedSync, startFeedRefresh } from '../../shared/ui/account-data.js';
 import { countSharedNow, initConsentUI } from './consent.js';
 import { bridgeInvitesToJoin } from './invites.js';
 import { initContactsUI } from './contacts.js';
@@ -232,6 +232,7 @@ async function enterApp() {
   // the SEPARATE feed /sync loop (HF-1). This is independent of startSync below.
   try { await seedFeed(); renderHome(); } catch (e) { /* feed stays empty on error */ }
   startFeedSync();
+  startFeedRefresh();                               // periodic re-seed keeps newest convos time-ordered
   try { runtime.whatsapp.mgmtRoomId = await resolveMgmt(WA); }
   catch (e) { logConsole('error', 'WhatsApp management room: ' + String(e.message || e)); }
   try { runtime.imessage.mgmtRoomId = await resolveImsgMgmt(); }

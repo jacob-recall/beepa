@@ -20,7 +20,11 @@ async function fetchSnapshot() {
     // Per-room account_data limited to m.tag (HF-9: read low-priority/archive
     // tags in the feed's own data path). Global account_data + presence stay
     // excluded; the sidebar parser ignores account_data, so this is additive.
-    room: { timeline: { limit: 5 }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
+    // Timeline limit 20 (not 5): a room's last few timeline events can be
+    // non-message (space-child, membership, reactions), which feedLastPreview
+    // skips — too small a window left such rooms with a stale/zero lastTs and
+    // sank them in the time-ordered feed. 20 reliably reaches a real message.
+    room: { timeline: { limit: 20 }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
     presence: { types: [] }, account_data: { types: [] },
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
@@ -345,7 +349,7 @@ async function startFeedSync() {
   while (S.feedRunning && S.token) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { timeline: { limit: 5 }, state: { types: [] } },
+        room: { timeline: { limit: 20 }, state: { types: [] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -360,4 +364,21 @@ async function startFeedSync() {
   }
 }
 
-export { MXID_RE, SELF_MIN_ROOMS, fetchSnapshot, parseSnapshot, buildConvos, refreshConvos, feedPreviewFromEvent, feedLastPreview, fetchSelfIdentityAccountData, deriveSelfMxidsHeuristic, refreshSelfMxids, seedFeed, feedRefreshMuted, feedIsHidden, feedHideRoom, feedUnhideRoom, scheduleFeedRevalidate, feedIngest, startFeedSync };
+// Periodic feed refresh: re-seed the validated snapshot so conversations a
+// bridge imports/updates over time — and their delivery timestamps — freshen
+// into the time-ordered feed without a page reload. The live feed /sync only
+// bumps rooms already known and only on live events; imported/backfilled
+// history arrives outside that stream, so a periodic re-seed is what keeps the
+// newest conversations correctly ordered. Bounded; stops when the token clears.
+let feedRefreshRunning = false;
+async function startFeedRefresh() {
+  if (feedRefreshRunning) return;
+  feedRefreshRunning = true;
+  while (feedRefreshRunning && S.token) {
+    await new Promise(r => setTimeout(r, 60000));
+    if (!S.token) { feedRefreshRunning = false; return; }
+    try { await seedFeed(); scheduleFeedRender(); } catch (e) { /* keep current model */ }
+  }
+}
+
+export { MXID_RE, SELF_MIN_ROOMS, fetchSnapshot, parseSnapshot, buildConvos, refreshConvos, feedPreviewFromEvent, feedLastPreview, fetchSelfIdentityAccountData, deriveSelfMxidsHeuristic, refreshSelfMxids, seedFeed, feedRefreshMuted, feedIsHidden, feedHideRoom, feedUnhideRoom, scheduleFeedRevalidate, feedIngest, startFeedSync, startFeedRefresh };

@@ -4,9 +4,59 @@
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { $, el, sanitizeLine, txn } from './el.js';
 import { setActiveNav, showSection, setDetailMode } from './nav.js';
-import { renderMessageEvent } from './render.js';
+import { convoResolveContent, renderMessageEvent } from './render.js';
 import { buildPlatBadge, setActiveConvoRow } from './rows.js';
 import { S, convoSeen, feedModel, runtime } from '../state.js';
+
+// Module-local per-conversation message cache (LRU by room, module-local like
+// convoSeen): roomId -> chronological array of raw, renderable message
+// EVENTS — the exact objects handed to renderMessageEvent, never a rendered
+// or derived form, so every render still goes through the render whitelist +
+// from_me anti-spoof gate in render.js. Lets openConvo paint instantly from
+// memory instead of always blocking on a fresh /messages fetch. Bounded so it
+// cannot grow unboundedly across a long session: at most CACHE_MAX_EVENTS
+// events kept per room, and only the CACHE_MAX_ROOMS most recently touched
+// rooms are kept at all (oldest evicted first).
+const convoCache = new Map();
+const CACHE_MAX_ROOMS = 20;
+const CACHE_MAX_EVENTS = 60;
+
+// Only cache events that actually resolve to a renderable message (mirrors
+// what renderMessageEvent would keep) — no point spending cache slots on
+// reactions/redactions/state events that render nothing.
+function isCacheable(ev) {
+  try { return !!convoResolveContent(ev); } catch (e) { return false; }
+}
+
+// Read + LRU-touch (moves roomId to most-recently-used).
+function cacheGet(roomId) {
+  const v = convoCache.get(roomId);
+  if (v) { convoCache.delete(roomId); convoCache.set(roomId, v); }
+  return v;
+}
+
+// Merge new events into a room's cache entry (deduped by event_id, existing
+// order preserved, new ones appended), cap per-room size, then evict the
+// least-recently-used room(s) if over the room cap.
+function cacheAppend(roomId, events) {
+  if (!Array.isArray(events) || !events.length) return;
+  let arr = convoCache.get(roomId) || [];
+  convoCache.delete(roomId);
+  const seen = new Set();
+  for (const e of arr) { if (e && typeof e.event_id === 'string') seen.add(e.event_id); }
+  for (const ev of events) {
+    const eid = ev && typeof ev.event_id === 'string' ? ev.event_id : null;
+    if (eid) { if (seen.has(eid)) continue; seen.add(eid); }
+    arr.push(ev);
+  }
+  if (arr.length > CACHE_MAX_EVENTS) arr = arr.slice(arr.length - CACHE_MAX_EVENTS);
+  convoCache.set(roomId, arr);                      // re-insert => most-recently-used
+  while (convoCache.size > CACHE_MAX_ROOMS) {
+    const oldestKey = convoCache.keys().next().value;  // Map preserves insertion order
+    if (oldestKey === undefined) break;
+    convoCache.delete(oldestKey);
+  }
+}
 
 // CV-R3: hub errors/status go to a SEPARATE, distinctly-styled region — NEVER a
 // message bubble in #convo-messages (anti-phishing). Created lazily since the
@@ -59,11 +109,25 @@ async function openConvo(roomId) {
   if (convoPane) convoPane.classList.remove('no-selection');
   setActiveConvoRow(roomId);
 
+  // Perf: paint instantly from the module-local cache (if we have one for
+  // this room) BEFORE the network fetch below, through the SAME
+  // renderMessageEvent gate as everything else — no bypass of the render
+  // whitelist / from_me check. convoSeen was just cleared above, so this is
+  // the first pass through it for this open and every cached event renders.
+  const cached = cacheGet(roomId);
+  if (cached && cached.length) {
+    for (const ev of cached) renderMessageEvent(ev);
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
   try {
     const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50';
     const data = await api('GET', q);
+    const chunk = Array.isArray(data.chunk) ? data.chunk.slice().reverse() : [];  // b -> chronological
+    cacheAppend(roomId, chunk.filter(isCacheable));   // keep the cache warm regardless of the guard below
     if (S.openRoomId === roomId) {                    // guard: user may have switched rooms mid-fetch
-      const chunk = Array.isArray(data.chunk) ? data.chunk.slice().reverse() : [];  // b -> chronological
+      // renderMessageEvent dedups via convoSeen against whatever the cache
+      // pass above already rendered, so this only paints what's new.
       for (const ev of chunk) renderMessageEvent(ev);
       if (box) box.scrollTop = box.scrollHeight;
     }
@@ -95,10 +159,13 @@ async function startConvoWatch(roomId) {
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[watchRoom];                 // read ONLY the open room's timeline
       if (room && room.timeline && Array.isArray(room.timeline.events) && S.openRoomId === watchRoom) {
+        const toCache = [];
         for (const ev of room.timeline.events) {
           if (S.openRoomId !== watchRoom) break;      // client guard: drop if the room changed
           renderMessageEvent(ev);
+          if (isCacheable(ev)) toCache.push(ev);
         }
+        if (toCache.length) cacheAppend(watchRoom, toCache);  // keep the cache warm while the room is open
         const box = $('convo-messages');
         if (box) box.scrollTop = box.scrollHeight;
       }

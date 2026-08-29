@@ -640,8 +640,13 @@ function renderBubble(ev) {
   const resolved = resolveMirrorContent(ev);
   if (!resolved) return;                              // reaction/redaction/state/etc. — skip
   const sent = !!(ev.content && ev.content['com.jkali.from_me'] === true);
-  const senderName = (ev.content && typeof ev.content['com.jkali.sender_name'] === 'string')
-    ? sanitizeLine(ev.content['com.jkali.sender_name'])
+  // Who to show on a received bubble: the uplink stamps the ORIGIN sender's
+  // display name (resolved from the teammate-local room's member state) as
+  // com.jkali.origin_sender. The raw ev.sender is always the teammate's own
+  // uplink account (@<teammate>:master — sole poster in a mirror room), so it
+  // is only a last-resort fallback, never the real correspondent.
+  const senderName = (ev.content && typeof ev.content['com.jkali.origin_sender'] === 'string')
+    ? sanitizeLine(ev.content['com.jkali.origin_sender'])
     : displayNameForMxid(ev.sender);
   const ts = mirrorTs(ev);
   maybeInsertDayDivider(box, ts);

@@ -89,6 +89,13 @@ ORIGIN_TS_KEY = "com.jkali.origin_ts"
 SOURCE_KEY = "com.jkali.source"
 ORIGIN_SENDER_KEY = "com.jkali.origin_sender"
 MEDIA_PLACEHOLDER_KEY = "com.jkali.media_placeholder"
+# The teammate's own bridge-ghost mxids (self-align, shared/ui/account-data.js
+# source (1)): messages the teammate sends from the native app (phone WhatsApp,
+# etc.) arrive with the GHOST as sender, not cfg.local_user, so from_me must
+# also match this user-written allowlist. Only the authoritative account-data
+# list is used here — the UI's cosmetic frequency heuristic (source (2)) is
+# deliberately NOT ported, because this stamp is a durable record on master.
+SELF_IDENTITIES_TYPE = "com.jkali.self_identities"
 
 # V2 proposal channel (PLAN-MASTER-SYNC.md §2 v2 / §7). A DEDICATED per-teammate
 # proposal room on the master carries manager-authored com.jkali.proposal events;
@@ -107,6 +114,11 @@ MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
 # forwarded com.jkali.proposal event for the teammate's guarded send path to
 # re-validate later.
 ROOMID_RE = re.compile(r"^![^:]+:[A-Za-z0-9.\-:]+$")
+# Mxid shape gate for self_identities entries. shared/ui/account-data.js pins
+# its MXID_RE to ':localhost'; here the same-server constraint is enforced in
+# read_self_mxids() against cfg.local_user's own server name instead of a
+# hardcoded literal, so the daemon stays deployable off-localhost.
+MXID_RE = re.compile(r"^@[^:]+:[A-Za-z0-9.\-:]+$")
 MEDIA_MSGTYPES = ("m.image", "m.video", "m.audio", "m.file")
 MEDIA_LABELS = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.file": "File"}
 DEFAULT_MEDIA_MAX = 25 * 1024 * 1024        # 25 MB re-upload cap (§8.2, v1.5)
@@ -177,6 +189,8 @@ class Uplink:
         self.cfg = cfg
         self.db = self._open_db(cfg.db_path)
         self.backoff = 1.0
+        self.self_mxids = set()   # refreshed at the top of every reconcile()
+        self._last_sourceless = None  # change-detector for the sourceless-share warning
 
     # -- local (read) and master (write) transports -------------------------
     def local(self, method, path, body=None, query=None, timeout=60):
@@ -246,6 +260,24 @@ class Uplink:
             "SELECT local_event_id FROM event_map").fetchall()}
 
     # -- consent ------------------------------------------------------------
+    def read_self_mxids(self):
+        """The teammate's own ghost mxids from com.jkali.self_identities.
+
+        Mirrors fetchSelfIdentityAccountData() in shared/ui/account-data.js:
+        admit only well-formed mxid strings; absent/error -> empty set.
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + SELF_IDENTITIES_TYPE)
+        try:
+            data = self.local("GET", path)
+        except urllib.error.HTTPError:
+            return set()
+        mxids = data.get("mxids") if isinstance(data, dict) else None
+        local_server = self.cfg.local_user.rsplit(":", 1)[-1]
+        return {m for m in (mxids if isinstance(mxids, list) else [])
+                if isinstance(m, str) and MXID_RE.match(m)
+                and m.rsplit(":", 1)[-1] == local_server}
+
     def read_policy(self):
         path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
                 + "/account_data/" + consent.SHARE_POLICY_TYPE)
@@ -387,9 +419,23 @@ class Uplink:
             profile_arg = ({"displayName": prof["displayName"], "share": prof["share"]}
                            if prof else None)
             desired[rid] = consent.effective_shared(convo, policy, overrides.get(rid), profile_arg)
+        # Visibility (pm_mng-es1): an explicit per-room 'share' the source
+        # detector cannot attribute is a consent decision this daemon cannot
+        # honor — say so instead of silently skipping. Only explicit overrides
+        # are checked (a share-all policy would flag every unbridged room),
+        # and only on change so the loop does not repeat itself every pass.
+        sourceless = sorted(rid for rid, st in overrides.items()
+                            if st == "share" and rid in join and not source_of.get(rid))
+        if sourceless != self._last_sourceless:
+            self._last_sourceless = sourceless
+            if sourceless:
+                log.warning("shared-but-sourceless (will NOT mirror): %s",
+                            ", ".join(sourceless))
         return desired, source_of, join, profile_of
 
     def reconcile(self):
+        # Refresh once per pass; _forward_message (backfill + tail) reads it.
+        self.self_mxids = self.read_self_mxids()
         sync_data = self.full_sync()
         desired, source_of, join, profile_of = self.desired_shared(sync_data)
         plan = reconcile.reconcile_decisions(desired, self.existing_mirror_ids())
@@ -657,8 +703,11 @@ class Uplink:
             if master_target:
                 content = dict(content)
                 content["m.relates_to"] = {"rel_type": "m.replace", "event_id": master_target}
-        # Metadata the master app renders by (§8.2).
-        content[FROM_ME_KEY] = (sender == self.cfg.local_user)
+        # Metadata the master app renders by (§8.2). from_me: the teammate's
+        # own account OR one of their attested bridge ghosts (see
+        # SELF_IDENTITIES_TYPE above) — phone-sent messages carry the ghost.
+        content[FROM_ME_KEY] = (sender == self.cfg.local_user
+                                or sender in self.self_mxids)
         content[ORIGIN_TS_KEY] = ev.get("origin_server_ts")
         content[SOURCE_KEY] = source or "unknown"
         content[ORIGIN_SENDER_KEY] = self._display_name(local_room_id, sender)

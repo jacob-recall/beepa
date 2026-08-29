@@ -266,6 +266,82 @@ async function runGmessagesConnect(btn, out, fallback) {
   btn.disabled = false;
 }
 
+// ---- one-click Instagram / LinkedIn / X connect (loopback helper on :8021) --
+// twitter/linkedin complete SERVER-SIDE in the helper — the session never
+// reaches the browser. instagram has no bridge provisioning login, so the
+// helper returns its cookie blob for us to submit through the SAME guarded
+// management-room path the paste box uses (sendSecretToMgmt + immediate
+// redact). If the helper is unreachable, we reveal the paste box as fallback.
+const SESSION_CONNECT_BASE = 'http://127.0.0.1:8021';
+const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
+
+async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd) {
+  if (S.busy) return;
+  warnEl.classList.add('hidden'); warnEl.textContent = '';
+  clearRedactRetry(warnEl);
+  // Open the site first so the session cookies exist for the helper to read.
+  window.open(siteUrl, '_blank', 'noopener');
+  let start;
+  try {
+    const r = await fetch(SESSION_CONNECT_BASE + '/connect/' + net + '/start',
+      { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
+    start = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      warnEl.textContent = /session not found/i.test(String(start && start.error || ''))
+        ? 'Finish signing in on the tab that opened, then click Connect again.'
+        : (sanitizeLine(String(start && start.error || '')) || 'Could not connect.');
+      warnEl.classList.remove('hidden');
+      return;
+    }
+  } catch (e) {
+    // Helper not running / unreachable — reveal the paste fallback.
+    pasteEl.classList.remove('hidden');
+    warnEl.textContent = 'One-click helper not reachable — paste your session below instead.';
+    warnEl.classList.remove('hidden');
+    return;
+  }
+
+  if (start && start.status === 'complete') {
+    // twitter / linkedin: done server-side; the session never touched the browser.
+    if (typeof onDone === 'function') onDone();
+    sendCmd(net, 'list-logins');
+    return;
+  }
+
+  if (start && start.status === 'cookies' && start.cookies) {
+    // instagram: submit the returned blob through the guarded mgmt path, then
+    // redact it — identical handling to the paste box. The value lives only in
+    // this scope and is nulled after the send.
+    S.busy = true; setButtonsDisabled(true);
+    let secret = String(start.cookies);
+    try {
+      if (loginCmd) await sendCmd(net, loginCmd);   // put the bot in login mode
+      const sent = await sendSecretToMgmt(net, secret);
+      secret = null;
+      if (!sent || !sent.eventId) {
+        warnEl.textContent = 'Sent, but the bridge did not return a message id, so it cannot be auto-deleted. ' + ESCAPE_HINT;
+        warnEl.classList.remove('hidden');
+      } else {
+        try { await redactMgmtEvent(sent.roomId, sent.eventId); if (typeof onDone === 'function') onDone(); }
+        catch (e) { showRedactFailure(warnEl, sent.roomId, sent.eventId, onDone); }
+      }
+    } catch (e) {
+      secret = null;
+      warnEl.textContent = 'Could not send the session: ' + String(e.message || e);
+      warnEl.classList.remove('hidden');
+    } finally {
+      S.busy = false; setButtonsDisabled(false);
+      sendCmd(net, 'list-logins');
+    }
+    return;
+  }
+
+  // status: failed
+  warnEl.textContent = 'Could not connect (the session may be stale — sign in again and retry).';
+  warnEl.classList.remove('hidden');
+  sendCmd(net, 'list-logins');
+}
+
 let connectionsBuilt = false;
 
 function ensureConnections() {
@@ -409,7 +485,7 @@ function buildConnections() {
   const igPaste = el('div', 'ig-paste hidden');
   igPaste.style.cssText = 'margin-top:10px;';
   igPaste.appendChild(el('p', 'muted',
-    'Sign in on Instagram (the Connect button opens it), then run  python3 session-connect/connect.py instagram  — it copies your session to the clipboard. Paste it below (Cmd-V) and Submit.'));
+    'Fallback (the one-click helper is not running): sign in on Instagram, then paste a Copy-as-cURL or the cookies JSON below and Submit.'));
   const igArea = el('textarea');
   igArea.placeholder = 'Paste your Instagram session here (the connect helper puts it on your clipboard)';
   igArea.rows = 4;
@@ -429,14 +505,9 @@ function buildConnections() {
   const igActions = el('div', 'bridge-actions');
   const igConnect = el('button', 'primary', 'Connect Instagram');
   igConnect.style.width = 'auto';
-  igConnect.addEventListener('click', async () => {
-    igWarn.classList.add('hidden');
-    igWarn.textContent = '';
-    await sendCmd('instagram', 'login instagram');  // C-1 guarded
-    igPaste.classList.remove('hidden');
-    igArea.focus();
-    window.open('https://www.instagram.com/', '_blank', 'noopener');
-  });
+  igConnect.addEventListener('click', () => runSessionConnect(
+    'instagram', 'https://www.instagram.com/', igWarn, igPaste,
+    () => igPaste.classList.add('hidden'), 'login instagram'));
   igActions.appendChild(igConnect);
 
   const igDisc = el('button', 'danger', 'Disconnect');
@@ -522,7 +593,7 @@ function buildConnections() {
   const liPaste = el('div', 'li-paste hidden');
   liPaste.style.cssText = 'margin-top:10px;';
   liPaste.appendChild(el('p', 'muted',
-    'Sign in on LinkedIn (the Connect button opens it), then run  python3 session-connect/connect.py linkedin  — it connects automatically, no paste needed. Fallback: DevTools → Network → a voyager request → Copy as cURL, paste below.'));
+    'Fallback (the one-click helper is not running): sign in on LinkedIn, then DevTools → Network → a voyager request → Copy as cURL, and paste below.'));
   const liArea = el('textarea');
   liArea.placeholder = 'Fallback only — paste a Copy-as-cURL here if the helper cannot connect';
   liArea.rows = 4;
@@ -542,14 +613,9 @@ function buildConnections() {
   const liActions = el('div', 'bridge-actions');
   const liConnect = el('button', 'primary', 'Connect LinkedIn');
   liConnect.style.width = 'auto';
-  liConnect.addEventListener('click', async () => {
-    liWarn.classList.add('hidden');
-    liWarn.textContent = '';
-    await sendCmd('linkedin', 'login cookies');      // C-1 guarded
-    liPaste.classList.remove('hidden');
-    liArea.focus();
-    window.open('https://www.linkedin.com/', '_blank', 'noopener');
-  });
+  liConnect.addEventListener('click', () => runSessionConnect(
+    'linkedin', 'https://www.linkedin.com/', liWarn, liPaste,
+    () => liPaste.classList.add('hidden')));
   liActions.appendChild(liConnect);
 
   const liDisc = el('button', 'danger', 'Disconnect');
@@ -632,7 +698,7 @@ function buildConnections() {
   const twPaste = el('div', 'tw-paste hidden');
   twPaste.style.cssText = 'margin-top:10px;';
   twPaste.appendChild(el('p', 'muted',
-    'Sign in on X (the Connect button opens it), then run  python3 session-connect/connect.py twitter  \u2014 it connects automatically, no paste needed. Fallback: DevTools \u2192 Network \u2192 a request \u2192 Copy as cURL, paste below.'));
+    'Fallback (the one-click helper is not running): sign in on X, then DevTools \u2192 Network \u2192 a request \u2192 Copy as cURL, and paste below.'));
   const twArea = el('textarea');
   twArea.placeholder = 'Fallback only — paste a Copy-as-cURL here if the helper cannot connect';
   twArea.rows = 4;
@@ -652,14 +718,9 @@ function buildConnections() {
   const twActions = el('div', 'bridge-actions');
   const twConnect = el('button', 'primary', 'Connect X');
   twConnect.style.width = 'auto';
-  twConnect.addEventListener('click', async () => {
-    twWarn.classList.add('hidden');
-    twWarn.textContent = '';
-    await sendCmd('twitter', 'login cookies');      // C-1 guarded
-    twPaste.classList.remove('hidden');
-    twArea.focus();
-    window.open('https://x.com/', '_blank', 'noopener');
-  });
+  twConnect.addEventListener('click', () => runSessionConnect(
+    'twitter', 'https://x.com/', twWarn, twPaste,
+    () => twPaste.classList.add('hidden')));
   twActions.appendChild(twConnect);
 
   const twDisc = el('button', 'danger', 'Disconnect');

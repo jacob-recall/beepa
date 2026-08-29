@@ -51,6 +51,10 @@ NETWORKS = {
     "linkedin": dict(service="mautrix-linkedin", port=29319,
                      config="linkedin/config.yaml", flow="cookies",
                      domain="%linkedin.com"),
+    # instagram has flow=None: the Meta bridge exposes no provisioning login,
+    # so service/port/config are UNUSED here (api() is never called) — the path
+    # only reads cookies and hands them off. Do not rely on port/service below
+    # unless Instagram gains a real server-side flow.
     "instagram": dict(service="mautrix-meta", port=29319,
                       config="meta/config.yaml", flow=None,
                       domain="%instagram.com"),

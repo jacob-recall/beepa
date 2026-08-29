@@ -184,6 +184,13 @@ rc_invites:
     per_second: 100
     burst_count: 1000
 
+# The master console (apps/master) refreshes with a full initial /sync every
+# 20s BY DESIGN; Synapse's initial-sync response cache (default 2m) would feed
+# it minutes-stale snapshots (stale room joins, missed proposals rooms/mirrors
+# — found live 2026-08-29). Single-user server: fresh computation is cheap.
+caches:
+  sync_response_cache_duration: 0
+
 # vim:ft=yaml
 YAML
 chmod 600 "${HS_YAML}"

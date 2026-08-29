@@ -34,7 +34,14 @@ Optional:
   UPLINK_DB          state db path       (default: <this dir>/state.db)
   UPLINK_BACKFILL    backfill message cap (default: 500)
   UPLINK_MEDIA_MAX   media re-upload byte cap (default: 26214400 = 25MB; over -> placeholder)
-  UPLINK_SYNC_TIMEOUT  /sync long-poll ms (default: 30000)
+  UPLINK_SYNC_TIMEOUT  /sync long-poll ms for the LOCAL tail AND the master
+                       proposal pull (default: 5000). The idle loop period is
+                       roughly the SUM of the two long-polls, so keep it short:
+                       each side's worst-case forwarding latency is about the
+                       OTHER side's long-poll plus processing.
+  UPLINK_RECONCILE_MS  min ms between full reconcile passes (default: 30000).
+                       Reconcile does a full initial /sync of the local hs, so
+                       it stays on its own slower cadence while tail/pull spin.
   UPLINK_LOG_LEVEL   INFO|DEBUG           (default: INFO)
 
 Python 3.9+ stdlib only (urllib + sqlite3). No pip dependencies.
@@ -158,7 +165,8 @@ class Config:
         }
         self.db_path = env.get("UPLINK_DB") or os.path.join(BASE, "state.db")
         self.backfill = max(0, min(int(env.get("UPLINK_BACKFILL", "500")), 500))
-        self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "30000"))
+        self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "5000"))
+        self.reconcile_ms = int(env.get("UPLINK_RECONCILE_MS", "30000"))
         self.log_level = env.get("UPLINK_LOG_LEVEL", "INFO")
         # v1.5 media re-upload: skip (-> placeholder) anything above this many bytes.
         self.media_max = max(0, int(env.get("UPLINK_MEDIA_MAX", str(DEFAULT_MEDIA_MAX))))
@@ -191,6 +199,7 @@ class Uplink:
         self.backoff = 1.0
         self.self_mxids = set()   # refreshed at the top of every reconcile()
         self._last_sourceless = None  # change-detector for the sourceless-share warning
+        self._last_reconcile = 0.0    # monotonic-enough throttle for reconcile()
 
     # -- local (read) and master (write) transports -------------------------
     def local(self, method, path, body=None, query=None, timeout=60):
@@ -922,10 +931,14 @@ class Uplink:
                      "account_data": {"types": []}},
             "presence": {"types": []}, "account_data": {"types": []},
         })
-        query = {"timeout": "0", "filter": flt}
+        # Long-poll (not timeout=0): a manager proposal arriving mid-poll returns
+        # immediately, so down-direction latency is ~the LOCAL tail's poll, not
+        # a full loop period. Same duration as the local tail (see module doc).
+        query = {"timeout": str(self.cfg.sync_timeout), "filter": flt}
         if since:
             query["since"] = since
-        data = self.master("GET", "/_matrix/client/v3/sync", query=query, timeout=90)
+        data = self.master("GET", "/_matrix/client/v3/sync", query=query,
+                           timeout=(self.cfg.sync_timeout // 1000) + 30)
         room = (((data.get("rooms") or {}).get("join")) or {}).get(mpr) or {}
         events = ((room.get("timeline") or {}).get("events")) or []
         posted = self.forward_proposals(mpr, lpr, events)
@@ -1003,7 +1016,13 @@ class Uplink:
                     self._conn_state = True
                     log.info("connected to master %s (space %s)",
                              self.cfg.master_user, self.cfg.master_space)
-                self.reconcile()
+                # Reconcile (full initial /sync + consent resolution) is the
+                # expensive pass — keep it on its own cadence while the two
+                # cheap long-polls below spin the loop every few seconds.
+                now = time.time()
+                if now - self._last_reconcile >= self.cfg.reconcile_ms / 1000.0:
+                    self.reconcile()
+                    self._last_reconcile = now
                 self.tail_once()
                 # V2 proposal channel: ensure the dedicated proposals rooms exist,
                 # then pull any new manager proposals DOWN into the local one. Both

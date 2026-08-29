@@ -37,10 +37,43 @@ function parseProposal(e) {
   };
 }
 
-async function fetchProposals() {
+// The proposals room id is discovered once (a full filtered /sync walks EVERY
+// joined room server-side — ~10s on a real account) and then cached, in memory
+// and, as a per-viewer convenience, in localStorage. The cache NEVER
+// authorizes anything: every fetch re-verifies the room still carries the
+// com.jkali.proposals state marker before reading it, so a stale or tampered
+// cached id degrades to rediscovery, never to trusting an unmarked room.
+const ROOMS_KEY = 'com.jkali.proposals_rooms';
+let proposalsRoomIds = null;
+let lastEmptyDiscovery = 0;
+
+function loadCachedRooms() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]');
+    return (Array.isArray(arr) ? arr : [])
+      .filter((r) => typeof r === 'string' && ROOMID_RE.test(r));
+  } catch (e) { return []; }
+}
+function saveCachedRooms(ids) {
+  try { localStorage.setItem(ROOMS_KEY, JSON.stringify(ids)); } catch (e) { /* ignore */ }
+}
+
+async function verifyMarker(rid) {
+  try {
+    await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid)
+      + '/state/com.jkali.proposals/');
+    return true;
+  } catch (e) { return false; }
+}
+
+// Slow path: the full-sync walk, run only when no cached id verifies. Rate-
+// limited when it comes back empty (no proposals room exists yet — e.g. the
+// uplink has not connected to a master), so the 10s poll does not re-pay the
+// full walk continuously.
+async function discoverProposalsRooms() {
   const filter = encodeURIComponent(JSON.stringify({
     room: {
-      timeline: { limit: 100, types: ['com.jkali.proposal'] },
+      timeline: { limit: 1, types: ['com.jkali.proposal'] },
       state: { types: ['com.jkali.proposals'], lazy_load_members: true },
       account_data: { types: [] },
     },
@@ -54,9 +87,33 @@ async function fetchProposals() {
     const r = join[rid];
     const stateEvents = ((r.state && r.state.events) || [])
       .concat((r.timeline && r.timeline.events) || []);
-    const isProposals = stateEvents.some(e => e.type === 'com.jkali.proposals' && e.state_key === '');
-    if (!isProposals) continue;
-    for (const e of ((r.timeline && r.timeline.events) || [])) {
+    if (stateEvents.some(e => e.type === 'com.jkali.proposals' && e.state_key === '')) {
+      out.push(rid);
+    }
+  }
+  return out;
+}
+
+async function proposalsRooms() {
+  const cached = proposalsRoomIds !== null ? proposalsRoomIds : loadCachedRooms();
+  const ok = [];
+  for (const rid of cached) if (await verifyMarker(rid)) ok.push(rid);
+  if (!ok.length) {
+    if (Date.now() - lastEmptyDiscovery < 60000) return [];
+    for (const rid of await discoverProposalsRooms()) ok.push(rid);
+    if (!ok.length) lastEmptyDiscovery = Date.now();
+  }
+  proposalsRoomIds = ok;
+  saveCachedRooms(ok);
+  return ok;
+}
+
+async function fetchProposals() {
+  const out = [];
+  for (const rid of await proposalsRooms()) {
+    const data = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid)
+      + '/messages?dir=b&limit=100');
+    for (const e of (Array.isArray(data.chunk) ? data.chunk : [])) {
       const p = parseProposal(e);
       if (p) out.push(p);
     }
@@ -218,6 +275,34 @@ async function renderProposalsView() {
   }
 }
 
-function initProposalsUI() { setProposalsViewHook(renderProposalsView); }
+// Live refresh: new proposals appear without leaving and re-entering the view.
+// Guards: only while the proposals LIST is actually showing (the shared
+// #list-body belongs to whichever view is active), and never while a draft is
+// open — a re-render rebuilds the detail pane and would destroy typed edits.
+// Re-renders only when the visible set actually changed.
+let pollTimer = null;
+
+function proposalsListShowing() {
+  const btn = $('list-mode-proposals');
+  return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
+}
+
+async function refreshIfChanged() {
+  if (!proposalsListShowing() || activeProposal) return;
+  let proposals;
+  try { proposals = await fetchProposals(); } catch (e) { return; }
+  const handled = loadHandled();
+  const fresh = proposals.filter(p => !handled.has(p.eventId))
+    .map(p => p.eventId).sort().join(',');
+  const cur = cachedProposals.map(p => p.eventId).sort().join(',');
+  if (fresh !== cur) await renderProposalsView();
+}
+
+function initProposalsUI() {
+  setProposalsViewHook(renderProposalsView);
+  if (!pollTimer) {
+    pollTimer = setInterval(() => { refreshIfChanged().catch(() => {}); }, 10000);
+  }
+}
 
 export { initProposalsUI, renderProposalsView };

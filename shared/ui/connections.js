@@ -98,6 +98,38 @@ const PILL_SOURCE = {
   'li-status': 'linkedin', 'tw-status': 'twitter',
 };
 
+// #3: a transient per-source UI phase so the connect action gives immediate,
+// legible feedback — "Connecting…" while it runs, then "importing conversations"
+// after it succeeds — that a mid-flight list-logins refresh won't clobber.
+// Phases auto-clear so a pill never sticks: 'connecting' after 30s, 'importing'
+// after 60s, each then restoring the real login status via list-logins.
+const SOURCE_PILL = { whatsapp: 'wa-status', gmessages: 'gmsg-status', instagram: 'ig-status', linkedin: 'li-status', twitter: 'tw-status' };
+const sourcePhase = {};
+const sourcePhaseTimer = {};
+function renderSourcePill(sourceId) {
+  const pill = $(SOURCE_PILL[sourceId] || '');
+  if (!pill) return;
+  const phase = sourcePhase[sourceId];
+  if (phase !== 'connecting' && phase !== 'importing') return;
+  pill.classList.remove('ok', 'stale');
+  pill.classList.add('busy');
+  pill.textContent = phase === 'connecting' ? 'Connecting…' : 'Connected — importing conversations…';
+}
+function setSourcePhase(sourceId, phase) {
+  if (!sourceId) return;
+  if (sourcePhaseTimer[sourceId]) { clearTimeout(sourcePhaseTimer[sourceId]); sourcePhaseTimer[sourceId] = null; }
+  sourcePhase[sourceId] = (phase === 'connecting' || phase === 'importing') ? phase : undefined;
+  if (sourcePhase[sourceId]) {
+    renderSourcePill(sourceId);
+    sourcePhaseTimer[sourceId] = setTimeout(() => {
+      sourcePhase[sourceId] = undefined; sourcePhaseTimer[sourceId] = null;
+      sendCmd(sourceId, 'list-logins');            // restore the real login status
+    }, phase === 'importing' ? 60000 : 30000);
+  } else {
+    sendCmd(sourceId, 'list-logins');
+  }
+}
+
 // A bridge login is only healthily connected when the bridge reports CONNECTED.
 // BAD_CREDENTIALS / LOGGED_OUT mean the stored session is dead and the user must
 // re-pair (reset the sync) — surfaced distinctly so a stale login never reads as
@@ -115,12 +147,24 @@ function updateCardStatus(logins, pillId, discId) {
              || (logins.length ? logins[0] : null);
   const state = login ? login.state : null;
   const healthy = state === 'CONNECTED';
-  if (sourceId && runtime[sourceId]) runtime[sourceId].connected = healthy;
+  if (sourceId && runtime[sourceId]) {
+    runtime[sourceId].connected = healthy;
+    // #4: per-conversation reconnect flag reads this — a dead login (needs
+    // re-pair) marks every conversation from this source as needing reconnect.
+    runtime[sourceId].needsReconnect = !!(login && NEEDS_RESET.has(state));
+  }
   const pill = $(pillId || 'wa-status');
   const disc = discId ? $(discId) : null;
+  const phase = sourceId ? sourcePhase[sourceId] : undefined;   // #3: transient connect/import phase
   if (pill) {
-    pill.classList.remove('ok', 'stale');
-    if (healthy) {
+    pill.classList.remove('ok', 'stale', 'busy');
+    if (phase === 'connecting') {
+      pill.textContent = 'Connecting…';
+      pill.classList.add('busy');
+    } else if (phase === 'importing') {
+      pill.textContent = 'Connected — importing conversations…';
+      pill.classList.add('busy');
+    } else if (healthy) {
       pill.textContent = 'Connected: ' + login.name;
       pill.classList.add('ok');
     } else if (login && NEEDS_RESET.has(state)) {
@@ -277,6 +321,7 @@ const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-C
 
 async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd) {
   if (S.busy) return;
+  setSourcePhase(net, 'connecting');               // #3: immediate "Connecting…" feedback
   warnEl.classList.add('hidden'); warnEl.textContent = '';
   clearRedactRetry(warnEl);
   // Open the site first so the session cookies exist for the helper to read.
@@ -291,6 +336,7 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
         ? 'Finish signing in on the tab that opened, then click Connect again.'
         : (sanitizeLine(String(start && start.error || '')) || 'Could not connect.');
       warnEl.classList.remove('hidden');
+      setSourcePhase(net, null);
       return;
     }
   } catch (e) {
@@ -301,13 +347,23 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
     pasteEl.classList.remove('hidden');
     warnEl.textContent = 'One-click helper not reachable — paste your session below instead.';
     warnEl.classList.remove('hidden');
+    setSourcePhase(net, null);
     return;
   }
 
   if (start && start.status === 'complete') {
     // twitter / linkedin: done server-side; the session never touched the browser.
     if (typeof onDone === 'function') onDone();
+    setSourcePhase(net, 'importing');              // #3: show "importing conversations…"
     sendCmd(net, 'list-logins');
+    return;
+  }
+
+  if (start && start.status === 'input_required') {
+    // The login needs one more interactive value the cookies can't supply
+    // (X's XChat passcode). Ask for it in the card and submit via /input —
+    // the value rides browser -> loopback -> bridge only, never a Matrix room.
+    promptSessionInput(net, start, warnEl, onDone);
     return;
   }
 
@@ -325,13 +381,14 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
         warnEl.textContent = 'Sent, but the bridge did not return a message id, so it cannot be auto-deleted. ' + ESCAPE_HINT;
         warnEl.classList.remove('hidden');
       } else {
-        try { await redactMgmtEvent(sent.roomId, sent.eventId); if (typeof onDone === 'function') onDone(); }
+        try { await redactMgmtEvent(sent.roomId, sent.eventId); if (typeof onDone === 'function') onDone(); setSourcePhase(net, 'importing'); }
         catch (e) { showRedactFailure(warnEl, sent.roomId, sent.eventId, onDone); }
       }
     } catch (e) {
       secret = null;
       warnEl.textContent = 'Could not send the session: ' + String(e.message || e);
       warnEl.classList.remove('hidden');
+      setSourcePhase(net, null);
     } finally {
       S.busy = false; setButtonsDisabled(false);
       sendCmd(net, 'list-logins');
@@ -343,6 +400,82 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
   warnEl.textContent = 'Could not connect (the session may be stale — sign in again and retry).';
   warnEl.classList.remove('hidden');
   sendCmd(net, 'list-logins');
+}
+
+// Render the interactive step the bridge asked for (e.g. X's XChat passcode)
+// as fields inside the bridge card, and submit them to the helper's /input
+// endpoint. Mounts on the card (not the hidden paste box) so it is always
+// visible. Values are treated like passwords: never echoed back, cleared from
+// the inputs before the network call, and dropped after. textContent/el() only.
+function promptSessionInput(net, start, warnEl, onDone) {
+  const mount = (warnEl.closest && warnEl.closest('.bridge-card')) || warnEl.parentNode;
+  const prev = mount.querySelector('.sc-input');   // one prompt at a time
+  if (prev) prev.remove();
+
+  const box = el('div', 'sc-input');
+  box.style.cssText = 'margin-top:10px;';
+  if (start.instructions) box.appendChild(el('p', 'muted', sanitize(String(start.instructions))));
+
+  const inputs = [];
+  const fields = Array.isArray(start.fields) ? start.fields : [];
+  for (const f of fields) {
+    if (!f || !f.id) continue;
+    const label = el('label', 'muted', sanitizeLine(String(f.name || f.id)));
+    label.style.cssText = 'display:block;margin-top:6px;';
+    const inp = el('input');
+    const kind = (String(f.type || '') + ' ' + String(f.id || '')).toLowerCase();
+    const isSecret = /code|pin|pass|otp|2fa/.test(kind);
+    inp.type = isSecret ? 'password' : 'text';
+    inp.autocomplete = 'off';
+    inp.spellcheck = false;
+    if (isSecret) inp.inputMode = 'numeric';
+    inp.style.cssText = 'width:100%;box-sizing:border-box;margin-top:4px;';
+    label.appendChild(inp);
+    box.appendChild(label);
+    inputs.push([String(f.id), inp]);
+  }
+
+  const warn = el('p', 'error hidden');
+  warn.style.cssText = 'margin:6px 0 0;';
+  const submit = el('button', 'primary', 'Submit');
+  submit.style.width = 'auto';
+  const row = el('div', 'bridge-actions');
+  row.appendChild(submit);
+  box.appendChild(row);
+  box.appendChild(warn);
+  mount.appendChild(box);
+  if (inputs.length) inputs[0][1].focus();
+
+  submit.addEventListener('click', async () => {
+    if (S.busy) return;
+    warn.classList.add('hidden'); warn.textContent = '';
+    const values = {};
+    for (const [id, inp] of inputs) values[id] = inp.value;
+    for (const [, inp] of inputs) inp.value = '';   // clear the credential immediately
+    S.busy = true; setButtonsDisabled(true); submit.disabled = true;
+    try {
+      const r = await fetch(SESSION_CONNECT_BASE + '/connect/' + net + '/input',
+        { method: 'POST', headers: SESSION_CONNECT_HEADERS,
+          body: JSON.stringify({ login_id: start.login_id, step_id: start.step_id, values }) });
+      const res = await r.json().catch(() => ({}));
+      if (res && res.status === 'complete') {
+        box.remove();
+        if (typeof onDone === 'function') onDone();
+      } else if (res && res.status === 'input_required') {
+        box.remove();
+        promptSessionInput(net, res, warnEl, onDone);   // bridge wants another step
+      } else {
+        warn.textContent = 'That didn’t work — check the value and try again.';
+        warn.classList.remove('hidden');
+      }
+    } catch (e) {
+      warn.textContent = 'Could not submit — the one-click helper may have stopped.';
+      warn.classList.remove('hidden');
+    } finally {
+      S.busy = false; setButtonsDisabled(false); submit.disabled = false;
+      sendCmd(net, 'list-logins');
+    }
+  });
 }
 
 let connectionsBuilt = false;

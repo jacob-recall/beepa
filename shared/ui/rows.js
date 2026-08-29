@@ -5,7 +5,7 @@ import { openConvo } from './chat.js';
 import { $, el, sanitizeLine } from './el.js';
 import { feedRelTime } from './search.js';
 import { SOURCES } from './sources.js';
-import { feedModel } from '../state.js';
+import { feedModel, runtime } from '../state.js';
 
 // Optional app-injected per-row decorator (e.g. apps/user's share controls,
 // PLAN-MASTER-SYNC §5.1). Shared code never imports from apps/; the app
@@ -43,6 +43,15 @@ function buildFeedRow(r) {
   row.appendChild(meta);
   if (r.lastTs) row.appendChild(el('span', 'when', feedRelTime(r.lastTs)));
   row.appendChild(buildPlatBadge(r.sourceId));
+  // #4: per-conversation reconnect flag. A bridge login is per-account, so a
+  // dead login (needsReconnect, set by updateCardStatus) surfaces on every
+  // conversation from that source — telling you which chats have stopped
+  // syncing and need a re-pair in Settings.
+  if (r.sourceId && runtime[r.sourceId] && runtime[r.sourceId].needsReconnect) {
+    const flag = el('span', 'reconnect-flag', 'Reconnect');
+    flag.title = 'This account’s bridge login needs reconnecting — reopen its card in Settings to re-pair.';
+    row.appendChild(flag);
+  }
   const open = () => openConvo(r.id);                 // CV.2: native hub conversation view
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });

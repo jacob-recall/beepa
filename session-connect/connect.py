@@ -18,14 +18,12 @@ itself, and no password is ever entered or stored.
              X-LI-Page-Instance) that no cookie store holds; we synthesize
              them. If LinkedIn ever rejects that, the Hub's paste box is the
              fallback (Copy-as-cURL still works).
-  instagram  reads your instagram.com cookies and copies them to the clipboard.
-             The Meta bridge exposes no provisioning login for Instagram, so
-             this one stays a single paste: open the Hub's Instagram card ->
-             Connect -> Cmd-V -> Submit.
+  instagram  reads your instagram.com cookies (sessionid, csrftoken, ds_user_id,
+             mid) and submits them via the provisioning API of the mautrix-meta
+             `ig-` build. No paste — it connects directly, same as the others.
 
-The credential never touches a Matrix room on the provisioning path; it goes
-straight into the bridge. On the Instagram path it rides the Hub's existing
-paste flow, which sends into the verified management room and redacts it.
+The credential never touches a Matrix room: it goes straight into the bridge
+over the loopback docker network.
 """
 import base64
 import json
@@ -33,7 +31,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 
 import chrome_cookies as ck
 
@@ -51,12 +48,12 @@ NETWORKS = {
     "linkedin": dict(service="mautrix-linkedin", port=29319,
                      config="linkedin/config.yaml", flow="cookies",
                      domain="%linkedin.com"),
-    # instagram has flow=None: the Meta bridge exposes no provisioning login,
-    # so service/port/config are UNUSED here (api() is never called) — the path
-    # only reads cookies and hands them off. Do not rely on port/service below
-    # unless Instagram gains a real server-side flow.
+    # instagram: the ig- build of mautrix-meta (Meta split Instagram out in
+    # 2026) exposes a server-side cookies provisioning flow
+    # (sessionid/csrftoken/ds_user_id/mid) — same shape as twitter/linkedin,
+    # fully one-click, no mgmt-room paste.
     "instagram": dict(service="mautrix-meta", port=29319,
-                      config="meta/config.yaml", flow=None,
+                      config="meta/config.yaml", flow="instagram",
                       domain="%instagram.com"),
 }
 
@@ -156,30 +153,6 @@ def provisioning_login(name, net):
             "or use the Hub's paste fallback): %s" % resp[:400])
 
 
-def instagram_clipboard(net):
-    jar = ck.read(net["domain"])
-    if not jar.get("sessionid"):
-        die("no Instagram session found — sign into instagram.com in Chrome (Default profile) and re-run.")
-    blob = json.dumps(jar)
-    copied = False
-    try:
-        subprocess.run(["pbcopy"], input=blob.encode(), check=True)
-        copied = True
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    print("\nInstagram session captured (%d cookies)." % len(jar))
-    if copied:
-        print("It's on your clipboard. In the Hub: open the Instagram card ->")
-        print("Connect Instagram -> paste (Cmd-V) -> Submit.")
-    else:
-        # pbcopy unavailable: write to an atomically-created 0600 temp file
-        # (unguessable name) rather than echo the secret to the terminal.
-        fd, path = tempfile.mkstemp(prefix="instagram_session_", suffix=".json")
-        with os.fdopen(fd, "w") as fh:
-            fh.write(blob)
-        print("Clipboard unavailable — written to %s (delete it after pasting)." % path)
-
-
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in NETWORKS:
         die("usage: connect.py {%s}" % "|".join(NETWORKS))
@@ -187,10 +160,7 @@ def main():
     net = NETWORKS[name]
     print("- Reading your %s session from Chrome (approve the Keychain prompt if it appears)..." % name)
     try:
-        if net["flow"]:
-            provisioning_login(name, net)
-        else:
-            instagram_clipboard(net)
+        provisioning_login(name, net)
     except ck.CookieError as e:
         die(str(e))
 

@@ -294,7 +294,10 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
       return;
     }
   } catch (e) {
-    // Helper not running / unreachable — reveal the paste fallback.
+    // Helper not running / unreachable — put the bot in login mode FIRST (the
+    // mgmt-room login command must precede the pasted cookies, or the bot
+    // ignores them), then reveal the paste fallback.
+    if (loginCmd) { try { await sendCmd(net, loginCmd); } catch (_) {} }
     pasteEl.classList.remove('hidden');
     warnEl.textContent = 'One-click helper not reachable — paste your session below instead.';
     warnEl.classList.remove('hidden');
@@ -615,7 +618,7 @@ function buildConnections() {
   liConnect.style.width = 'auto';
   liConnect.addEventListener('click', () => runSessionConnect(
     'linkedin', 'https://www.linkedin.com/', liWarn, liPaste,
-    () => liPaste.classList.add('hidden')));
+    () => liPaste.classList.add('hidden'), 'login cookies'));
   liActions.appendChild(liConnect);
 
   const liDisc = el('button', 'danger', 'Disconnect');
@@ -720,7 +723,7 @@ function buildConnections() {
   twConnect.style.width = 'auto';
   twConnect.addEventListener('click', () => runSessionConnect(
     'twitter', 'https://x.com/', twWarn, twPaste,
-    () => twPaste.classList.add('hidden')));
+    () => twPaste.classList.add('hidden'), 'login cookies'));
   twActions.appendChild(twConnect);
 
   const twDisc = el('button', 'danger', 'Disconnect');

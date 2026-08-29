@@ -7,18 +7,12 @@ click: the browser cannot read Chrome's cookie store or `docker compose exec`
 the bridge, so this small local service does it on the browser's behalf. It is
 the exact shape and security posture of gmessages-connect/connect_server.py.
 
-Per network:
-  * twitter / linkedin — completed SERVER-SIDE via the bridge provisioning API.
-    The session is read, submitted, and discarded inside this process; nothing
-    but a generic status (+ the linked account localpart) is returned (F6).
-  * instagram — the Meta bridge exposes NO provisioning login (the 'instagram'
-    flow is 404), so it cannot be completed server-side. This endpoint returns
-    the IG cookie blob to the user's OWN Hub tab (loopback + origin-gated), which
-    submits it through the existing management-room paste path and redacts it —
-    the SAME credential the paste box already handles, minus the manual paste.
-    This is the one deliberate deviation from the gmessages helper's "cookies
-    never leave the process"; it is confined to Instagram and to the one allowed
-    loopback origin, and is documented as such.
+All three networks (twitter / linkedin / instagram) are completed SERVER-SIDE
+via the bridge provisioning API: the session is read, submitted, and discarded
+inside this process; nothing but a generic status (+ the linked account
+localpart) is returned (F6). Instagram uses the mautrix-meta `ig-` build, which
+exposes an `instagram` cookies flow (sessionid/csrftoken/ds_user_id/mid) just
+like the others — the session never leaves this process.
 
 Security invariants (do not weaken) — identical to gmessages-connect:
   * Binds EXACTLY 127.0.0.1:8021 — loopback only, never 0.0.0.0 / "".
@@ -29,9 +23,8 @@ Security invariants (do not weaken) — identical to gmessages-connect:
   * F5 — GET /connect/health has ZERO side effects and no CORS. No path reads
     cookies / Keychain / the bridge at import, start, on a timer, or from health
     — ONLY an authorized POST does.
-  * F6 — the provisioning shared_secret and raw bridge bodies are NEVER returned
-    or logged; failures map to fixed generic messages. (Instagram's cookie blob
-    is returned ONLY to the authorized loopback origin, by design, above.)
+  * F6 — the provisioning shared_secret, cookies, and raw bridge bodies are
+    NEVER returned or logged; failures map to fixed generic messages.
   * F2 — bridge-returned login_id/step_id are validated (connect.ID_RE) before
     being interpolated into a provisioning-API path.
 
@@ -153,12 +146,9 @@ def _make_handler():
             if not self._authorized():   # F1: gate BEFORE any side effect
                 return
             self._discard_body()
-            if name == "instagram":
-                self._start_instagram()
-            else:
-                self._start_provisioning(name)
+            self._start_provisioning(name)
 
-        # ---- twitter / linkedin: completed server-side ----
+        # ---- all networks: completed server-side via the provisioning API ----
         def _start_provisioning(self, name):
             net = connect.NETWORKS[name]
             try:
@@ -200,25 +190,6 @@ def _make_handler():
             else:
                 # session likely stale (re-sign-in) — never echo the raw body (F6)
                 self._json(200, {"status": "failed"}, cors=True)
-
-        # ---- instagram: hand the cookie blob to the user's own Hub tab ----
-        def _start_instagram(self):
-            net = connect.NETWORKS["instagram"]
-            try:
-                jar = connect.ck.read(net["domain"])
-            except connect.ck.CookieError:
-                self._json(400, {"error":
-                    "Instagram session not found — sign into instagram.com in Chrome and try again."},
-                    cors=True)
-                return
-            if not jar.get("sessionid"):
-                self._json(400, {"error":
-                    "Instagram session not found — sign into instagram.com in Chrome and try again."},
-                    cors=True)
-                return
-            # Returned ONLY to the authorized loopback origin; the browser submits
-            # it via the existing management-room paste path and redacts it.
-            self._json(200, {"status": "cookies", "cookies": json.dumps(jar)}, cors=True)
 
     return Handler
 

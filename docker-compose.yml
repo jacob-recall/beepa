@@ -51,9 +51,13 @@ services:
     # No host ports: appservice listens on the compose network only (29318).
 
   mautrix-meta:
-    # Instagram DM bridge — unified mautrix-meta; network is chosen at login
-    # (`login instagram`), not by config (no network.mode field). Pinned 2026-08-26.
-    image: dock.mau.dev/mautrix/meta:latest@sha256:61d684f9e385c6150cabe1a49555a409a97a154f2466b45626298de51f1c3f40
+    # Instagram DM bridge. Meta split Instagram out of the unified build (Jul
+    # 2026, after killing the old IG API), so the `:latest` build is Facebook/
+    # Messenger-only and REJECTS `login instagram`. This is the Instagram-
+    # specific `ig-` build (same codebase, built with build-ig.sh), which
+    # restores the Instagram login flow. Drop-in: Instagram-only, 0 prior logins.
+    # Pinned 2026-08-29.
+    image: dock.mau.dev/mautrix/meta:ig-v26.08@sha256:4b2704de94809351884da2640b1b1421920980a60269aa871fa870a8d50e7eb0
     restart: unless-stopped
     environment:
       UID: "501"

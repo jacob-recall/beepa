@@ -146,12 +146,13 @@
 #detail-admin .share-global-label .title { font-size: 15px; font-weight: 500; }
 #detail-admin .share-global-label .desc { display: none; }
 #detail-admin .share-source-row {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 12px;
   padding: 10px 0; border-bottom: 1px solid var(--color-divider);
 }
 #detail-admin .share-source-row:last-child { border-bottom: none; }
-#detail-admin .share-source-label { flex: 1; font-size: 14px; min-width: 100px; }
-#detail-admin .share-toggle { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+#detail-admin .share-source-label { flex: 1; font-size: 14px; min-width: 100px; display: flex; align-items: center; gap: 8px; }
+#detail-admin .share-source-label .plat-badge { width: 22px; height: 22px; border-radius: 6px; background-size: contain; }
+#detail-admin .share-source-row .share-slider { flex: 1; min-width: 140px; max-width: 220px; margin-left: auto; }
 #detail-admin .share-summary-list { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
 #detail-admin .share-summary-row {
   display: flex; align-items: center; gap: 8px; padding: 6px 0;

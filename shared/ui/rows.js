@@ -1,7 +1,6 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { feedHideRoom, feedIsHidden, feedUnhideRoom } from './account-data.js';
 import { openConvo } from './chat.js';
 import { $, el, sanitizeLine } from './el.js';
 import { feedRelTime } from './search.js';
@@ -45,20 +44,6 @@ function buildFeedRow(r) {
   if (r.lastTs) row.appendChild(el('span', 'when', feedRelTime(r.lastTs)));
   row.appendChild(buildPlatBadge(r.sourceId));
   const open = () => openConvo(r.id);                 // CV.2: native hub conversation view
-  // HF-9: per-row hide/unhide. A currently-hidden row (only reachable with
-  // "Show hidden" on) offers Unhide; otherwise Hide. textContent only, built
-  // with el(); the click acts on r.id (validated ∈ feedModel inside the handler)
-  // and never opens the conversation (stopPropagation).
-  const hidden = feedIsHidden(r.id);
-  const hideBtn = el('button', 'feed-hide', hidden ? 'Unhide' : 'Hide');
-  hideBtn.type = 'button';
-  hideBtn.setAttribute('aria-label', (hidden ? 'Unhide ' : 'Hide ') + name);
-  hideBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    if (hidden) feedUnhideRoom(r.id); else feedHideRoom(r.id);
-  });
-  hideBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') e.stopPropagation(); });
-  row.appendChild(hideBtn);
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   if (convoRowDecorator) convoRowDecorator(row, { id: r.id, sourceId: r.sourceId });

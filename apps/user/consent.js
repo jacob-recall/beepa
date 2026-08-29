@@ -91,47 +91,132 @@ function reasonText(r) {
   return r.reason === 'excluded' ? 'private (excluded)' : 'private';
 }
 
-// ---- per-row: effective-state badge + tri-state override toggle ----
+// ---- sliding tri-state control (kebab rows + per-source headers) ----
 
-function buildShareBadge(convo) {
-  const r = effectiveFor(convo);
-  return el('span', 'share-badge ' + (r.shared ? 'shared' : 'private'), reasonText(r));
-}
+const SHARE_CYCLE = [
+  { val: 'inherit', label: 'Auto', override: null },
+  { val: 'share', label: 'Share', override: 'share' },
+  { val: 'private', label: 'Private', override: 'private' },
+];
 
-function buildShareToggle(convo, badgeEl) {
-  const wrap = el('span', 'share-toggle');
-  const opts = [['share', 'Share'], ['inherit', 'Auto'], ['private', 'Private']];
-  const buttons = [];
+const SOURCE_POLICY_CYCLE = [
+  { val: 'inherit', label: 'Auto' },
+  { val: 'share-all', label: 'Share' },
+  { val: 'private-all', label: 'Private' },
+];
+
+function buildTriStateSlider(cycle, opts) {
+  const { ariaLabel, getIndex, onAdvance, getHint, hintShared } = opts;
+  const btn = el('button', 'share-slider');
+  btn.type = 'button';
+  btn.setAttribute('role', 'slider');
+  btn.setAttribute('aria-label', ariaLabel);
+
+  const track = el('span', 'share-slider-track');
+  track.appendChild(el('span', 'share-slider-thumb'));
+  const segs = el('span', 'share-slider-segs');
+  for (const o of cycle) segs.appendChild(el('span', 'share-slider-seg', o.label));
+  track.appendChild(segs);
+  btn.appendChild(track);
+
+  const hint = el('span', 'share-slider-hint');
+  btn.appendChild(hint);
+
   function refresh() {
-    const cur = overrides.get(convo.id) || 'inherit';
-    for (const [val, b] of buttons) b.classList.toggle('active', val === cur);
-    const r = effectiveFor(convo);
-    badgeEl.textContent = reasonText(r);
-    badgeEl.className = 'share-badge ' + (r.shared ? 'shared' : 'private');
+    const idx = getIndex();
+    track.style.setProperty('--idx', String(idx));
+    for (let i = 0; i < segs.children.length; i++) {
+      segs.children[i].classList.toggle('active', i === idx);
+    }
+    const hintText = getHint();
+    hint.textContent = hintText;
+    hint.classList.toggle('shared', hintShared ? hintShared() : false);
+    btn.setAttribute('aria-valuenow', String(idx));
+    btn.setAttribute('aria-valuetext', cycle[idx].label + (hintText ? ' — ' + hintText : ''));
   }
-  for (const [val, label] of opts) {
-    const b = el('button', 'share-opt', label);
-    b.type = 'button';
-    b.setAttribute('aria-label', label + ' ' + sanitizeLine(convo.title || convo.id));
-    b.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const state = val === 'inherit' ? null : val;
-      try {
-        await writeShareOverride(convo.id, state);
-        if (state) overrides.set(convo.id, state); else overrides.delete(convo.id);
-      } catch (err) { /* leave the row as-is on failure */ return; }
-      refresh();
-    });
-    buttons.push([val, b]);
-    wrap.appendChild(b);
-  }
+
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    // Pick the segment under the pointer directly — the old advance-by-one
+    // cycle made rapid clicks overshoot the intended state (pm_mng-7r6).
+    // The segs are pointer-events:none, so map the click X onto thirds of
+    // the track. Keyboard activation (detail === 0) keeps advance-by-one.
+    let next;
+    const rect = track.getBoundingClientRect();
+    if (e.detail > 0 && rect.width > 0) {
+      const frac = (e.clientX - rect.left) / rect.width;
+      next = Math.max(0, Math.min(cycle.length - 1, Math.floor(frac * cycle.length)));
+      if (next === getIndex()) return;                 // clicked the current state
+    } else {
+      next = (getIndex() + 1) % cycle.length;
+    }
+    try {
+      const ok = await onAdvance(cycle[next]);
+      if (ok === false) return;
+    } catch (err) { return; }
+    refresh();
+  });
+
   refresh();
-  return wrap;
+  return btn;
 }
 
-// Registered via setConvoRowDecorator (rows.js) / feed rows: appends the
-// badge + toggle to an already-built row, and swallows clicks so they never
-// open the conversation underneath.
+function shareCycleIndex(convo) {
+  const cur = overrides.get(convo.id) || 'inherit';
+  const idx = SHARE_CYCLE.findIndex((o) => o.val === cur);
+  return idx >= 0 ? idx : 0;
+}
+
+function buildShareSlider(convo) {
+  return buildTriStateSlider(SHARE_CYCLE, {
+    ariaLabel: 'Sharing for ' + sanitizeLine(convo.title || convo.id),
+    getIndex: () => shareCycleIndex(convo),
+    getHint: () => reasonText(effectiveFor(convo)),
+    hintShared: () => effectiveFor(convo).shared,
+    onAdvance: async (opt) => {
+      await writeShareOverride(convo.id, opt.override);
+      if (opt.override) overrides.set(convo.id, opt.override); else overrides.delete(convo.id);
+    },
+  });
+}
+
+function sourcePolicyIndex(sourceId) {
+  const cur = (policy.sources && policy.sources[sourceId]) || 'inherit';
+  const idx = SOURCE_POLICY_CYCLE.findIndex((o) => o.val === cur);
+  return idx >= 0 ? idx : 0;
+}
+
+function sourcePolicyHint(source) {
+  const cur = (policy.sources && policy.sources[source.id]) || 'inherit';
+  if (cur === 'share-all') return 'All ' + source.label + ' → manager';
+  if (cur === 'private-all') return 'All ' + source.label + ' private';
+  if (policy.global === 'share-all') return 'Following global (share all)';
+  return 'Following global (private)';
+}
+
+function sourcePolicyShared(source) {
+  const cur = (policy.sources && policy.sources[source.id]) || 'inherit';
+  if (cur === 'share-all') return true;
+  if (cur === 'private-all') return false;
+  return policy.global === 'share-all';
+}
+
+function buildSourcePolicySlider(source) {
+  return buildTriStateSlider(SOURCE_POLICY_CYCLE, {
+    ariaLabel: 'Sharing for all ' + source.label,
+    getIndex: () => sourcePolicyIndex(source.id),
+    getHint: () => sourcePolicyHint(source),
+    hintShared: () => sourcePolicyShared(source),
+    onAdvance: async (opt) => {
+      const sources = { ...(policy.sources || {}) };
+      if (opt.val === 'inherit') delete sources[source.id]; else sources[source.id] = opt.val;
+      policy = await writeSharePolicy({ ...policy, sources });
+      renderConsentSummary();
+    },
+  });
+}
+
+// Registered via setConvoRowDecorator (rows.js): kebab with sliding share control.
 function decorateRow(row, convo) {
   if (!convo || !convo.id) return;
   // Design 1a: sharing controls are NOT shown on every row; a kebab (⋯) on the
@@ -142,19 +227,16 @@ function decorateRow(row, convo) {
   kebab.title = 'Sharing';
   kebab.setAttribute('aria-label', 'Sharing controls');
   const menu = el('div', 'share-menu hidden');
-  const badge = buildShareBadge(convo);
-  menu.appendChild(badge);
-  menu.appendChild(buildShareToggle(convo, badge));
-  // Hide/Unhide, in the same kebab — only for Home-feed rows, where hiding is
-  // meaningful (feedModel.has is true for every Home row). Uses the existing
-  // feed-hide account-data mechanism.
+  menu.appendChild(buildShareSlider(convo));
+  // Hide/Unhide — only for Home-feed rows (feedModel.has is true for every Home row).
   if (feedModel.has(convo.id)) {
-    const hideBtn = el('button', 'share-hide', feedIsHidden(convo.id) ? 'Unhide' : 'Hide');
+    const hideBtn = el('button', 'share-menu-link', feedIsHidden(convo.id) ? 'Unhide conversation' : 'Hide conversation');
     hideBtn.type = 'button';
     hideBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (feedIsHidden(convo.id)) await feedUnhideRoom(convo.id);
       else await feedHideRoom(convo.id);
+      hideBtn.textContent = feedIsHidden(convo.id) ? 'Unhide conversation' : 'Hide conversation';
       menu.classList.add('hidden');
     });
     menu.appendChild(hideBtn);
@@ -212,32 +294,10 @@ function buildGlobalSwitch() {
 function buildSourceSwitchRow(source) {
   const row = el('div', 'share-source-row');
   const label = el('div', 'share-source-label');
-  label.appendChild(el('span', 'ic', source.icon || ''));
+  label.appendChild(el('span', 'plat-badge ' + source.id, ''));
   label.appendChild(document.createTextNode(' ' + source.label));
   row.appendChild(label);
-  const wrap = el('span', 'share-toggle');
-  const opts = [['share-all', 'Share all'], ['inherit', 'Auto'], ['private-all', 'Private all']];
-  const buttons = [];
-  function refresh() {
-    const cur = (policy.sources && policy.sources[source.id]) || 'inherit';
-    for (const [val, b] of buttons) b.classList.toggle('active', val === cur);
-  }
-  for (const [val, lbl] of opts) {
-    const b = el('button', 'share-opt', lbl);
-    b.type = 'button';
-    b.addEventListener('click', async () => {
-      const sources = { ...(policy.sources || {}) };
-      if (val === 'inherit') delete sources[source.id]; else sources[source.id] = val;
-      try { policy = await writeSharePolicy({ ...policy, sources }); }
-      catch (e) { return; }
-      refresh();
-      renderConsentSummary();
-    });
-    buttons.push([val, b]);
-    wrap.appendChild(b);
-  }
-  refresh();
-  row.appendChild(wrap);
+  row.appendChild(buildSourcePolicySlider(source));
   return row;
 }
 function buildSourceSwitches() {
@@ -255,7 +315,7 @@ function mountSourceSwitch(sourceId) {
   if (!host) return;
   const source = SOURCES.find((s) => s.id === sourceId);
   host.replaceChildren();
-  if (source) host.appendChild(buildSourceSwitchRow(source));
+  if (source) host.appendChild(buildSourcePolicySlider(source));
 }
 
 // ---- consent summary panel (§4.2): truthfully what the manager can see now ----
@@ -265,7 +325,8 @@ function renderConsentSummary() {
   if (!host) return;
   host.replaceChildren();
 
-  const results = resolveAll(allConvos(), policy, overrides, profileMap);
+  const convos = allConvos();
+  const results = resolveAll(convos, policy, overrides, profileMap);
   const shared = results.filter((r) => r.shared);
   const seen = loadSeen();
   // "Newly" = currently shared, not via an explicit per-conversation share (that
@@ -297,6 +358,41 @@ function renderConsentSummary() {
       list.appendChild(row);
     }
     host.appendChild(list);
+  }
+
+  // Explicit shares the uplink cannot honor (pm_mng-j92): the override points
+  // at a room that is not in any connected source's conversation list — e.g.
+  // a portal from a previous bridge login, or a community-space child. The
+  // uplink silently skips those, so without this box the share LOOKS
+  // successful while the manager never sees the conversation.
+  const knownIds = new Set(convos.map((c) => c.id));
+  const orphanShares = [...overrides.entries()]
+    .filter(([rid, st]) => st === 'share' && !knownIds.has(rid));
+  if (orphanShares.length) {
+    const box = el('div', 'share-newly-box');
+    box.appendChild(el('h3', '', 'Shared but not mirrorable'));
+    box.appendChild(el('p', 'muted',
+      'These are marked Share, but they no longer belong to any connected source '
+      + '(for example a chat from a previous bridge login). The manager does NOT '
+      + 'see them. Clear the stale share, or re-share the conversation from its '
+      + 'current entry in the chat list.'));
+    for (const [rid] of orphanShares) {
+      const row = el('div', 'share-summary-row');
+      row.appendChild(el('span', 'title', sanitizeLine(rid)));
+      row.appendChild(el('span', 'reason', 'no source'));
+      const btn = el('button', 'danger', 'Clear');
+      btn.type = 'button';
+      btn.addEventListener('click', async () => {
+        try {
+          await writeShareOverride(rid, null);
+          overrides.delete(rid);
+        } catch (e) { return; }
+        renderConsentSummary();
+      });
+      row.appendChild(btn);
+      box.appendChild(row);
+    }
+    host.appendChild(box);
   }
 
   if (newlyShared.length) {

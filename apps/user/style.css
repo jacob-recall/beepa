@@ -82,6 +82,8 @@
 #list-pane.hidden { display: none; }
 #list-head { flex: 0 0 auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
 #list-head .list-search { width: 100%; }
+#source-share-switch { width: 100%; }
+#source-share-switch .share-slider { width: 100%; }
 #list-head-actions { display: flex; gap: 8px; }
 #list-head-actions input { flex: 1; }
 /* Bridge invites the auto-join gate refused or deferred (apps/user/main.js). */

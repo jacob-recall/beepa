@@ -87,7 +87,8 @@ prompt) if you want to keep it one-shot.
 ## How to run / test
 
 ```bash
-# install + load the launchd service:
+# Normal path: ./setup.sh installs + loads this (and the IG/LI/X helper) for you.
+# Manual equivalent:
 cp gmessages-connect/com.jkali.gmessages-connect.plist ~/Library/LaunchAgents/
 launchctl unload ~/Library/LaunchAgents/com.jkali.gmessages-connect.plist 2>/dev/null
 launchctl load  ~/Library/LaunchAgents/com.jkali.gmessages-connect.plist

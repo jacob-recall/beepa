@@ -26,6 +26,7 @@ where a manager reads them and can leave reply *suggestions* — never send.
 | Synapse (master) | `127.0.0.1:8018` | compose project `matrix-master` (`master/`) |
 | Enroll/admin service | `127.0.0.1:8019` | `master/enroll.py serve` (launchd) — enrollment codes, add-teammate |
 | GMessages connect helper | `127.0.0.1:8020` | `gmessages-connect/connect_server.py` (launchd `com.jkali.gmessages-connect`) — one-click Google Messages login |
+| IG/LI/X connect helper | `127.0.0.1:8021` | `session-connect/connect_server.py` (launchd `com.jkali.session-connect`) — one-click Instagram / LinkedIn / X login |
 | iMessage daemon | `127.0.0.1:29350` | `imessage/daemon.py` (launchd appservice) |
 | Uplink daemon | no port (outbound-only) | `agents/uplink/uplink.py` (launchd) — mirrors consent-shared rooms up |
 | mautrix bridges ×5 | compose network only | whatsapp, meta (Instagram), linkedin, twitter, gmessages — no host ports |
@@ -33,6 +34,17 @@ where a manager reads them and can leave reply *suggestions* — never send.
 
 Matrix account: `@jkali:localhost` (password delivered once at setup — keep it
 in your password manager).
+
+## Setup (per machine)
+
+```sh
+./setup.sh    # brings up the stack + installs/loads the connect helpers (launchd)
+```
+
+One command, safe to re-run. It starts the local stack and turns on the
+one-click Connect helpers (Google Messages + Instagram/LinkedIn/X), so no
+per-login `launchctl` step is needed. Joining the manager's org is separate:
+`agents/uplink/link.sh <enroll-url> <code>`.
 
 ## Daily use
 

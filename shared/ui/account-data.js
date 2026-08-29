@@ -20,11 +20,12 @@ async function fetchSnapshot() {
     // Per-room account_data limited to m.tag (HF-9: read low-priority/archive
     // tags in the feed's own data path). Global account_data + presence stay
     // excluded; the sidebar parser ignores account_data, so this is additive.
-    // Timeline limit 20 (not 5): a room's last few timeline events can be
-    // non-message (space-child, membership, reactions), which feedLastPreview
-    // skips — too small a window left such rooms with a stale/zero lastTs and
-    // sank them in the time-ordered feed. 20 reliably reaches a real message.
-    room: { timeline: { limit: 20 }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
+    // Keep the per-room timeline window SMALL: the seed fetches every joined
+    // room, so a large window is expensive on big accounts (this drives the
+    // source-view load too, via refreshConvos). The last real message is
+    // normally within the last few events, and bridge-side message backfill —
+    // not a bigger window — is what fills empty rooms for correct ordering.
+    room: { timeline: { limit: 6 }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
     presence: { types: [] }, account_data: { types: [] },
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
@@ -354,7 +355,7 @@ async function startFeedSync() {
   while (S.feedRunning && S.token) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { timeline: { limit: 20 }, state: { types: [] } },
+        room: { timeline: { limit: 6 }, state: { types: [] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -380,7 +381,7 @@ async function startFeedRefresh() {
   if (feedRefreshRunning) return;
   feedRefreshRunning = true;
   while (feedRefreshRunning && S.token) {
-    await new Promise(r => setTimeout(r, 60000));
+    await new Promise(r => setTimeout(r, 180000));   // 3 min: seed re-reads ALL rooms, so keep it infrequent
     if (!S.token) { feedRefreshRunning = false; return; }
     try { await seedFeed(); scheduleFeedRender(); } catch (e) { /* keep current model */ }
   }

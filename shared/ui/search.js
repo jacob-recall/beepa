@@ -98,13 +98,19 @@ async function loadSourceList(sourceId) {
     search.value = '';
     search.placeholder = 'Search ' + (source ? source.label : 'conversations');
   }
-  list.replaceChildren();
-  list.appendChild(elEmpty('Loading…'));
-  try {
-    await refreshConvos();
-  } catch (e) {
-    list.replaceChildren(elEmpty('Could not load conversations: ' + String(e.message || e)));
-    return;
+  // Render from the in-memory cache (convosBySource, built once by the initial
+  // seed and kept fresh by the periodic re-seed + live feed sync) — NO per-click
+  // snapshot fetch, so switching sources is instant. Only fetch the one time the
+  // cache has never been built (a click before the first seed finished).
+  if (!convosBySource[sourceId]) {
+    list.replaceChildren();
+    list.appendChild(elEmpty('Loading…'));
+    try {
+      await refreshConvos();
+    } catch (e) {
+      list.replaceChildren(elEmpty('Could not load conversations: ' + String(e.message || e)));
+      return;
+    }
   }
   renderSourceList();
   if (feedRenderHook) feedRenderHook();

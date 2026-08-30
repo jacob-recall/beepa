@@ -47,6 +47,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 UPLINK_PY = os.path.join(REPO, "agents", "uplink", "uplink.py")
 
+# Scenario 12 seeds contacts.db directly through the real store module (same
+# way tests/unit/contacts_store.test.py imports it) rather than reimplementing
+# its schema here.
+sys.path.insert(0, os.path.join(REPO, "agents", "contacts"))
+import contacts_store  # noqa: E402
+
 TEST_HS = "http://127.0.0.1:8028"
 MASTER_HS = "http://127.0.0.1:8018"
 LOCAL_SERVER = "localhost"
@@ -386,6 +392,24 @@ def master_profile_tag(room_id, token=MASTER_ALICE_TOKEN):
                       + "/state/com.jkali.profile/")
     except MxError:
         return None
+
+
+def master_contact_states(room_id, token=MASTER_ALICE_TOKEN):
+    """{state_key: content} for every com.jkali.contact STATE event in a
+    master contacts room (Task 6's per-handle mirror, §12 phase 6)."""
+    r = master(token, "GET",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+              + "/state")
+    out = {}
+    for e in r:
+        if e.get("type") == "com.jkali.contact":
+            out[e.get("state_key")] = e.get("content") or {}
+    return out
+
+
+def contact_state_key(source, network_id):
+    """Byte-parity with uplink.py's _put_contact: state_key = sha1(source|network_id)."""
+    return hashlib.sha1((source + "|" + network_id).encode("utf-8")).hexdigest()
 
 
 def master_room_alive(room_id, token=MASTER_ALICE_TOKEN):
@@ -1453,6 +1477,191 @@ def scenario_11_profile_span_platforms():
     return ok, "; ".join(ev)
 
 
+def scenario_12_contact_share_and_propose():
+    """§12 phase 6: share one address-book contact up, group it with a mirrored
+    room under one person_id, then have the master submit a PERSON-TARGETED
+    proposal (identifier, not room) against that contact. Self-directed only —
+    the seeded, shared handle is the tester's OWN synthetic self-number, so
+    even if the approve->start-chat leg were driven for real it would message
+    no one but the tester (imsg-startchat SC.A). No real iMessage daemon runs
+    against this synthetic stack (docker-compose.test.yml is Synapse-only), so
+    that leg is asserted at the proposal-shape level here; SC.A's manual
+    self-test (PLAN-IMSG-STARTCHAT.md) is the real send-path acceptance check.
+
+    Assertions:
+      1. The self-number's com.jkali.contact state event lands in the master
+         contacts room carrying the SAME person_id as the profile's mirrored
+         room's com.jkali.profile stamp (cross-platform grouping, visible on
+         the master, by construction from one com.jkali.contact_profiles doc).
+      2. A second, NOT-shared contact (a different, unshared source) never
+         appears in the master contacts room at all.
+      3. The manager submits a person-targeted proposal (target_source +
+         target_identifier + target_display, NO target_room); exactly one
+         com.jkali.proposal with that shape lands in the teammate's dedicated
+         local proposals room.
+      4. The master has no send path: m.room.message into the proposals room
+         is rejected (403) and a static scan of apps/master/*.js (reusing
+         scenario 7's write-surface scanner) confirms no m.room.message send
+         and no 'start-chat' reference anywhere in the master app.
+    """
+    e = fresh_env("s12")
+    contacts_db_path = os.path.join(STATE_DIR, "contacts_s12.db")
+    if os.path.exists(contacts_db_path):
+        os.remove(contacts_db_path)
+
+    # Synthetic E.164 self-number + a second, DIFFERENT-source handle that
+    # stays unshared (contact-share policy below only share-alls imessage).
+    tag_n = int(time.time()) % 1000000
+    self_number = "+1555%07d" % tag_n
+    other_number = "+1555%07d" % ((tag_n + 1) % 10000000)
+
+    # 1a. Seed contacts.db directly (agents/contacts/contacts_store.py's real
+    # API) with the self-number contact PLUS a second, not-shared contact.
+    conn = contacts_store.open_store(contacts_db_path)
+    try:
+        contacts_store.upsert_contacts(conn, "imessage", [
+            {"network_id": self_number, "kind": "phone", "display_name": "Self (Tester)"},
+        ])
+        contacts_store.upsert_contacts(conn, "linkedin", [
+            {"network_id": other_number, "kind": "handle", "display_name": "Not Shared"},
+        ])
+    finally:
+        conn.close()
+
+    # 1b. Cross-platform profile (reuses scenario 11's shape): links the
+    # self-number iMessage handle AND an existing mirrored LinkedIn room under
+    # ONE person_id, set to share.
+    li_space = create_space(e["tuser_tok"], "LinkedIn")
+    li_room = make_convo(e, li_space, "Self Person (LinkedIn)")
+    post_msg(e["contact_tok"], li_room, "seed for s12 cross-platform profile")
+
+    prof_id = "cp_self_" + uniq("id")
+    prof_name = "Self Person"
+    set_profiles(e["tuser_tok"], e["tuser_id"], {"profiles": [{
+        "id": prof_id, "displayName": prof_name,
+        "roomIds": [li_room],
+        "handleIds": [{"source": "imessage", "network_id": self_number}],
+        "share": "share",
+    }]})
+
+    # 1c. Contact-share policy: share ALL imessage contacts. linkedin (the
+    # NOT-shared contact's source) has no rule and global stays 'private', so
+    # it never resolves shared (own dimension from conversation consent).
+    local(e["tuser_tok"], "PUT",
+          "/_matrix/client/v3/user/" + urllib.parse.quote(e["tuser_id"], safe="")
+          + "/account_data/com.jkali.contact_share_policy",
+          {"global": "private", "sources": {"imessage": "share-all"}})
+
+    proc = start_uplink(e, extra_env={"UPLINK_CONTACTS_DB": contacts_db_path})
+    ev = []
+    ok = True
+    try:
+        # -- assertion 1: self-number contact mirrors, person_id matches the
+        # profile's mirrored-room com.jkali.profile stamp.
+        mcr = wait_until(lambda: meta_get(e["db_path"], "master_contacts_room"),
+                         timeout=45, desc="s12 master contacts room")
+        li_row = wait_until(lambda: mirror_of(e["db_path"], li_room), timeout=45,
+                            desc="s12 li room mirror")
+        li_master = li_row[0]
+        li_tag = wait_until(lambda: master_profile_tag(li_master), timeout=30,
+                            desc="s12 li profile stamp")
+
+        self_key = contact_state_key("imessage", self_number)
+        self_contact = wait_until(lambda: master_contact_states(mcr).get(self_key),
+                                  timeout=45, desc="s12 self-number contact mirrored")
+
+        person_match = (self_contact.get("person_id") == prof_id
+                        and (li_tag or {}).get("id") == prof_id)
+        ev.append("self_contact_person_id=%s li_profile_id=%s want=%s"
+                  % (self_contact.get("person_id"), (li_tag or {}).get("id"), prof_id))
+        ok = ok and person_match
+
+        # -- assertion 2: the NOT-shared (linkedin-source) contact never appears.
+        time.sleep(4)  # let the reconcile pass consider (and skip) it
+        other_key = contact_state_key("linkedin", other_number)
+        other_present = other_key in master_contact_states(mcr)
+        ev.append("not_shared_contact_present=%s(want False)" % other_present)
+        ok = ok and not other_present
+
+        # -- assertion 3: person-targeted proposal, submitted by the master.
+        mpr = wait_until(lambda: meta_get(e["db_path"], "master_proposals_room"),
+                         timeout=45, desc="s12 master proposals room")
+        lpr = wait_until(lambda: meta_get(e["db_path"], "local_proposals_room"),
+                         timeout=45, desc="s12 local proposals room")
+        master(MASTER_MANAGER_TOKEN, "POST",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/join", {})
+
+        nonce = "pmmng-test-" + uniq("n")
+        prop_content = {
+            "target_source": "imessage",
+            "target_identifier": self_number,
+            "target_display": prof_name,
+            "body": nonce,
+            "created_by": MASTER_MANAGER_USER,
+            "origin_ts": int(time.time() * 1000),
+        }
+        master(MASTER_MANAGER_TOKEN, "PUT",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+              + "/send/com.jkali.proposal/" + uniq("prop"), prop_content)
+
+        got = wait_until(
+            lambda: [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                     if (p.get("content") or {}).get("body") == nonce] or None,
+            timeout=45, desc="s12 identifier proposal pulled down")
+        time.sleep(6)  # extra cycles must not duplicate it
+        final_local = [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                       if (p.get("content") or {}).get("body") == nonce]
+        once = len(final_local) == 1
+        ev.append("local_identifier_proposal_count=%d(want 1)" % len(final_local))
+        ok = ok and once
+
+        pc = (final_local[0].get("content") or {}) if final_local else {}
+        shape_ok = (pc.get("target_identifier") == self_number
+                   and pc.get("target_source") == "imessage"
+                   and "target_room" not in pc)
+        ev.append("identifier_shape_ok=%s target_identifier=%s has_target_room=%s"
+                  % (shape_ok, pc.get("target_identifier"), "target_room" in pc))
+        ok = ok and shape_ok
+
+        # It landed ONLY in the local proposals room: never a mirror room, the
+        # real conversation, or the contacts room (same isolation as scenario 10).
+        convo_props = local_events_of_type(e["tuser_tok"], li_room, "com.jkali.proposal")
+        isolated = not convo_props
+        ev.append("isolated(not_in_convo)=%s" % isolated)
+        ok = ok and isolated
+
+        # -- assertion 4: the master cannot send at all (defense in depth) and
+        # has no start-chat/m.room.message code path (static scan, reused from
+        # scenario 7). start-chat itself needs the teammate's LOCAL account,
+        # which the master never holds -> structurally unreachable from here.
+        msg_code = None
+        try:
+            master(MASTER_MANAGER_TOKEN, "PUT",
+                  "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+                  + "/send/m.room.message/" + uniq("mgrmsg12"),
+                  {"msgtype": "m.text", "body": "manager should not be able to message here"})
+            msg_code = 200  # must NOT happen
+        except MxError as e2:
+            msg_code = e2.code
+        ev.append("manager_msg_send=%s(want 403)" % msg_code)
+        ok = ok and msg_code == 403
+
+        scanned, has_msg_send, send_types, write_violations = scan_apps_master_write_surface()
+        no_send_path = scanned and not has_msg_send and not write_violations
+        # apps/master never even names 'start-chat' (that concept lives only on
+        # the teammate side, in apps/user/proposals.js + imessage/daemon.py).
+        master_files = glob.glob(os.path.join(REPO, "apps", "master", "*.js"))
+        no_startchat_ref = not any(
+            "start-chat" in open(f).read() for f in master_files)
+        ev.append("master_no_send_path=%s master_no_startchat_ref=%s"
+                  % (no_send_path, no_startchat_ref))
+        ok = ok and no_send_path and no_startchat_ref
+    finally:
+        stop_uplink(proc)
+
+    return ok, "; ".join(ev)
+
+
 # ------------------------------------------------------------------ docker helpers
 def docker(args, check=True):
     env = dict(os.environ)
@@ -1496,6 +1705,7 @@ SCENARIOS = [
     ("9_media_reupload", scenario_9_media_reupload),
     ("10_proposal_down", scenario_10_proposal_down),
     ("11_profile_span_platforms", scenario_11_profile_span_platforms),
+    ("12_contact_share_and_propose", scenario_12_contact_share_and_propose),
 ]
 
 

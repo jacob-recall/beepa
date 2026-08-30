@@ -58,6 +58,11 @@ const CONTACT_STATE_TYPE = 'com.jkali.contact';
 // target_room with ROOM_SHAPE_RE. The identifier is inert: the master only
 // records it in a com.jkali.proposal; the teammate's own guarded local send path
 // re-validates it before anything is ever sent.
+// Deliberately a LOCAL copy, NOT imported from shared/ui/sources.js: this app
+// must never import that module graph (it is import-chained to the send path —
+// see this file's header + apps/master/CLAUDE.md), so the master stays
+// send-incapable by absent code. A one-line regex duplicated here is the right
+// trade to preserve that invariant; do not "dedupe" it by importing sources.js.
 const E164_RE = /^\+[1-9]\d{6,14}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 

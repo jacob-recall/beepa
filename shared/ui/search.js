@@ -2,10 +2,9 @@
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
 import { feedIsHidden, refreshConvos } from './account-data.js';
-import { confirmModal, logConsole, setButtonsDisabled } from './connections.js';
 import { $, el, sanitizeLine } from './el.js';
 import { buildConvoRow, buildFeedRow, elEmpty } from './rows.js';
-import { SOURCES, sendCmd, validHandle } from './sources.js';
+import { SOURCES } from './sources.js';
 import { S, convosBySource, feedModel } from '../state.js';
 
 // Optional app-injected hook: called with the sourceId whenever the per-source
@@ -140,43 +139,7 @@ function renderSourceList() {
   for (const c of rows) list.appendChild(buildConvoRow(c, false));
 }
 
-// ---- Directory (P3.3): cross-source local filter + gated start-chat ----
-function buildDirectory() {
-  /* people-search wired in contacts.js initContactsUI */
-}
-// D-1/D-2: only a USER-TYPED handle, strictly validated, is ever sent; search
-// results are display-only and never become a destination handle.
-async function startChat(sourceId, input, msgInput) {
-  const source = SOURCES.find(s => s.id === sourceId);
-  if (!source || !source.canStartChat) return;     // capability gate
-  const h = (input.value || '').trim();
-  if (!validHandle(h)) {                            // UX pre-check; daemon re-validates
-    logConsole('error', source.label + ': enter a valid phone (+14155551234) or email address.');
-    return;
-  }
-  if (msgInput) {
-    // iMessage two-field form: a non-empty first message is required.
-    const message = (msgInput.value || '').trim();
-    if (!message) {
-      logConsole('error', source.label + ': enter a first message to start the chat.');
-      return;
-    }
-    // SC-P7: the confirm modal (el()/textContent) shows the EXACT handle and
-    // message that will be sent; validHandle already rejected control/bidi.
-    if (!(await confirmModal('Start ' + source.label + ' chat',
-      'Start a new ' + source.label + ' chat with ' + h + ' and send this first message:\n\n' + message,
-      false))) return;
-    await sendCmd(sourceId, 'start-chat ' + h + ' | ' + message);  // C-1 verifies mgmt room
-    input.value = '';
-    msgInput.value = '';
-    return;
-  }
-  // Single-field sources (e.g. WhatsApp): handle-only start-chat, unchanged.
-  if (!(await confirmModal('Start ' + source.label + ' chat',
-    'Start a new ' + source.label + ' chat with ' + h + '?', false))) return;
-  await sendCmd(sourceId, 'start-chat ' + h);      // C-1 verifies mgmt room before send
-  input.value = '';
-}
+// ---- Directory (P3.3): cross-source local filter ----
 function appendDirectoryRows(out, q) {
   let total = 0;
   for (const s of SOURCES) {
@@ -205,4 +168,4 @@ function renderPeople() {
   renderDirectory();
 }
 
-export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, buildDirectory, startChat, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook, setFeedRenderHook };
+export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook, setFeedRenderHook };

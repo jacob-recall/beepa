@@ -98,8 +98,6 @@ function platformRailClick(sourceId) {
   else openPlatformConnect(sourceId);
 }
 
-function listBody() { return $('list-body'); }
-
 function showListMode(show) {
   const lm = $('list-mode');
   if (lm) lm.classList.toggle('hidden', !show);
@@ -405,6 +403,6 @@ function wireTool(id, key) {
 export {
   showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
   setSharingViewHook, setProposalsViewHook, setContactsViewHook,
-  listBody, setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
+  setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
   refreshPlatformRail, openPlatformConnect,
 };

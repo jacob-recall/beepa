@@ -14,7 +14,7 @@ import { confirmModal, ensureConnections, ensureSettings, logConsole, setPlatfor
 import { $ } from '../../shared/ui/el.js';
 import { buildNav, navTo, refreshPlatformRail, showAuth } from '../../shared/ui/nav.js';
 import { setActiveConvoRow } from '../../shared/ui/rows.js';
-import { buildDirectory, renderHome, renderSourceList, setFeedRenderHook } from '../../shared/ui/search.js';
+import { renderHome, renderSourceList, setFeedRenderHook } from '../../shared/ui/search.js';
 import { GMSG, IG, LI, SOURCES, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
 import { S, convoNamePending, convoNames, convoSeen, feedManualHidden, feedModel, runtime } from '../../shared/state.js';
 
@@ -220,7 +220,6 @@ async function enterApp() {
   buildNav();
   setPlatformRailHook(refreshPlatformRail);
   setFeedRenderHook(refreshPlatformRail);
-  buildDirectory();
   ensureConnections();
   ensureSettings();
   try { await initConsentUI(); } catch (e) { /* share controls stay at safe defaults on error */ }

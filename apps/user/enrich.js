@@ -17,15 +17,12 @@
 
 import { readProfiles, writeProfiles, autoMergeByNumber } from '../../shared/model/contacts.js';
 import { convosBySource, feedModel } from '../../shared/state.js';
-import { SOURCES } from '../../shared/ui/sources.js';
+import { SOURCES, PHONE_RE } from '../../shared/ui/sources.js';
 import { sanitizeLine } from '../../shared/ui/el.js';
 
 // Same loopback helper + guarded headers the connect flows use.
 const SESSION_CONNECT_BASE = 'http://127.0.0.1:8021';
 const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
-
-// Strict E.164: leading +, non-zero country digit, 7..15 total digits.
-const E164_RE = /^\+[1-9]\d{6,14}$/;
 
 let mergeDone = false;        // becomes true after the ONE real pass (rooms present)
 let mergeAttempts = 0;        // retry budget while the feed is still seeding
@@ -83,7 +80,7 @@ async function autoMergeContacts() {
       if (!rec || typeof rec !== 'object') continue;
       if (rec.kind !== 'phone') continue;             // phones only (email excluded)
       const val = typeof rec.value === 'string' ? rec.value : '';
-      if (!E164_RE.test(val)) continue;               // validate before trusting
+      if (!PHONE_RE.test(val)) continue;               // validate before trusting
       roomNumbers[rid] = val;
     }
     if (!Object.keys(roomNumbers).length) return;

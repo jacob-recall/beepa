@@ -14,6 +14,15 @@ localpart) is returned (F6). Instagram uses the mautrix-meta `ig-` build, which
 exposes an `instagram` cookies flow (sessionid/csrftoken/ds_user_id/mid) just
 like the others — the session never leaves this process.
 
+Some logins need an extra INTERACTIVE step after the cookies (X's XChat
+passcode: the bridge returns type=user_input). The browser cannot be handed the
+session, but it CAN supply that one value: POST /connect/<net>/start returns
+{status:input_required, login_id, step_id, fields}, the Hub renders the field(s),
+and POST /connect/<net>/input submits them here. The value (a short passcode) is
+a credential: it rides browser -> loopback -> bridge only, and is never logged
+or returned (F6). login_id/step_id come from the bridge, are echoed by the
+browser, and are re-validated (connect.ID_RE) here before use (F2).
+
 Security invariants (do not weaken) — identical to gmessages-connect:
   * Binds EXACTLY 127.0.0.1:8021 — loopback only, never 0.0.0.0 / "".
   * F1 — every do_POST is gated by _authorized() BEFORE any side effect: (a)
@@ -23,10 +32,10 @@ Security invariants (do not weaken) — identical to gmessages-connect:
   * F5 — GET /connect/health has ZERO side effects and no CORS. No path reads
     cookies / Keychain / the bridge at import, start, on a timer, or from health
     — ONLY an authorized POST does.
-  * F6 — the provisioning shared_secret, cookies, and raw bridge bodies are
-    NEVER returned or logged; failures map to fixed generic messages.
+  * F6 — the provisioning shared_secret, cookies, passcodes, and raw bridge
+    bodies are NEVER returned or logged; failures map to fixed generic messages.
   * F2 — bridge-returned login_id/step_id are validated (connect.ID_RE) before
-    being interpolated into a provisioning-API path.
+    being interpolated into a provisioning-API path — on both /start and /input.
 
 Run:  python3 connect_server.py --host 127.0.0.1 --port 8021
 (usually via run-connect.sh under launchd — com.jkali.session-connect).
@@ -43,8 +52,9 @@ SERVER_NETWORKS = ("twitter", "linkedin", "instagram")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8021
+MAX_BODY = 64 * 1024  # /input bodies are tiny (a passcode); cap defensively.
 
-_PATH_RE = re.compile(r"^/connect/([a-z]+)/start$")
+_PATH_RE = re.compile(r"^/connect/([a-z]+)/(start|input)$")
 
 
 def _make_handler():
@@ -83,16 +93,39 @@ def _make_handler():
             self.end_headers()
             self.wfile.write(payload)
 
-        def _discard_body(self):
+        def _body_len(self):
             try:
-                n = int(self.headers.get("Content-Length") or "0")
+                return int(self.headers.get("Content-Length") or "0")
             except (TypeError, ValueError):
-                n = 0
-            if n > 0:
+                return 0
+
+        def _discard_body(self):
+            # Drain in bounded chunks (never allocate a caller-declared size) so
+            # an oversized Content-Length can't balloon this single-threaded
+            # server's memory before the connection is closed.
+            n = self._body_len()
+            while n > 0:
                 try:
-                    self.rfile.read(n)
+                    chunk = self.rfile.read(min(n, 65536))
                 except Exception:
-                    pass
+                    break
+                if not chunk:
+                    break
+                n -= len(chunk)
+
+        def _read_json_body(self):
+            """Read and parse a small JSON body; drain and return None on any
+            problem (oversized, malformed, not an object). Never logged."""
+            n = self._body_len()
+            if n <= 0 or n > MAX_BODY:
+                self._discard_body()
+                return None
+            try:
+                raw = self.rfile.read(n)
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return None
+            return obj if isinstance(obj, dict) else None
 
         # ---- F1: authorization gate, run at the TOP of every do_POST ----
         def _authorized(self):
@@ -108,14 +141,16 @@ def _make_handler():
                 return False
             return True
 
-        def _network(self):
+        def _route(self):
+            """(network, verb) for a valid /connect/<net>/(start|input) path,
+            else (None, None)."""
             m = _PATH_RE.match(self.path)
             if m and m.group(1) in SERVER_NETWORKS:
-                return m.group(1)
-            return None
+                return m.group(1), m.group(2)
+            return None, None
 
         def do_OPTIONS(self):
-            if self._origin() is not None and self._network() is not None:
+            if self._origin() is not None and self._route()[0] is not None:
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -139,16 +174,54 @@ def _make_handler():
 
         def do_POST(self):
             self._diag(-1)
-            name = self._network()
+            name, verb = self._route()
             if name is None:
                 self._json(404, {"error": "not found"})
                 return
             if not self._authorized():   # F1: gate BEFORE any side effect
                 return
-            self._discard_body()
-            self._start_provisioning(name)
+            if verb == "input":
+                body = self._read_json_body()   # reads + drains the body itself
+                self._submit_input(name, body)
+            else:
+                self._discard_body()
+                self._start_provisioning(name)
 
-        # ---- all networks: completed server-side via the provisioning API ----
+        # ---- turn a bridge step response into what the browser gets back ----
+        # complete -> {status:complete, account}; user_input -> {status:
+        # input_required, login_id, step_id, fields}; anything else -> failed.
+        # Never echoes the raw bridge body (F6); validates ids (F2).
+        def _finish(self, resp):
+            try:
+                data = json.loads(resp)
+            except (ValueError, TypeError):
+                self._json(200, {"status": "failed"}, cors=True); return
+            if data.get("type") == "complete":
+                who = re.search(r'"user_login_id":"([^"]+)"', resp)
+                account = who.group(1).split("/")[0] if who else ""
+                self._json(200, {"status": "complete", "account": account}, cors=True)
+                return
+            if data.get("type") == "user_input":
+                lid, step = data.get("login_id"), data.get("step_id")
+                if not lid or not step or not connect.ID_RE.match(lid) or not connect.ID_RE.match(step):
+                    self._json(200, {"status": "failed"}, cors=True); return
+                fields = []
+                for f in (data.get("user_input") or {}).get("fields", []):
+                    if not isinstance(f, dict) or not f.get("id"):
+                        continue
+                    fields.append({"id": str(f.get("id")),
+                                   "name": str(f.get("name") or f.get("id")),
+                                   "type": str(f.get("type") or "text"),
+                                   "description": str(f.get("description") or "")})
+                self._json(200, {"status": "input_required", "login_id": lid,
+                                 "step_id": step,
+                                 "instructions": str(data.get("instructions") or ""),
+                                 "fields": fields}, cors=True)
+                return
+            # session likely stale (re-sign-in) — never echo the raw body (F6)
+            self._json(200, {"status": "failed"}, cors=True)
+
+        # ---- all networks: read cookies, submit them, hand back the outcome ----
         def _start_provisioning(self, name):
             net = connect.NETWORKS[name]
             try:
@@ -183,13 +256,32 @@ def _make_handler():
             except BaseException:
                 self._json(502, {"error": "Could not complete login."}, cors=True)
                 return
-            if '"type":"complete"' in resp or '"complete"' in resp:
-                who = re.search(r'"user_login_id":"([^"]+)"', resp)
-                account = who.group(1).split("/")[0] if who else ""
-                self._json(200, {"status": "complete", "account": account}, cors=True)
-            else:
-                # session likely stale (re-sign-in) — never echo the raw body (F6)
-                self._json(200, {"status": "failed"}, cors=True)
+            self._finish(resp)
+
+        # ---- submit one interactive step (e.g. X's XChat passcode) ----
+        def _submit_input(self, name, body):
+            net = connect.NETWORKS[name]
+            lid = (body or {}).get("login_id")
+            step = (body or {}).get("step_id")
+            values = (body or {}).get("values")
+            if (not lid or not step or not isinstance(values, dict)
+                    or not connect.ID_RE.match(str(lid)) or not connect.ID_RE.match(str(step))):
+                self._json(400, {"error": "Could not complete login."}, cors=True)
+                return
+            # Coerce to a flat {str: str} map; the passcode value is never logged.
+            payload = {str(k): str(v) for k, v in values.items()}
+            try:
+                secret = connect.shared_secret(net["config"])
+            except SystemExit:
+                self._json(500, {"error": "Could not complete login."}, cors=True)
+                return
+            try:
+                resp = connect.api(net, "/login/step/%s/%s/user_input" % (lid, step),
+                                   secret, body=payload)
+            except BaseException:
+                self._json(502, {"error": "Could not complete login."}, cors=True)
+                return
+            self._finish(resp)
 
     return Handler
 

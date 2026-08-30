@@ -5,9 +5,10 @@ no DevTools, no "Copy as cURL".
 
 Usage:  python3 session-connect/connect.py {twitter|linkedin|instagram}
 
-Prereq: you're signed into the site in Chrome (the Default profile). Whatever
-account is logged in there is the one captured — you never log in from the Hub
-itself, and no password is ever entered or stored.
+Prereq: you're signed into the site in Chrome (any profile — every profile's
+cookie store is scanned and the one holding the logged-in session wins).
+Whatever account is logged in is the one captured — you never log in from the
+Hub itself, and no password is ever entered or stored.
 
   twitter    reads x.com cookies (ct0, auth_token) and submits them to the
              bridge's provisioning API over the loopback docker network. No
@@ -26,6 +27,7 @@ The credential never touches a Matrix room: it goes straight into the bridge
 over the loopback docker network.
 """
 import base64
+import getpass
 import json
 import os
 import re
@@ -39,22 +41,30 @@ USER_ID = "@jkali:localhost"
 # Bridge-supplied ids get interpolated into a `sh -c` string; allow only the
 # characters real login_id/step_id values use (alnum, dot, dash, underscore),
 # so a hostile/garbled bridge response can never break out with a quote.
-ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# `\Z` (not `$`) so a trailing newline can't sneak through an id that gets
+# interpolated into the provisioning-API path.
+ID_RE = re.compile(r"^[A-Za-z0-9._-]+\Z")
 
+# `domain` is the EXACT site host (matched as itself plus its subdomains, never
+# as a bare "...x.com" suffix — so netflix.com/dropbox.com can't leak into the
+# x.com jar). `signal` is the cookie that marks a logged-in session there; it
+# tells the multi-profile cookie reader which Chrome profile holds the real
+# login (the user may be signed in under Default or "Profile N"). See
+# chrome_cookies.read().
 NETWORKS = {
     "twitter": dict(service="mautrix-twitter", port=29327,
                     config="twitter/config.yaml", flow="cookies",
-                    domain="%x.com"),
+                    domain="x.com", signal="auth_token"),
     "linkedin": dict(service="mautrix-linkedin", port=29319,
                      config="linkedin/config.yaml", flow="cookies",
-                     domain="%linkedin.com"),
+                     domain="linkedin.com", signal="li_at"),
     # instagram: the ig- build of mautrix-meta (Meta split Instagram out in
     # 2026) exposes a server-side cookies provisioning flow
     # (sessionid/csrftoken/ds_user_id/mid) — same shape as twitter/linkedin,
     # fully one-click, no mgmt-room paste.
     "instagram": dict(service="mautrix-meta", port=29319,
                       config="meta/config.yaml", flow="instagram",
-                      domain="%instagram.com"),
+                      domain="instagram.com", signal="sessionid"),
 }
 
 
@@ -108,9 +118,9 @@ def synth_header(header, jar):
 
 
 def resolve_fields(name, net, fields):
-    jar = ck.read(net["domain"])
+    jar = ck.read(net["domain"], prefer=net.get("signal"))
     if not jar:
-        die("no %s cookies found — sign into the site in Chrome (Default profile) and re-run." % name)
+        die("no %s cookies found — sign into the site in Chrome and re-run." % name)
     values = {}
     for f in fields:
         fid = f.get("id")
@@ -144,7 +154,31 @@ def provisioning_login(name, net):
     print("  bridge asked for: %s" % ", ".join(f.get("id", "?") for f in fields))
     values = resolve_fields(name, net, fields)
     resp = api(net, "/login/step/%s/%s/cookies" % (lid, step), secret, body=values)
-    if '"type":"complete"' in resp or '"complete"' in resp:
+    try:
+        data = json.loads(resp)
+    except ValueError:
+        die("the bridge did not accept the session (it may be stale — re-sign-in "
+            "and re-run): %s" % resp[:400])
+
+    # Some networks (X's XChat passcode) need extra interactive steps after the
+    # cookies. Loop until the bridge says complete or gives up. In the terminal
+    # the value is read with getpass (never echoed); the Hub asks in its own UI.
+    while data.get("type") == "user_input":
+        lid, step = data.get("login_id"), data.get("step_id")
+        if not lid or not step or not ID_RE.match(lid) or not ID_RE.match(step):
+            die("unexpected login step: %s" % resp[:300])
+        if data.get("instructions"):
+            print("\n%s" % data["instructions"])
+        body = {}
+        for f in (data.get("user_input") or {}).get("fields", []):
+            body[f["id"]] = getpass.getpass("%s: " % (f.get("name") or f.get("id")))
+        resp = api(net, "/login/step/%s/%s/user_input" % (lid, step), secret, body=body)
+        try:
+            data = json.loads(resp)
+        except ValueError:
+            die("unexpected login step: %s" % resp[:300])
+
+    if data.get("type") == "complete":
         who = re.search(r'"user_login_id":"([^"]+)"', resp)
         tag = " as " + who.group(1).split("/")[0] if who else ""
         print("\nConnected%s. Your chats will sync into the %s space shortly." % (tag, name))

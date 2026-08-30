@@ -424,11 +424,13 @@ function promptSessionInput(net, start, warnEl, onDone) {
     label.style.cssText = 'display:block;margin-top:6px;';
     const inp = el('input');
     const kind = (String(f.type || '') + ' ' + String(f.id || '')).toLowerCase();
-    const isSecret = /code|pin|pass|otp|2fa/.test(kind);
-    inp.type = isSecret ? 'password' : 'text';
+    // Every field in a bridge login step is a credential, so mask by default;
+    // only obviously-plain identifiers get a visible text box.
+    const isPlain = /^(text|email|username|user|phone|tel|url|name)$/.test(String(f.type || '').toLowerCase());
+    inp.type = isPlain ? 'text' : 'password';
     inp.autocomplete = 'off';
     inp.spellcheck = false;
-    if (isSecret) inp.inputMode = 'numeric';
+    if (/code|pin|otp|2fa/.test(kind)) inp.inputMode = 'numeric';
     inp.style.cssText = 'width:100%;box-sizing:border-box;margin-top:4px;';
     label.appendChild(inp);
     box.appendChild(label);

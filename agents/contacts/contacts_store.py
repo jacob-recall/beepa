@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS import_meta (key TEXT PRIMARY KEY, value TEXT);
 def open_store(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    # contacts.db is written by both this store's callers and the uplink
+    # process; serialize concurrent writers instead of raising "database
+    # is locked".
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
     conn.commit()
     os.chmod(path, 0o600)

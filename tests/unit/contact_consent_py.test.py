@@ -9,4 +9,8 @@ eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"
 eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"global":"share-all","sources":{"imessage":"private-all"}})), {"shared":False,"reason":"private"}, "src-private")
 eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"global":"private","sources":{"imessage":"share-all"}})), {"shared":True,"reason":"all imessage contacts"}, "src-share")
 eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"global":"yolo"})), {"shared":False,"reason":"private"}, "garbage")
+# array-shaped sources must be rejected like no sources (parity with JS !Array.isArray guard)
+eq(consent.normalize_contact_policy({"global":"private","sources":["share-all","private-all"]}), {"global":"private","sources":{}}, "array sources -> {}")
+eq(consent.normalize_contact_policy({"global":"private","sources":["share-all","private-all"]}), consent.normalize_contact_policy({"global":"private"}), "array sources same as no sources")
+eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"global":"private","sources":["share-all"]})), {"shared":False,"reason":"private"}, "array sources resolves like empty -> private")
 print("ok contact_consent_py")

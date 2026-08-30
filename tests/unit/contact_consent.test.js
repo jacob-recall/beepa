@@ -11,4 +11,9 @@ eq(resolveContactShare('imessage', normalizeContactPolicy({global:'share-all', s
 eq(resolveContactShare('imessage', normalizeContactPolicy({global:'private', sources:{imessage:'share-all'}})), {shared:true, reason:'all imessage contacts'}, 'src-share wins');
 // garbage collapses to safe default
 eq(resolveContactShare('imessage', normalizeContactPolicy({global:'yolo', sources:{imessage:'maybe'}})), {shared:false, reason:'private'}, 'garbage safe');
+// array-shaped sources (typeof 'object' in JS) must be rejected like no sources,
+// not walked as {'0':..,'1':..} — matches Python's isinstance(dict). Parity guard.
+eq(normalizeContactPolicy({global:'private', sources:['share-all','private-all']}), {global:'private', sources:{}}, 'array sources -> {}');
+eq(normalizeContactPolicy({global:'private', sources:['share-all','private-all']}), normalizeContactPolicy({global:'private'}), 'array sources same as no sources');
+eq(resolveContactShare('imessage', normalizeContactPolicy({global:'private', sources:['share-all']})), {shared:false, reason:'private'}, 'array sources resolves like empty -> private');
 console.log('ok contact_consent');

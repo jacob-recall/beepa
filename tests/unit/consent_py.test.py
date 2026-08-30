@@ -139,6 +139,21 @@ eq(normalize_policy({"global": "bogus", "sources": {}}), {"global": "private", "
 eq(normalize_policy({"global": "private", "sources": {"a": "share-all", "b": "private-all", "c": "inherit", "d": "junk", "e": 123}}),
    {"global": "private", "sources": {"a": "share-all", "b": "private-all"}}, "normalizePolicy: drops inherit/junk")
 eq(normalize_policy({"global": "share-all", "sources": None}), {"global": "share-all", "sources": {}}, "normalizePolicy: null sources -> {}")
+# An ARRAY sources must be rejected like a missing one (parity with JS, which
+# now guards with !Array.isArray so it can't walk it as {'0':..,'1':..}).
+eq(normalize_policy({"global": "private", "sources": ["share-all", "private-all"]}),
+   {"global": "private", "sources": {}}, "normalizePolicy: array sources -> {} (same as no sources)")
+eq(normalize_policy({"global": "private", "sources": ["share-all", "private-all"]}),
+   normalize_policy({"global": "private", "sources": {}}),
+   "normalizePolicy: array sources resolves identically to empty sources")
+
+# Array-shaped `sources` resolves the same as no sources (fall through to global).
+_arr_policy = {"global": "private", "sources": ["share-all", "private-all"]}
+eq(resolve(convo("imessage", "iMessage"), _arr_policy, None),
+   {"shared": False, "reason": "private"}, "resolve: array sources -> private (same as empty)")
+eq(resolve(convo("imessage", "iMessage"), _arr_policy, None),
+   resolve(convo("imessage", "iMessage"), {"global": "private", "sources": {}}, None),
+   "resolve: array sources resolves identically to empty sources")
 
 # normalize_override
 eq(normalize_override(None), None, "normalizeOverride: None")

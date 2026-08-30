@@ -193,6 +193,26 @@ function convo(sourceId, sourceLabel) {
     { global: 'private', sources: { a: 'share-all', b: 'private-all' } },
     'normalizePolicy: drops inherit/junk/non-string source states');
   eq(normalizePolicy({ global: 'share-all', sources: null }), { global: 'share-all', sources: {} }, 'normalizePolicy: null sources -> {}');
+  // An ARRAY sources (typeof 'object' in JS) must be rejected like a missing
+  // one, not walked as {'0':..,'1':..} — matches Python's isinstance(dict).
+  eq(normalizePolicy({ global: 'private', sources: ['share-all', 'private-all'] }),
+    { global: 'private', sources: {} }, 'normalizePolicy: array sources -> {} (same as no sources)');
+  eq(normalizePolicy({ global: 'private', sources: ['share-all', 'private-all'] }),
+    normalizePolicy({ global: 'private', sources: {} }),
+    'normalizePolicy: array sources resolves identically to empty sources');
+}
+
+// ---------------------------------------------------------------------------
+// Array-shaped `sources` resolves the same as no sources (both -> fall through
+// to global). Guards the JS↔Python parity fix (arrays are typeof 'object').
+// ---------------------------------------------------------------------------
+{
+  const arrPolicy = { global: 'private', sources: ['share-all', 'private-all'] };
+  eq(resolve(convo('imessage', 'iMessage'), arrPolicy, undefined),
+    { shared: false, reason: 'private' }, 'resolve: array sources -> private (same as empty)');
+  eq(resolve(convo('imessage', 'iMessage'), arrPolicy, undefined),
+    resolve(convo('imessage', 'iMessage'), { global: 'private', sources: {} }, undefined),
+    'resolve: array sources resolves identically to empty sources');
 }
 
 // ---------------------------------------------------------------------------

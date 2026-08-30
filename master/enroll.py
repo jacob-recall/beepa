@@ -330,7 +330,11 @@ def _require_manager(token):
     if who is None:
         raise HttpError(401, "invalid or expired token")
     manager = _manager_mxid()
-    if who != manager or who != "@manager:master":
+    # Accept ONLY the one configured manager mxid; reject every other caller.
+    # (Was `who != manager or who != "@manager:master"` — a tautology that is
+    # true for every `who`, so it rejected everyone once the manager was renamed
+    # and only ever "worked" by the default naming coincidence. AUDIT F4.)
+    if who != manager:
         raise HttpError(403, "not authorized: caller is not the manager")
     return manager
 

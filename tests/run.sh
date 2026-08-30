@@ -15,6 +15,7 @@ python3 tests/unit/contacts_store.test.py
 python3 tests/unit/import_macos.test.py
 python3 tests/unit/contact_consent_py.test.py
 python3 tests/unit/uplink_reconcile.test.py
+python3 tests/unit/enroll_require_manager.test.py
 python3 tests/unit/uplink_proposal_sanitize.test.py
 python3 tests/unit/number_resolver.test.py
 python3 tests/unit/consent_py.test.py

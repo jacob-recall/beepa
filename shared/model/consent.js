@@ -126,7 +126,7 @@ function resolveAll(convos, policy, overrides, profiles) {
 // kept; 'inherit' is dropped (absent == inherit), and anything unrecognized is
 // discarded rather than trusted.
 function normalizePolicy(p) {
-  const src = (p && p.sources && typeof p.sources === 'object') ? p.sources : {};
+  const src = (p && p.sources && typeof p.sources === 'object' && !Array.isArray(p.sources)) ? p.sources : {};
   const global = (p && GLOBAL_STATES.has(p.global) && p.global === 'share-all') ? 'share-all' : 'private';
   const sources = {};
   for (const k of Object.keys(src)) {
@@ -180,15 +180,6 @@ async function writeSharePolicy(policy) {
   return body;
 }
 
-// Read one room's override. Absent -> null (inherit).
-async function readShareOverride(roomId) {
-  try {
-    return normalizeOverride(await api('GET', overridePath(roomId)));
-  } catch (e) {
-    return null;
-  }
-}
-
 // Write one room's override. state 'share'|'private' sets it; anything else
 // (including null/'inherit') clears it back to inherit (an empty content event,
 // since account-data cannot be deleted). Returns the normalized state or null.
@@ -235,7 +226,7 @@ const CONTACT_SOURCE_STATES = new Set(['share-all', 'private-all', 'inherit']);
 // Unknown global -> 'private' (safe default). Only recognized source states are
 // kept; 'inherit' (source omitted == inherit) and anything unrecognized are dropped.
 function normalizeContactPolicy(raw) {
-  const src = (raw && raw.sources && typeof raw.sources === 'object') ? raw.sources : {};
+  const src = (raw && raw.sources && typeof raw.sources === 'object' && !Array.isArray(raw.sources)) ? raw.sources : {};
   const global = (raw && CONTACT_GLOBAL_STATES.has(raw.global) && raw.global === 'share-all') ? 'share-all' : 'private';
   const sources = {};
   for (const k of Object.keys(src)) {
@@ -279,7 +270,7 @@ export {
   resolve, effectiveShared, resolveAll,
   normalizePolicy, normalizeOverride,
   readSharePolicy, writeSharePolicy,
-  readShareOverride, writeShareOverride,
+  writeShareOverride,
   overridesFromSync,
   CONTACT_SHARE_POLICY_TYPE,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,

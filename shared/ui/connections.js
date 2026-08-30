@@ -319,6 +319,18 @@ async function runGmessagesConnect(btn, out, fallback) {
 const SESSION_CONNECT_BASE = 'http://127.0.0.1:8021';
 const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
 
+// Degrade to the paste flow: arm the bot's login mode FIRST (the mgmt-room
+// login command must precede the pasted cookies, or the bot ignores them),
+// then reveal the paste fallback and show `msg`. Shared by both failure
+// paths below — an unreachable helper (catch) and a helper-side HTTP error
+// (!r.ok) — so a paste afterward is never silently ignored in either case.
+async function revealPasteFallback(net, pasteEl, loginCmd, warnEl, msg) {
+  if (loginCmd) { try { await sendCmd(net, loginCmd); } catch (_) {} }
+  pasteEl.classList.remove('hidden');
+  warnEl.textContent = msg;
+  warnEl.classList.remove('hidden');
+}
+
 async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd) {
   if (S.busy) return;
   setSourcePhase(net, 'connecting');               // #3: immediate "Connecting…" feedback
@@ -332,21 +344,20 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
       { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
     start = await r.json().catch(() => ({}));
     if (!r.ok) {
-      warnEl.textContent = /session not found/i.test(String(start && start.error || ''))
-        ? 'Finish signing in on the tab that opened, then click Connect again.'
-        : (sanitizeLine(String(start && start.error || '')) || 'Could not connect.');
-      warnEl.classList.remove('hidden');
+      // Helper responded with an error — degrade to the paste flow exactly
+      // like an unreachable helper does, so a subsequently pasted session
+      // isn't silently ignored (the bot must be armed for login first).
+      const msg = /session not found/i.test(String(start && start.error || ''))
+        ? 'Finish signing in on the tab that opened, then click Connect again — or paste your session below.'
+        : (sanitizeLine(String(start && start.error || '')) || 'Could not connect — paste your session below instead.');
+      await revealPasteFallback(net, pasteEl, loginCmd, warnEl, msg);
       setSourcePhase(net, null);
       return;
     }
   } catch (e) {
-    // Helper not running / unreachable — put the bot in login mode FIRST (the
-    // mgmt-room login command must precede the pasted cookies, or the bot
-    // ignores them), then reveal the paste fallback.
-    if (loginCmd) { try { await sendCmd(net, loginCmd); } catch (_) {} }
-    pasteEl.classList.remove('hidden');
-    warnEl.textContent = 'One-click helper not reachable — paste your session below instead.';
-    warnEl.classList.remove('hidden');
+    // Helper not running / unreachable — same degrade-to-paste path.
+    await revealPasteFallback(net, pasteEl, loginCmd, warnEl,
+      'One-click helper not reachable — paste your session below instead.');
     setSourcePhase(net, null);
     return;
   }

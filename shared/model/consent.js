@@ -217,6 +217,63 @@ function overridesFromSync(syncData) {
   return out;
 }
 
+// ===========================================================================
+// CONTACT-SHARE — a SEPARATE consent dimension from conversation sharing above.
+// Decides whether a teammate's address-book contacts (per source) leave their
+// machine for the manager. Same shape/precedence philosophy as the conversation
+// resolver, but its own policy, its own account-data key, and its own default:
+// PRIVATE (absent policy => not shared). MUST stay byte-parity with
+// agents/uplink/consent.py's resolve_contact_share/normalize_contact_policy.
+// ===========================================================================
+
+const CONTACT_SHARE_POLICY_TYPE = 'com.jkali.contact_share_policy'; // global user account-data
+const CONTACT_GLOBAL_STATES = new Set(['share-all', 'private']);
+const CONTACT_SOURCE_STATES = new Set(['share-all', 'private-all', 'inherit']);
+
+// Coerce a stored/incoming contact-share policy into the known-safe shape
+// { global: 'share-all'|'private', sources: { <source>: 'share-all'|'private-all' } }.
+// Unknown global -> 'private' (safe default). Only recognized source states are
+// kept; 'inherit' (source omitted == inherit) and anything unrecognized are dropped.
+function normalizeContactPolicy(raw) {
+  const src = (raw && raw.sources && typeof raw.sources === 'object') ? raw.sources : {};
+  const global = (raw && CONTACT_GLOBAL_STATES.has(raw.global) && raw.global === 'share-all') ? 'share-all' : 'private';
+  const sources = {};
+  for (const k of Object.keys(src)) {
+    const v = src[k];
+    if (v === 'share-all' || v === 'private-all') sources[k] = v; // drop 'inherit'/junk
+  }
+  return { global, sources };
+}
+
+// Resolve whether a given source's contacts are shared AND the reason.
+//   source : the source id (e.g. 'imessage')
+//   policy : a normalized contact policy (from normalizeContactPolicy)
+// Precedence (most-specific-wins), mirroring resolve() above:
+//   1. per-source 'share-all'   -> shared,     reason 'all <source> contacts'
+//   2. per-source 'private-all' -> not shared, reason 'private'
+//   3. global 'share-all'       -> shared,     reason 'all contacts'
+//   4. safe default             -> not shared, reason 'private'
+function resolveContactShare(source, policy) {
+  const pol = policy || {};
+  const sources = (pol.sources && typeof pol.sources === 'object') ? pol.sources : {};
+
+  const src = source ? sources[source] : undefined;
+  if (src === 'share-all') return { shared: true, reason: 'all ' + source + ' contacts' };
+  if (src === 'private-all') return { shared: false, reason: 'private' };
+  // (src === 'inherit' or absent -> fall through to global)
+
+  if (pol.global === 'share-all') return { shared: true, reason: 'all contacts' };
+
+  return { shared: false, reason: 'private' };
+}
+
+// Account-data path for the global contact-share policy on the LOCAL homeserver.
+// userId is already validated by the caller (same as policyPath()'s S.userId).
+function contactSharePolicyPath(userId) {
+  return '/_matrix/client/v3/user/' + encodeURIComponent(userId) +
+    '/account_data/' + CONTACT_SHARE_POLICY_TYPE;
+}
+
 export {
   SHARE_POLICY_TYPE, SHARE_OVERRIDE_TYPE, PROFILE_STATES,
   resolve, effectiveShared, resolveAll,
@@ -224,4 +281,6 @@ export {
   readSharePolicy, writeSharePolicy,
   readShareOverride, writeShareOverride,
   overridesFromSync,
+  CONTACT_SHARE_POLICY_TYPE,
+  normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
 };

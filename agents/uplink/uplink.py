@@ -137,6 +137,17 @@ MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
 # forwarded com.jkali.proposal event for the teammate's guarded send path to
 # re-validate later.
 ROOMID_RE = re.compile(r"^![^:]+:[A-Za-z0-9.\-:]+$")
+# Person-targeted proposal handle gates. Byte-parity with the master app's
+# buildIdentifierProposalContent (apps/master/main.js E164_RE/EMAIL_RE) and the
+# teammate inbox's parseProposal (apps/user/proposals.js). A person-targeted
+# proposal carries a handle instead of a target_room; the uplink only whitelists
+# it as inert data — the teammate's guarded start-chat path re-validates it
+# authoritatively before anything is sent.
+PROPOSAL_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+PROPOSAL_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+# Short lowercase source id (e.g. "imessage", "wa"); tight gate so a hostile
+# master cannot smuggle an arbitrary string into the carried-down target_source.
+PROPOSAL_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # Mxid shape gate for self_identities entries. shared/ui/account-data.js pins
 # its MXID_RE to ':localhost'; here the same-server constraint is enforced in
 # read_self_mxids() against cfg.local_user's own server name instead of a
@@ -147,6 +158,77 @@ MEDIA_LABELS = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.f
 DEFAULT_MEDIA_MAX = 25 * 1024 * 1024        # 25 MB re-upload cap (§8.2, v1.5)
 
 log = logging.getLogger("uplink")
+
+
+def sanitize_proposal_content(content, sender, event_id, origin_ts):
+    """Whitelist a master com.jkali.proposal content dict into the local shape.
+
+    Pure (no I/O, no self) so it is unit-testable. Accepts BOTH proposal shapes
+    and returns None (fail-closed) for anything malformed, so the caller records
+    it as handled and never retries:
+
+    - ROOM proposal: `target_room` is a valid room id (SHAPE only — it is a
+      teammate-LOCAL room id the uplink never sends to; the teammate's guarded
+      send path re-validates it against the live joined set). Carries down
+      target_room/body/created_by/origin_ts/proposal_source_event/template.
+    - PERSON-TARGETED proposal: no target_room, but a `target_identifier` that
+      is a valid E.164 handle OR strict email, a `target_source` that is a short
+      lowercase source id, and a non-empty body. The handle is inert data here —
+      re-validated authoritatively at the teammate before any start-chat. Carries
+      down target_source/target_identifier/target_display?/body/created_by/
+      origin_ts/proposal_source_event/template. NO target_room.
+
+    target_room takes precedence: if it is present and valid, the room shape wins
+    and no identifier keys leak into the output. body must be a non-empty string
+    for either shape."""
+    c = content if isinstance(content, dict) else {}
+    body = c.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return None
+
+    created_by = (c.get("created_by") if isinstance(c.get("created_by"), str)
+                  else (sender or ""))
+    ots = c.get("origin_ts") if isinstance(c.get("origin_ts"), int) else origin_ts
+
+    target = c.get("target_room")
+    if isinstance(target, str) and ROOMID_RE.match(target):
+        # ---- room proposal (unchanged behavior) ----
+        out = {
+            "target_room": target,
+            "body": body,
+            "created_by": created_by,
+            "origin_ts": ots,
+            # Provenance back to the master event (audit; also the dedup txn seed).
+            "com.jkali.proposal_source_event": event_id,
+        }
+        if c.get("template") is True:
+            out["template"] = True
+        return out
+
+    # ---- person-targeted proposal ----
+    identifier = c.get("target_identifier")
+    source = c.get("target_source")
+    if (isinstance(identifier, str)
+            and (PROPOSAL_E164_RE.match(identifier) or PROPOSAL_EMAIL_RE.match(identifier))
+            and isinstance(source, str) and PROPOSAL_SOURCE_RE.match(source)):
+        out = {
+            "target_source": source,
+            "target_identifier": identifier,
+            "body": body,
+            "created_by": created_by,
+            "origin_ts": ots,
+            "com.jkali.proposal_source_event": event_id,
+        }
+        # target_display is cosmetic: carry only if a string, clamped.
+        display = c.get("target_display")
+        if isinstance(display, str) and display:
+            out["target_display"] = display[:128]
+        if c.get("template") is True:
+            out["template"] = True
+        return out
+
+    # ---- neither shape valid: fail closed ----
+    return None
 
 
 class MasterUnreachable(Exception):
@@ -934,31 +1016,17 @@ class Uplink:
     def _sanitize_proposal(self, ev):
         """Whitelist a master proposal event into the local proposal content.
 
-        Only known-safe fields are carried down; returns None for a malformed
-        proposal (missing/invalid target_room or empty body) so it is recorded as
-        handled and never retried. target_room is validated by SHAPE only (it is a
-        teammate-LOCAL room id); the uplink never sends to it — the teammate's
-        guarded local send path re-validates it against the live joined set."""
+        Thin ev-shaped wrapper around the pure sanitize_proposal_content() so the
+        validation logic stays unit-testable without an event envelope. Returns
+        None for a malformed proposal (see the helper) so it is recorded as
+        handled and never retried."""
         c = ev.get("content") if isinstance(ev.get("content"), dict) else {}
-        target = c.get("target_room")
-        body = c.get("body")
-        if not isinstance(target, str) or not ROOMID_RE.match(target):
-            return None
-        if not isinstance(body, str) or not body.strip():
-            return None
-        out = {
-            "target_room": target,
-            "body": body,
-            "created_by": (c.get("created_by") if isinstance(c.get("created_by"), str)
-                           else (ev.get("sender") or "")),
-            "origin_ts": (c.get("origin_ts") if isinstance(c.get("origin_ts"), int)
-                          else ev.get("origin_server_ts")),
-            # Provenance back to the master event (audit; also the dedup txn seed).
-            "com.jkali.proposal_source_event": ev.get("event_id"),
-        }
-        if c.get("template") is True:
-            out["template"] = True
-        return out
+        return sanitize_proposal_content(
+            c,
+            sender=(ev.get("sender") or ""),
+            event_id=ev.get("event_id"),
+            origin_ts=ev.get("origin_server_ts"),
+        )
 
     def forward_proposals(self, master_room_id, local_proposals_room, events):
         """Write each NEW master proposal into the local proposals room, once.

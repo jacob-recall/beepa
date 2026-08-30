@@ -30,12 +30,39 @@ store in sync. Python 3.9+ stdlib only (`sqlite3`, `subprocess`, `json`,
     zero usable handles is dropped entirely (it can never be a
     `start-chat` target). A `_RAW_FOR_TEST` module-level seam lets tests
     inject raw contact dicts and skip the OS call entirely.
+  - **Phone country-code inference (fix round 1, I1).** A phone that
+    already carries a country code (leading `+`, or a `00` international
+    prefix) is normalized as-is — never touched further. A **bare**
+    national number (macOS commonly stores US numbers as e.g. `"(555)
+    123-4567"`, with no country code at all) is *not* naively prefixed
+    with `+` — doing that mints a fabricated, wrong E.164 value that
+    happens to pass the regex but will never match the real iMessage
+    handle. Instead, `_get_system_region()` reads the Mac's own region out
+    of `defaults read -g AppleLocale` (e.g. `"en_US"` -> `"US"`), and
+    `_REGION_CALLING_CODES` (a compact, hardcoded dict — not
+    libphonenumber-grade, see the bd follow-up below) maps that region to
+    a calling code, which gets prepended to the bare digits. This lookup
+    happens **once per import run**, not once per number
+    (`_normalize_raw_contacts` calls `_get_calling_code()` a single time
+    and threads the result through every phone in the batch).
+    - **Limitation, by design, not an oversight:** this only resolves a
+      bare number that belongs to the Mac's *own* region. A bare-format
+      number from a different country (e.g. a UK contact's local-format
+      number on a US-region Mac) has no signal to disambiguate and is
+      **dropped, never guessed** — counted in `import_once`'s
+      `dropped_ambiguous` so it's observable, not silently lost. See bd
+      issue `pm_mng-syy` for the real fix (a proper phone-number library
+      with per-contact region hints instead of one global region guess).
   - `import_once(db_path) -> dict` reads, flattens to per-identifier
     `seen` rows, and calls `upsert_contacts(conn, "imessage", seen)`.
-    **Fail-closed**: any non-zero `osascript` exit or empty/unparseable
-    output raises internally and `import_once` returns `{"error": ...}`
-    without ever calling `upsert_contacts` — a failed read must never look
-    like "everyone was deleted".
+    Returns `upsert_contacts`'s `added`/`updated`/`soft_deleted` plus
+    `dropped_ambiguous` (the count of bare national numbers dropped for
+    lack of a resolvable country code — see above).
+    **Fail-closed**: any non-zero `osascript` exit, empty/unparseable
+    output, or a garbled-but-list payload (e.g. a non-dict contact entry —
+    fix round 1, I2) raises internally and `import_once` returns
+    `{"error": ...}` without ever calling `upsert_contacts` — a failed
+    read must never look like "everyone was deleted".
   - Never logs a handle value or display name; the CLI entry point prints
     only aggregate counts.
 - `run-import.sh` / `com.jkali.contacts-import.plist` — launchd wiring.
@@ -61,7 +88,14 @@ store in sync. Python 3.9+ stdlib only (`sqlite3`, `subprocess`, `json`,
   reduce to `^\+[1-9]\d{6,14}$` or an email that fails the strict regex is
   simply excluded from that contact's handles — never written to the
   store as garbage, and never used to fabricate a not-actually-E.164
-  network_id.
+  network_id. This includes a bare national number whose country code
+  can't be resolved: it is dropped (and counted in `dropped_ambiguous`),
+  never assumed.
+- **A garbled-but-list OS payload fails closed too.** `_normalize_raw_contacts`
+  raises `RuntimeError` on any non-dict element in the parsed JSON, so
+  `import_once` returns `{"error": ...}` instead of an uncaught traceback
+  for that shape — same durability guarantee as a non-zero `osascript`
+  exit.
 - **No PII in logs.** `import_macos.py`'s `__main__` block and any error
   path print only counts / exception type names, never a name, phone, or
   email.

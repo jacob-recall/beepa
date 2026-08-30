@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "agents", "uplink"))
 import reconcile  # noqa: E402
 from reconcile import (  # noqa: E402
     reconcile_decisions, select_new_events, next_watermark, select_contacts_to_mirror,
+    select_contacts_to_tombstone,
 )
 from consent import normalize_contact_policy  # noqa: E402
 
@@ -141,6 +142,43 @@ eq([r["version"] for r in select_contacts_to_mirror(mixed, 2, share_imsg)], [3],
 # empty / None inputs are safe.
 eq(select_contacts_to_mirror([], 0, share_imsg), [], "contacts: empty rows")
 eq(select_contacts_to_mirror(None, 0, share_imsg), [], "contacts: None rows")
+
+
+# ---- contact revocation: select_contacts_to_tombstone (pm_mng-q5u.1) ------
+# The pure "which mirrored handles are no longer shared-and-live" diff. Handles
+# are (source, network_id) tuples: mirrored = every contact_mirror row;
+# currently_shared = handles whose source resolves shared AND are not deleted.
+A = ("imessage", "hA")
+B = ("imessage", "hB")
+C = ("imessage", "hC")
+
+# mirrored {A,B,C}, currently shared {A,C} -> tombstone exactly {B}.
+eq(select_contacts_to_tombstone({A, B, C}, {A, C}), [B],
+   "contact-revoke: unshared handle tombstoned")
+# nothing to tombstone when every mirrored handle is still shared.
+eq(select_contacts_to_tombstone({A, B, C}, {A, B, C}), [],
+   "contact-revoke: all still shared -> none")
+# idempotent: after B's row is dropped on the master 2xx, B leaves `mirrored`
+# and is never re-selected (already-tombstoned is not re-sent).
+eq(select_contacts_to_tombstone({A, C}, {A, C}), [],
+   "contact-revoke: already-tombstoned not re-selected")
+# a re-shared handle (back in currently_shared) is left alone, not tombstoned.
+eq(select_contacts_to_tombstone({A, B, C}, {A, B, C}), [],
+   "contact-revoke: re-shared handle not tombstoned")
+# a whole source going private tombstones ALL its mirrored handles (deterministic
+# sorted order), while another still-shared source's handle stays.
+W = ("whatsapp", "hW")
+eq(select_contacts_to_tombstone({A, B, C, W}, {W}), [A, B, C],
+   "contact-revoke: source-wide revoke tombstones all, sorted, keeps other source")
+# a deleted (not-live) handle on a still-shared source is absent from
+# currently_shared, so it is tombstoned even though its source is shared.
+eq(select_contacts_to_tombstone({A, B}, {A}), [B],
+   "contact-revoke: deleted handle tombstoned though source shared")
+# empty / None inputs are safe.
+eq(select_contacts_to_tombstone(set(), {A}), [], "contact-revoke: empty mirrored")
+eq(select_contacts_to_tombstone({A, B}, set()), [A, B],
+   "contact-revoke: nothing shared -> all tombstoned")
+eq(select_contacts_to_tombstone(None, None), [], "contact-revoke: None inputs")
 
 
 print("\n%d passed, %d failed" % (_pass, _fail))

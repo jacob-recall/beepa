@@ -10,6 +10,7 @@ import {
   resolve, resolveAll,
   readSharePolicy, writeSharePolicy,
   writeShareOverride, overridesFromSync,
+  normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
 } from '../../shared/model/consent.js';
 import { readProfiles, roomProfileMap } from '../../shared/model/contacts.js';
 import { api } from '../../shared/matrix/client.js';
@@ -18,12 +19,18 @@ import { setConvoRowDecorator } from '../../shared/ui/rows.js';
 import { setSourceViewHook } from '../../shared/ui/search.js';
 import { setSharingViewHook } from '../../shared/ui/nav.js';
 import { SOURCES } from '../../shared/ui/sources.js';
-import { convosBySource, feedModel } from '../../shared/state.js';
+import { S, convosBySource, feedModel } from '../../shared/state.js';
 import { feedHideRoom, feedUnhideRoom, feedIsHidden } from '../../shared/ui/account-data.js';
 
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.
 let policy = { global: 'private', sources: {} };
+// The CONTACT-share policy (com.jkali.contact_share_policy) — a SEPARATE
+// consent dimension from conversation sharing above: it decides whether this
+// teammate's ADDRESS BOOK (contacts, per source) leaves the machine for the
+// manager, not which conversations mirror. Its own account-data key, its own
+// default: PRIVATE (empty/absent => not shared). Never conflated with `policy`.
+let contactPolicy = { global: 'private', sources: {} };
 const overrides = new Map(); // roomId -> 'share' | 'private' (absent = inherit)
 // roomId -> { id, displayName, share } for the room's contact profile, if any
 // (§12 phase 5). Populated from shared/model/contacts.js account-data; a
@@ -56,8 +63,28 @@ async function fetchOverridesSnapshot() {
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
 }
+// Read/write the contact-share policy account-data, mirroring the conversation
+// policy's readSharePolicy/writeSharePolicy exactly: GET/PUT the account-data
+// via the model's contactSharePolicyPath(S.userId) (never a hand-rolled path)
+// and normalize through the model's normalizeContactPolicy so a malformed
+// event can only ever collapse to the safe default (private), never smuggle a
+// share through. Absent/404 => default { global:'private', sources:{} }.
+async function readContactPolicy() {
+  try {
+    return normalizeContactPolicy(await api('GET', contactSharePolicyPath(S.userId)));
+  } catch (e) {
+    return { global: 'private', sources: {} };
+  }
+}
+async function writeContactPolicy(p) {
+  const body = normalizeContactPolicy(p);
+  await api('PUT', contactSharePolicyPath(S.userId), body);
+  return body;
+}
+
 async function loadConsentState() {
   try { policy = await readSharePolicy(); } catch (e) { /* keep previous cache */ }
+  try { contactPolicy = await readContactPolicy(); } catch (e) { /* keep previous cache */ }
   try {
     const map = overridesFromSync(await fetchOverridesSnapshot());
     overrides.clear();
@@ -433,6 +460,114 @@ function countSharedNow(convos) {
   return resolveAll(convos, policy, overrides, profileMap).filter((r) => r.shared).length;
 }
 
+// ===========================================================================
+// CONTACT-SHARE consent UI — a SEPARATE dimension from conversation sharing.
+// Writes the contact-share policy (com.jkali.contact_share_policy) only; it
+// NEVER touches `policy` / com.jkali.share_policy above. Mirrors the
+// conversation global-switch + per-source tri-state pattern, but for the
+// address book (people), and reads/writes through readContactPolicy /
+// writeContactPolicy → the model's contactSharePolicyPath + normalizer.
+// ===========================================================================
+
+// Global "share all contacts" switch (writes contactPolicy.global).
+function buildContactGlobalSwitch() {
+  const wrap = el('div', 'share-global-row');
+  const label = el('div', 'share-global-label');
+  label.appendChild(el('div', 'title', 'Share all contacts'));
+  wrap.appendChild(label);
+  const btn = el('button', 'switch' + (contactPolicy.global === 'share-all' ? ' on' : ''));
+  btn.type = 'button';
+  btn.setAttribute('role', 'switch');
+  btn.setAttribute('aria-label', 'Share my contacts with my manager');
+  btn.setAttribute('aria-checked', contactPolicy.global === 'share-all' ? 'true' : 'false');
+  btn.appendChild(el('span', 'switch-knob'));
+  btn.addEventListener('click', async () => {
+    const next = contactPolicy.global === 'share-all' ? 'private' : 'share-all';
+    try { contactPolicy = await writeContactPolicy({ ...contactPolicy, global: next }); }
+    catch (e) { return; }
+    // Full re-render so the per-source "following global" hints update too.
+    renderContactShareView();
+  });
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+function contactSourcePolicyIndex(sourceId) {
+  const cur = (contactPolicy.sources && contactPolicy.sources[sourceId]) || 'inherit';
+  const idx = SOURCE_POLICY_CYCLE.findIndex((o) => o.val === cur);
+  return idx >= 0 ? idx : 0;
+}
+
+function contactSourcePolicyHint(source) {
+  const cur = (contactPolicy.sources && contactPolicy.sources[source.id]) || 'inherit';
+  if (cur === 'share-all') return 'All ' + source.label + ' contacts → manager';
+  if (cur === 'private-all') return 'All ' + source.label + ' contacts private';
+  if (contactPolicy.global === 'share-all') return 'Following global (share all)';
+  return 'Following global (private)';
+}
+
+function contactSourcePolicyShared(source) {
+  return resolveContactShare(source.id, contactPolicy).shared;
+}
+
+function buildContactSourcePolicySlider(source) {
+  return buildTriStateSlider(SOURCE_POLICY_CYCLE, {
+    ariaLabel: 'Share ' + source.label + ' contacts',
+    getIndex: () => contactSourcePolicyIndex(source.id),
+    getHint: () => contactSourcePolicyHint(source),
+    hintShared: () => contactSourcePolicyShared(source),
+    onAdvance: async (opt) => {
+      const sources = { ...(contactPolicy.sources || {}) };
+      if (opt.val === 'inherit') delete sources[source.id]; else sources[source.id] = opt.val;
+      contactPolicy = await writeContactPolicy({ ...contactPolicy, sources });
+    },
+  });
+}
+
+function buildContactSourceSwitchRow(source) {
+  const row = el('div', 'share-source-row');
+  const label = el('div', 'share-source-label');
+  label.appendChild(el('span', 'plat-badge ' + source.id, ''));
+  label.appendChild(document.createTextNode(' ' + source.label));
+  row.appendChild(label);
+  row.appendChild(buildContactSourcePolicySlider(source));
+  return row;
+}
+
+// Rendered into #share-contacts (its own settings-block) whenever the sharing
+// view opens. Default/empty policy renders as PRIVATE (every switch off) —
+// resolveContactShare returns not-shared for an absent/default policy.
+function renderContactShareView() {
+  const host = $('share-contacts');
+  if (!host) return;
+  host.replaceChildren();
+
+  const head = el('h3', 'share-contacts-title', 'Share my contacts with my manager');
+  head.style.margin = '0 0 6px';
+  host.appendChild(head);
+  host.appendChild(el('p', 'muted',
+    'Separate from conversation sharing above: this shares your ADDRESS BOOK — '
+    + 'the people in your contacts, not just your conversations — with your '
+    + 'manager. It is OFF by default; nothing about who you know leaves this '
+    + 'machine until you turn it on.'));
+
+  host.appendChild(buildContactGlobalSwitch());
+
+  host.appendChild(el('p', 'muted',
+    'Turning this off stops sharing your contacts going forward, and removes the '
+    + 'contacts already shared on the next sync.'));
+
+  // Optional per-source contact sharing (mirrors the per-source conversation
+  // switches): each source can override the global with share-all / private-all
+  // / inherit ("Auto").
+  const list = el('div', 'share-sources-list');
+  for (const s of SOURCES) {
+    if (s.kind === 'all') continue;
+    list.appendChild(buildContactSourceSwitchRow(s));
+  }
+  host.appendChild(list);
+}
+
 // Rendered whenever the 'sharing' nav view opens, via setSharingViewHook (nav.js).
 function renderSharingView() {
   const globalHost = $('share-global');
@@ -440,6 +575,7 @@ function renderSharingView() {
   const sourcesHost = $('share-sources');
   if (sourcesHost) { sourcesHost.replaceChildren(); sourcesHost.appendChild(buildSourceSwitches()); }
   renderConsentSummary();
+  renderContactShareView();
 }
 
 // ---- entry point (call once from apps/user/main.js after sign-in) ----

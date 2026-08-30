@@ -93,6 +93,35 @@ def select_contacts_to_mirror(rows, cursor, policy):
     return out
 
 
+def select_contacts_to_tombstone(mirrored, currently_shared):
+    """Which already-mirrored contact handles must be tombstoned this pass.
+
+    Revocation reconcile (pm_mng-q5u.1). The contact mirror is no longer purely
+    forward-only: each pass diffs the DESIRED shared-and-live set against what is
+    already on the master (contact_mirror) and removes the difference, the same
+    reconcile shape conversations use in reconcile_decisions().
+
+    mirrored         : iterable of (source, network_id) tuples that currently
+                       have a LIVE master com.jkali.contact state event
+                       (i.e. every row in contact_mirror).
+    currently_shared : iterable of (source, network_id) tuples that resolve
+                       shared under the current contact-share policy AND are
+                       still live (not soft-deleted) in the store.
+
+    Returns the sorted list of (source, network_id) handles to tombstone =
+    mirrored MINUS currently_shared. A handle whose source has flipped to
+    private, or whose contact was deleted, is mirrored-but-not-shared and so is
+    selected; a still-shared (or re-shared) handle is in both sets and is left
+    alone.
+
+    Pure, and idempotent when the caller drops a handle from contact_mirror after
+    the master confirms its tombstone: the handle then leaves `mirrored` and is
+    never re-selected, so an already-tombstoned contact is not re-sent.
+    """
+    shared = set(currently_shared or ())
+    return sorted(h for h in set(mirrored or ()) if h not in shared)
+
+
 def next_watermark(current, candidate, confirmed):
     """Advance the per-room watermark ONLY after the master confirms receipt.
 

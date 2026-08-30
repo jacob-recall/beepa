@@ -3,13 +3,14 @@
 import {
   readProfiles, writeProfiles,
   upsertProfile, removeProfile, linkRoom, unlinkRoom, setProfileShare, newProfileId,
+  linkHandle, unlinkHandle,
   suggestions,
 } from '../../shared/model/contacts.js';
 import { loadConsentState } from './consent.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setContactsViewHook, setDetailMode } from '../../shared/ui/nav.js';
 import { appendDirectoryRows } from '../../shared/ui/search.js';
-import { SOURCES } from '../../shared/ui/sources.js';
+import { SOURCES, validHandle } from '../../shared/ui/sources.js';
 import { convosBySource, feedModel } from '../../shared/state.js';
 import { openConvo } from '../../shared/ui/chat.js';
 import { buildPlatBadge } from '../../shared/ui/rows.js';
@@ -301,6 +302,75 @@ function renderContactDetail(profileId) {
   attach.appendChild(attachResults);
   host.appendChild(attach);
 
+  // Address-book handles — the cross-platform identity anchor (source +
+  // network_id). A handle belongs to at most one profile; linkHandle enforces
+  // that. Manual entry only (the user types the phone/email) — never fetched
+  // from the imported-contacts DB. Persists through the SAME persist() path the
+  // rest of this view uses, so the People view stays consistent.
+  const handles = el('div', 'contact-handles');
+  handles.appendChild(el('div', 'list-section', 'Handles'));
+  const existing = Array.isArray(profile.handleIds) ? profile.handleIds : [];
+  if (!existing.length) {
+    handles.appendChild(el('p', 'muted', 'No handles linked.'));
+  } else {
+    for (const h of existing) {
+      const row = el('div', 'contact-linked-row');
+      const src = SOURCES.find((s) => s.id === h.source);
+      const meta = el('span', 'contact-row-meta');
+      meta.appendChild(el('span', 'title',
+        (src ? src.label : sanitizeLine(h.source)) + ' · ' + sanitizeLine(h.network_id)));
+      row.appendChild(meta);
+      const unlink = el('button', 'contact-unlink', 'Unlink');
+      unlink.type = 'button';
+      unlink.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await persist(unlinkHandle(store.profiles, h.source, h.network_id));
+      });
+      row.appendChild(unlink);
+      handles.appendChild(row);
+    }
+  }
+
+  const addHandle = el('div', 'contact-attach');
+  const picker = document.createElement('select');
+  for (const s of SOURCES) {
+    if (s.kind === 'all') continue;
+    const opt = document.createElement('option');
+    opt.value = s.id;
+    opt.textContent = s.label;
+    picker.appendChild(opt);
+  }
+  const handleInput = el('input');
+  handleInput.placeholder = 'Phone (+15551234567) or email';
+  handleInput.spellcheck = false;
+  handleInput.autocomplete = 'off';
+  const addBtn = el('button', null, 'Link handle');
+  addBtn.type = 'button';
+  const handleWarn = el('p', 'error hidden');
+  const addHandleNow = async () => {
+    handleWarn.classList.add('hidden');
+    handleWarn.textContent = '';
+    const source = picker.value;
+    const identifier = handleInput.value.trim();
+    if (!validHandle(identifier)) {
+      handleWarn.textContent = 'Enter a valid phone (+15551234567) or email address.';
+      handleWarn.classList.remove('hidden');
+      return;
+    }
+    // persist() re-renders this detail view, which rebuilds the form fresh.
+    await persist(linkHandle(store.profiles, profile.id, source, identifier));
+  };
+  addBtn.addEventListener('click', addHandleNow);
+  handleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addHandleNow(); }
+  });
+  addHandle.appendChild(picker);
+  addHandle.appendChild(handleInput);
+  addHandle.appendChild(addBtn);
+  addHandle.appendChild(handleWarn);
+  handles.appendChild(addHandle);
+  host.appendChild(handles);
+
   const del = el('button', 'danger contact-delete-block', 'Delete contact');
   del.type = 'button';
   del.addEventListener('click', async () => {
@@ -401,24 +471,34 @@ function renderPeopleViewBody() {
 // ===========================================================================
 let addContactBackdrop = null;
 
+// Reuse the shared modal shell instead of hand-styling a second backdrop:
+// #modal-backdrop already carries the fixed/inset/flex/z-index positioning in
+// CSS, and `.card narrow` the card chrome. We add our own card as a sibling of
+// the default confirm-modal card (#modal) inside that same backdrop, and hide
+// #modal while ours is open so the two never render at once (confirmModal and
+// this picker are never open simultaneously). Only minimal inline sizing here.
 function buildAddContactModal() {
-  const backdrop = el('div');
-  backdrop.style.cssText = 'position:fixed;inset:0;display:flex;z-index:100;';
-  backdrop.classList.add('hidden');
+  const backdrop = $('modal-backdrop');
+  if (!backdrop) return null;
   const card = el('div', 'card narrow');
-  card.style.cssText = 'margin:auto;width:380px;max-height:80vh;overflow-y:auto;padding:18px;';
+  card.style.cssText = 'margin:auto;width:380px;max-height:80vh;overflow-y:auto;';
+  card.classList.add('hidden');
   backdrop.appendChild(card);
-  document.body.appendChild(backdrop);
   return { backdrop, card };
 }
 
 function closeAddToContact() {
-  if (addContactBackdrop) addContactBackdrop.backdrop.classList.add('hidden');
+  if (!addContactBackdrop) return;
+  addContactBackdrop.card.classList.add('hidden');
+  const dflt = $('modal');
+  if (dflt) dflt.classList.remove('hidden');       // restore the confirm-modal card
+  addContactBackdrop.backdrop.classList.add('hidden');
 }
 
 async function openAddToContact(roomId) {
   if (typeof roomId !== 'string' || !roomId) return;
   if (!addContactBackdrop) addContactBackdrop = buildAddContactModal();
+  if (!addContactBackdrop) return;
   const { backdrop, card } = addContactBackdrop;
 
   try { store = await readProfiles(); } catch (e) { /* keep cache */ }
@@ -456,8 +536,15 @@ async function openAddToContact(roomId) {
   // conversation, and renderPeopleList()/setDetailMode('empty') inside persist()
   // would wipe the open conversation out from under the user (that is why "New
   // contact" appeared broken). Just write + refresh the store cache; the People
-  // view re-reads the store the next time it is opened.
-  const saveFromModal = async (next) => { store = await writeProfiles(next); };
+  // view re-reads the store the next time it is opened. We DO refresh consent.js's
+  // module-level profileMap via loadConsentState() — persist() is otherwise the
+  // only path that does, so without it a room linked/created here would not be
+  // reflected in row Share/Private badges until the next natural refresh — but
+  // we deliberately do NOT re-render the People view from here.
+  const saveFromModal = async (next) => {
+    store = await writeProfiles(next);
+    try { await loadConsentState(); } catch (e) { /* consent-cache refresh is best-effort */ }
+  };
   const finishLink = async (profileId) => {
     try {
       await saveFromModal(linkRoom(store, profileId, roomId));
@@ -510,6 +597,9 @@ async function openAddToContact(roomId) {
   closeRow.appendChild(cancelBtn);
   card.appendChild(closeRow);
 
+  const dflt = $('modal');
+  if (dflt) dflt.classList.add('hidden');          // hide the confirm-modal card while ours shows
+  card.classList.remove('hidden');
   backdrop.classList.remove('hidden');
   searchInput.focus();
 }

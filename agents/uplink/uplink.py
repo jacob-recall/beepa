@@ -1243,7 +1243,14 @@ class Uplink:
           (c) contact_cursor advances to a row's version only after the PUT's 2xx
               (or immediately for a no-network skip). On MasterUnreachable the
               exception propagates before the cursor is advanced past the unsent
-              row, so the next pass resumes there with no loss and no duplicate."""
+              row, so the next pass resumes there with no loss and no duplicate.
+          (d) Revocation reconcile (pm_mng-q5u.1): diff the DESIRED shared-and-
+              live handle set against what is already on the master
+              (contact_mirror) and tombstone the difference — a contact whose
+              source flipped to PRIVATE, or whose row was deleted, is removed
+              from the manager's view rather than left behind. The mirror row is
+              dropped only after the master confirms the tombstone (same
+              2xx-then-advance discipline); a re-shared handle reappears."""
         room = self.ensure_contacts_room()
         if not room:
             return
@@ -1281,25 +1288,68 @@ class Uplink:
                 if v in shared_versions:
                     # SHARED: PUT (may raise MasterUnreachable -> cursor unmoved).
                     sk = self._put_contact(room, row, id_to_dn)
-                    self.db.execute(
-                        "INSERT OR REPLACE INTO contact_mirror "
-                        "(source, network_id, mirrored_version, master_state_key) "
-                        "VALUES (?,?,?,?)",
-                        (row["source"], row["network_id"], v, sk))
-                    self.db.commit()
                     if row["deleted"]:
+                        # A shared-source delete is a tombstone. Drop the mirror
+                        # record (not INSERT OR REPLACE) so the revocation pass
+                        # below treats the handle as already-removed and never
+                        # re-tombstones it — the same "record dropped after the
+                        # master 2xx" discipline as the reconcile pass.
+                        self.db.execute(
+                            "DELETE FROM contact_mirror WHERE source=? AND network_id=?",
+                            (row["source"], row["network_id"]))
+                        self.db.commit()
                         tombstoned += 1
                     else:
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO contact_mirror "
+                            "(source, network_id, mirrored_version, master_state_key) "
+                            "VALUES (?,?,?,?)",
+                            (row["source"], row["network_id"], v, sk))
+                        self.db.commit()
                         pushed += 1
                 else:
                     # NOT shared: never sent. No network call was made.
                     skipped += 1
                 # Advance only after this row was handled (confirmed PUT or skip).
                 self.meta_set("contact_cursor", str(v))
-            if relinked or pushed or tombstoned or skipped:
-                log.info("contacts: relinked=%d pushed=%d tombstoned=%d skipped=%d "
-                         "(cursor now %s)", relinked, pushed, tombstoned, skipped,
-                         self.meta_get("contact_cursor", "0"))
+            # Revocation reconcile (pm_mng-q5u.1): the push path above is
+            # forward-only and can only tombstone a delete it happens to see past
+            # the cursor on a still-shared source. A source (or global) contact-
+            # share policy that flips to PRIVATE bumps no row version, so an
+            # already-mirrored contact would otherwise stay on the master forever
+            # — a consent violation. So each pass ALSO diffs the desired
+            # shared-and-live set against what is already mirrored and removes the
+            # difference: for every contact_mirror handle whose source no longer
+            # resolves shared (or whose row was deleted), push a {deleted: true}
+            # tombstone and, on the master's 2xx, drop the mirror row so it is not
+            # re-tombstoned. Re-enabling sharing re-pushes the handle (a version
+            # bump flows via the cursor path; the pure-backfill case is q5u.2).
+            mirrored = {(r[0], r[1]) for r in self.db.execute(
+                "SELECT source, network_id FROM contact_mirror").fetchall()}
+            live_shared = set()
+            for source in SOURCE_ID_TO_LABEL:
+                if not consent.resolve_contact_share(source, policy).get("shared"):
+                    continue  # source not shared -> none of its handles are live-shared
+                for row in contacts_store.shared_since(conn, source, 0):
+                    if not row["deleted"]:
+                        live_shared.add((source, row["network_id"]))
+            revoked = 0
+            for (source, network_id) in reconcile.select_contacts_to_tombstone(
+                    mirrored, live_shared):
+                # Reuse the exact tombstone-send path (_put_contact's deleted
+                # branch); it raises MasterUnreachable before returning on an
+                # outage, so the row below is dropped ONLY after the master 2xx.
+                self._put_contact(room, {"source": source, "network_id": network_id,
+                                         "deleted": 1}, id_to_dn)
+                self.db.execute(
+                    "DELETE FROM contact_mirror WHERE source=? AND network_id=?",
+                    (source, network_id))
+                self.db.commit()
+                revoked += 1
+            if relinked or pushed or tombstoned or skipped or revoked:
+                log.info("contacts: relinked=%d pushed=%d tombstoned=%d revoked=%d "
+                         "skipped=%d (cursor now %s)", relinked, pushed, tombstoned,
+                         revoked, skipped, self.meta_get("contact_cursor", "0"))
         finally:
             conn.close()
 

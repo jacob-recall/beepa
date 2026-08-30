@@ -33,6 +33,7 @@ function normalizeProfiles(data) {
   const raw = (data && Array.isArray(data.profiles)) ? data.profiles : [];
   const seenIds = new Set();
   const claimedRooms = new Set(); // enforce: at most one profile per room
+  const claimedHandles = new Set(); // enforce: at most one profile per handle
   const profiles = [];
   for (const p of raw) {
     if (!p || typeof p !== 'object') continue;
@@ -48,7 +49,19 @@ function normalizeProfiles(data) {
       claimedRooms.add(rid);
       roomIds.push(rid);
     }
-    profiles.push({ id, displayName, roomIds, share: normShare(p.share) });
+    const handleIds = [];
+    const rawHandles = Array.isArray(p.handleIds) ? p.handleIds : [];
+    for (const h of rawHandles) {
+      if (!h || typeof h !== 'object') continue;
+      const source = typeof h.source === 'string' ? h.source : '';
+      const network_id = typeof h.network_id === 'string' ? h.network_id : '';
+      if (!source || !network_id) continue;
+      const key = source + '|' + network_id;
+      if (claimedHandles.has(key)) continue;
+      claimedHandles.add(key);
+      handleIds.push({ source, network_id });
+    }
+    profiles.push({ id, displayName, roomIds, handleIds, share: normShare(p.share) });
   }
   return { profiles };
 }
@@ -148,6 +161,51 @@ function setProfileShare(store, id, share) {
   return upsertProfile(store, { id, share });
 }
 
+// ===========================================================================
+// HANDLE OWNERSHIP — the cross-platform identity anchor. person_id =
+// ContactProfile.id. A handle (source + network_id) belongs to AT MOST ONE
+// profile; the helpers below uphold that just like the room helpers do.
+// They accept the profiles ARRAY (as normalizeProfiles returns) and re-
+// normalize, so a malformed stored profile can never smuggle a handle into
+// two profiles.
+// ===========================================================================
+
+// The id of the profile currently owning (source, network_id), or null.
+function handleOwner(profiles, source, network_id) {
+  for (const p of normalizeProfiles({ profiles }).profiles) {
+    for (const h of p.handleIds) {
+      if (h.source === source && h.network_id === network_id) return p.id;
+    }
+  }
+  return null;
+}
+
+// Attach a handle to profile `profileId`, first detaching it from any other
+// profile so the at-most-one invariant holds. No-op if the target is absent
+// or source/network_id is not a non-empty string.
+function linkHandle(profiles, profileId, source, network_id) {
+  const norm = normalizeProfiles({ profiles });
+  const target = norm.profiles.find((p) => p.id === profileId);
+  if (!target || typeof source !== 'string' || !source ||
+      typeof network_id !== 'string' || !network_id) return norm;
+  for (const p of norm.profiles) {
+    p.handleIds = p.handleIds.filter(
+      (h) => !(h.source === source && h.network_id === network_id));
+  }
+  target.handleIds.push({ source, network_id });
+  return norm;
+}
+
+// Detach a handle from whatever profile currently holds it.
+function unlinkHandle(profiles, source, network_id) {
+  const norm = normalizeProfiles({ profiles });
+  for (const p of norm.profiles) {
+    p.handleIds = p.handleIds.filter(
+      (h) => !(h.source === source && h.network_id === network_id));
+  }
+  return norm;
+}
+
 // A random profile id (opaque). Not pure; used only by the create-UI.
 function newProfileId() {
   return 'cp_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -214,6 +272,7 @@ export {
   normalizeProfiles, emptyProfiles,
   findProfile, profileForRoom, profileShareForRoom, roomProfileMap,
   upsertProfile, removeProfile, linkRoom, unlinkRoom, setProfileShare, newProfileId,
+  handleOwner, linkHandle, unlinkHandle,
   suggestions,
   readProfiles, writeProfiles,
 };

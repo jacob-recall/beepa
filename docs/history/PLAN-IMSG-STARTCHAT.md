@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Amendment: enable iMessage "start a new chat" (guarded) — imsg-startchat-v1
 
 User approved (2026-08-26) enabling iMessage start-chat from the Directory,

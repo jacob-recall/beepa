@@ -36,6 +36,18 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   never trust stored data past that function. Linking/unlinking/sharing is
   manual only; `suggestions()` is pure and advisory (never mutates, never
   auto-merges).
+
+  **Approved exception — `autoMergeByNumber()`.** This is the ONE sanctioned
+  auto-merge path: it groups conversations that a trusted local helper has
+  resolved to the same real phone number (E.164), so the same person on two
+  bridges lands in one profile without manual curation. It is safe because
+  it (1) only ever CREATES an auto-profile (`share: 'inherit'`, never
+  `'share'` — so auto-merge never shares anything new with the manager) or
+  ADDS rooms to a single already-existing profile without touching that
+  profile's share; and (2) NEVER merges two existing profiles — if a
+  number's rooms already span two or more distinct profiles it skips the
+  number entirely, so a deliberate user separation is never undone. It is
+  pure and idempotent.
 - `ui/el.js` — `$`, `el()` (textContent-only DOM builder), `sanitize()` /
   `sanitizeLine()` (strip control/bidi/zero-width chars, clamp length),
   `txn()`. Every other module's only DOM-safety primitive.
@@ -111,10 +123,9 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
 ```bash
 # consent resolver unit tests (JS side), via the pinned node:20-alpine:
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/consent.test.js
-# (tests/run.sh wraps only this one; also run the python-side test and the
-# uplink reconcile test directly — see tests/CLAUDE.md)
-python3 tests/unit/consent_py.test.py
-python3 tests/unit/uplink_reconcile.test.py
+# tests/run.sh runs all 19 unit tests, including the python-side mirror
+# (consent_py.test.py) and the uplink reconcile test — see tests/CLAUDE.md
+tests/run.sh
 
 # a quick syntax check across every shared module:
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine sh -c \

@@ -63,9 +63,11 @@ Settings tabs): `help`, `login …`, `logout`, `ping`, `sync`.
 ## Backfill (imported history)
 
 Per-bridge `backfill.enabled` as configured today: WhatsApp **on**,
-Google Messages **on**, LinkedIn **on**, X/Twitter **on**, Instagram **off**
-(anti-flag posture, see `PLAN-META.md`); iMessage backfills via its own
-daemon (`backfill_count` in `imessage/daemon.json`). Toggle in each bridge's
+Google Messages **on**, LinkedIn **on**, X/Twitter **on**, Instagram
+**minimal backfill** — `max_initial_messages: 20` on new portals only;
+thread backfill and media (XMA) backfill are off (anti-flag posture, see
+`docs/history/PLAN-META.md`); iMessage backfills via its own daemon
+(`backfill_count` in `imessage/daemon.json`). Toggle in each bridge's
 `config.yaml` *before* first login if you want different history behavior.
 
 ## WhatsApp login
@@ -170,22 +172,32 @@ emoji** it shows, in the Google Messages app on your phone.
 
 Compose service `mautrix-meta` (digest-pinned, no host ports, own DB
 `mautrix_meta`). Bot `@instagrambot:localhost`; chats appear in the
-**Instagram** space. Design + security dispositions: `PLAN-META.md`.
-Backfill **off** — only messages from login onward.
+**Instagram** space. Design + security dispositions:
+`docs/history/PLAN-META.md`. Minimal backfill only (see Backfill above).
 
-### Log in (you do this — no automation, on purpose)
-1. In your everyday Chrome (2FA enabled), log into instagram.com normally.
-2. DevTools → Network → filter XHR → type `graphql`; click around so a
-   `graphql` request appears.
-3. Right-click it → **Copy → Copy as cURL**.
-4. DM `@instagrambot:localhost`, send `login instagram`, paste the cURL when
-   prompted (or the cookies `sessionid, csrftoken, mid, ig_did, ds_user_id`
-   as JSON).
-5. **Immediately delete that message** — it is a bearer credential. The
-   bridge log is `info`-level and does not record it.
+### Connect — one click (no terminal/paste)
+
+In the app's Connections card, click **Connect** on the Instagram card. The
+local connect helper (`127.0.0.1:8021`, launchd `com.jkali.session-connect`)
+reads your `instagram.com` session cookies from Chrome (any signed-in
+profile; approve the one-time macOS Keychain prompt) and submits them to the
+bridge's provisioning API directly — no DevTools, no paste, no message that
+needs deleting. See `session-connect/CLAUDE.md`.
+
+- **CLI equivalent**: `python3 session-connect/connect.py instagram`.
+- **Fallback if the button fails** (stale/incomplete session, etc.):
+  1. In your everyday Chrome (2FA enabled), log into instagram.com normally.
+  2. DevTools → Network → filter XHR → type `graphql`; click around so a
+     `graphql` request appears.
+  3. Right-click it → **Copy → Copy as cURL**.
+  4. DM `@instagrambot:localhost`, send `login instagram`, paste the cURL
+     when prompted (or the cookies `sessionid, csrftoken, mid, ig_did,
+     ds_user_id` as JSON).
+  5. **Immediately delete that message** — it is a bearer credential. The
+     bridge log is `info`-level and does not record it.
 
 ### Staying un-flagged
-Home IP only (never a VPS), 2FA on, backfill off, one account. This is a
+Home IP only (never a VPS), 2FA on, minimal backfill, one account. This is a
 unified Meta bridge with no `network.mode` field: only ever run
 `login instagram` — `login facebook`/`messenger` would bridge those too.
 
@@ -197,25 +209,36 @@ remove the bridge device (or reset password), then `logout` to the bot.
 
 Compose service `mautrix-linkedin` (digest-pinned, no host ports, own DB
 `mautrix_linkedin`). Bot `@linkedinbot:localhost`; **LinkedIn** space.
-Session-paste login, like Instagram:
 
-1. Log into linkedin.com normally in your everyday Chrome.
-2. DevTools → Network → filter `graphql` (voyager API); click around.
-3. Right-click a request → **Copy → Copy as cURL**.
-4. App → Connections → LinkedIn → **Connect LinkedIn**, paste the cURL,
-   **Submit session** — sent through the management-room guard and
-   **auto-redacted** immediately. (Or DM the bot `login cookies` manually and
-   delete the pasted message yourself.)
+### Connect — one click (no terminal/paste)
 
-LinkedIn needs the full cURL (not just cookies): the `X-LI-Track` /
-`X-LI-Page-Instance` headers ride alongside the `li_at` cookie. Never paste a
-real cURL anywhere else — it is a bearer credential. If auto-redact ever
-fails, the card offers an in-app "Delete it now" retry; only if that also fails
-bring up the opt-in Element escape hatch (`docker compose --profile escape up -d
-element`) to delete the message there. ToS caveat and `down -v` warning as per
-WhatsApp. Commands: `help`, `version`, `login cookies`, `list-logins`,
-`logout <id>`, `set-preferred-login`, `search`, `start-chat`,
-`resolve-identifier`, `sync`.
+In the app's Connections card, click **Connect** on the LinkedIn card. The
+local connect helper (`127.0.0.1:8021`) reads your `linkedin.com` session
+cookies from Chrome (incl. the httpOnly `li_at`), synthesizes the two
+LinkedIn tracking headers (`X-LI-Track` / `X-LI-Page-Instance`) no cookie
+store holds, and submits everything to the bridge's provisioning API
+directly. See `session-connect/CLAUDE.md`.
+
+- **CLI equivalent**: `python3 session-connect/connect.py linkedin`.
+- **Fallback if the button fails** (LinkedIn ever rejects the synthesized
+  headers, etc.), session-paste like Instagram:
+  1. Log into linkedin.com normally in your everyday Chrome.
+  2. DevTools → Network → filter `graphql` (voyager API); click around.
+  3. Right-click a request → **Copy → Copy as cURL**.
+  4. App → Connections → LinkedIn → paste the cURL, **Submit session** —
+     sent through the management-room guard and **auto-redacted**
+     immediately. (Or DM the bot `login cookies` manually and delete the
+     pasted message yourself.)
+
+LinkedIn needs the full cURL (not just cookies) in the fallback path: the
+`X-LI-Track` / `X-LI-Page-Instance` headers ride alongside the `li_at`
+cookie. Never paste a real cURL anywhere else — it is a bearer credential.
+If auto-redact ever fails, the card offers an in-app "Delete it now" retry;
+only if that also fails bring up the opt-in Element escape hatch (`docker
+compose --profile escape up -d element`) to delete the message there. ToS
+caveat and `down -v` warning as per WhatsApp. Commands: `help`, `version`,
+`login cookies`, `list-logins`, `logout <id>`, `set-preferred-login`,
+`search`, `start-chat`, `resolve-identifier`, `sync`.
 
 ## X (Twitter) bridge (mautrix-twitter)
 

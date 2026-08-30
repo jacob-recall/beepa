@@ -1,0 +1,149 @@
+# session-connect/ — the one-click Instagram / LinkedIn / X login helper
+
+Turns Instagram/LinkedIn/X connect into one click in `apps/user`: the
+teammate clicks **Connect** on the network's card and the bridge is logged
+in, with no DevTools, no Copy-as-cURL, no paste. A browser cannot read
+Chrome's cookie store or `docker compose exec` the bridge, so a tiny
+loopback service (`127.0.0.1:8021`, launchd `com.jkali.session-connect`)
+does it on the browser's behalf — the exact shape and security posture of
+`gmessages-connect/`, extended to three networks plus an extra interactive
+step for X and a read-only number-enrichment endpoint.
+
+## What lives here
+
+- `connect.py` — the provisioning logic, **usable standalone as a CLI**
+  (`python3 session-connect/connect.py {twitter|linkedin|instagram}`). Its
+  functions are imported by the server without running `main()`:
+  - `NETWORKS` — per-network config: bridge service/port, `config.yaml`
+    path, provisioning `flow` name, and the cookie `domain`/`signal` used
+    to pick the right Chrome profile.
+  - `shared_secret()` — reads the bridge provisioning secret from the
+    network's `config.yaml`.
+  - `resolve_fields()` — reads Chrome cookies via `chrome_cookies.read()`
+    and, for fields the bridge asks for that live in a request header
+    rather than a cookie, calls `synth_header()`.
+  - `synth_header()` — rebuilds the `Cookie` header from the jar (including
+    httpOnly cookies) and synthesizes LinkedIn's two tracking headers
+    (`X-LI-Track`, `X-LI-Page-Instance`) that no cookie store holds — the
+    bridge only pattern-checks them, LinkedIn's read APIs accept a
+    well-formed value.
+  - `api()` — calls the bridge provisioning API inside its container via
+    `docker compose exec` (fixed argv list, `shell=False`).
+  - `provisioning_login()` — drives one network's login end to end,
+    including the `user_input` loop (used by X's XChat passcode step); the
+    CLI path prompts with `getpass` (never echoed).
+  - `ID_RE` — F2: `^[A-Za-z0-9._-]+\Z` for validating any bridge-returned
+    `login_id`/`step_id` before it is interpolated into a provisioning-API
+    path.
+- `chrome_cookies.py` — shared cookie reader (same approach as
+  `gmessages-connect/connect.py`): copies each Chrome profile's cookie DB to
+  a private 0600 `mkstemp` file, derives the AES key from the "Chrome Safe
+  Storage" Keychain item, decrypts the v10 blobs, and deletes the temp copy
+  in a `try/finally`. **Multi-profile**: Chrome keeps one cookie store per
+  profile (`Default`, `Profile 1`, …); `read()` scans every profile for the
+  target domain and picks the one that actually holds the logged-in session
+  — the profile whose jar carries the network's `signal` cookie (e.g.
+  LinkedIn's `li_at`) wins, falling back to the profile with the most
+  matching cookies. Never merges across profiles, so a returned jar is
+  always one profile's session and can't mix two accounts.
+- `connect_server.py` — the loopback helper (mirrors
+  `gmessages-connect/connect_server.py` and `master/enroll.py serve`):
+  single-threaded `HTTPServer` on **exactly `127.0.0.1:8021`**, silent
+  access log, CORS preflight locked to the app's own origin.
+- `run-connect.sh` + `com.jkali.session-connect.plist` — the launchd
+  service (`RunAtLoad`, `KeepAlive`, `Umask 63` = 0o77). `run-connect.sh`
+  puts docker on `PATH` because `api()` shells `docker compose exec`. Logs
+  go to `logs/` (gitignored).
+
+## The three login flows
+
+All three networks are completed **server-side** via the bridge's
+provisioning API: the session is read, submitted, and discarded inside this
+process; nothing but a generic status (+ the linked account localpart) is
+ever returned (F6) — the credential never touches a Matrix room.
+
+- **twitter** — `flow: "cookies"`. Reads `x.com` cookies (`ct0`,
+  `auth_token`); submits directly.
+- **linkedin** — `flow: "cookies"`. Reads `linkedin.com` cookies (incl. the
+  httpOnly `li_at`) plus the two synthesized tracking headers; submits
+  directly. If LinkedIn ever rejects the synthesized headers, the app's
+  paste box (Copy-as-cURL) is the documented fallback.
+- **instagram** — `flow: "instagram"`, the mautrix-meta `ig-` build's
+  dedicated login flow. Same shape as the other two under the hood (reads
+  `sessionid`/`csrftoken`/`ds_user_id`/`mid` cookies from the `instagram.com`
+  jar and submits them), just addressed at a different provisioning
+  endpoint name.
+- **X's extra step** — after cookies, X's bridge can respond
+  `type: user_input` (the XChat passcode). The CLI loops with `getpass`;
+  the server surfaces it as `POST /connect/<net>/start` →
+  `{status: input_required, login_id, step_id, fields}`, the Hub renders
+  the field(s), and `POST /connect/<net>/input` submits the value back here
+  — the browser never sees the session, only supplies this one short-lived
+  value, which is never logged or returned (F6).
+
+## Endpoints
+
+- `GET  /connect/health` → `200 "ok"` — **pure liveness, zero side effects**
+  (no cookie read, no Keychain, no bridge call, no CORS headers).
+- `POST /connect/<twitter|linkedin|instagram>/start` → reads cookies, starts
+  the bridge login, submits them, and returns one of:
+  `{status: complete, account}` | `{status: input_required, login_id,
+  step_id, instructions, fields}` | `{status: failed}`.
+- `POST /connect/<net>/input` → `{login_id, step_id, values}` in, submits
+  the interactive step (e.g. X's passcode) to the bridge, same
+  complete/input_required/failed shape back.
+- `POST /enrich/numbers` → `{numbers: {room_id: {value, kind, source}}}` —
+  calls the read-only `agents/enrich/number_resolver.resolve_all()` (a pure
+  `SELECT` across the bridge databases, no writes anywhere on this path)
+  and returns each 1:1 conversation's real phone number/email. Like the
+  cookie returns, the values go only to the authorized loopback origin and
+  are never logged.
+
+## Security invariants (from `connect_server.py`'s docstring — do not weaken)
+
+- **F1 — every `do_POST` is gated by `_authorized()` before any side
+  effect**: (a) `Origin` ∈ the two loopback aliases of the user's own app
+  (`http://127.0.0.1:8011`, `http://localhost:8011`); (b) `Content-Type ==
+  application/json`; (c) `X-Beepa-Connect: 1`. (b)+(c) are non-simple
+  headers, forcing a cross-origin page into a CORS preflight that fails,
+  since the server only ever echoes the one allowed origin.
+- **Loopback only.** Binds exactly `127.0.0.1:8021` — never `0.0.0.0` or
+  `""`.
+- **F5 — `GET /connect/health` has zero side effects and no CORS.** No path
+  reads cookies, the Keychain, or the bridge at import, on `start`, on a
+  timer, or from health — only an authorized `POST` does.
+- **F6 — the provisioning `shared_secret`, cookies, passcodes, and raw
+  bridge response bodies are never returned or logged.** Failures map to
+  fixed generic messages (`log_message` is a no-op; the one diagnostic
+  line, `_diag`, carries only method/path/origin/status). `/enrich/numbers`
+  follows the same posture: real phone numbers/emails go only to the
+  authorized origin, never to a log.
+- **F2 — bridge-returned `login_id`/`step_id` are validated** with
+  `connect.ID_RE` before being interpolated into a provisioning-API path,
+  on both `/start` and `/input`.
+
+## How to run / test
+
+```bash
+# Normal path: ./setup.sh installs + loads this (and the Google Messages
+# helper) for you.
+# Manual equivalent:
+cp session-connect/com.jkali.session-connect.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.jkali.session-connect.plist 2>/dev/null
+launchctl load  ~/Library/LaunchAgents/com.jkali.session-connect.plist
+
+# liveness (side-effect-free — no Keychain prompt):
+curl -s http://127.0.0.1:8021/connect/health          # -> ok
+
+# guard checks (these never reach a cookie read, so no Keychain prompt):
+curl -si -X POST http://127.0.0.1:8021/connect/instagram/start                     # 403 (no Origin)
+curl -si -X POST http://127.0.0.1:8021/connect/instagram/start -H 'Origin: http://evil.example'  # 403
+
+# CLI equivalent for any of the three, from a terminal:
+python3 session-connect/connect.py {twitter|linkedin|instagram}
+```
+
+Do **not** trigger a fully-authorized `/start` in an unattended test: it
+reads the user's Chrome cookies, fires a Keychain prompt, and starts a real
+login against the live bridge. Verify the guards + health only; test the
+happy path live.

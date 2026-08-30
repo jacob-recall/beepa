@@ -60,21 +60,15 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
-```bash
-# Example:
-# npm install
-# npm test
-```
+See `tests/CLAUDE.md` for how to run the unit tests and integration harness.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+See `docs/ARCHITECTURE.md` for the verified system architecture and data flow.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+See `docs/SYSTEM-DESIGN.md` for project conventions and design patterns.
 
 ## Master-sync architecture
 
@@ -107,9 +101,9 @@ lives where, security invariants, and how to run/test each piece:
 - `master/CLAUDE.md` — the always-on master Synapse stack (separate
   compose project `matrix-master`, its own ports), provisioning, and the
   v1.5 enrollment-code flow.
-- `tests/CLAUDE.md` — unit tests (consent parity, uplink reconcile logic)
-  and the 11-scenario integration harness that drives two real homeservers
-  end to end.
+- `tests/CLAUDE.md` — 19 unit tests, all wired into tests/run.sh (consent
+  parity, uplink reconcile logic, and more), and the 12-scenario
+  integration harness that drives two real homeservers end to end.
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)
 stays the source of truth for their own conversations. A teammate's layered

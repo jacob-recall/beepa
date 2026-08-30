@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # PLAN-GMSG — Google Messages bridge (as built)
 
 Adds `mautrix-gmessages` as a fourth source on the `matrix-wa` stack, mirroring

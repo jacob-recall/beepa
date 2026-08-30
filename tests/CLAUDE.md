@@ -1,4 +1,4 @@
-# tests/ — unit tests + the 11-scenario integration harness
+# tests/ — 19 unit tests, all wired into tests/run.sh + the 12-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -8,13 +8,26 @@ explicit, named test — see the scenario list below.
 
 ```
 tests/
-  run.sh                          convenience wrapper (JS unit test only — see below)
+  run.sh                          runs all 19 unit tests (9 node + 9 python) — see below
   unit/
     consent.test.js               shared/model/consent.js — every precedence case
     master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
     user_invites.test.js          apps/user/invites.js — the hub's bridge-invite auto-join trust gate
+    csp_parity.test.js            CSP header parity across apps
+    contact_consent.test.js       contact-level consent precedence
+    contacts_profile_handles.test.js  unified-contact profile/handle shaping
+    proposal_identifier.test.js   proposal identifier derivation
+    proposal_parse.test.js        proposal parsing
+    auto_merge_number.test.js     the sanctioned autoMergeByNumber() path
+    contacts_store.test.py        agents/uplink contacts store
+    import_macos.test.py          macOS address-book import
+    contact_consent_py.test.py    contact-level consent — MUST mirror contact_consent.test.js
+    uplink_reconcile.test.py      agents/uplink/reconcile.py — reconcile/idempotency/watermark
+    uplink_proposal_sanitize.test.py  proposal sanitization on the way down
+    number_resolver.test.py       phone-number resolution
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
-    uplink_reconcile.test.py       agents/uplink/reconcile.py — reconcile/idempotency/watermark
+    uplink_proposals.test.py      proposal handling
+    uplink_sources.test.py        source-space derivation
   integration/
     run.sh                        wrapper: `python3 tests/integration/harness.py "$@"`
     harness.py                    drives 2 real homeservers + the real uplink.py subprocess
@@ -82,7 +95,7 @@ the source the same way `shared/ui/sources.js` does), sets consent via
 account-data, runs the **real** `agents/uplink/uplink.py` as a subprocess,
 and asserts on MASTER homeserver state.
 
-**The 11 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
+**The 12 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
 requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
 
 1. `1_share_one_conversation` — share → mirror room appears with correct
@@ -111,6 +124,9 @@ requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
     profile's conversations across ≥2 platforms mirror up stamped with
     `com.jkali.profile`, so the master groups them under one person; a
     per-conversation `private` still excludes a member conversation.
+12. `12_contact_share_and_propose` — a shared contact profile reaches the
+    master's contacts index, and a manager-authored proposal against that
+    contact reaches the right teammate's proposals room.
 
 `tests/integration/test_enroll.py` separately proves the v1.5 enrollment
 flow end to end (valid/reused/expired/invalid code) against the running
@@ -125,11 +141,8 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh wraps the two JS tests — run the python ones directly:
-docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/consent.test.js
-docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/master_invites.test.js
-python3 tests/unit/consent_py.test.py
-python3 tests/unit/uplink_reconcile.test.py
+# tests/run.sh runs all 19 (9 node + 9 python):
+tests/run.sh
 
 # --- integration (needs BOTH stacks up first) ---
 # 1. matrix-master, provisioned (see master/CLAUDE.md):
@@ -142,7 +155,7 @@ TEAMMATES="alice bob" master/provision.sh
 # 2. the throwaway test-user hub:
 docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml up -d
 
-# 3. run all 11 scenarios, or filter by name substring:
+# 3. run all 12 scenarios, or filter by name substring:
 tests/integration/run.sh
 tests/integration/run.sh 3_offline          # just the catch-up scenario
 
@@ -157,12 +170,6 @@ docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml d
 `harness.py` writes uplink state DBs/logs to a scratch dir outside the repo
 (`SYNCTEST_STATE_DIR` env var, defaulting under the session scratchpad) —
 safe to delete between runs.
-
-**Note:** `tests/run.sh` runs the two node tests (`consent.test.js`,
-`master_invites.test.js`) only — the two python unit tests are still not in
-it. Keep telling people (as this file does) to run `consent_py.test.py` /
-`uplink_reconcile.test.py` directly; don't assume `tests/run.sh` alone is
-full unit coverage.
 
 ## How to change this safely
 

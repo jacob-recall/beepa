@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: iMessage connector, Phase 1 MVP (imsg-p1-v1)
 
 User-approved direction (2026-08-25): bridge iMessage into the existing local

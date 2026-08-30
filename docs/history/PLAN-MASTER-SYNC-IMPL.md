@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # PLAN-MASTER-SYNC-IMPL — Implementation Plan
 
 Executes the design in **PLAN-MASTER-SYNC.md**. Status: **COMPLETE —

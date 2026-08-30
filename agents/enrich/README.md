@@ -3,9 +3,10 @@
 `number_resolver.py` maps each 1:1 conversation's Matrix `room_id` to the
 counterpart's real E.164 phone number (or, for iMessage, an email
 address), by reading the bridge databases directly. This is the first
-piece of the "conversation number enrichment" feature — a later task
-exposes it over a loopback endpoint so the Hub can auto-merge contacts
-that share a number.
+piece of the "conversation number enrichment" feature. It is exposed over
+a loopback endpoint (`POST /enrich/numbers` in
+`session-connect/connect_server.py`), and the Hub auto-merges contacts
+that share a number via `shared/model/contacts.js`'s `autoMergeByNumber()`.
 
 **This module is read-only.** Every query below is a `SELECT`; nothing
 here ever writes to a bridge database, a bridge config, or a bridge

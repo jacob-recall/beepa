@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: Bridge Hub + backfill re-link (bridge-hub-v2)
 
 User-approved design: a static, localhost-only web page ("Bridge Hub") that

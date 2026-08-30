@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Amendment: unified Home feed (recent conversations across all platforms) — home-v1
 
 User request (2026-08-26): the hub's home/landing view becomes a UNIFIED list of

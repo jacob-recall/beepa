@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Integration harness for the uplink one-way sync (PLAN-MASTER-SYNC §13, P2.4/P2.5).
 
-Drives the eight edge-case scenarios end-to-end against TWO real running
+Drives the twelve edge-case scenarios end-to-end against TWO real running
 homeservers:
 
   * TEST-USER hub  — an ISOLATED throwaway Synapse (server_name: localhost) on

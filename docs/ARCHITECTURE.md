@@ -149,22 +149,18 @@ side-effect-free; cookies / the shared_secret / raw bridge bodies are never
 returned or logged. See `gmessages-connect/CLAUDE.md`.
 
 ### `tests/`
-- Unit (pure logic, no network — **all run and passing in this audit**):
-  `consent.test.js` (83 ✓, needs docker node:20-alpine), `consent_py.test.py`
-  (80 ✓), `uplink_reconcile.test.py` (23 ✓), `uplink_sources.test.py` (✓).
-- Integration: `harness.py` — **11** scenarios (comments claiming 8 are stale,
-  F11) driving the real `uplink.py` against two live homeservers (the
-  `matrix-synctest` throwaway on :8028 + the real master on :8018);
-  `test_enroll.py` for the enrollment flow. **Not run in this audit** — they
-  write real rooms to the live master. Last claimed green 2026-08-27
-  (unverified).
-- `tests/run.sh` runs only the JS unit test (F20).
+- Unit: 19 unit tests (9 JS + 9 python — consent parity, uplink reconcile,
+  auto-merge, proposals, contacts, and more), all wired into `tests/run.sh`.
+- Integration: `harness.py` — **12** scenarios driving the real `uplink.py`
+  against two live homeservers (the `matrix-synctest` throwaway on :8028 +
+  the real master on :8018); `test_enroll.py` for the enrollment flow.
+- `tests/run.sh` runs all 19 unit tests.
 
 ### Root docs
 `PLAN*.md` / `SPEC-META-HUB.md` are historical design/decision records (13
-files, one per feature wave). Accurate as history; several status lines are
-stale (F13). `README.md` predated the master-sync layer entirely and was
-rewritten as part of this audit.
+files, one per feature wave), archived under `docs/history/` — superseded,
+kept for reference only. `README.md` predated the master-sync layer
+entirely and was rewritten as part of this audit.
 
 ## Data flow (verified against code)
 

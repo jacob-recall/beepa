@@ -1,3 +1,5 @@
+> STATUS: SHIPPED (commits 0331eed..861e010 + fixes 0f0cb50, 27e9db4, f0aad7b). The checkboxes below are historical.
+
 # iMessage Contact-Import Vertical Slice — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

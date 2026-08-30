@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # PLAN-MASTER-SYNC — Master ↔ User Distributed Sync
 
 Design spec. Status: **COMPLETE — V1, V1.5, V2, and unified contacts (§12

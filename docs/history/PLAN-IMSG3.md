@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: Phase 3 — Hub left-bar per-source tabs + cross-source Directory (hub-p3-v1)
 
 Extends the Hub shell (PLAN-HUB.md, A1/A2 GOVERNING; hub is the single UI at

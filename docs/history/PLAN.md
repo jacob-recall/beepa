@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: Local WhatsApp↔Matrix bridge (wa-bridge-local-v3)
 
 Approved design: self-hosted mautrix-whatsapp on this Mac, localhost-only, via

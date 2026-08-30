@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: Instagram bridge via mautrix-meta (meta-bridge-local-v1)
 
 Approved design (2026-08-26). Adds a 4th bridge — **mautrix-meta in Instagram

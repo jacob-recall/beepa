@@ -1,5 +1,5 @@
 #!/bin/sh
-# Integration suite for the uplink one-way sync (the 8 Phase-2 scenarios).
+# Integration suite for the uplink one-way sync (the 12 Phase-2 scenarios).
 #
 # Prereqs (both are SEPARATE from the live matrix-wa hub, which this suite never
 # touches):

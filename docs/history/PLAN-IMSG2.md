@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: iMessage Phase 2 — richness + guided permission wizard (imsg-p2-v1)
 
 Builds on the verified Phase 1 connector (PLAN-IMSG.md; M-1..M-22 GOVERNING

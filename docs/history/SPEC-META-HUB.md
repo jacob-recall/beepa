@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # HANDOFF SPEC: add Instagram as a hub SOURCE (meta bridge)
 
 **Audience:** the agent that owns `hub/site/app.js` (Home feed / Directory / Connections).

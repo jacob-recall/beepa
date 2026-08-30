@@ -1,3 +1,5 @@
+> ARCHIVED (2026-08-30): historical planning doc, superseded — kept for reference only.
+
 # Plan: native in-hub conversation view (replace Element pane for read/reply) — convo-v1
 
 User chose (2026-08-26) to build the hub's OWN conversation screen so opening a

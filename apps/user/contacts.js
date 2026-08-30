@@ -446,15 +446,26 @@ async function openAddToContact(roomId) {
   card.appendChild(searchInput);
 
   const results = el('div', 'contact-attach-results');
+  results.style.cssText = 'max-height:320px;overflow-y:auto;margin:6px 0;';
   card.appendChild(results);
 
   const feedback = el('p', 'muted');
   card.appendChild(feedback);
 
+  // Save WITHOUT persist()'s People-view re-renders: this modal is opened from a
+  // conversation, and renderPeopleList()/setDetailMode('empty') inside persist()
+  // would wipe the open conversation out from under the user (that is why "New
+  // contact" appeared broken). Just write + refresh the store cache; the People
+  // view re-reads the store the next time it is opened.
+  const saveFromModal = async (next) => { store = await writeProfiles(next); };
   const finishLink = async (profileId) => {
-    await persist(linkRoom(store, profileId, roomId));
-    feedback.textContent = 'Added.';
-    setTimeout(closeAddToContact, 700);
+    try {
+      await saveFromModal(linkRoom(store, profileId, roomId));
+      feedback.textContent = 'Added.';
+      setTimeout(closeAddToContact, 700);
+    } catch (e) {
+      feedback.textContent = 'Could not save — try again.';
+    }
   };
 
   const renderResults = () => {
@@ -478,12 +489,16 @@ async function openAddToContact(roomId) {
   const newBtn = el('button', 'primary', 'New contact from this conversation');
   newBtn.type = 'button';
   newBtn.addEventListener('click', async () => {
-    const id = newProfileId();
-    let next = upsertProfile(store, { id, displayName: convoTitle, share: 'inherit' });
-    next = linkRoom(next, id, roomId);
-    await persist(next);
-    feedback.textContent = 'Added.';
-    setTimeout(closeAddToContact, 700);
+    try {
+      const id = newProfileId();
+      let next = upsertProfile(store, { id, displayName: convoTitle, share: 'inherit' });
+      next = linkRoom(next, id, roomId);
+      await saveFromModal(next);
+      feedback.textContent = 'Created “' + convoTitle + '”.';
+      setTimeout(closeAddToContact, 900);
+    } catch (e) {
+      feedback.textContent = 'Could not create — try again.';
+    }
   });
   newRow.appendChild(newBtn);
   card.appendChild(newRow);

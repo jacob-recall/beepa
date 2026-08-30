@@ -5,6 +5,7 @@ import { fetchSnapshot, seedFeed, startFeedSync, startFeedRefresh } from '../../
 import { countSharedNow, initConsentUI } from './consent.js';
 import { bridgeInvitesToJoin } from './invites.js';
 import { initContactsUI, openAddToContact } from './contacts.js';
+import { autoMergeContacts } from './enrich.js';
 import { initProposalsUI } from './proposals.js';
 import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
@@ -233,6 +234,10 @@ async function enterApp() {
   try { await seedFeed(); renderHome(); } catch (e) { /* feed stays empty on error */ }
   startFeedSync();
   startFeedRefresh();                               // periodic re-seed keeps newest convos time-ordered
+  // Conversation-number enrichment: once per session, in the background, group
+  // same-phone-number conversations into one contact. Fire-and-forget so it
+  // never blocks the UI; fails soft if the loopback helper is not reachable.
+  autoMergeContacts().catch(() => {});
   try { runtime.whatsapp.mgmtRoomId = await resolveMgmt(WA); }
   catch (e) { logConsole('error', 'WhatsApp management room: ' + String(e.message || e)); }
   try { runtime.imessage.mgmtRoomId = await resolveImsgMgmt(); }

@@ -161,3 +161,40 @@
   #convo-back, #proposal-back, #contact-back { display: inline-block; }
   .settings-popover { left: 8px; right: 8px; bottom: 8px; min-width: 0; }
 }
+
+/* ---- Proposals: Slack-threads-style inbox ---- */
+.proposal-thread { border-bottom: 1px solid rgba(127,127,127,0.12); }
+.proposal-row { cursor: pointer; align-items: center; }
+.proposal-row .plat-badge { flex: 0 0 auto; margin-right: 6px; }
+.proposal-chevron { flex: 0 0 auto; margin-left: 8px; color: #8a8f98; transition: transform .12s ease; }
+.proposal-chevron.expanded { transform: rotate(90deg); }
+.proposal-panel { padding: 6px 14px 14px; background: rgba(127,127,127,0.05); }
+.proposal-note { margin: 0 0 8px; font-size: 12px; }
+.proposal-body { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; padding: 8px; border: 1px solid rgba(127,127,127,0.3); border-radius: 8px; }
+.proposal-card-error { color: #c0392b; margin: 6px 0 0; font-size: 13px; }
+.proposal-card-error.hidden { display: none; }
+.proposal-actions { display: flex; gap: 8px; margin-top: 8px; }
+.proposal-btn { padding: 6px 14px; border-radius: 8px; border: 1px solid rgba(127,127,127,0.3); background: transparent; cursor: pointer; font: inherit; }
+.proposal-btn.primary { background: #2f6df6; color: #fff; border-color: #2f6df6; }
+.proposal-btn.proposal-dismiss { color: #8a8f98; }
+
+/* ---- Proposals: list top bar (count + kebab) + full-height detail ---- */
+.proposals-head { display: flex; align-items: center; justify-content: space-between; position: relative; padding: 10px 12px; border-bottom: 1px solid rgba(127,127,127,0.14); }
+.proposals-head-left { display: flex; align-items: center; gap: 8px; }
+.proposals-title { font-weight: 600; }
+.proposals-count { min-width: 20px; text-align: center; padding: 1px 7px; border-radius: 10px; background: #2f6df6; color: #fff; font-size: 12px; }
+.proposal-kebab { border: 0; background: transparent; font-size: 20px; line-height: 1; cursor: pointer; color: #8a8f98; padding: 2px 8px; border-radius: 6px; }
+.proposal-kebab:hover { background: rgba(127,127,127,0.12); }
+.proposal-kebab-menu { position: absolute; right: 10px; top: 40px; z-index: 20; background: var(--panel, #fff); border: 1px solid rgba(127,127,127,0.25); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.18); overflow: hidden; }
+.proposal-kebab-item { display: block; width: 100%; text-align: left; padding: 8px 14px; border: 0; background: transparent; cursor: pointer; font: inherit; white-space: nowrap; }
+.proposal-kebab-item:hover { background: rgba(127,127,127,0.12); }
+.proposals-divider { padding: 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.proposal-row.dismissed { opacity: .6; }
+#proposal-detail-body { display: flex; flex-direction: column; height: 100%; padding: 14px 16px; box-sizing: border-box; }
+.proposal-to { display: flex; align-items: center; gap: 6px; }
+.proposal-to-name { font-weight: 600; }
+.proposal-body-full { flex: 1; min-height: 160px; width: 100%; box-sizing: border-box; resize: none; font: inherit; padding: 12px; margin: 8px 0; border: 1px solid rgba(127,127,127,0.3); border-radius: 10px; }
+
+/* Proposals tab: small numbered dot badge (not "(N)" text) */
+#list-mode-proposals { position: relative; overflow: visible; }
+.proposal-count-dot { position: absolute; top: -5px; right: -7px; min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: #e02424; color: #fff; font-size: 10px; line-height: 16px; font-weight: 600; text-align: center; pointer-events: none; }

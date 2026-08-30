@@ -69,22 +69,106 @@ function profilePreview(p) {
   return p.roomIds.length ? p.roomIds.length + ' linked' : 'No conversations';
 }
 
+// Distinct platform icons for a profile: dedupe the sourceIds reached by
+// mapping each roomId through convoById, rendered in SOURCES order (skipping
+// the synthetic 'all' entry) via the shared buildPlatBadge — no reinvented
+// icon rendering. A profile with no linked/resolvable rooms renders no icons.
+function contactPlatformIds(p) {
+  const seen = new Set();
+  for (const rid of p.roomIds) {
+    const c = convoById(rid);
+    if (c && c.sourceId) seen.add(c.sourceId);
+  }
+  const out = [];
+  for (const s of SOURCES) {
+    if (s.kind === 'all') continue;
+    if (seen.has(s.id)) out.push(s.id);
+  }
+  return out;
+}
+
+function buildContactPlatRow(p) {
+  const strip = el('div', 'contact-plat-row');
+  for (const sourceId of contactPlatformIds(p)) strip.appendChild(buildPlatBadge(sourceId));
+  return strip;
+}
+
+// One accordion entry per roomId: platform badge + sanitized title, opens the
+// conversation via the shared, validated openConvo — no second nav path.
+// A stale roomId with no matching convo falls back to showing the id itself.
+function buildAccordionEntry(rid) {
+  const c = convoById(rid);
+  const row = el('div', 'contact-accordion-row');
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  if (c && c.sourceId) row.appendChild(buildPlatBadge(c.sourceId));
+  row.appendChild(el('span', 'title', sanitizeLine((c && c.title) || rid)));
+  const open = () => openConvo(rid);
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  return row;
+}
+
+// Inline accordion body: every conversation linked to the profile, plus a
+// "Manage" control that reaches the existing selectContact/renderContactDetail
+// panel (share toggle, rename, link/unlink) — kept reachable, just moved off
+// the row's own click, which now toggles this accordion instead.
+function buildContactAccordion(p) {
+  const acc = el('div', 'contact-accordion hidden');
+  if (!p.roomIds.length) {
+    acc.appendChild(el('p', 'muted', 'No conversations linked.'));
+  } else {
+    for (const rid of p.roomIds) acc.appendChild(buildAccordionEntry(rid));
+  }
+  const manage = el('button', 'contact-manage-btn', 'Manage contact');
+  manage.type = 'button';
+  manage.addEventListener('click', (e) => { e.stopPropagation(); selectContact(p.id); });
+  acc.appendChild(manage);
+  return acc;
+}
+
+// Collapse every open accordion (and its chevron) other than the one passed.
+// Keeps "only one open at a time" without any hidden state beyond the DOM.
+function collapseOtherAccordions(exceptAcc, exceptChevron) {
+  for (const other of document.querySelectorAll('.contact-accordion')) {
+    if (other !== exceptAcc) other.classList.add('hidden');
+  }
+  for (const chevron of document.querySelectorAll('.contact-chevron')) {
+    if (chevron !== exceptChevron) chevron.classList.remove('expanded');
+  }
+}
+
 function buildContactRow(p) {
   const name = sanitizeLine(p.displayName || 'Unnamed');
+  const wrap = el('div', 'contact-row-wrap');
   const row = el('div', 'convo contact-row');
   row.dataset.profileId = p.id;
   row.setAttribute('role', 'button');
   row.tabIndex = 0;
+  row.setAttribute('aria-expanded', 'false');
   row.appendChild(el('div', 'avatar', (name || '?').slice(0, 1).toUpperCase()));
   const meta = el('div', 'meta');
   meta.appendChild(el('div', 'title', name));
   meta.appendChild(el('div', 'preview', profilePreview(p)));
   row.appendChild(meta);
-  row.appendChild(el('span', 'when', String(p.roomIds.length)));
-  const open = () => selectContact(p.id);
-  row.addEventListener('click', open);
-  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  return row;
+  row.appendChild(buildContactPlatRow(p));
+  const chevron = el('span', 'contact-chevron', '▸');
+  row.appendChild(chevron);
+  wrap.appendChild(row);
+
+  const accordion = buildContactAccordion(p);
+  wrap.appendChild(accordion);
+
+  const toggle = () => {
+    const willOpen = accordion.classList.contains('hidden');
+    collapseOtherAccordions(accordion, chevron);
+    accordion.classList.toggle('hidden', !willOpen);
+    chevron.classList.toggle('expanded', willOpen);
+    row.setAttribute('aria-expanded', String(willOpen));
+  };
+  row.addEventListener('click', toggle);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+  return wrap;
 }
 
 function buildSuggestionRow(group, ignored) {
@@ -311,8 +395,112 @@ function renderPeopleViewBody() {
   else setDetailMode('empty');
 }
 
+// ===========================================================================
+// In-conversation "Add to contact" picker. Reuses the same model helpers and
+// persist() path as the People view — never a parallel storage/link scheme.
+// ===========================================================================
+let addContactBackdrop = null;
+
+function buildAddContactModal() {
+  const backdrop = el('div');
+  backdrop.style.cssText = 'position:fixed;inset:0;display:flex;z-index:100;';
+  backdrop.classList.add('hidden');
+  const card = el('div', 'card narrow');
+  card.style.cssText = 'margin:auto;width:380px;max-height:80vh;overflow-y:auto;padding:18px;';
+  backdrop.appendChild(card);
+  document.body.appendChild(backdrop);
+  return { backdrop, card };
+}
+
+function closeAddToContact() {
+  if (addContactBackdrop) addContactBackdrop.backdrop.classList.add('hidden');
+}
+
+async function openAddToContact(roomId) {
+  if (typeof roomId !== 'string' || !roomId) return;
+  if (!addContactBackdrop) addContactBackdrop = buildAddContactModal();
+  const { backdrop, card } = addContactBackdrop;
+
+  try { store = await readProfiles(); } catch (e) { /* keep cache */ }
+
+  const convo = convoById(roomId);
+  const convoTitle = sanitizeLine((convo && convo.title) || roomId);
+
+  card.replaceChildren();
+  card.appendChild(el('h3', null, 'Add to contact'));
+  card.appendChild(el('p', 'muted', convoTitle));
+
+  const currentId = roomToProfileId()[roomId];
+  if (currentId) {
+    const current = store.profiles.find((p) => p.id === currentId);
+    if (current) {
+      card.appendChild(el('p', 'muted',
+        'Currently linked to ' + (sanitizeLine(current.displayName) || 'Unnamed') + '. Picking a different contact below will move it.'));
+    }
+  }
+
+  const searchInput = el('input');
+  searchInput.placeholder = 'Search contacts…';
+  searchInput.spellcheck = false;
+  searchInput.autocomplete = 'off';
+  card.appendChild(searchInput);
+
+  const results = el('div', 'contact-attach-results');
+  card.appendChild(results);
+
+  const feedback = el('p', 'muted');
+  card.appendChild(feedback);
+
+  const finishLink = async (profileId) => {
+    await persist(linkRoom(store, profileId, roomId));
+    feedback.textContent = 'Added.';
+    setTimeout(closeAddToContact, 700);
+  };
+
+  const renderResults = () => {
+    const q = searchInput.value.trim().toLowerCase();
+    results.replaceChildren();
+    for (const p of filterProfiles(q)) {
+      if (p.id === currentId) continue;
+      const row = el('div', 'contact-attach-row');
+      row.appendChild(el('span', 'title', sanitizeLine(p.displayName || 'Unnamed')));
+      const btn = el('button', null, 'Link');
+      btn.type = 'button';
+      btn.addEventListener('click', () => finishLink(p.id));
+      row.appendChild(btn);
+      results.appendChild(row);
+    }
+  };
+  searchInput.addEventListener('input', renderResults);
+  renderResults();
+
+  const newRow = el('div', 'row');
+  const newBtn = el('button', 'primary', 'New contact from this conversation');
+  newBtn.type = 'button';
+  newBtn.addEventListener('click', async () => {
+    const id = newProfileId();
+    let next = upsertProfile(store, { id, displayName: convoTitle, share: 'inherit' });
+    next = linkRoom(next, id, roomId);
+    await persist(next);
+    feedback.textContent = 'Added.';
+    setTimeout(closeAddToContact, 700);
+  });
+  newRow.appendChild(newBtn);
+  card.appendChild(newRow);
+
+  const closeRow = el('div', 'row');
+  const cancelBtn = el('button', null, 'Cancel');
+  cancelBtn.type = 'button';
+  cancelBtn.addEventListener('click', closeAddToContact);
+  closeRow.appendChild(cancelBtn);
+  card.appendChild(closeRow);
+
+  backdrop.classList.remove('hidden');
+  searchInput.focus();
+}
+
 function initContactsUI() {
   setContactsViewHook(renderPeopleView);
 }
 
-export { initContactsUI, renderPeopleView };
+export { initContactsUI, renderPeopleView, openAddToContact };

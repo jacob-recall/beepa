@@ -4,7 +4,7 @@
 import { fetchSnapshot, seedFeed, startFeedSync, startFeedRefresh } from '../../shared/ui/account-data.js';
 import { countSharedNow, initConsentUI } from './consent.js';
 import { bridgeInvitesToJoin } from './invites.js';
-import { initContactsUI } from './contacts.js';
+import { initContactsUI, openAddToContact } from './contacts.js';
 import { initProposalsUI } from './proposals.js';
 import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
@@ -310,6 +310,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const convoPane = $('msgr-convo');
     if (convoPane) convoPane.classList.add('no-selection');
     setActiveConvoRow(null);
+  });
+  const convoAddContact = $('convo-add-contact');
+  if (convoAddContact) convoAddContact.addEventListener('click', () => {
+    if (!S.openRoomId) return;                       // no-op with no conversation open
+    openAddToContact(S.openRoomId);
   });
   const convoSend = $('convo-send');
   // Wrap so the click Event is never passed as an explicit target/body — the

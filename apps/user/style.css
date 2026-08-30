@@ -137,6 +137,17 @@
 .contact-linked-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
 .contact-delete-block { margin-top: 16px; }
 
+.contact-row-wrap { display: flex; flex-direction: column; }
+.contact-row .plat-badge { width: 18px; height: 18px; }
+.contact-plat-row { display: flex; flex: 0 0 auto; gap: 4px; align-items: center; margin-left: auto; }
+.contact-chevron { flex: 0 0 auto; color: var(--color-muted); font-size: 12px; transition: transform 0.15s ease; }
+.contact-chevron.expanded { transform: rotate(90deg); }
+.contact-accordion { display: flex; flex-direction: column; gap: 2px; padding: 6px 16px 10px 65px; background: var(--color-surface); border-bottom: 1px solid var(--color-divider); }
+.contact-accordion-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.contact-accordion-row:hover { background: var(--color-list-hover); }
+.contact-accordion-row .title { font-size: 14px; color: var(--color-text); }
+.contact-manage-btn { align-self: flex-start; margin-top: 4px; font-size: 12px; padding: 4px 8px; }
+
 #modal-backdrop { position: fixed; inset: 0; display: flex; z-index: 100; }
 #modal { margin: auto; width: 380px; padding: 18px; }
 

@@ -14,7 +14,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "agents", "uplink"))
 import reconcile  # noqa: E402
-from reconcile import reconcile_decisions, select_new_events, next_watermark  # noqa: E402
+from reconcile import (  # noqa: E402
+    reconcile_decisions, select_new_events, next_watermark, select_contacts_to_mirror,
+)
+from consent import normalize_contact_policy  # noqa: E402
 
 _pass = 0
 _fail = 0
@@ -103,6 +106,41 @@ for _ in range(5):
 eq(wm, "p0", "watermark: unchanged across an offline burst")
 wm = next_watermark(wm, "p9", True)        # reconnect + confirm
 eq(wm, "p9", "watermark: catches up after reconnect")
+
+
+# ---- contact-share selection (Task 6) -------------------------------------
+# The pure "which versions to push" planner: version > cursor AND the source
+# resolves shared under the contact-share policy, in ascending version order.
+# A not-shared source is omitted so it never reaches the daemon's PUT path.
+def _crows(*versions, source="imessage"):
+    return [{"source": source, "network_id": "h%d" % v, "kind": "phone",
+             "display_name": None, "person_id": None, "deleted": 0, "version": v}
+            for v in versions]
+
+
+share_imsg = normalize_contact_policy({"sources": {"imessage": "share-all"}})
+not_shared = normalize_contact_policy({"global": "private"})
+
+# cursor=2, rows [1..5], policy shares imessage -> exactly 3,4,5 in order.
+sel = select_contacts_to_mirror(_crows(1, 2, 3, 4, 5), 2, share_imsg)
+eq([r["version"] for r in sel], [3, 4, 5], "contacts: cursor=2 shared -> 3,4,5")
+# same rows, a not-shared policy -> none leave the machine.
+eq(select_contacts_to_mirror(_crows(1, 2, 3, 4, 5), 2, not_shared), [],
+   "contacts: not-shared policy -> none")
+# cursor=0 picks up everything; unsorted input is returned in version order.
+eq([r["version"] for r in select_contacts_to_mirror(_crows(5, 3, 1, 4, 2), 0, share_imsg)],
+   [1, 2, 3, 4, 5], "contacts: unsorted input sorted by version")
+# per-source private-all overrides global share-all (most-specific-wins).
+priv_imsg = normalize_contact_policy({"global": "share-all", "sources": {"imessage": "private-all"}})
+eq(select_contacts_to_mirror(_crows(3, 4, 5), 2, priv_imsg), [],
+   "contacts: per-source private-all skips despite global share-all")
+# mixed sources: only the shared source's rows are selected.
+mixed = _crows(3, source="imessage") + _crows(4, source="whatsapp")
+eq([r["version"] for r in select_contacts_to_mirror(mixed, 2, share_imsg)], [3],
+   "contacts: only the shared source's rows selected")
+# empty / None inputs are safe.
+eq(select_contacts_to_mirror([], 0, share_imsg), [], "contacts: empty rows")
+eq(select_contacts_to_mirror(None, 0, share_imsg), [], "contacts: None rows")
 
 
 print("\n%d passed, %d failed" % (_pass, _fail))

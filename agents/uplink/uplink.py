@@ -46,6 +46,7 @@ Optional:
 
 Python 3.9+ stdlib only (urllib + sqlite3). No pip dependencies.
 """
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,12 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import consent            # noqa: E402
 import reconcile          # noqa: E402
+
+# The durable address-book store (agents/contacts/contacts_store.py, Task 1) is
+# the SOURCE for the contact mirror. It is a sibling package; add its dir to the
+# path and import the module directly (stdlib-only, no side effects at import).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contacts"))
+import contacts_store     # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -113,6 +120,15 @@ SELF_IDENTITIES_TYPE = "com.jkali.self_identities"
 PROPOSAL_TYPE = "com.jkali.proposal"        # timeline event carrying a suggestion
 PROPOSALS_MARKER = "com.jkali.proposals"    # state marker on a proposals room
 
+# §12 phase 5 contact mirror (Task 6). A DEDICATED per-teammate contacts room on
+# the master carries one com.jkali.contact STATE event per SHARED address-book
+# handle (keyed by sha1(source|network_id)); the room is marked com.jkali.contacts
+# and power-leveled so the manager can only READ. The uplink pushes only handles
+# whose SOURCE resolves to shared under com.jkali.contact_share_policy — a
+# not-shared handle never leaves the machine.
+CONTACT_STATE_TYPE = "com.jkali.contact"    # per-handle state event on the contacts room
+CONTACTS_MARKER = "com.jkali.contacts"      # state marker on the contacts room
+
 # Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
 MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
 # Generic Matrix room-id shape (any server_name) — the proposal's target_room is
@@ -135,6 +151,67 @@ log = logging.getLogger("uplink")
 
 class MasterUnreachable(Exception):
     """Raised when the MASTER homeserver cannot be reached (buffer + backoff)."""
+
+
+# --------------------------------------------------------------- handle owner
+# Byte-parity Python port of the handle-grouping half of
+# shared/model/contacts.js (normalizeProfiles + handleOwner). It exists so the
+# uplink derives person_id from the AUTHORITATIVE account-data grouping exactly
+# as the JS does, and the master therefore groups a handle under the same person.
+# Composite key is `source + '|' + network_id`; a handle belongs to AT MOST ONE
+# profile and the FIRST profile that claims it wins (re-normalized here so a
+# malformed stored profile can never smuggle a handle into two profiles).
+def _normalize_profiles_handles(profiles):
+    """The handle-relevant subset of normalizeProfiles(): dedup profile ids
+    (first wins), coerce displayName to a string, and claim each well-formed
+    handle for the first profile that lists it. Returns an ordered list of
+    {'id', 'displayName', 'handleIds': [(source, network_id), ...]}. roomIds do
+    not affect handle ownership and are intentionally not processed here."""
+    raw = profiles if isinstance(profiles, list) else []
+    seen_ids = set()
+    claimed = set()
+    out = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if not isinstance(pid, str) or not pid or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+        dn = p.get("displayName")
+        dn = dn if isinstance(dn, str) else ""
+        handles = []
+        raw_handles = p.get("handleIds")
+        if isinstance(raw_handles, list):
+            for h in raw_handles:
+                if not isinstance(h, dict):
+                    continue
+                source = h.get("source")
+                source = source if isinstance(source, str) else ""
+                network_id = h.get("network_id")
+                network_id = network_id if isinstance(network_id, str) else ""
+                if not source or not network_id:
+                    continue
+                key = source + "|" + network_id
+                if key in claimed:
+                    continue
+                claimed.add(key)
+                handles.append((source, network_id))
+        out.append({"id": pid, "displayName": dn, "handleIds": handles})
+    return out
+
+
+def handle_owner(profiles, source, network_id):
+    """The id of the profile that owns (source, network_id), or None.
+
+    Byte-parity with handleOwner() in shared/model/contacts.js: same composite
+    key, same first-profile-wins rule, same re-normalization. Given the raw
+    `profiles` array from com.jkali.contact_profiles."""
+    for p in _normalize_profiles_handles(profiles):
+        for (src, nid) in p["handleIds"]:
+            if src == source and nid == network_id:
+                return p["id"]
+    return None
 
 
 class Config:
@@ -164,6 +241,10 @@ class Config:
             "master_space": self.master_space,
         }
         self.db_path = env.get("UPLINK_DB") or os.path.join(BASE, "state.db")
+        # The address-book store the contact mirror reads (Task 1). Defaults to
+        # the importer's sibling store; the integration harness repoints it.
+        self.contacts_db = env.get("UPLINK_CONTACTS_DB") or os.path.normpath(
+            os.path.join(BASE, "..", "contacts", "contacts.db"))
         self.backfill = max(0, min(int(env.get("UPLINK_BACKFILL", "500")), 500))
         self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "5000"))
         self.reconcile_ms = int(env.get("UPLINK_RECONCILE_MS", "30000"))
@@ -230,6 +311,15 @@ class Uplink:
         db.execute(
             "CREATE TABLE IF NOT EXISTS proposal_map ("
             "master_event_id TEXT PRIMARY KEY, local_event_id TEXT)")
+        # §12 phase 5 contact mirror (Task 6): the per-handle up-direction record
+        # — which store version was last mirrored for a handle and under which
+        # master state_key. Belt-and-suspenders alongside the contact_cursor
+        # watermark (com.jkali.contact state events are already idempotent by
+        # state_key, so a replay overwrites rather than duplicates).
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS contact_mirror ("
+            "source TEXT, network_id TEXT, mirrored_version INTEGER, "
+            "master_state_key TEXT, PRIMARY KEY(source, network_id))")
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
         try:
@@ -948,6 +1038,203 @@ class Uplink:
         if posted:
             log.info("proposals: pulled %d new -> local room %s", posted, lpr)
 
+    # -- contact mirror (§12 phase 5, Task 6, LOCAL contacts.db -> MASTER) ---
+    # Address-book contacts (PII) leave the machine ONLY when consent says so.
+    # HARD LIMITS enforced here:
+    #   - a handle whose SOURCE resolves NOT shared (consent.resolve_contact_share
+    #     over com.jkali.contact_share_policy) is SKIPPED before any network call
+    #     and never PUT to the master;
+    #   - contact_cursor advances to a row's version ONLY after the master PUT
+    #     returns 2xx (self.master raises MasterUnreachable otherwise, leaving the
+    #     cursor unmoved for a next-pass retry) — exactly-once, no loss on outage;
+    #   - the contacts room is created ONCE, power-leveled so the manager can only
+    #     READ (state_default 100, manager at 0 -> no com.jkali.contact write);
+    #   - never log a contact value (network_id / display_name) — counts only.
+    def read_contact_profiles(self):
+        """The raw profiles list from com.jkali.contact_profiles (or []).
+
+        handle_owner() re-normalizes it, so this stays a thin read. Absent or an
+        HTTP error -> [] (no groupings)."""
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + CONTACT_PROFILES_TYPE)
+        try:
+            data = self.local("GET", path)
+        except urllib.error.HTTPError:
+            return []
+        profiles = data.get("profiles") if isinstance(data, dict) else None
+        return profiles if isinstance(profiles, list) else []
+
+    def read_contact_policy(self):
+        """Normalized contact-share policy from com.jkali.contact_share_policy.
+
+        Absent/error -> the safe default (global 'private', no sources), matching
+        the conversation policy read's fail-safe: nothing shared unless a level
+        explicitly says so."""
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + consent.CONTACT_SHARE_POLICY_TYPE)
+        try:
+            return consent.normalize_contact_policy(self.local("GET", path))
+        except urllib.error.HTTPError:
+            return {"global": "private", "sources": {}}
+
+    def ensure_contacts_room(self):
+        """Idempotently ensure the per-teammate master contacts room; cache its id.
+
+        Created as the teammate's own scoped account, linked under the teammate's
+        master space, marked com.jkali.contacts, and power-leveled so the manager
+        can only READ: state_default 100 with the manager pinned to 0 means the
+        manager cannot write a com.jkali.contact state event (there is no
+        per-event lower power for it), and events_default 50 keeps the manager
+        from posting timeline events too. Mirrors the read-only PL-pinning of
+        create_mirror() / ensure_proposal_rooms() (§8.3)."""
+        cfg = self.cfg
+        mcr = self.meta_get("master_contacts_room")
+        if mcr:
+            return mcr
+        body = {
+            "name": "Contacts",
+            "topic": "Shared address-book contacts for this teammate. Read-only — "
+                     "only contacts the teammate has consented to share appear here.",
+            "preset": "private_chat",
+            "invite": [cfg.manager_mxid],
+            "initial_state": [
+                {"type": CONTACTS_MARKER, "state_key": "", "content": {}},
+                {"type": "m.space.parent", "state_key": cfg.master_space,
+                 "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
+            ],
+            # Read-only enforcement: owner 100, manager 0, state_default 100 =>
+            # the manager cannot write com.jkali.contact (or any state); no entry
+            # in `events` lowers com.jkali.contact's required power below that.
+            "power_level_content_override": {
+                "users": {cfg.master_user: 100, cfg.manager_mxid: 0},
+                "events_default": 50,
+                "state_default": 100,
+                "invite": 100, "kick": 100, "ban": 100, "redact": 100,
+            },
+        }
+        res = self.master("POST", "/_matrix/client/v3/createRoom", body)
+        mcr = res["room_id"]
+        self.master("PUT", "/_matrix/client/v3/rooms/"
+                    + urllib.parse.quote(cfg.master_space, safe="")
+                    + "/state/m.space.child/" + urllib.parse.quote(mcr, safe=""),
+                    {"via": [self._server_name(cfg.master_user)]})
+        self.meta_set("master_contacts_room", mcr)
+        # A fresh master room means nothing is mirrored yet: reset the cursor and
+        # the per-handle mirror record so everything is re-pushed into the new room.
+        self.db.execute("DELETE FROM meta WHERE k='contact_cursor'")
+        self.db.execute("DELETE FROM contact_mirror")
+        self.db.commit()
+        log.info("created master contacts room %s under space %s", mcr, cfg.master_space)
+        return mcr
+
+    def _put_contact(self, room, row, id_to_dn):
+        """Upsert one com.jkali.contact STATE event; return its state_key.
+
+        state_key = sha1(source + '|' + network_id): re-PUTting the same handle
+        overwrites its own state event, so a replay is idempotent. A soft-deleted
+        (deleted=1) row pushes a tombstone ({deleted: true}) so the master drops
+        it; otherwise the grouping fields ride along (person_id/person_display are
+        null when the handle is unlinked). Raises MasterUnreachable (via
+        self.master) on a master outage WITHOUT recording anything, so the caller
+        leaves the cursor unadvanced and retries next pass."""
+        source = row["source"]
+        network_id = row["network_id"]
+        state_key = hashlib.sha1((source + "|" + network_id).encode("utf-8")).hexdigest()
+        if row["deleted"]:
+            content = {"deleted": True}
+        else:
+            pid = row.get("person_id")
+            content = {
+                "source": source,
+                "network_id": network_id,
+                "kind": row.get("kind"),
+                "display_name": row.get("display_name"),
+                "person_id": pid,
+                "person_display": id_to_dn.get(pid) if pid else None,
+                "deleted": False,
+            }
+        self.master("PUT", "/_matrix/client/v3/rooms/"
+                    + urllib.parse.quote(room, safe="")
+                    + "/state/" + CONTACT_STATE_TYPE + "/"
+                    + urllib.parse.quote(state_key, safe=""), content)
+        return state_key
+
+    def mirror_contacts(self):
+        """Mirror shared address-book contacts up to the master, exactly-once.
+
+        Called each reconcile pass AFTER the conversation reconcile.
+          (a) Recompute contacts.db's derived person_id cache from the
+              authoritative account-data grouping (com.jkali.contact_profiles via
+              handle_owner). A re-link becomes a version bump that then flows to
+              the master as a normal update; set_person_id only bumps when the
+              link actually changed.
+          (b) For each store row newer than contact_cursor whose SOURCE resolves
+              to shared, upsert a com.jkali.contact state event (soft-deleted ->
+              tombstone). A row that resolves NOT shared is skipped BEFORE any
+              network call and never leaves the machine.
+          (c) contact_cursor advances to a row's version only after the PUT's 2xx
+              (or immediately for a no-network skip). On MasterUnreachable the
+              exception propagates before the cursor is advanced past the unsent
+              row, so the next pass resumes there with no loss and no duplicate."""
+        room = self.ensure_contacts_room()
+        if not room:
+            return
+        if not os.path.exists(self.cfg.contacts_db):
+            return  # the importer has not produced a store yet -> nothing to mirror
+        profiles = self.read_contact_profiles()
+        id_to_dn = {p["id"]: p["displayName"] for p in _normalize_profiles_handles(profiles)}
+        policy = self.read_contact_policy()
+        conn = contacts_store.open_store(self.cfg.contacts_db)
+        try:
+            # (a) Recompute the derived person_id cache for every known-source row.
+            # Only touch the store when the link actually changed (keeps the
+            # two-writer contacts.db writes short).
+            relinked = 0
+            for source in SOURCE_ID_TO_LABEL:
+                for row in contacts_store.shared_since(conn, source, 0):
+                    owner = handle_owner(profiles, source, row["network_id"])
+                    if row["person_id"] != owner:
+                        if contacts_store.set_person_id(conn, source, row["network_id"], owner):
+                            relinked += 1
+            # (b/c) Select + push rows newer than the cursor, in global version
+            # order (contact_cursor is a single monotonic version across sources).
+            cursor = int(self.meta_get("contact_cursor", "0") or "0")
+            rows = []
+            for source in SOURCE_ID_TO_LABEL:
+                rows.extend(contacts_store.shared_since(conn, source, cursor))
+            rows.sort(key=lambda r: r["version"])
+            shared_versions = {
+                r["version"]
+                for r in reconcile.select_contacts_to_mirror(rows, cursor, policy)
+            }
+            pushed = tombstoned = skipped = 0
+            for row in rows:
+                v = row["version"]
+                if v in shared_versions:
+                    # SHARED: PUT (may raise MasterUnreachable -> cursor unmoved).
+                    sk = self._put_contact(room, row, id_to_dn)
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO contact_mirror "
+                        "(source, network_id, mirrored_version, master_state_key) "
+                        "VALUES (?,?,?,?)",
+                        (row["source"], row["network_id"], v, sk))
+                    self.db.commit()
+                    if row["deleted"]:
+                        tombstoned += 1
+                    else:
+                        pushed += 1
+                else:
+                    # NOT shared: never sent. No network call was made.
+                    skipped += 1
+                # Advance only after this row was handled (confirmed PUT or skip).
+                self.meta_set("contact_cursor", str(v))
+            if relinked or pushed or tombstoned or skipped:
+                log.info("contacts: relinked=%d pushed=%d tombstoned=%d skipped=%d "
+                         "(cursor now %s)", relinked, pushed, tombstoned, skipped,
+                         self.meta_get("contact_cursor", "0"))
+        finally:
+            conn.close()
+
     # -- main loop ----------------------------------------------------------
     def tail_once(self):
         """One /sync of the LOCAL hs; forward new events in shared mirror rooms."""
@@ -1022,6 +1309,11 @@ class Uplink:
                 now = time.time()
                 if now - self._last_reconcile >= self.cfg.reconcile_ms / 1000.0:
                     self.reconcile()
+                    # §12 phase 5: mirror shared address-book contacts up AFTER
+                    # the conversation reconcile. Consent-gated + exactly-once;
+                    # a master outage raises MasterUnreachable and is buffered
+                    # by the handler below (cursor left unadvanced).
+                    self.mirror_contacts()
                     self._last_reconcile = now
                 self.tail_once()
                 # V2 proposal channel: ensure the dedicated proposals rooms exist,

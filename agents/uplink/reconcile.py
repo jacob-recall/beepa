@@ -4,6 +4,12 @@ PLAN-MASTER-SYNC.md §5.4 (reconcile) and §8.2 (watermark & idempotency).
 No I/O, no side effects at import — unit-tested in tests/unit/uplink_reconcile.test.py.
 """
 
+# consent is a sibling pure module (agents/uplink/consent.py): the contact-share
+# resolver, no I/O, no import-time side effects. It is the SINGLE authority on
+# whether a source's contacts may leave the machine, so the contact-selection
+# planner below calls it rather than re-deriving the rule.
+import consent
+
 
 def reconcile_decisions(desired_shared, existing_mirrors):
     """Decide per local room what the reconciler must do.
@@ -59,6 +65,31 @@ def select_new_events(event_ids, mapped_ids):
             continue
         seen.add(eid)
         out.append(eid)
+    return out
+
+
+def select_contacts_to_mirror(rows, cursor, policy):
+    """Which contact rows must be pushed to the master this pass (§12 phase 5).
+
+    rows   : store rows (dicts with at least 'source' and 'version'), any order.
+    cursor : the last mirrored global version (contact_cursor); only rows with
+             version > cursor are candidates.
+    policy : a normalized contact-share policy (consent.normalize_contact_policy).
+
+    Returns the candidate rows whose SOURCE resolves to shared under the policy,
+    in ascending version order. A row that resolves NOT shared is OMITTED, so it
+    is never handed to the caller's PUT path and never leaves the machine. This
+    is the consent gate for contacts, kept pure so it is unit-testable without a
+    live homeserver; the daemon still advances its cursor over the skipped rows
+    it does not receive here.
+    """
+    out = []
+    for row in sorted(rows or [], key=lambda r: (r.get("version") or 0)):
+        v = row.get("version")
+        if v is None or v <= cursor:
+            continue
+        if consent.resolve_contact_share(row.get("source"), policy).get("shared"):
+            out.append(row)
     return out
 
 

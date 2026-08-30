@@ -59,6 +59,10 @@
 .profile-group { margin: 0; }
 .profile-header { padding: 8px 16px; }
 .profile-members .convo { padding-left: 24px; }
+.profile-platforms { display: inline-flex; gap: 4px; margin-left: 8px; }
+
+#list-head { display: flex; flex-direction: column; gap: 8px; }
+#contacts-export { align-self: flex-start; }
 
 #proposal-pane { flex: 0 0 auto; }
 .proposal-footer { display: flex; align-items: center; gap: 12px; padding: 12px 16px; }

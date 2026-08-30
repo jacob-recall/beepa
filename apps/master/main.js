@@ -459,6 +459,10 @@ async function refreshAll() {
   MS.rooms = rooms;
   MS.byUser = buildByUser(rooms);
   MS.feed = [].concat(...[...MS.byUser.values()]).sort((a, b) => b.lastTs - a.lastTs);
+  // Fold this refresh into the persistent contacts index. Fire-and-forget:
+  // it is O(contacts) over data already in memory (no extra /sync), and its
+  // own try/catch means a failure here never affects rendering below.
+  persistContactsIndex().catch(() => {});
   renderTeammateNav();
   renderUnverifiedNote();
   // The open room can disappear mid-session (the teammate un-shared it, or it
@@ -513,6 +517,18 @@ function buildPlatBadge(sourceId) {
 }
 function platformLabel(sourceId) {
   return (sourceId && PLATFORM_LABEL[sourceId]) || '';
+}
+
+// Stable badge order for a multi-platform summary row: the same order the
+// per-row badges already imply (PLATFORM_ICON's declaration order), with any
+// unrecognized source id appended afterwards, alphabetically, rather than
+// dropped. Pure data shaping — no rendering here.
+const PLATFORM_ORDER = Object.keys(PLATFORM_ICON);
+function computePlatforms(sourceIds) {
+  const set = new Set((sourceIds || []).filter(Boolean));
+  const known = PLATFORM_ORDER.filter(s => set.has(s));
+  const rest = [...set].filter(s => !PLATFORM_ORDER.includes(s)).sort();
+  return known.concat(rest);
 }
 
 // One row = one mirror room, whichever list it appears in (Recent / a
@@ -1088,6 +1104,11 @@ function groupContactsView(contacts, feed, q) {
   // profileId == person_id — and the same teammate).
   for (const g of groups.values()) {
     g.rooms = (feed || []).filter(c => c.profileId === g.personId && c.userLabel === g.label);
+    // COMPUTED DIMENSIONALITY: the distinct set of platforms this one person
+    // spans, across their handles AND their mirror rooms — a one-glance "this
+    // person is on WhatsApp + iMessage + …" summary. Pure derivation over
+    // already-grouped data; no extra reads.
+    g.platforms = computePlatforms(g.contacts.map(c => c.source).concat(g.rooms.map(r => r.sourceId)));
   }
   return order;
 }
@@ -1121,12 +1142,165 @@ function buildContactPersonGroup(g) {
   const h = g.contacts.length, t = g.rooms.length;
   header.appendChild(el('span', 'profile-count',
     h + ' handle' + (h === 1 ? '' : 's') + (t ? ' · ' + t + ' thread' + (t === 1 ? '' : 's') : '')));
+  // Platform-badge summary row — reuses buildPlatBadge (the same per-source
+  // badge already used on every contact/room row), never new icon rendering.
+  const platRow = el('span', 'profile-platforms');
+  for (const src of (g.platforms || [])) platRow.appendChild(buildPlatBadge(src));
+  header.appendChild(platRow);
   wrap.appendChild(header);
   const members = el('div', 'profile-members');
   for (const ct of g.contacts) members.appendChild(buildContactRow(ct));
   for (const c of g.rooms) members.appendChild(buildFeedRow(c));
   wrap.appendChild(members);
   return wrap;
+}
+
+// ===========================================================================
+// Persistent contacts index (B1) — a fast, backed-up copy of the contacts
+// view folded into one record per person, kept in IndexedDB at the master
+// origin. This is a read-side cache/backup ONLY: it is rebuilt from the
+// already-in-memory MS state on every refresh (O(contacts), no extra /sync
+// or network round-trips) and never gates rendering — every IndexedDB call
+// is wrapped in try/catch so the app works fully even where IndexedDB is
+// unavailable (a private window, disabled site data), falling back to the
+// in-memory MS exactly as before this feature existed.
+// ===========================================================================
+const CONTACTS_IDB_NAME = 'beepa-master-contacts';
+const CONTACTS_IDB_STORE = 'people';
+const CONTACTS_IDB_VERSION = 1;
+
+function openContactsDb() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) { reject(new Error('indexedDB unavailable')); return; }
+    const req = indexedDB.open(CONTACTS_IDB_NAME, CONTACTS_IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(CONTACTS_IDB_STORE)) {
+        db.createObjectStore(CONTACTS_IDB_STORE, { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// One record per person (schema — see apps/master/CLAUDE.md / the B1 report):
+//   { key, person_id, teammate, display_name, platforms:[...],
+//     handles:[{source, value}], rooms:[{room_id, source, name}],
+//     first_seen, last_seen }
+// `key` is (teammate label + person_id), or (teammate label + the bare
+// handle) for a person_id-less contact, so two teammates' address books
+// never collide and an ungrouped handle still gets its own durable record.
+// Built from groupContactsView with an EMPTY query (i.e. unfiltered — the
+// persisted index always covers every contact, independent of the current
+// search box) over the already-in-memory MS.contacts/MS.feed.
+function buildContactsIndexRecords(nowTs) {
+  const groups = groupContactsView(MS.contacts, MS.feed, '');
+  const records = [];
+  for (const item of groups) {
+    if (item.kind === 'person') {
+      records.push({
+        key: item.label + '|' + item.personId,
+        person_id: item.personId,
+        teammate: item.label,
+        display_name: item.display || '',
+        platforms: item.platforms || [],
+        handles: item.contacts.map(c => ({ source: c.source, value: c.network_id })),
+        rooms: item.rooms.map(r => ({ room_id: r.id, source: r.sourceId, name: r.title })),
+        last_seen: nowTs,
+      });
+    } else {
+      const ct = item.contact;
+      records.push({
+        key: (ct.label || '') + '|handle:' + ct.network_id,
+        person_id: null,
+        teammate: ct.label,
+        display_name: ct.display_name || ct.person_display || ct.network_id,
+        platforms: computePlatforms([ct.source]),
+        handles: [{ source: ct.source, value: ct.network_id }],
+        rooms: [],
+        last_seen: nowTs,
+      });
+    }
+  }
+  return records;
+}
+
+// Fold this refresh's records into IndexedDB, preserving each record's
+// earliest-seen `first_seen` (read-then-put per key, one shared transaction).
+// Best-effort only: any failure (unavailable/blocked storage, quota) is
+// swallowed — the contacts view itself never depends on this succeeding.
+async function persistContactsIndex() {
+  try {
+    const records = buildContactsIndexRecords(Date.now());
+    const db = await openContactsDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(CONTACTS_IDB_STORE, 'readwrite');
+      const store = tx.objectStore(CONTACTS_IDB_STORE);
+      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => resolve();
+      for (const rec of records) {
+        const getReq = store.get(rec.key);
+        getReq.onsuccess = () => {
+          const existing = getReq.result;
+          rec.first_seen = (existing && existing.first_seen) || rec.last_seen;
+          store.put(rec);
+        };
+        // getReq.onerror is left to the transaction's onerror above.
+      }
+    });
+    db.close();
+  } catch (e) {
+    // IndexedDB unavailable or failed — no-op. MS stays the source of truth.
+  }
+}
+
+// Read the full persisted index back (used by Export). Falls back to a
+// freshly-built, in-memory-only record set (first_seen == last_seen) when
+// IndexedDB cannot be read, so Export still works with storage disabled.
+async function readContactsIndexAll() {
+  try {
+    const db = await openContactsDb();
+    const records = await new Promise((resolve, reject) => {
+      const tx = db.transaction(CONTACTS_IDB_STORE, 'readonly');
+      const store = tx.objectStore(CONTACTS_IDB_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return records;
+  } catch (e) {
+    const now = Date.now();
+    return buildContactsIndexRecords(now).map(r => Object.assign({ first_seen: now }, r));
+  }
+}
+
+// Export/backup: download the full persisted index as a portable JSON file.
+// A plain Blob + a real <a download> click — this is the master web app
+// served from the master homeserver (not a sandboxed artifact), so a normal
+// browser download works. This reads data only; it is not a write path.
+async function exportContacts() {
+  const status = $('contacts-export-status');
+  try {
+    const records = await readContactsIndexAll();
+    const payload = { exported_at: new Date().toISOString(), contacts: records };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'beepa-contacts-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    if (status) { status.textContent = ''; status.classList.add('hidden'); }
+  } catch (e) {
+    if (status) {
+      status.textContent = 'Could not export contacts: ' + String(e.message || e);
+      status.classList.remove('hidden');
+    }
+  }
 }
 
 function renderContacts() {
@@ -1257,6 +1431,8 @@ function togglePopover(popId, btnId) {
 function showContactsSearch(show) {
   const input = $('contacts-search');
   if (input) input.classList.toggle('hidden', !show);
+  const btn = $('contacts-export');
+  if (btn) btn.classList.toggle('hidden', !show);
 }
 function navTo(key) {
   closePopovers();
@@ -1454,6 +1630,10 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   $('search-input').addEventListener('input', renderSearch);
   const contactsSearch = $('contacts-search');
   if (contactsSearch) contactsSearch.addEventListener('input', renderContacts);
+  // Export/backup only — reads the persisted index (or falls back to the
+  // in-memory MS) and downloads it as JSON. No write path.
+  const contactsExport = $('contacts-export');
+  if (contactsExport) contactsExport.addEventListener('click', () => { exportContacts().catch(() => {}); });
   const contactBack = $('contact-back');
   if (contactBack) contactBack.addEventListener('click', () => {
     setDetailMode('empty');

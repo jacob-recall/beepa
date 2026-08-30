@@ -23,6 +23,13 @@ a credential: it rides browser -> loopback -> bridge only, and is never logged
 or returned (F6). login_id/step_id come from the bridge, are echoed by the
 browser, and are re-validated (connect.ID_RE) here before use (F2).
 
+POST /enrich/numbers (F1-gated, CORS to the same loopback origin) calls the
+read-only agents/enrich/number_resolver.resolve_all() and returns
+{numbers: {room_id: {value, kind, source}}}. The values are real phone
+numbers / emails: like the cookie return, they go ONLY to the authorized
+loopback origin and are NEVER logged (F6). The resolver is SELECT-only — no
+write happens anywhere on this path.
+
 Security invariants (do not weaken) — identical to gmessages-connect:
   * Binds EXACTLY 127.0.0.1:8021 — loopback only, never 0.0.0.0 / "".
   * F1 — every do_POST is gated by _authorized() BEFORE any side effect: (a)
@@ -42,13 +49,24 @@ Run:  python3 connect_server.py --host 127.0.0.1 --port 8021
 """
 import argparse
 import json
+import os
 import re
 import sys
 
 import connect  # session-connect/connect.py — same dir; imported side-effect-free
 
+# Read-only number resolver lives in the sibling agents/enrich package. Add
+# that dir to sys.path so we import the module across the boundary rather than
+# copying its code; the import is side-effect-free (no DB read at import).
+_ENRICH_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents", "enrich")
+if _ENRICH_DIR not in sys.path:
+    sys.path.insert(0, _ENRICH_DIR)
+import number_resolver  # agents/enrich/number_resolver.py — SELECT-only, fail-soft
+
 APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
 SERVER_NETWORKS = ("twitter", "linkedin", "instagram")
+ENRICH_NUMBERS_PATH = "/enrich/numbers"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8021
@@ -150,7 +168,8 @@ def _make_handler():
             return None, None
 
         def do_OPTIONS(self):
-            if self._origin() is not None and self._route()[0] is not None:
+            if self._origin() is not None and (
+                    self._route()[0] is not None or self.path == ENRICH_NUMBERS_PATH):
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -174,6 +193,12 @@ def _make_handler():
 
         def do_POST(self):
             self._diag(-1)
+            if self.path == ENRICH_NUMBERS_PATH:
+                if not self._authorized():   # F1: gate BEFORE any DB read
+                    return
+                self._discard_body()
+                self._enrich_numbers()
+                return
             name, verb = self._route()
             if name is None:
                 self._json(404, {"error": "not found"})
@@ -186,6 +211,20 @@ def _make_handler():
             else:
                 self._discard_body()
                 self._start_provisioning(name)
+
+        # ---- read each 1:1 conversation's real phone/email, LOCAL-only ----
+        def _enrich_numbers(self):
+            # F6 posture: this returns PII (real E.164 numbers / emails) but,
+            # exactly like the Instagram cookie return, ONLY to the authorized
+            # loopback origin — the numbers/map are NEVER logged (the sole
+            # log line, _diag, carries only method/path/origin/status). The
+            # resolver is SELECT-only, so this is a pure read: no writes.
+            try:
+                numbers = number_resolver.resolve_all()
+            except Exception:  # fail closed on an unexpected raise; leak nothing
+                self._json(500, {"error": "Could not resolve numbers."}, cors=True)
+                return
+            self._json(200, {"numbers": numbers}, cors=True)
 
         # ---- turn a bridge step response into what the browser gets back ----
         # complete -> {status:complete, account}; user_input -> {status:

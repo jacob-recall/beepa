@@ -13,6 +13,17 @@
 //   * ids are unique non-empty strings; roomIds are valid + deduped.
 // Linking is MANUAL only (link/unlink helpers). `suggestions()` only proposes
 // candidates — it NEVER mutates and NEVER auto-merges.
+//
+// APPROVED EXCEPTION — `autoMergeByNumber()` (below) is the ONE sanctioned
+// auto-merge path: it groups conversations that a trusted local helper has
+// resolved to the SAME real phone number (E.164), so the same person on two
+// bridges lands in one profile without manual curation. It is safe because it
+// (1) only ever CREATES an auto-profile (share:'inherit', never 'share' — so
+// auto-merge never shares anything new with the manager) or ADDS rooms to a
+// single already-existing profile without touching that profile's share; and
+// (2) NEVER merges two existing profiles — if a number's rooms already span two
+// or more distinct profiles it skips the number entirely, so a deliberate
+// user separation is never undone. It is pure and idempotent.
 
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { S } from '../state.js';
@@ -245,6 +256,85 @@ function suggestions(convos, store) {
 }
 
 // ===========================================================================
+// AUTO-MERGE BY PHONE NUMBER — the one approved auto-merge (see the module
+// header). Pure; no I/O, no DOM. `roomNumbers` is { roomId: '<E.164>' } — PHONES
+// ONLY (the caller filters to kind==='phone'; email is single-bridge and must
+// never drive a cross-bridge merge). `opts.nameOf(roomId) -> string` optionally
+// seeds a freshly-created auto-profile's displayName.
+//
+// Rules (SAFETY-CRITICAL):
+//   * Group roomIds by their shared E.164; only numbers with >=2 rooms matter.
+//   * For each such group, look at which existing profiles already hold any of
+//     its rooms (per normalizeProfiles):
+//       - NONE  -> create ONE new auto-profile (newProfileId(), share:'inherit'
+//                  NEVER 'share', displayName from nameOf(firstRoom) or '') and
+//                  link every room in the group into it.
+//       - EXACTLY ONE -> link the group's other (ungrouped) rooms into THAT
+//                  profile; never change that profile's share.
+//       - TWO OR MORE distinct profiles -> SKIP the group entirely (never merge
+//                  existing profiles; a user may have split them on purpose).
+//   * IDEMPOTENT: a group whose rooms already all sit in one profile is a no-op,
+//     so a second run yields changed:false.
+// Returns the new normalized { profiles } plus a boolean `changed`.
+// ===========================================================================
+function autoMergeByNumber(store, roomNumbers, opts = {}) {
+  const nameOf = typeof opts.nameOf === 'function' ? opts.nameOf : null;
+  let work = normalizeProfiles(store);
+
+  // room -> owning profile id, from the ORIGINAL state. Groups are disjoint
+  // (each room maps to exactly one number), so this snapshot stays valid across
+  // groups; we update it in place as we link so idempotency holds within a run.
+  const roomToProfile = {};
+  for (const p of work.profiles) {
+    for (const rid of p.roomIds) roomToProfile[rid] = p.id;
+  }
+
+  // Group rooms by number, first-seen order, validating both sides. A malformed
+  // room id or number is dropped here — never trusted into a link.
+  const rn = (roomNumbers && typeof roomNumbers === 'object') ? roomNumbers : {};
+  const groups = new Map(); // e164 -> [roomId, ...]
+  for (const rid of Object.keys(rn)) {
+    if (typeof rid !== 'string' || !ROOMID_RE.test(rid)) continue;
+    const num = rn[rid];
+    if (typeof num !== 'string' || !num) continue;
+    if (!groups.has(num)) groups.set(num, []);
+    const arr = groups.get(num);
+    if (arr.indexOf(rid) === -1) arr.push(rid);
+  }
+
+  let changed = false;
+  for (const [, rooms] of groups) {
+    if (rooms.length < 2) continue;                 // a lone room can't merge
+    const profs = new Set();
+    for (const rid of rooms) {
+      const pid = roomToProfile[rid];
+      if (pid) profs.add(pid);
+    }
+    if (profs.size >= 2) continue;                  // spans distinct profiles -> never merge
+    if (profs.size === 1) {
+      const targetId = profs.values().next().value;
+      for (const rid of rooms) {                    // pull the ungrouped rooms into it
+        if (!roomToProfile[rid]) {
+          work = linkRoom(work, targetId, rid);
+          roomToProfile[rid] = targetId;
+          changed = true;
+        }
+      }
+    } else {                                        // none in a profile -> new auto-profile
+      const id = newProfileId();
+      const displayName = (nameOf && String(nameOf(rooms[0]) || '')) || '';
+      work = upsertProfile(work, { id, displayName, share: 'inherit' });
+      for (const rid of rooms) {
+        work = linkRoom(work, id, rid);
+        roomToProfile[rid] = id;
+      }
+      changed = true;
+    }
+  }
+  return { profiles: work.profiles, changed };
+}
+
+// ===========================================================================
 // STORAGE HELPERS — read/write com.jkali.contact_profiles on the LOCAL
 // homeserver as the user's own account. Absent -> empty (never an error).
 // ===========================================================================
@@ -273,6 +363,6 @@ export {
   findProfile, profileForRoom, profileShareForRoom, roomProfileMap,
   upsertProfile, removeProfile, linkRoom, unlinkRoom, setProfileShare, newProfileId,
   handleOwner, linkHandle, unlinkHandle,
-  suggestions,
+  suggestions, autoMergeByNumber,
   readProfiles, writeProfiles,
 };

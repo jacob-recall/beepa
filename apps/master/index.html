@@ -33,6 +33,7 @@
     <nav id="nav-primary" aria-label="Main">
       <button id="nav-recent" class="navitem nav-icon" type="button" title="Feed" aria-label="Feed"><span class="ic">&#127968;</span></button>
       <button id="nav-search" class="navitem nav-icon" type="button" title="Search" aria-label="Search"><span class="ic">&#128269;</span></button>
+      <button id="nav-contacts" class="navitem nav-icon" type="button" title="Contacts" aria-label="Contacts"><span class="ic">&#128100;</span></button>
       <button id="nav-teammates-toggle" class="navitem nav-icon" type="button" title="Teammates" aria-label="Teammates" aria-expanded="false"><span class="ic">&#128101;</span></button>
     </nav>
     <div class="spacer"></div>
@@ -54,6 +55,7 @@
         <div id="list-pane">
           <div id="list-head">
             <input id="search-input" class="list-search hidden" placeholder="Search everyone" spellcheck="false" autocomplete="off">
+            <input id="contacts-search" class="list-search hidden" placeholder="Search contacts" spellcheck="false" autocomplete="off">
           </div>
           <div id="list-body" class="convo-list"></div>
         </div>
@@ -114,6 +116,36 @@
                   <div class="code-display"><div id="addteam-code" class="code-value"></div></div>
                   <code id="addteam-cmd" class="addteam-cmd"></code>
                 </div>
+              </div>
+            </div>
+          </div>
+          <div id="detail-contact" class="detail-panel hidden">
+            <header id="contact-head" class="detail-panel-head">
+              <button id="contact-back" type="button" title="Back">&#8592;</button>
+              <div id="contact-heading">
+                <div class="room-title-row">
+                  <span id="contact-name"></span>
+                </div>
+                <div class="room-sub-row">
+                  <span id="contact-badge" class="plat-badge"></span>
+                  <span id="contact-identifier" class="muted"></span>
+                </div>
+              </div>
+            </header>
+            <div class="admin-scroll">
+              <div id="contact-rooms" class="convo-list"></div>
+              <div id="contact-proposal-pane" class="proposal-compose-static">
+                <div class="proposal-head">
+                  <span class="proposal-kicker">Propose a message</span>
+                  <span class="proposal-hint">Proposal only — teammate reviews and sends from their account.</span>
+                </div>
+                <p id="contact-proposal-note" class="proposal-note"></p>
+                <textarea id="contact-proposal-input" class="input" rows="3" placeholder="Write a suggested message…" spellcheck="true"></textarea>
+                <div class="proposal-controls">
+                  <span class="spacer"></span>
+                  <button id="contact-proposal-send" type="button" class="btn btn-primary proposal-btn">Propose</button>
+                </div>
+                <div id="contact-proposal-status" class="proposal-status hidden"></div>
               </div>
             </div>
           </div>

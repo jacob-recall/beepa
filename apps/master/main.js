@@ -43,6 +43,24 @@ const MASTER_BASE = 'http://127.0.0.1:8018';
 // CSP connect-src is extended by exactly this origin for this one call.
 const ENROLL_BASE = 'http://127.0.0.1:8019';
 
+// The two custom room-state types the uplink stamps on a teammate's dedicated
+// "Contacts" room (agents/uplink/uplink.py): CONTACTS_MARKER on the room itself
+// (discovered exactly like the com.jkali.proposals marker), and one
+// CONTACT_STATE_TYPE STATE event per shared address-book handle. Read-only here:
+// master-side power levels pin @manager to 0 with state_default 100, so the
+// manager can never write a com.jkali.contact — these values are pure data.
+const CONTACTS_MARKER = 'com.jkali.contacts';
+const CONTACT_STATE_TYPE = 'com.jkali.contact';
+
+// Identifier shape gates for a PERSON-targeted proposal. A contact handle may
+// only be proposed to when it is an E.164 phone number OR a strict email —
+// exactly the same validate-before-write discipline submitProposal applies to a
+// target_room with ROOM_SHAPE_RE. The identifier is inert: the master only
+// records it in a com.jkali.proposal; the teammate's own guarded local send path
+// re-validates it before anything is ever sent.
+const E164_RE = /^\+[1-9]\d{6,14}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // ---- point the shared transport at the MASTER homeserver, not the user hub's.
 // Own compose project (matrix-master), own port (127.0.0.1:8018), own
 // server_name ("master") — see master/docker-compose.master.yml + provision.sh.
@@ -59,6 +77,8 @@ const MS = {
   feed: [],            // flattened rows across all teammates, recency-sorted
   proposalsByUser: new Map(),  // teammate label -> their proposals room id (write target)
   proposalsRoomSet: new Set(), // every discovered proposals room id (send-guard allowlist)
+  contacts: [],        // flattened shared address-book handles across every teammate
+  openContact: null,   // the contact whose person-targeted composer is currently open
   activeView: 'recent',
   openRoomId: null,
   openRoomUser: null,
@@ -192,7 +212,8 @@ function parseSnapshot(data) {
     const r = join[rid];
     const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
                    lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
-                   profileId: null, profileDisplayName: null, createSender: null };
+                   profileId: null, profileDisplayName: null, createSender: null,
+                   isContacts: false, contacts: [] };
     // State from BOTH the `state` block and `timeline` (a newer space's
     // create/name/child events can still be in the timeline window).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
@@ -221,6 +242,17 @@ function parseSnapshot(data) {
       // room — the ONLY room this app ever writes into, and only a
       // com.jkali.proposal event (see submitProposal). Never a mirror room.
       if (e.type === 'com.jkali.proposals' && e.state_key === '') info.isProposals = true;
+      // A room marked com.jkali.contacts is this teammate's dedicated shared
+      // address-book room — read-only here (never written to). Same discovery
+      // shape as the proposals marker above.
+      if (e.type === CONTACTS_MARKER && e.state_key === '') info.isContacts = true;
+      // Each shared contact handle rides as a com.jkali.contact STATE event
+      // (state_key = sha1(source|network_id)). Collected raw from room state
+      // only (never message content) and sanitized at the render call site.
+      if (e.type === CONTACT_STATE_TYPE && typeof e.state_key === 'string' && e.state_key
+          && e.content && typeof e.content === 'object') {
+        info.contacts.push(e.content);
+      }
       // §8.2: the uplink tags each mirror room's platform at creation as a
       // room STATE event (not per-account_data, so it is visible to @manager
       // — a different account than the room's creator) so the master app can
@@ -266,11 +298,34 @@ function parseSnapshot(data) {
 // Rooms discovered but not joined yet (a pending invite) are simply not listed;
 // that is a normal transient state, not a verification failure, and is not
 // counted as "hidden" below.
+// Normalize one com.jkali.contact STATE content into the flat shape the
+// contacts view consumes, or null to DROP it: tombstones (deleted:true) and
+// handles without a network_id never render. person_id is the join key to the
+// mirror rooms' com.jkali.profile stamp (same person, many platforms); a null
+// person_id lists the handle ungrouped. No DOM/sanitize here — this is pure
+// data shaping; sanitizeLine is applied at each render call site.
+function parseContact(content, label) {
+  if (!content || typeof content !== 'object' || content.deleted === true) return null;
+  const network_id = typeof content.network_id === 'string' ? content.network_id : '';
+  if (!network_id) return null;
+  return {
+    label,
+    source: typeof content.source === 'string' ? content.source : null,
+    network_id,
+    kind: typeof content.kind === 'string' ? content.kind : null,
+    display_name: typeof content.display_name === 'string' ? content.display_name : '',
+    person_id: (typeof content.person_id === 'string' && content.person_id) ? content.person_id : null,
+    person_display: (typeof content.person_display === 'string' && content.person_display)
+      ? content.person_display : '',
+  };
+}
+
 function buildByUser(rooms) {
   const byUser = new Map();
   const proposalsByUser = new Map();
   const proposalsRoomSet = new Set();
   const proposalCandidates = new Map();   // label -> [roomId] (smallest id wins)
+  const allContacts = [];                 // flattened shared handles across teammates
   const accepted = acceptedSpaces(rooms);
   const skipped = { spaces: 0, children: 0 };
   for (const r of Object.values(rooms)) if (r.isSpace) skipped.spaces++;
@@ -303,6 +358,17 @@ function buildByUser(rooms) {
         proposalsRoomSet.add(childId);
         continue;
       }
+      // A contacts room is a read-only address-book source, never a conversation
+      // and never a write target. Same "not also a mirror" guard as proposals:
+      // its shared handles fold into the flat contacts list (tombstones dropped),
+      // tagged with this verified teammate label.
+      if (r.isContacts && !r.mirrorOf) {
+        for (const cc of r.contacts) {
+          const parsed = parseContact(cc, label);
+          if (parsed) allContacts.push(parsed);
+        }
+        continue;
+      }
       convos.push({
         id: childId,
         title: sanitizeLine(r.name || childId),
@@ -324,6 +390,7 @@ function buildByUser(rooms) {
   }
   MS.proposalsByUser = proposalsByUser;
   MS.proposalsRoomSet = proposalsRoomSet;
+  MS.contacts = allContacts;
   MS.skippedUnverified = skipped;
   return byUser;
 }
@@ -404,6 +471,7 @@ async function refreshAll() {
   }
   if (MS.activeView === 'recent') renderRecent();
   else if (MS.activeView === 'search') renderSearch();
+  else if (MS.activeView === 'contacts') renderContacts();
   else if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0) {
     renderTeammate(MS.activeView.slice('teammate:'.length));
   }
@@ -852,6 +920,28 @@ async function loadTemplates(proposalsRoom) {
   } catch (e) { /* templates are optional; leave just the placeholder */ }
 }
 
+// Pure builder for a PERSON-targeted proposal's content (extracted so a unit
+// test can hold the shape gate still — tests/unit/proposal_identifier.test.js).
+// Returns the com.jkali.proposal content object, or null when the identifier
+// fails its shape check (E.164 phone OR strict email) or the body is empty.
+// Crucially, it carries NO target_room — a person-targeted proposal names an
+// inert identifier the teammate resolves themselves, not a room the master
+// could ever address. This is data-shaping only: it never sends anything.
+function buildIdentifierProposalContent({ source, identifier, display, body } = {}) {
+  const id = typeof identifier === 'string' ? identifier.trim() : '';
+  const text = typeof body === 'string' ? body.trim() : '';
+  if (!text) return null;
+  if (!E164_RE.test(id) && !EMAIL_RE.test(id)) return null;
+  return {
+    target_source: typeof source === 'string' ? source : null,
+    target_identifier: id,
+    target_display: (typeof display === 'string' && display) ? sanitizeLine(display) : null,
+    body: text,
+    created_by: S.userId,
+    origin_ts: Date.now(),
+  };
+}
+
 // The single guarded write in this app. Defense in depth:
 //  - the destination and the target are the ones PINNED when the room was
 //    opened (MS.openProposalCtx) — never re-resolved here, so a mid-session
@@ -865,7 +955,44 @@ async function loadTemplates(proposalsRoom) {
 //    not apply) and is only recorded, never sent to;
 //  - the event TYPE is the hardcoded literal 'com.jkali.proposal' — there is no
 //    code path here that PUTs /send/m.room.message anywhere.
-async function submitProposal() {
+async function submitProposal(opts) {
+  // ---- PERSON-targeted branch (v-contacts) ------------------------------
+  // Same write, same event type, same allowlist gate as the room-targeted
+  // path below — only the content shape differs (an identifier, never a
+  // target_room). Still resolves the destination to the SELECTED contact's
+  // teammate proposals room and re-asserts it against the live allowlist.
+  if (opts && opts.kind === 'identifier') {
+    const label = opts.label;
+    const proposalsRoom = label ? MS.proposalsByUser.get(label) : null;
+    if (!proposalsRoom || MS.proposalsByUser.get(label) !== proposalsRoom
+        || !ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) {
+      contactProposalStatus('No proposals channel for this teammate yet.', true);
+      return;
+    }
+    const content = buildIdentifierProposalContent({
+      source: opts.source, identifier: opts.identifier, display: opts.display, body: opts.body,
+    });
+    if (!content) {
+      contactProposalStatus('Enter a message and make sure the contact is a phone number or email.', true);
+      return;
+    }
+    const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    contactProposalStatus('Sending suggestion…');
+    try {
+      // Event type is the literal 'com.jkali.proposal' — the SAME single write
+      // endpoint the room-targeted path uses. No m.room.message, no start-chat.
+      await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
+        + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
+      const input = $('contact-proposal-input');
+      if (input) input.value = '';
+      contactProposalStatus('Suggestion sent to ' + sanitizeLine(label || 'teammate')
+        + ' for review. It was not sent to anyone externally.');
+    } catch (e) {
+      contactProposalStatus('Could not send suggestion: ' + String(e.message || e), true);
+    }
+    return;
+  }
+  // ---- room-targeted branch (unchanged) ---------------------------------
   const ctx = MS.openProposalCtx;
   if (!ctx || !ctx.label || !ctx.mirrorRoomId) {
     proposalStatus('No conversation is open.', true); return;
@@ -911,6 +1038,166 @@ async function submitProposal() {
   }
 }
 
+// ===========================================================================
+// Contacts view (v-contacts) — a searchable, person-grouped read of every
+// teammate's shared address book (com.jkali.contact state, collected in
+// buildByUser). GROUPED BY person_id: a handle and that person's mirror rooms
+// (already tagged com.jkali.profile == the same person_id) fold under one
+// header, exactly as groupByProfile clusters the conversation feed. A handle
+// with a null person_id lists ungrouped. Selecting a handle opens the
+// person-targeted composer, whose only write is submitProposal's identifier
+// branch above — still a com.jkali.proposal, never a message.
+// ===========================================================================
+
+// Search over display_name / person_display / network_id, then group. Returns
+// an ordered list of {kind:'person', ...} groups and {kind:'loose', contact}
+// singletons. The person group's join key is (teammate label + person_id) so a
+// person_id shared by two teammates never merges their address books.
+function groupContactsView(contacts, feed, q) {
+  const filtered = q
+    ? contacts.filter(ct =>
+        (ct.display_name || '').toLowerCase().includes(q)
+        || (ct.person_display || '').toLowerCase().includes(q)
+        || (ct.network_id || '').toLowerCase().includes(q))
+    : contacts;
+  const order = [];
+  const groups = new Map();  // (label person_id) -> group
+  for (const ct of filtered) {
+    if (ct.person_id) {
+      const key = ct.label + ' ' + ct.person_id;
+      let g = groups.get(key);
+      if (!g) {
+        g = { kind: 'person', label: ct.label, personId: ct.person_id,
+              display: ct.person_display || ct.display_name || ct.person_id,
+              contacts: [], rooms: [] };
+        groups.set(key, g);
+        order.push(g);
+      }
+      g.contacts.push(ct);
+      if (ct.person_display) g.display = ct.person_display;  // prefer a real name
+    } else {
+      order.push({ kind: 'loose', contact: ct });
+    }
+  }
+  // Attach each person's mirror rooms (same join key the conversation feed uses:
+  // profileId == person_id — and the same teammate).
+  for (const g of groups.values()) {
+    g.rooms = (feed || []).filter(c => c.profileId === g.personId && c.userLabel === g.label);
+  }
+  return order;
+}
+
+// One address-book handle row (clickable/keyboard-activatable -> composer).
+function buildContactRow(ct) {
+  const row = el('div', 'convo contact-row');
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  const name = ct.display_name || ct.person_display || ct.network_id;
+  row.appendChild(el('div', 'avatar', (name || '?').slice(0, 1).toUpperCase()));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', sanitizeLine(name)));
+  meta.appendChild(el('div', 'preview', sanitizeLine(ct.network_id)));
+  row.appendChild(meta);
+  row.appendChild(el('span', 'badge', ct.label || ''));
+  row.appendChild(buildPlatBadge(ct.source));
+  const open = () => selectContact(ct);
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  return row;
+}
+
+// One person cluster: header + this person's handles + their mirror-room rows
+// (reusing buildFeedRow, so each thread keeps its badge/preview/open behavior).
+function buildContactPersonGroup(g) {
+  const wrap = el('div', 'profile-group');
+  const header = el('div', 'profile-header');
+  header.appendChild(el('span', 'profile-avatar', (g.display || '?').slice(0, 1).toUpperCase()));
+  header.appendChild(el('span', 'profile-name', sanitizeLine(g.display)));
+  const h = g.contacts.length, t = g.rooms.length;
+  header.appendChild(el('span', 'profile-count',
+    h + ' handle' + (h === 1 ? '' : 's') + (t ? ' · ' + t + ' thread' + (t === 1 ? '' : 's') : '')));
+  wrap.appendChild(header);
+  const members = el('div', 'profile-members');
+  for (const ct of g.contacts) members.appendChild(buildContactRow(ct));
+  for (const c of g.rooms) members.appendChild(buildFeedRow(c));
+  wrap.appendChild(members);
+  return wrap;
+}
+
+function renderContacts() {
+  const q = (($('contacts-search') && $('contacts-search').value) || '').trim().toLowerCase();
+  const list = $('list-body');
+  if (!list) return;
+  list.replaceChildren();
+  const items = groupContactsView(MS.contacts, MS.feed, q);
+  if (!items.length) {
+    list.appendChild(elEmpty(q ? 'No contacts match "' + q + '".'
+      : 'No shared contacts yet.'));
+    return;
+  }
+  for (const item of items) {
+    list.appendChild(item.kind === 'person' ? buildContactPersonGroup(item) : buildContactRow(item.contact));
+  }
+}
+
+function contactProposalStatus(text, isError) {
+  const s = $('contact-proposal-status');
+  if (!s) return;
+  s.textContent = text || '';
+  s.classList.toggle('hidden', !text);
+  s.classList.toggle('error', !!isError);
+}
+
+// Open the person-targeted composer for one handle. The composer's ONLY write
+// is submitProposal({kind:'identifier', ...}) — a com.jkali.proposal, never a
+// send. The identifier shown is the contact's own network_id (inert data).
+function selectContact(ct) {
+  if (!ct) return;
+  MS.openContact = ct;
+  const name = ct.person_display || ct.display_name || ct.network_id;
+  $('contact-name').textContent = sanitizeLine(name);
+  const badge = $('contact-badge');
+  const b = buildPlatBadge(ct.source);
+  badge.className = b.className;
+  badge.textContent = b.textContent;
+  $('contact-identifier').textContent = sanitizeLine(ct.network_id);
+  const roomsBox = $('contact-rooms');
+  if (roomsBox) {
+    roomsBox.replaceChildren();
+    const rooms = ct.person_id
+      ? MS.feed.filter(c => c.profileId === ct.person_id && c.userLabel === ct.label) : [];
+    for (const c of rooms) roomsBox.appendChild(buildFeedRow(c));
+  }
+  const input = $('contact-proposal-input');
+  if (input) input.value = '';
+  const note = $('contact-proposal-note');
+  if (note) {
+    note.textContent = "You can't send. A suggestion goes to " + sanitizeLine(ct.label || 'the teammate')
+      + "'s inbox as a draft — they decide whether to send it.";
+  }
+  const proposalsRoom = ct.label ? MS.proposalsByUser.get(ct.label) : null;
+  const send = $('contact-proposal-send');
+  if (send) send.disabled = !proposalsRoom;
+  contactProposalStatus(proposalsRoom ? '' : 'No proposals channel for this teammate yet.', !proposalsRoom);
+  showWorkspace(true);
+  setDetailMode('contact');
+}
+
+async function submitContactProposal() {
+  const ct = MS.openContact;
+  if (!ct) { contactProposalStatus('No contact selected.', true); return; }
+  const input = $('contact-proposal-input');
+  const body = (input && input.value) ? input.value : '';
+  await submitProposal({
+    kind: 'identifier',
+    label: ct.label,
+    source: ct.source,
+    identifier: ct.network_id,
+    display: ct.person_display || ct.display_name,
+    body,
+  });
+}
+
 // ---- navigation (same two-pane shell as apps/user) ----
 function showSection(id) {
   for (const s of document.querySelectorAll('#content .view')) s.classList.toggle('hidden', s.id !== id);
@@ -931,8 +1218,10 @@ function setDetailMode(mode) {
   const pane = $('msgr-convo');
   const room = $('detail-room');
   const admin = $('detail-admin');
+  const contact = $('detail-contact');
   if (room) room.classList.toggle('hidden', mode !== 'room');
   if (admin) admin.classList.toggle('hidden', mode !== 'admin');
+  if (contact) contact.classList.toggle('hidden', mode !== 'contact');
   if (pane) pane.classList.toggle('no-selection', mode === 'empty' || mode === 'admin');
 }
 function showListSearch(show) {
@@ -960,12 +1249,17 @@ function togglePopover(popId, btnId) {
     btn.setAttribute('aria-expanded', 'true');
   }
 }
+function showContactsSearch(show) {
+  const input = $('contacts-search');
+  if (input) input.classList.toggle('hidden', !show);
+}
 function navTo(key) {
   closePopovers();
   if (MS.openRoomId && key !== 'room') {
     stopTail();
     setDetailMode('empty');
   }
+  showContactsSearch(key === 'contacts');
   MS.activeView = key;
   setActiveNav(key);
   if (key === 'recent') {
@@ -978,6 +1272,11 @@ function navTo(key) {
     showListSearch(true);
     setDetailMode('empty');
     renderSearch();
+  } else if (key === 'contacts') {
+    showWorkspace(true);
+    showListSearch(false);
+    setDetailMode('empty');
+    renderContacts();
   } else if (key === 'addteam') {
     showWorkspace(false);
     setDetailMode('admin');
@@ -1073,7 +1372,14 @@ async function enterApp() {
   MS.pollTimer = setInterval(() => { refreshAll().catch(() => {}); }, 20000);
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+// buildIdentifierProposalContent is exported so a plain-node unit test can
+// exercise the shape gate in isolation (tests/unit/proposal_identifier.test.js).
+// Exporting it makes this module importable outside the browser, so the one
+// top-level DOM binding below is guarded — importing under node must not touch
+// `document`. In the browser `document` always exists and behavior is unchanged.
+export { buildIdentifierProposalContent };
+
+if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {
     const err = $('signin-error');
     err.classList.add('hidden');
@@ -1093,6 +1399,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('nav-recent').addEventListener('click', () => navTo('recent'));
   $('nav-search').dataset.navkey = 'search';
   $('nav-search').addEventListener('click', () => navTo('search'));
+  const navContacts = $('nav-contacts');
+  if (navContacts) {
+    navContacts.dataset.navkey = 'contacts';
+    navContacts.addEventListener('click', () => navTo('contacts'));
+  }
   const tt = $('nav-teammates-toggle');
   if (tt && !tt.dataset.wired) {
     tt.dataset.wired = '1';
@@ -1136,6 +1447,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
   $('search-input').addEventListener('input', renderSearch);
+  const contactsSearch = $('contacts-search');
+  if (contactsSearch) contactsSearch.addEventListener('input', renderContacts);
+  const contactBack = $('contact-back');
+  if (contactBack) contactBack.addEventListener('click', () => {
+    setDetailMode('empty');
+    navTo('contacts');
+  });
+  const contactSend = $('contact-proposal-send');
+  if (contactSend) contactSend.addEventListener('click', () => { submitContactProposal().catch(() => {}); });
   $('room-back').addEventListener('click', () => {
     stopTail();
     setDetailMode('empty');

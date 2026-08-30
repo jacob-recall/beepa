@@ -27,7 +27,8 @@ const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-C
 // Strict E.164: leading +, non-zero country digit, 7..15 total digits.
 const E164_RE = /^\+[1-9]\d{6,14}$/;
 
-let ranThisSession = false;   // throttle: at most one enrichment pass per session
+let mergeDone = false;        // becomes true after the ONE real pass (rooms present)
+let mergeAttempts = 0;        // retry budget while the feed is still seeding
 
 // The rooms the user is actually in, from the live model (union of the
 // per-source convo lists and the Home feed model), plus their display names.
@@ -50,9 +51,18 @@ function liveRooms() {
 // to rooms the user is in, auto-merge, and persist only if something changed.
 // Fail-soft throughout: an unreachable/erroring helper does nothing, no error UI.
 async function autoMergeContacts() {
-  if (ranThisSession) return;
-  ranThisSession = true;
+  if (mergeDone) return;
   try {
+    // The feed may not be seeded yet at app init. Do NOT consume the one pass on
+    // an empty model — retry every 5s (up to ~1 min) until rooms are present, so
+    // the merge can't silently miss the whole session.
+    const { known, nameByRoom } = liveRooms();
+    if (!known.size) {
+      if (mergeAttempts++ < 12) setTimeout(() => { autoMergeContacts().catch(() => {}); }, 5000);
+      return;
+    }
+    mergeDone = true;                                 // rooms present — this is our one real pass
+
     let numbers;
     try {
       const r = await fetch(SESSION_CONNECT_BASE + '/enrich/numbers',
@@ -64,8 +74,6 @@ async function autoMergeContacts() {
       return;                                         // helper unreachable -> do nothing
     }
     if (!numbers || typeof numbers !== 'object') return;
-
-    const { known, nameByRoom } = liveRooms();
 
     // Build roomNumbers: phones only, E.164-validated, membership-intersected.
     const roomNumbers = {};

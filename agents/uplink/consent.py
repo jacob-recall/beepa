@@ -142,6 +142,64 @@ def normalize_override(data):
     return v if v in OVERRIDE_STATES else None
 
 
+# ===========================================================================
+# CONTACT-SHARE — a SEPARATE consent dimension from conversation sharing above.
+# Decides whether a teammate's address-book contacts (per source) leave their
+# machine for the manager. Own policy, own account-data key, own default:
+# PRIVATE (absent policy => not shared). MUST stay byte-parity with
+# shared/model/consent.js's resolveContactShare/normalizeContactPolicy.
+# ===========================================================================
+
+CONTACT_SHARE_POLICY_TYPE = "com.jkali.contact_share_policy"  # global user account-data
+CONTACT_GLOBAL_STATES = {"share-all", "private"}
+CONTACT_SOURCE_STATES = {"share-all", "private-all", "inherit"}
+
+
+def normalize_contact_policy(raw):
+    """Coerce a contact-share policy into { 'global', 'sources' }.
+
+    Unknown global -> 'private' (safe default). Only 'share-all'/'private-all'
+    source states survive; 'inherit' (source omitted == inherit) and junk are
+    dropped. Mirrors normalizeContactPolicy() in consent.js.
+    """
+    src = raw.get("sources") if isinstance(raw, dict) else None
+    if not isinstance(src, dict):
+        src = {}
+    g = raw.get("global") if isinstance(raw, dict) else None
+    global_ = "share-all" if (g in CONTACT_GLOBAL_STATES and g == "share-all") else "private"
+    sources = {}
+    for k, v in src.items():
+        if v == "share-all" or v == "private-all":
+            sources[k] = v
+    return {"global": global_, "sources": sources}
+
+
+def resolve_contact_share(source, policy):
+    """Resolve whether a source's contacts are shared AND the reason.
+
+    Precedence (most-specific-wins), mirroring resolveContactShare() in JS:
+      1. per-source 'share-all'   -> shared,     'all <source> contacts'
+      2. per-source 'private-all' -> not shared, 'private'
+      3. global 'share-all'       -> shared,     'all contacts'
+      4. safe default             -> not shared, 'private'
+    """
+    pol = policy if isinstance(policy, dict) else {}
+    raw_sources = pol.get("sources")
+    sources = raw_sources if isinstance(raw_sources, dict) else {}
+
+    src = sources.get(source) if source else None
+    if src == "share-all":
+        return {"shared": True, "reason": "all " + source + " contacts"}
+    if src == "private-all":
+        return {"shared": False, "reason": "private"}
+    # (src == 'inherit' or absent -> fall through to global)
+
+    if pol.get("global") == "share-all":
+        return {"shared": True, "reason": "all contacts"}
+
+    return {"shared": False, "reason": "private"}
+
+
 def overrides_from_sync(sync_data):
     """Extract per-room overrides from a /sync response's room account-data.
 

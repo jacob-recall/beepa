@@ -122,7 +122,10 @@ function renderSourceList() {
   const list = $('list-body');
   if (!list || !S.sourceViewId) return;
   const source = SOURCES.find(s => s.id === S.sourceViewId);
-  const convos = convosBySource[S.sourceViewId] || [];
+  // Sort most-recent-first (by last-activity ts); ties/no-message rooms fall to
+  // the bottom. A copy — never reorder the shared convosBySource array in place.
+  const convos = (convosBySource[S.sourceViewId] || [])
+    .slice().sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
   list.replaceChildren();
   if (!convos.length) {
     list.appendChild(elEmpty('No conversations yet on ' + (source ? source.label : 'this service') + '.'));

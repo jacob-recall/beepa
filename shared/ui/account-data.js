@@ -35,7 +35,7 @@ function parseSnapshot(data) {
   const join = (data.rooms && data.rooms.join) || {};
   for (const rid of Object.keys(join)) {
     const r = join[rid];
-    const info = { id: rid, name: null, isSpace: false, children: [], lastBody: null };
+    const info = { id: rid, name: null, isSpace: false, children: [], lastBody: null, lastTs: 0 };
     // Read state from BOTH the sync `state` block AND `timeline` — a newer
     // space (e.g. iMessage) keeps its m.space.child / name in the timeline
     // window, not the `state` block, so state-only misses its children.
@@ -53,7 +53,9 @@ function parseSnapshot(data) {
     for (let i = tl.length - 1; i >= 0; i--) {
       const e = tl[i];
       if (e.type === 'm.room.message' && e.content && typeof e.content.body === 'string') {
-        info.lastBody = e.content.body; break;
+        info.lastBody = e.content.body;
+        info.lastTs = typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0;
+        break;
       }
     }
     rooms[rid] = info;
@@ -81,6 +83,7 @@ function buildConvos(source, rooms) {
       id: childId,
       title: sanitizeLine(title),
       sub: sanitizeLine(r.lastBody || ''),
+      lastTs: r.lastTs || 0,
       sourceId: source.id,
       sourceLabel: source.label,
     });

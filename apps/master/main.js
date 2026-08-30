@@ -932,8 +932,13 @@ function buildIdentifierProposalContent({ source, identifier, display, body } = 
   const text = typeof body === 'string' ? body.trim() : '';
   if (!text) return null;
   if (!E164_RE.test(id) && !EMAIL_RE.test(id)) return null;
+  // The source must be a valid short source id — the SAME shape the uplink
+  // enforces (agents/uplink/uplink.py PROPOSAL_SOURCE_RE). A null/blank/
+  // malformed source produces a proposal the uplink sanitizer silently drops,
+  // so reject it here (return null) instead of writing a dead proposal.
+  if (typeof source !== 'string' || !/^[a-z][a-z0-9_]{0,31}$/.test(source)) return null;
   return {
-    target_source: typeof source === 'string' ? source : null,
+    target_source: source,
     target_identifier: id,
     target_display: (typeof display === 'string' && display) ? sanitizeLine(display) : null,
     body: text,

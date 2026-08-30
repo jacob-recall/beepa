@@ -1398,6 +1398,16 @@ class Uplink:
             except urllib.error.HTTPError as e:
                 log.error("http error: %s", e)
                 time.sleep(5)
+            except sqlite3.OperationalError:
+                # Transient contacts.db lock (e.g. the hourly importer holds a
+                # RESERVED write while mirror_contacts tries to write) that the
+                # busy_timeout could not clear. This is recoverable — the next
+                # reconcile pass retries. Log count-only (never the exception
+                # text, which could name a handle) and continue; the
+                # exactly-once cursor logic is untouched because a failed
+                # contacts write never advanced it.
+                log.warning("transient contacts.db lock; retrying next pass")
+                time.sleep(5)
             except KeyboardInterrupt:
                 log.info("uplink stopping")
                 return

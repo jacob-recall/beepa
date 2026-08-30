@@ -74,6 +74,32 @@ ok(buildIdentifierProposalContent(
   { source: 'imessage', identifier: '+14155550123', display: 'A', body: null }) === null,
   'rejects non-string body');
 
+// ---- bad / missing source SHAPE -> null (must match the uplink's
+//      PROPOSAL_SOURCE_RE = /^[a-z][a-z0-9_]{0,31}$/; a bad source is written
+//      and then silently dropped by the uplink sanitizer, so reject it here) --
+const badSources = [
+  ['missing source',        { identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['null source',           { source: null,        identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['non-string source',     { source: 42,          identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['empty source',          { source: '',          identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['capitalized source',    { source: 'Imessage',  identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['source with a space',   { source: 'a b',       identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['source starts with digit', { source: '1imessage', identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['source with a dash',    { source: 'i-message', identifier: '+14155550123', display: 'A', body: 'x' }],
+  ['source too long (>32)', { source: 'a'.repeat(33), identifier: '+14155550123', display: 'A', body: 'x' }],
+];
+for (const [label, arg] of badSources) {
+  ok(buildIdentifierProposalContent(arg) === null, 'rejects bad source: ' + label);
+}
+// valid source still returns content, with target_source preserved verbatim
+const okSrc = buildIdentifierProposalContent(
+  { source: 'imessage', identifier: '+14155550123', display: 'A', body: 'x' });
+ok(okSrc !== null && okSrc.target_source === 'imessage', 'valid source "imessage" -> content, target_source preserved');
+const okSrcUnderscore = buildIdentifierProposalContent(
+  { source: 'google_messages', identifier: '+14155550123', display: 'A', body: 'x' });
+ok(okSrcUnderscore !== null && okSrcUnderscore.target_source === 'google_messages',
+  'valid source with underscore/digits accepted');
+
 // ---- no-arg / empty-arg safety ----
 ok(buildIdentifierProposalContent() === null, 'no args returns null');
 ok(buildIdentifierProposalContent({}) === null, 'empty object returns null');

@@ -53,6 +53,19 @@ def test_store_file_is_0600():
     path = conn.execute("PRAGMA database_list").fetchall()[0][2]
     assert (os.stat(path).st_mode & 0o777) == 0o600
 
+def test_connection_uses_immediate_transactions():
+    # IMMEDIATE isolation makes `with conn:` take a RESERVED write lock up
+    # front so two writers serialize under busy_timeout instead of
+    # deadlocking on the SHARED->RESERVED upgrade (sqlite3.OperationalError).
+    conn = _fresh()
+    assert conn.isolation_level == "IMMEDIATE"
+
+def test_store_parent_dir_is_0700():
+    conn = _fresh()
+    path = conn.execute("PRAGMA database_list").fetchall()[0][2]
+    parent = os.path.dirname(os.path.abspath(path))
+    assert (os.stat(parent).st_mode & 0o777) == 0o700
+
 def test_reimport_preserves_person_id_grouping():
     conn = _fresh()
     cs.upsert_contacts(conn, "imessage", [
@@ -71,5 +84,7 @@ def test_reimport_preserves_person_id_grouping():
 if __name__ == "__main__":
     test_add_then_incremental_then_soft_delete_and_never_wipe()
     test_store_file_is_0600()
+    test_connection_uses_immediate_transactions()
+    test_store_parent_dir_is_0700()
     test_reimport_preserves_person_id_grouping()
     print("ok")

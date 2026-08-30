@@ -37,7 +37,15 @@ CREATE TABLE IF NOT EXISTS import_meta (key TEXT PRIMARY KEY, value TEXT);
 
 
 def open_store(path):
-    conn = sqlite3.connect(path)
+    # isolation_level="IMMEDIATE" makes every `with conn:` transaction begin
+    # with a RESERVED write lock immediately, instead of the sqlite3 default
+    # (deferred: SHARED first, upgraded to RESERVED only at the first write).
+    # contacts.db is written by TWO processes (the hourly importer and the
+    # uplink's set_person_id loop); two deferred writers can each hold SHARED
+    # and then deadlock trying to upgrade to RESERVED, which the busy_timeout
+    # cannot resolve and which surfaces as sqlite3.OperationalError. Taking
+    # RESERVED up front serializes the writers under busy_timeout instead.
+    conn = sqlite3.connect(path, isolation_level="IMMEDIATE")
     conn.row_factory = sqlite3.Row
     # contacts.db is written by both this store's callers and the uplink
     # process; serialize concurrent writers instead of raising "database
@@ -46,6 +54,11 @@ def open_store(path):
     conn.executescript(_SCHEMA)
     conn.commit()
     os.chmod(path, 0o600)
+    # SQLite's transient -journal/-wal/-shm siblings are created next to the
+    # db with the process umask (often 0644) and briefly hold contact rows.
+    # chmod the PARENT DIRECTORY to 0700 so those siblings are unreadable by
+    # other users regardless of their own mode; the db file itself stays 0600.
+    os.chmod(os.path.dirname(os.path.abspath(path)), 0o700)
     return conn
 
 

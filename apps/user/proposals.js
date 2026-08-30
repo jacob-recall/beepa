@@ -3,6 +3,8 @@
 import { ROOMID_RE, api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { openConvo, sendConvoMessage } from '../../shared/ui/chat.js';
+import { sendCmd, validHandle } from '../../shared/ui/sources.js';
+import { confirmModal } from '../../shared/ui/connections.js';
 import { setProposalsViewHook, setDetailMode } from '../../shared/ui/nav.js';
 import { feedRelTime } from '../../shared/ui/search.js';
 import { S, feedModel } from '../../shared/state.js';
@@ -20,21 +22,47 @@ function saveHandled(set) {
 }
 function markHandled(p) { const s = loadHandled(); s.add(p.eventId); saveHandled(s); }
 
+// Discriminated parse. A proposal is EITHER aimed at an existing conversation
+// (kind:'room', the original behavior — sent via the guarded sendConvoMessage
+// path) OR at a bare contact identifier with no conversation yet
+// (kind:'identifier' — sent by starting a NEW iMessage chat through the gated
+// start-chat capability). A proposal that is neither a valid target_room nor a
+// valid target_identifier is dropped (null), exactly as before. The two shapes
+// are mutually exclusive here: target_room wins if present, and an identifier
+// parse NEVER carries a targetRoom key, so a person-targeted draft can never be
+// mistaken for (or redirected into) a room send.
 function parseProposal(e) {
   if (!e || e.type !== 'com.jkali.proposal' || !e.content) return null;
   const c = e.content;
-  const target = c.target_room;
   const body = c.body;
-  if (typeof target !== 'string' || !target) return null;
   if (typeof body !== 'string' || !body.trim()) return null;
-  return {
-    eventId: e.event_id,
-    targetRoom: target,
-    body: body,
-    template: c.template === true,
-    ts: typeof c.origin_ts === 'number' ? c.origin_ts
-        : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0),
-  };
+  const ts = typeof c.origin_ts === 'number' ? c.origin_ts
+      : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
+  const template = c.template === true;
+
+  const room = c.target_room;
+  if (typeof room === 'string' && room) {
+    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts };
+  }
+
+  // Identifier-targeted: content carries target_identifier + target_source and
+  // NO target_room. The handle is re-validated against the SC-7 regexes (E.164
+  // OR strict email) at parse time — a malformed handle drops the whole
+  // proposal; the send path re-validates again, and the daemon is authoritative.
+  const identifier = typeof c.target_identifier === 'string' ? c.target_identifier.trim() : '';
+  if (identifier && validHandle(identifier)) {
+    const source = typeof c.target_source === 'string' ? c.target_source : '';
+    const display = (typeof c.target_display === 'string' && c.target_display) ? c.target_display : identifier;
+    return {
+      kind: 'identifier',
+      eventId: e.event_id,
+      targetSource: source,
+      targetIdentifier: identifier,
+      targetDisplay: display,
+      body, template, ts,
+    };
+  }
+  return null;
 }
 
 // The proposals room id is discovered once (a full filtered /sync walks EVERY
@@ -122,6 +150,7 @@ async function fetchProposals() {
 }
 
 function targetName(p) {
+  if (p.kind === 'identifier') return sanitizeLine(p.targetDisplay || p.targetIdentifier);
   const rec = feedModel.get(p.targetRoom);
   return sanitizeLine((rec && rec.name) || p.targetRoom);
 }
@@ -133,7 +162,6 @@ function setDetailError(err, msg) {
 }
 
 function buildThreadRow(p) {
-  const rec = feedModel.get(p.targetRoom);
   const name = targetName(p);
   const preview = sanitizeLine(p.body).replace(/\s+/g, ' ').slice(0, 80);
   const row = el('div', 'convo thread-row');
@@ -163,12 +191,56 @@ async function sendProposal(p, body, err, btn) {
   setDetailError(err, '');
   const text = (body || '').trim();
   if (!text) { setDetailError(err, 'Type a message before sending.'); return; }
+
+  if (p.kind === 'identifier') { await sendIdentifierProposal(p, text, err, btn); return; }
+
+  // kind === 'room' — unchanged: the ONLY conversation send path.
   if (btn) btn.disabled = true;
   await openConvo(p.targetRoom);
   const ok = await sendConvoMessage(p.targetRoom, text);
   if (btn) btn.disabled = false;
   if (ok) { markHandled(p); renderProposalsView(); return; }
   setDetailError(err, 'Could not send — conversation unavailable.');
+}
+
+// Person-targeted send leg: approving a draft aimed at a contact identifier with
+// no existing conversation starts a NEW iMessage chat through the already-
+// approved, gated start-chat capability. NEVER auto-sends: this only runs from
+// an explicit Send click, and it additionally requires the teammate to confirm a
+// VERBATIM modal showing the exact handle + message. The identifier send goes
+// ONLY through sendCmd(...,'start-chat ...') into the C-1 unconditionally-
+// verified iMessage mgmt room — no portal send, no bypass. The client re-
+// validates the handle (SC-7 regex) as a UX pre-check; the daemon is the
+// authoritative gate and enforces the rate caps. The handle and body are never
+// logged or echoed by this function.
+async function sendIdentifierProposal(p, text, err, btn) {
+  // Only iMessage supports start-chat today.
+  if (p.targetSource !== 'imessage') {
+    setDetailError(err, 'Unsupported: only iMessage new-chat drafts can be sent from here.');
+    return;
+  }
+  const handle = (p.targetIdentifier || '').trim();
+  // Client-side SC-7 re-validation (E.164 phone OR strict email). UX pre-check.
+  if (!validHandle(handle)) {
+    setDetailError(err, 'Cannot send — the contact handle is not a valid phone number or email.');
+    return;
+  }
+  // Verbatim confirm: show the EXACT handle + message that will be sent, so
+  // confirm-equals-send. textContent-only inside confirmModal.
+  const confirmed = await confirmModal(
+    'Start a NEW iMessage chat?',
+    'To: ' + handle + '\n\nMessage:\n' + text,
+    false);
+  if (!confirmed) return;
+
+  if (btn) btn.disabled = true;
+  try {
+    await sendCmd('imessage', 'start-chat ' + handle + ' | ' + text);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  markHandled(p);
+  renderProposalsView();
 }
 
 async function prefillProposal(p, body, err) {
@@ -193,7 +265,15 @@ function renderProposalDetail(p) {
 
   const to = el('div', 'proposal-to');
   to.appendChild(el('span', 'proposal-to-label', 'To'));
-  to.appendChild(el('span', 'proposal-to-name', targetName(p)));
+  if (p.kind === 'identifier') {
+    // "To: <display> (<handle>) — starts a NEW iMessage chat" (textContent only).
+    to.appendChild(el('span', 'proposal-to-name',
+      sanitizeLine(p.targetDisplay || p.targetIdentifier)
+      + ' (' + sanitizeLine(p.targetIdentifier) + ')'));
+    to.appendChild(el('span', 'proposal-to-new muted', ' — starts a NEW iMessage chat'));
+  } else {
+    to.appendChild(el('span', 'proposal-to-name', targetName(p)));
+  }
   host.appendChild(to);
 
   const ta = el('textarea', 'proposal-body');
@@ -208,14 +288,18 @@ function renderProposalDetail(p) {
   const sendBtn = el('button', 'proposal-btn proposal-send primary', 'Send');
   sendBtn.type = 'button';
   sendBtn.addEventListener('click', () => sendProposal(p, ta.value, err, sendBtn));
-  const editBtn = el('button', 'proposal-btn', 'Open in chat');
-  editBtn.type = 'button';
-  editBtn.addEventListener('click', () => prefillProposal(p, ta.value, err));
+  actions.appendChild(sendBtn);
+  // "Open in chat" prefills an EXISTING conversation's composer — only meaningful
+  // for a room-targeted draft; an identifier draft has no conversation yet.
+  if (p.kind === 'room') {
+    const editBtn = el('button', 'proposal-btn', 'Open in chat');
+    editBtn.type = 'button';
+    editBtn.addEventListener('click', () => prefillProposal(p, ta.value, err));
+    actions.appendChild(editBtn);
+  }
   const dropBtn = el('button', 'proposal-btn proposal-dismiss', 'Dismiss');
   dropBtn.type = 'button';
   dropBtn.addEventListener('click', () => { markHandled(p); renderProposalsView(); });
-  actions.appendChild(sendBtn);
-  actions.appendChild(editBtn);
   actions.appendChild(dropBtn);
   host.appendChild(actions);
 
@@ -305,4 +389,4 @@ function initProposalsUI() {
   }
 }
 
-export { initProposalsUI, renderProposalsView };
+export { initProposalsUI, renderProposalsView, parseProposal };

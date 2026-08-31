@@ -18,6 +18,34 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log() { printf '[setup] %s\n' "$*" >&2; }
 
+# --- preflight: ensure Docker is installed AND running ---
+# Installs Docker Desktop via Homebrew if it is missing, then launches it and
+# waits. Docker Desktop's first launch is interactive (license/privileged
+# helper), so if it can't come up we stop with clear guidance rather than fail
+# opaquely later.
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    log "Docker not found."
+    if command -v brew >/dev/null 2>&1; then
+      log "installing Docker Desktop via Homebrew (brew install --cask docker)…"
+      brew install --cask docker || { log "brew install failed — install Docker Desktop manually then re-run: https://www.docker.com/products/docker-desktop/"; exit 1; }
+    else
+      log "Homebrew not found. Install Docker Desktop, then re-run setup.sh:"
+      log "  https://www.docker.com/products/docker-desktop/"
+      exit 1
+    fi
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    log "Docker is installed but not running — launching Docker Desktop…"
+    [ "$(uname -s 2>/dev/null)" = "Darwin" ] && open -a Docker 2>/dev/null || true
+    log "waiting for Docker to start (up to ~90s)…"
+    for _ in $(seq 1 45); do docker info >/dev/null 2>&1 && break; sleep 2; done
+    docker info >/dev/null 2>&1 || { log "Docker still not running. Start Docker Desktop, then re-run setup.sh."; exit 1; }
+  fi
+  log "docker: installed and running"
+}
+ensure_docker
+
 # --- 0. ensure .env (Postgres password + host UID/GID) ---
 # The compose stack needs POSTGRES_PASSWORD, and Synapse/bridges run as the host
 # user so the bind-mounted config/state stays writable (the old hardcoded 501:20
@@ -135,6 +163,14 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   # from Beeper's public repo. It loads only when the binary exists AND the
   # teammate has filled in self_handle — otherwise say what's missing and carry
   # on (every other network is unaffected). Set SKIP_IMESSAGE=1 to opt out.
+  # Xcode Command Line Tools (Swift) are needed to build the iMessage CLI. Trigger
+  # the installer if Swift is missing — it opens a GUI dialog and installs in the
+  # background, so the build below simply skips this run and picks up on the next.
+  if ! command -v swift >/dev/null 2>&1; then
+    log "Swift not found — triggering Xcode Command Line Tools install (click Install in the dialog)…"
+    xcode-select --install 2>/dev/null || true
+    log "  when it finishes, re-run setup.sh to build iMessage (other networks work meanwhile)."
+  fi
   [ -x "${HERE}/imessage/build-cli.sh" ] && "${HERE}/imessage/build-cli.sh" || true
   IMSG_CFG="${HERE}/imessage/daemon.json"
   IMSG_CLI="${HERE}/imessage/bin/imessage-cli"

@@ -24,14 +24,15 @@ HOST_PORTS=(8008 8009 8011 8020 8021 29350)
 # --------------------------------------------------------------------------
 step "Preflight checks"
 
+# Docker is required, but setup.sh (called in step 1) now installs it via
+# Homebrew and starts it if needed — so don't hard-fail here, just note it.
 if ! command -v docker >/dev/null 2>&1; then
-  fail "Docker not found. Install Docker Desktop, then re-run this script.
-  https://www.docker.com/products/docker-desktop/"
+  log "docker: not found — setup.sh will install Docker Desktop (Homebrew)."
+elif ! docker info >/dev/null 2>&1; then
+  log "docker: installed but not running — setup.sh will start it."
+else
+  log "docker: found and running"
 fi
-if ! docker info >/dev/null 2>&1; then
-  fail "Docker is installed but not running. Start Docker Desktop, then re-run this script."
-fi
-log "docker: found and running"
 
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 if [ "${OS_NAME}" != "Darwin" ]; then

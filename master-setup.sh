@@ -26,9 +26,24 @@ TEAMMATES="${TEAMMATES:-jkali}"
 
 # --------------------------------------------------------------------------
 step "Preflight"
-command -v docker >/dev/null 2>&1 || fail "Docker not found. Install Docker Desktop, then re-run."
-docker info >/dev/null 2>&1 || fail "Docker is installed but not running. Start Docker Desktop, then re-run."
-log "docker: found and running"
+# Install Docker Desktop via Homebrew if missing, then launch + wait for it.
+if ! command -v docker >/dev/null 2>&1; then
+  log "Docker not found."
+  if command -v brew >/dev/null 2>&1; then
+    log "installing Docker Desktop via Homebrew…"
+    brew install --cask docker || fail "brew install failed — install Docker Desktop manually: https://www.docker.com/products/docker-desktop/"
+  else
+    fail "Homebrew not found. Install Docker Desktop, then re-run: https://www.docker.com/products/docker-desktop/"
+  fi
+fi
+if ! docker info >/dev/null 2>&1; then
+  log "Docker installed but not running — launching Docker Desktop…"
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && open -a Docker 2>/dev/null || true
+  log "waiting for Docker (up to ~90s)…"
+  for _ in $(seq 1 45); do docker info >/dev/null 2>&1 && break; sleep 2; done
+  docker info >/dev/null 2>&1 || fail "Docker still not running. Start Docker Desktop, then re-run master-setup.sh."
+fi
+log "docker: installed and running"
 for p in 8018 8019; do
   if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"${p}" -sTCP:LISTEN >/dev/null 2>&1; then
     log "port ${p} already in use — OK if that's this master stack from a previous run"

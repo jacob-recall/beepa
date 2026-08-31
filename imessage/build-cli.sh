@@ -32,7 +32,12 @@ fi
 (
   cd "${SRC}"
   git fetch --quiet origin 2>/dev/null || true
-  git checkout --quiet "${PIN}" 2>/dev/null || { log "pinned commit ${PIN} not available — skipping"; exit 1; }
+  # -f: discard any local edits so the build is deterministic (the stripper below
+  # reproduces the one edit the build needs).
+  git checkout -f --quiet "${PIN}" 2>/dev/null || { log "pinned commit ${PIN} not available — skipping"; exit 1; }
+  # Xcode #Preview macros (PreviewsMacros) aren't available to a headless
+  # `swift build` and fail compilation; strip those editor-only blocks first.
+  python3 "${HERE}/imessage/strip-previews.py" "${SRC}/src"
   log "building imessage-cli with Swift (first build downloads deps; can take a few minutes)…"
   swift build -c release --product imessage-cli
 ) || { log "swift build failed — see output above; iMessage skipped, other networks unaffected"; exit 0; }

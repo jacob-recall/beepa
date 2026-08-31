@@ -129,4 +129,19 @@ if ! grep -q '^registration_shared_secret:' "${HS}" 2>/dev/null; then
   log "added registration_shared_secret to homeserver.yaml"
 fi
 
+# iMessage daemon config: render its as_token/hs_token from the SAME secrets as
+# synapse/imessage-registration.yaml so a fresh install's daemon and appservice
+# agree (they diverged before this). Only when absent — never clobber a hand-
+# filled one. self_handle + the vendored bin/imessage-cli stay manual (macOS #3).
+IMSG_TMPL="${HERE}/hub/imessage-daemon.json.tmpl"
+IMSG_DEST="${OUT_ROOT}/imessage/daemon.json"
+if [ -f "${IMSG_TMPL}" ] && [ ! -f "${IMSG_DEST}" ]; then
+  mkdir -p "$(dirname "${IMSG_DEST}")"
+  CLI_PATH="${OUT_ROOT}/imessage/bin/imessage-cli"; export CLI_PATH
+  python3 "${HERE}/hub/_render_subst.py" "${IMSG_TMPL}" "${IMSG_DEST}" \
+    AS_TOKEN_IMESSAGE HS_TOKEN_IMESSAGE CLI_PATH
+  chmod 600 "${IMSG_DEST}"
+  log "wrote imessage/daemon.json (tokens match imessage-registration.yaml; still fill self_handle + provide bin/imessage-cli)"
+fi
+
 log "done — hub config rendered under ${OUT_ROOT}"

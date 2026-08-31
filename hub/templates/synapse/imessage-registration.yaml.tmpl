@@ -1,0 +1,12 @@
+id: imessage
+url: http://host.docker.internal:29350
+as_token: ${AS_TOKEN_IMESSAGE}
+hs_token: ${HS_TOKEN_IMESSAGE}
+sender_localpart: imessagebot
+rate_limited: false
+namespaces:
+    users:
+        - regex: ^@imessagebot:localhost$
+          exclusive: true
+        - regex: ^@imessage_.*:localhost$
+          exclusive: true

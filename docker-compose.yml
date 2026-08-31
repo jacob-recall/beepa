@@ -24,8 +24,8 @@ services:
     image: ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./synapse:/data
     ports:
@@ -38,8 +38,8 @@ services:
     image: dock.mau.dev/mautrix/whatsapp:v26.08@sha256:86237c4d0d33a1e08910b1f820e6c561f9b8e21dc26943caf266e01021087002
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./whatsapp:/data
     depends_on:
@@ -60,8 +60,8 @@ services:
     image: dock.mau.dev/mautrix/meta:ig-v26.08@sha256:4b2704de94809351884da2640b1b1421920980a60269aa871fa870a8d50e7eb0
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./meta:/data
     depends_on:
@@ -76,8 +76,8 @@ services:
     image: dock.mau.dev/mautrix/linkedin:v0.2608.0@sha256:c10f4e6ed9484ff8053a4e84788d2cc5f9f9c519c91e087afa5179be0ad34d03
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./linkedin:/data
     depends_on:
@@ -93,8 +93,8 @@ services:
     image: dock.mau.dev/mautrix/twitter:latest@sha256:a780515de3c7fa8f410e2d6355d4c69a0c439742c40bafeec8a3d8e61a94cbc4
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./twitter:/data
     depends_on:
@@ -111,8 +111,8 @@ services:
     image: dock.mau.dev/mautrix/gmessages:v26.08@sha256:cecc0b77bd4d64e6e04b7b5961749e3890daad7885b37e6cde5bb24a07735f3e
     restart: unless-stopped
     environment:
-      UID: "501"
-      GID: "20"
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
     volumes:
       - ./gmessages:/data
     depends_on:

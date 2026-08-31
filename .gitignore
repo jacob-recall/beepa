@@ -1,12 +1,14 @@
-# Secrets and generated state — never commit
-.env
-synapse/
-whatsapp/
-meta/
-gmessages/
-linkedin/
-twitter/
-element/config.json
+# Secrets and generated RENDERED state — never commit.
+# Anchored to the repo root so the tracked templates under hub/templates/
+# (hub/templates/synapse, hub/templates/whatsapp, …) are NOT swept up by these.
+/.env
+/synapse/
+/whatsapp/
+/meta/
+/gmessages/
+/linkedin/
+/twitter/
+/element/config.json
 *.backup
 *.bak
 pg_dump*
@@ -43,6 +45,10 @@ master/logs/*.err
 # Uplink enrollment credentials written on the teammate side — never commit
 uplink.env.local
 *.uplink.env.local
+
+# Hub local-user provisioning: stored password + minted LOCAL_* creds — 600, never commit
+hub/.local-user.local
+agents/uplink/local.env.local
 
 # Uplink daemon logs (launchd) — never commit
 agents/uplink/logs/

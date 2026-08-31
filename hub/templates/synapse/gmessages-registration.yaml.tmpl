@@ -1,0 +1,16 @@
+id: gmessages
+url: http://mautrix-gmessages:29336
+as_token: ${AS_TOKEN_GMESSAGES}
+hs_token: ${HS_TOKEN_GMESSAGES}
+sender_localpart: neGjYF32GPICYID4IbB2VPB0vmfK4P7u
+rate_limited: false
+namespaces:
+    users:
+        - regex: ^@gmessagesbot:localhost$
+          exclusive: true
+        - regex: ^@gmessages_.*:localhost$
+          exclusive: true
+        - regex: ^@jkali:localhost$
+          exclusive: false
+de.sorunome.msc2409.push_ephemeral: true
+receive_ephemeral: true

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# hub/render-hub.sh — INSTALL-TIME. Renders the tracked templates in
+# hub/templates/ into a complete, working hub config (synapse/ + each bridge
+# dir), minting any missing secrets. Idempotent: existing secrets in
+# synapse/.hub-secrets.local are reused (so re-running never rotates tokens out
+# from under a live stack), and only missing ones are minted. Called by setup.sh
+# before `docker compose up`. No secret is ever printed.
+#
+# Faithfulness: rendering with the current secrets reproduces the current config
+# byte-for-byte — that is what `hub/render-hub.sh --verify` checks against the
+# working tree.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TPL="${HERE}/hub/templates"
+SECRETS="${HERE}/synapse/.hub-secrets.local"
+ENV_FILE="${HERE}/.env"
+SYN_IMAGE='ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb'
+OUT_ROOT="${OUT_ROOT:-${HERE}}"          # overridable for --verify into a scratch dir
+VERIFY=0; [ "${1:-}" = "--verify" ] && VERIFY=1
+log() { printf '[render-hub] %s\n' "$*" >&2; }
+
+mint() { if command -v openssl >/dev/null 2>&1; then openssl rand -hex 32; \
+         else head -c 48 /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | head -c 64; fi; }
+
+# --- placeholders the templates ACTUALLY reference (derived, not hardcoded) --
+# Scanning the templates keeps this correct as bridges/sentinels change (e.g.
+# whatsapp's shared_secret stays the literal 'disable', so no PROV_WHATSAPP).
+# Only our own known placeholder names are matched, so mautrix's ${...} config
+# refs are never picked up. DB_PASSWORD comes from .env and is excluded here.
+KNOWN='DB_PASSWORD|MACAROON_SECRET|FORM_SECRET|AS_TOKEN_[A-Z]+|HS_TOKEN_[A-Z]+|PROV_[A-Z]+|PICKLE_[A-Z]+'
+VARS="$(grep -rhoE '\$\{('"${KNOWN}"')\}' "${TPL}" \
+        | sed -E 's/^\$\{(.*)\}$/\1/' | sort -u | grep -v '^DB_PASSWORD$' | tr '\n' ' ')"
+
+# --- DB password comes from .env (single source of truth) -----------------
+[ -f "${ENV_FILE}" ] || { log "FATAL: ${ENV_FILE} missing (setup.sh mints it first)"; exit 1; }
+# shellcheck disable=SC1090
+DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+[ -n "${DB_PASSWORD}" ] || { log "FATAL: POSTGRES_PASSWORD not set in .env"; exit 1; }
+export DB_PASSWORD
+
+# --- load existing secrets, mint any missing (never in --verify) ----------
+[ -f "${SECRETS}" ] && { set -a; . "${SECRETS}"; set +a; }
+missing=""
+for v in ${VARS}; do
+  if [ -z "${!v:-}" ]; then
+    if [ "${VERIFY}" = 1 ]; then
+      log "FATAL(--verify): ${v} not in ${SECRETS}; run hub/make-templates.sh first"; exit 1
+    fi
+    printf -v "$v" '%s' "$(mint)"; export "${v?}"; missing="${missing} ${v}"
+  else
+    export "${v?}"
+  fi
+done
+if [ -n "${missing}" ] && [ "${VERIFY}" != 1 ]; then
+  ( umask 077
+    [ -f "${SECRETS}" ] || printf '# Rendered-hub secrets — 600, gitignored, DO NOT COMMIT.\n' > "${SECRETS}"
+    for v in ${missing}; do printf "%s='%s'\n" "$v" "${!v}" >> "${SECRETS}"; done )
+  chmod 600 "${SECRETS}"
+  log "minted$(printf ' %s' ${missing}) into synapse/.hub-secrets.local"
+fi
+
+# --- render every template with an explicit var allowlist -----------------
+# A tiny python substituter (portable; macOS has no envsubst) replaces only our
+# named placeholders, leaving mautrix's own ${...} config refs untouched.
+count=0
+while IFS= read -r tmpl; do
+  rel="${tmpl#"${TPL}/"}"; dest="${OUT_ROOT}/${rel%.tmpl}"
+  mkdir -p "$(dirname "${dest}")"
+  # shellcheck disable=SC2086
+  python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD ${VARS}
+  chmod 600 "${dest}"
+  count=$((count+1))
+done < <(find "${TPL}" -name '*.tmpl' | sort)
+log "rendered ${count} config files into ${OUT_ROOT}"
+
+[ "${VERIFY}" = 1 ] && { log "verify render complete (diff is the caller's job)"; exit 0; }
+
+# --- runtime files Synapse needs beyond the YAMLs -------------------------
+mkdir -p "${OUT_ROOT}/synapse/media_store"
+LOGCFG="${OUT_ROOT}/synapse/localhost.log.config"
+if [ ! -f "${LOGCFG}" ]; then
+  cat > "${LOGCFG}" <<'LOGEOF'
+version: 1
+formatters:
+  precise:
+    format: '%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s'
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: precise
+loggers:
+  _placeholder:
+    level: "INFO"
+root:
+  level: INFO
+  handlers: [console]
+disable_existing_loggers: false
+LOGEOF
+  log "wrote synapse/localhost.log.config"
+fi
+
+# Signing key: generate once via the pinned Synapse image; never regenerate.
+SIGN="${OUT_ROOT}/synapse/localhost.signing.key"
+if [ ! -f "${SIGN}" ]; then
+  if command -v docker >/dev/null 2>&1; then
+    docker run --rm --entrypoint generate_signing_key "${SYN_IMAGE}" -o /dev/stdout \
+      > "${SIGN}" 2>/dev/null && chmod 600 "${SIGN}" \
+      && log "generated synapse/localhost.signing.key" \
+      || { log "WARN: signing-key generation failed; run once: docker run --rm --entrypoint generate_signing_key ${SYN_IMAGE} -o /dev/stdout > synapse/localhost.signing.key"; rm -f "${SIGN}"; }
+  else
+    log "WARN: docker not found; cannot generate signing key yet"
+  fi
+fi
+
+# registration_shared_secret: enables register_new_matrix_user for local-user
+# provisioning (homeserver.yaml has enable_registration:false; the shared secret
+# is the only account-creation path). Appended, not templated, so the config
+# render stays byte-faithful to the current working homeserver.yaml. Minted/
+# reused separately since it is not a template placeholder.
+if [ -z "${REG_SHARED_SECRET:-}" ]; then
+  REG_SHARED_SECRET="$(mint)"
+  ( umask 077; printf "REG_SHARED_SECRET='%s'\n" "${REG_SHARED_SECRET}" >> "${SECRETS}" ); chmod 600 "${SECRETS}"
+  log "minted REG_SHARED_SECRET into synapse/.hub-secrets.local"
+fi
+HS="${OUT_ROOT}/synapse/homeserver.yaml"
+if ! grep -q '^registration_shared_secret:' "${HS}" 2>/dev/null; then
+  printf '\nregistration_shared_secret: "%s"\n' "${REG_SHARED_SECRET}" >> "${HS}"
+  log "added registration_shared_secret to homeserver.yaml"
+fi
+
+log "done — hub config rendered under ${OUT_ROOT}"

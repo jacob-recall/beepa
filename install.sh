@@ -90,6 +90,14 @@ fi
 # --------------------------------------------------------------------------
 step "Step 3/3 — enroll the uplink to the master"
 
+# Use the LOCAL_* creds setup.sh's provisioning step wrote, so link.sh does not
+# prompt for a hub token the teammate would have to find by hand.
+LOCAL_ENV="${HERE}/agents/uplink/local.env.local"
+if [ -f "${LOCAL_ENV}" ]; then
+  set -a; . "${LOCAL_ENV}"; set +a
+  log "local hub creds ready (${LOCAL_USER:-@jkali:localhost}) — link.sh will use them"
+fi
+
 UPLINK_ENV="${HERE}/agents/uplink/uplink.env.local"
 if [ -f "${UPLINK_ENV}" ]; then
   log "already enrolled: ${UPLINK_ENV} exists."

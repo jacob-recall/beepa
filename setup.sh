@@ -18,12 +18,59 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log() { printf '[setup] %s\n' "$*" >&2; }
 
+# --- 0. ensure .env (Postgres password + host UID/GID) ---
+# The compose stack needs POSTGRES_PASSWORD, and Synapse/bridges run as the host
+# user so the bind-mounted config/state stays writable (the old hardcoded 501:20
+# broke for any uid != 501). Both live in the gitignored .env. Mint it on first
+# run; NEVER overwrite an existing one — that would change the DB password out
+# from under an existing Postgres volume.
+ENV_FILE="${HERE}/.env"
+if [ ! -f "${ENV_FILE}" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    PW="$(openssl rand -hex 32)"
+  else
+    PW="$(head -c 48 /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | head -c 64)"
+  fi
+  ( umask 077; {
+      printf 'POSTGRES_PASSWORD=%s\n' "${PW}"
+      printf 'HOST_UID=%s\n' "$(id -u)"
+      printf 'HOST_GID=%s\n' "$(id -g)"
+    } > "${ENV_FILE}" )
+  chmod 600 "${ENV_FILE}"
+  log "created .env (fresh Postgres password; HOST_UID=$(id -u) HOST_GID=$(id -g))"
+else
+  # Existing .env: leave the password alone; just ensure the UID/GID lines exist
+  # so the container user matches whoever owns the bind mounts.
+  grep -q '^HOST_UID=' "${ENV_FILE}" || printf 'HOST_UID=%s\n' "$(id -u)" >> "${ENV_FILE}"
+  grep -q '^HOST_GID=' "${ENV_FILE}" || printf 'HOST_GID=%s\n' "$(id -g)" >> "${ENV_FILE}"
+  log ".env present — password unchanged; host UID/GID ensured"
+fi
+
+# --- 0b. render the hub config from tracked templates (idempotent) ---
+# A fresh clone has no synapse/ or bridge config (they're gitignored). Render
+# them from hub/templates/ with minted-or-reused secrets before starting Docker.
+# Reuses synapse/.hub-secrets.local when present, so re-running never rotates
+# tokens out from under a live stack.
+if [ -x "${HERE}/hub/render-hub.sh" ]; then
+  "${HERE}/hub/render-hub.sh"
+else
+  log "WARNING: hub/render-hub.sh missing — cannot render hub config"
+fi
+
 # --- 1. bring up the local stack (idempotent) ---
 if command -v docker >/dev/null 2>&1; then
   log "starting the local hub (docker compose: bridge + client)…"
   ( cd "${HERE}" && docker compose --profile bridge --profile client up -d )
 else
   log "docker not found — install Docker Desktop and re-run to start the stack."
+fi
+
+# --- 1b. provision this hub's local account + uplink LOCAL_TOKEN ---
+# Fresh hub has no account (enable_registration:false); this registers one via
+# the registration_shared_secret render-hub.sh added, and writes LOCAL_* for the
+# uplink linker. Best-effort: on an already-configured hub it skips cleanly.
+if [ -x "${HERE}/hub/provision-user.sh" ]; then
+  "${HERE}/hub/provision-user.sh" || log "local-user provisioning skipped (non-fatal)"
 fi
 
 # --- 2. install + (re)load the host connect helpers (launchd) ---

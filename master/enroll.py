@@ -155,6 +155,17 @@ def _cs_base():
             or DEFAULT_CS_BASE).rstrip("/")
 
 
+def _public_hs_url():
+    """The master CS-API base advertised to TEAMMATES (their uplink connects
+    here, possibly across Tailscale) — distinct from _cs_base(), which enroll
+    uses locally ON the master host. Set MASTER_PUBLIC_URL (env or tokens.local)
+    to the tailnet URL; defaults to _cs_base() so a single-host/local setup is
+    unchanged. See master/tailscale-serve.sh."""
+    return (os.environ.get("MASTER_PUBLIC_URL")
+            or _tokens().get("MASTER_PUBLIC_URL")
+            or _cs_base()).rstrip("/")
+
+
 def known_teammates():
     """Teammate localparts that provision.sh issued a scoped account for."""
     toks = _tokens()
@@ -455,7 +466,7 @@ def exchange(code):
     _save_store(store)
 
     return {
-        "master_hs_url": cs_base,
+        "master_hs_url": _public_hs_url(),   # tailnet URL for the teammate's uplink
         "master_user": mxid,
         "master_token": token,
         "manager_mxid": manager,
@@ -696,6 +707,7 @@ def add_teammate(token, username, enroll_url=None):
     code = mint(user)   # reuses existing single-use / hashed-store mint logic
     if not enroll_url:
         enroll_url = (os.environ.get("ENROLL_PUBLIC_URL")
+                      or _tokens().get("ENROLL_PUBLIC_URL")
                       or ("http://127.0.0.1:%d" % DEFAULT_SERVE_PORT)).rstrip("/")
     redeem_cmd = "bash agents/uplink/link.sh '%s' '%s'" % (enroll_url, code)
     return {"username": user, "code": code,

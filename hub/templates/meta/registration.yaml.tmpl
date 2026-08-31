@@ -1,0 +1,17 @@
+id: instagram
+url: http://mautrix-meta:29319
+as_token: ${AS_TOKEN_META}
+hs_token: ${HS_TOKEN_META}
+sender_localpart: 4ziWK9qOhZHZrTTUn4OP1kUbAtWAhvic
+rate_limited: false
+namespaces:
+    users:
+        - regex: ^@instagrambot:localhost$
+          exclusive: true
+        - regex: ^@instagram_.*:localhost$
+          exclusive: true
+    aliases:
+        - regex: ^#instagram_.*:localhost$
+          exclusive: true
+de.sorunome.msc2409.push_ephemeral: true
+receive_ephemeral: true

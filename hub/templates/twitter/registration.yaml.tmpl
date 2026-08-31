@@ -1,0 +1,14 @@
+id: twitter
+url: http://mautrix-twitter:29327
+as_token: ${AS_TOKEN_TWITTER}
+hs_token: ${HS_TOKEN_TWITTER}
+sender_localpart: xYroEYU6WtpCMz1Cd0EsFP9zdyYhVVrv
+rate_limited: false
+namespaces:
+    users:
+        - regex: ^@twitterbot:localhost$
+          exclusive: true
+        - regex: ^@twitter_.*:localhost$
+          exclusive: true
+de.sorunome.msc2409.push_ephemeral: true
+receive_ephemeral: true

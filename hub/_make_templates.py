@@ -27,6 +27,18 @@ CONFIGS = {
     "META":      "meta/config.yaml",
     "TWITTER":   "twitter/config.yaml",
 }
+# Each containerized bridge ALSO reads its OWN registration.yaml from its data
+# dir (same tokens as the synapse/ copy Synapse loads). If it's absent on a
+# fresh clone the bridge generates a NEW one with a fresh token that Synapse
+# rejects (401). Templatize these too so their tokens match — value-based, so
+# they pick up the same ${AS_TOKEN_*}/${HS_TOKEN_*} already captured above.
+BRIDGE_REGS = {
+    "WHATSAPP":  "whatsapp/registration.yaml",
+    "GMESSAGES": "gmessages/registration.yaml",
+    "LINKEDIN":  "linkedin/registration.yaml",
+    "META":      "meta/registration.yaml",
+    "TWITTER":   "twitter/registration.yaml",
+}
 
 def read(rel):
     with open(os.path.join(ROOT, rel), "r") as f:
@@ -87,6 +99,8 @@ made.append(templatize("synapse/homeserver.yaml"))
 for rel in REGS.values():
     made.append(templatize(rel))
 for rel in CONFIGS.values():
+    made.append(templatize(rel))
+for rel in BRIDGE_REGS.values():
     made.append(templatize(rel))
 
 # --- 3. capture current secrets so first render reproduces exactly --------

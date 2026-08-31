@@ -129,21 +129,25 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   install_agent "${HERE}/agents/contacts/com.jkali.contacts-import.plist" \
     "com.jkali.contacts-import" ""
 
-  # iMessage appservice daemon (imessage/daemon.py): a KeepAlive launchd
-  # agent, macOS only. It needs two things this script does NOT create —
-  # its secrets file and the pinned Beeper CLI build — so it is loaded only
-  # when both exist; otherwise say exactly what is missing and carry on
-  # (every other network is unaffected).
+  # iMessage appservice daemon (imessage/daemon.py): a KeepAlive launchd agent,
+  # macOS only. daemon.json is rendered by hub/render-hub.sh (tokens match the
+  # registration; self_handle left as a placeholder). The CLI is built on demand
+  # from Beeper's public repo. It loads only when the binary exists AND the
+  # teammate has filled in self_handle — otherwise say what's missing and carry
+  # on (every other network is unaffected). Set SKIP_IMESSAGE=1 to opt out.
+  [ -x "${HERE}/imessage/build-cli.sh" ] && "${HERE}/imessage/build-cli.sh" || true
   IMSG_CFG="${HERE}/imessage/daemon.json"
   IMSG_CLI="${HERE}/imessage/bin/imessage-cli"
-  if [ -f "${IMSG_CFG}" ] && [ -x "${IMSG_CLI}" ]; then
+  IMSG_HANDLE_UNSET=0
+  grep -q 'REPLACE_WITH_YOUR_IMESSAGE_HANDLE' "${IMSG_CFG}" 2>/dev/null && IMSG_HANDLE_UNSET=1
+  if [ -f "${IMSG_CFG}" ] && [ -x "${IMSG_CLI}" ] && [ "${IMSG_HANDLE_UNSET}" = 0 ]; then
     install_agent "${HERE}/imessage/com.jkali.imessage-daemon.plist" \
       "com.jkali.imessage-daemon" ""
   else
-    log "skip com.jkali.imessage-daemon — prerequisites missing:"
-    [ -f "${IMSG_CFG}" ] || log "  - ${IMSG_CFG}: copy imessage/daemon.json.example and fill as_token/hs_token" \
-      "from synapse/imessage-registration.yaml, user_id, self_handle, cli_path (chmod 600)"
-    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI}: the pinned platform-imessage CLI build (see README.md 'iMessage bridge')"
+    log "skip com.jkali.imessage-daemon — not ready yet:"
+    [ -f "${IMSG_CFG}" ] || log "  - ${IMSG_CFG} missing (hub/render-hub.sh renders it)"
+    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI} missing (imessage/build-cli.sh builds it; needs Xcode CLT)"
+    [ "${IMSG_HANDLE_UNSET}" = 1 ] && log "  - set self_handle (your iMessage phone/email) in ${IMSG_CFG}, and grant the CLI Full Disk Access"
     log "  then re-run setup.sh to load it."
   fi
 fi

@@ -536,6 +536,35 @@ function computePlatforms(sourceIds) {
   return known.concat(rest);
 }
 
+// Per-TEAMMATE "which platforms has this person shared" — the distinct set
+// of source ids spanning BOTH their shared mirror rooms (MS.byUser, keyed by
+// the verified label) AND their shared contact handles (MS.contacts, each
+// already tagged with the verified label in buildByUser/parseContact). Same
+// dedupe/order as the existing per-person computePlatforms; pure derivation
+// over already-fetched MS state — no new reads, called fresh on each render.
+function computeUserPlatforms(label) {
+  const convos = MS.byUser.get(label) || [];
+  const fromRooms = convos.map(c => c.sourceId);
+  const fromContacts = MS.contacts.filter(ct => ct.label === label).map(ct => ct.source);
+  return computePlatforms(fromRooms.concat(fromContacts));
+}
+
+// Shared badge-row builder for the per-teammate platform summary: either a
+// row of platform badges (buildPlatBadge — same icons used everywhere else)
+// or an explicit "nothing shared yet" note. Never a false positive: a label
+// with zero distinct platforms always renders the note, never an empty row
+// that could read as "loading" or be mistaken for a real (if sparse) share.
+function buildUserPlatformsRow(label) {
+  const row = el('span', 'user-platforms-row');
+  const platforms = computeUserPlatforms(label);
+  if (!platforms.length) {
+    row.appendChild(el('span', 'muted user-platforms-empty', 'nothing shared yet'));
+  } else {
+    for (const src of platforms) row.appendChild(buildPlatBadge(src));
+  }
+  return row;
+}
+
 // One row = one mirror room, whichever list it appears in (Recent / a
 // teammate's section / Search results). Shows the conversation name, the
 // preview, whose account it is (userLabel), and the platform badge — the
@@ -638,6 +667,10 @@ function renderTeammateNav() {
     btn.appendChild(el('span', 'teammate-avatar', initials(label)));
     btn.appendChild(el('span', 'teammate-name', label));
     btn.appendChild(el('span', 'teammate-count', String(convos.length)));
+    // At-a-glance "which platforms has this teammate shared" (union of their
+    // mirror rooms + shared contact handles) — same badge row shape used in
+    // the per-teammate view below, wrapped onto its own line under the name.
+    btn.appendChild(buildUserPlatformsRow(label));
     btn.addEventListener('click', () => { closePopovers(); navTo(key); });
     nav.appendChild(btn);
   }
@@ -658,6 +691,13 @@ function renderTeammate(label) {
   const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
+  // At-a-glance "shared platforms" summary for this teammate, above their
+  // conversation list — additive: the existing empty-state/list rendering
+  // below is unchanged either way.
+  const summary = el('div', 'user-platforms-summary');
+  summary.appendChild(el('span', 'user-platforms-caption', 'Shared platforms:'));
+  summary.appendChild(buildUserPlatformsRow(label));
+  list.appendChild(summary);
   if (!convos.length) { list.appendChild(elEmpty('Nothing shared yet.')); return; }
   for (const item of groupByProfile(convos)) list.appendChild(buildListItem(item));
 }

@@ -31,6 +31,9 @@ imessage/platform-imessage/
 .beads-credential-key
 .beads/proxieddb/
 
+# Integration-test homeserver state (rendered config + signing key) — never commit
+tests/integration/synapse/
+
 # Master (matrix-master) secrets and generated state — never commit
 master/synapse/
 master/tokens.local

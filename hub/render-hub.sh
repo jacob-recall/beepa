@@ -40,6 +40,9 @@ DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -
 export DB_PASSWORD
 
 # --- load existing secrets, mint any missing (never in --verify) ----------
+# On a fresh clone synapse/ does not exist yet (the render loop makes it later),
+# so ensure the secrets dir exists before we read or write .hub-secrets.local.
+mkdir -p "$(dirname "${SECRETS}")"
 [ -f "${SECRETS}" ] && { set -a; . "${SECRETS}"; set +a; }
 missing=""
 for v in ${VARS}; do

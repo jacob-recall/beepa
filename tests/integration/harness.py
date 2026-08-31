@@ -1693,6 +1693,100 @@ def live_stack_ok():
 
 
 # ------------------------------------------------------------------ main
+def scenario_13_contact_backfill_on_enable():
+    """pm_mng-q5u.2: the contact mirror is a per-pass DIFF, not a forward-only
+    cursor, so enabling a source BACKFILLS contacts imported before the flip,
+    a later import's new contact flows, revoking tombstones everything, and
+    re-enabling re-pushes it. Self-directed only: every seeded handle is a
+    synthetic +1555… number of the tester's own, nothing is ever sent.
+
+    Legs (all against the real uplink + both live homeservers):
+      1. seed TWO imessage contacts, NO contact-share policy (default
+         private) -> the contacts room exists but holds ZERO
+         com.jkali.contact states after a settle.
+      2. PUT policy {imessage: share-all} -> BOTH pre-existing rows appear
+         (deleted:false). This leg fails on the old cursor code, which had
+         already advanced past both rows while they were private.
+      3. re-import a 3-row snapshot (the two + one new) -> the third appears.
+      4. PUT policy global private -> all three become {deleted: true}.
+      5. PUT {imessage: share-all} again -> all three are back, deleted:false
+         (their mirror rows were dropped on the tombstone 2xx, so the diff
+         re-pushes them).
+    """
+    e = fresh_env("s13")
+    contacts_db_path = os.path.join(STATE_DIR, "contacts_s13.db")
+    if os.path.exists(contacts_db_path):
+        os.remove(contacts_db_path)
+
+    tag_n = int(time.time()) % 1000000
+    nums = ["+1555%07d" % ((tag_n + i) % 10000000) for i in range(3)]
+    keys = [contact_state_key("imessage", n) for n in nums]
+
+    def seed(count):
+        conn = contacts_store.open_store(contacts_db_path)
+        try:
+            contacts_store.upsert_contacts(conn, "imessage", [
+                {"network_id": nums[i], "kind": "phone", "display_name": "Self %d" % i}
+                for i in range(count)
+            ])
+        finally:
+            conn.close()
+
+    def put_policy(policy):
+        local(e["tuser_tok"], "PUT",
+              "/_matrix/client/v3/user/" + urllib.parse.quote(e["tuser_id"], safe="")
+              + "/account_data/com.jkali.contact_share_policy", policy)
+
+    def states(mcr, want_keys, deleted):
+        """True when every key in want_keys is present with the wanted
+        deleted-flag (a missing key is neither)."""
+        st = master_contact_states(mcr)
+        return all(k in st and bool(st[k].get("deleted")) == deleted for k in want_keys)
+
+    # leg 1: two rows, default-private policy.
+    seed(2)
+    proc = start_uplink(e, extra_env={"UPLINK_CONTACTS_DB": contacts_db_path})
+    ev = []
+    ok = True
+    try:
+        mcr = wait_until(lambda: meta_get(e["db_path"], "master_contacts_room"),
+                         timeout=45, desc="s13 master contacts room")
+        time.sleep(4)  # the pass that created the room has planned+applied by now
+        n0 = len(master_contact_states(mcr))
+        ev.append("private_states=%d(want 0)" % n0)
+        ok = ok and n0 == 0
+
+        # leg 2: enable -> backfill of rows that pre-date the flip.
+        put_policy({"global": "private", "sources": {"imessage": "share-all"}})
+        wait_until(lambda: states(mcr, keys[:2], False), timeout=75,
+                   desc="s13 backfill of pre-existing contacts")
+        ev.append("backfilled=2")
+
+        # leg 3: a later import adds one contact (complete 3-row snapshot).
+        seed(3)
+        wait_until(lambda: states(mcr, keys, False), timeout=75,
+                   desc="s13 new contact after re-import")
+        ev.append("new_contact_flowed=1")
+
+        # leg 4: revoke -> every mirrored handle tombstoned.
+        put_policy({"global": "private"})
+        wait_until(lambda: states(mcr, keys, True), timeout=75,
+                   desc="s13 revoke tombstones all")
+        ev.append("revoked=3")
+
+        # leg 5: re-enable -> re-pushed after tombstone.
+        put_policy({"global": "private", "sources": {"imessage": "share-all"}})
+        wait_until(lambda: states(mcr, keys, False), timeout=75,
+                   desc="s13 re-share after tombstone")
+        ev.append("reshared=3")
+    except Exception as ex:
+        ok = False
+        ev.append("EXCEPTION: %r" % ex)
+    finally:
+        stop_uplink(proc)
+    return ok, "; ".join(ev)
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -1706,6 +1800,7 @@ SCENARIOS = [
     ("10_proposal_down", scenario_10_proposal_down),
     ("11_profile_span_platforms", scenario_11_profile_span_platforms),
     ("12_contact_share_and_propose", scenario_12_contact_share_and_propose),
+    ("13_contact_backfill_on_enable", scenario_13_contact_backfill_on_enable),
 ]
 
 

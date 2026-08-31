@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "agents", "uplink"))
 import reconcile  # noqa: E402
 from reconcile import (  # noqa: E402
-    reconcile_decisions, select_new_events, next_watermark, select_contacts_to_mirror,
+    reconcile_decisions, select_new_events, next_watermark, plan_contact_mirror,
     select_contacts_to_tombstone,
 )
 from consent import normalize_contact_policy  # noqa: E402
@@ -109,39 +109,87 @@ wm = next_watermark(wm, "p9", True)        # reconnect + confirm
 eq(wm, "p9", "watermark: catches up after reconnect")
 
 
-# ---- contact-share selection (Task 6) -------------------------------------
-# The pure "which versions to push" planner: version > cursor AND the source
-# resolves shared under the contact-share policy, in ascending version order.
-# A not-shared source is omitted so it never reaches the daemon's PUT path.
-def _crows(*versions, source="imessage"):
+# ---- contact mirror planner: plan_contact_mirror (pm_mng-q5u.2) -----------
+# Per-pass diff of desired-shared-and-live vs mirrored. Replaces the forward-
+# only contact_cursor so that enabling a source BACKFILLS its already-imported
+# contacts. `sources` filters rows only; `mirrored` is the complete
+# contact_mirror table and is never filtered (unknown-source mirrors are
+# tombstoned, not stranded). A not-shared row appears in neither list.
+def _crows(*versions, source="imessage", deleted=0):
     return [{"source": source, "network_id": "h%d" % v, "kind": "phone",
-             "display_name": None, "person_id": None, "deleted": 0, "version": v}
+             "display_name": None, "person_id": None, "deleted": deleted, "version": v}
             for v in versions]
 
 
+SOURCES = ("imessage", "whatsapp", "linkedin")
 share_imsg = normalize_contact_policy({"sources": {"imessage": "share-all"}})
+share_all = normalize_contact_policy({"global": "share-all"})
 not_shared = normalize_contact_policy({"global": "private"})
+K = lambda v, s="imessage": (s, "h%d" % v)  # noqa: E731
 
-# cursor=2, rows [1..5], policy shares imessage -> exactly 3,4,5 in order.
-sel = select_contacts_to_mirror(_crows(1, 2, 3, 4, 5), 2, share_imsg)
-eq([r["version"] for r in sel], [3, 4, 5], "contacts: cursor=2 shared -> 3,4,5")
-# same rows, a not-shared policy -> none leave the machine.
-eq(select_contacts_to_mirror(_crows(1, 2, 3, 4, 5), 2, not_shared), [],
-   "contacts: not-shared policy -> none")
-# cursor=0 picks up everything; unsorted input is returned in version order.
-eq([r["version"] for r in select_contacts_to_mirror(_crows(5, 3, 1, 4, 2), 0, share_imsg)],
-   [1, 2, 3, 4, 5], "contacts: unsorted input sorted by version")
-# per-source private-all overrides global share-all (most-specific-wins).
+
+def _plan(rows, mirrored, policy, sources=SOURCES, **kw):
+    return plan_contact_mirror(rows, mirrored, policy, sources, **kw)
+
+
+# BACKFILL: rows at 1..3 imported before the flip, nothing mirrored, source
+# now shared -> all three pushed, ascending version order.
+p = _plan(_crows(3, 1, 2), {}, share_imsg)
+eq([r["version"] for r in p["push"]], [1, 2, 3], "plan: backfill pushes all, sorted")
+eq(p["tombstone"], [], "plan: backfill tombstones none")
+eq((p["not_shared"], p["pending"]), (0, 0), "plan: backfill counts")
+# NOT shared -> nothing leaves the machine, in either direction; counted.
+p = _plan(_crows(1, 2, 3), {}, not_shared)
+eq((p["push"], p["tombstone"], p["not_shared"]), ([], [], 3), "plan: private -> none, counted")
+# already mirrored at the SAME version -> not re-pushed (no duplicate work).
+p = _plan(_crows(1, 2), {K(1): 1, K(2): 2}, share_imsg)
+eq(p["push"], [], "plan: same version -> no re-push")
+eq(p["tombstone"], [], "plan: same version -> no tombstone")
+# mirrored at a DIFFERENT version -> re-pushed: older (an update) AND newer
+# (a rebuilt contacts.db restarts versions at 1; `<` would strand stale PII).
+p = _plan(_crows(5) + _crows(2), {K(5): 3, K(2): 9}, share_imsg)
+eq([r["version"] for r in p["push"]], [2, 5], "plan: != version -> re-push, both directions")
+# deleted row never mirrored -> appears nowhere.
+p = _plan(_crows(4, deleted=1), {}, share_imsg)
+eq((p["push"], p["tombstone"]), ([], []), "plan: deleted+unmirrored -> nowhere")
+# deleted row that IS mirrored -> tombstone (and not pushed).
+p = _plan(_crows(4, deleted=1), {K(4): 4}, share_imsg)
+eq((p["push"], p["tombstone"]), ([], [K(4)]), "plan: deleted+mirrored -> tombstone")
+# source flipped to private with mirrors -> tombstone ALL of them, push none.
+p = _plan(_crows(1, 2, 3), {K(1): 1, K(2): 2, K(3): 3}, not_shared)
+eq((p["push"], p["tombstone"]), ([], [K(1), K(2), K(3)]), "plan: revoke -> tombstone all")
+# mixed sources: only the shared source pushes; the other is counted not_shared.
+p = _plan(_crows(3, source="imessage") + _crows(4, source="whatsapp"), {}, share_imsg)
+eq([(r["source"], r["version"]) for r in p["push"]], [("imessage", 3)], "plan: only shared source pushes")
+eq(p["not_shared"], 1, "plan: other source counted not_shared")
+# per-source private-all beats global share-all (most-specific-wins).
 priv_imsg = normalize_contact_policy({"global": "share-all", "sources": {"imessage": "private-all"}})
-eq(select_contacts_to_mirror(_crows(3, 4, 5), 2, priv_imsg), [],
-   "contacts: per-source private-all skips despite global share-all")
-# mixed sources: only the shared source's rows are selected.
-mixed = _crows(3, source="imessage") + _crows(4, source="whatsapp")
-eq([r["version"] for r in select_contacts_to_mirror(mixed, 2, share_imsg)], [3],
-   "contacts: only the shared source's rows selected")
+p = _plan(_crows(3, 4), {}, priv_imsg)
+eq(p["push"], [], "plan: per-source private-all beats global share-all")
+# a row whose source is NOT in `sources` is ignored even under global
+# share-all (the planner is the self-contained gate; SR-4).
+p = _plan(_crows(7, source="mystery"), {}, share_all)
+eq((p["push"], p["not_shared"]), ([], 0), "plan: unknown source never pushed")
+# a MIRRORED handle whose source is not in `sources` (and has no row) is
+# tombstoned, not stranded: `mirrored` is never filtered by `sources`.
+p = _plan(_crows(1), {("oldsource", "h1"): 1, K(1): 1}, share_imsg)
+eq(p["tombstone"], [("oldsource", "h1")], "plan: stranded unknown-source mirror tombstoned")
+eq(p["push"], [], "plan: known mirrored row untouched alongside")
+# re-share after tombstone: the mirror row was dropped on the tombstone 2xx,
+# so the handle is simply "not mirrored" and is pushed again.
+p = _plan(_crows(1), {}, share_imsg)
+eq([r["version"] for r in p["push"]], [1], "plan: re-share re-pushes")
+# push cap: 5 shared rows, cap 2 -> exactly the 2 lowest versions, pending=3,
+# tombstones unaffected (never capped).
+p = _plan(_crows(5, 4, 3, 2, 1), {("linkedin", "gone"): 1}, share_imsg, push_cap=2)
+eq([r["version"] for r in p["push"]], [1, 2], "plan: cap -> lowest versions")
+eq(p["pending"], 3, "plan: cap -> pending counted")
+eq(p["tombstone"], [("linkedin", "gone")], "plan: cap never applies to tombstones")
 # empty / None inputs are safe.
-eq(select_contacts_to_mirror([], 0, share_imsg), [], "contacts: empty rows")
-eq(select_contacts_to_mirror(None, 0, share_imsg), [], "contacts: None rows")
+eq(_plan([], {}, share_imsg), {"tombstone": [], "push": [], "not_shared": 0, "pending": 0},
+   "plan: empty")
+eq(_plan(None, None, share_imsg, sources=None),
+   {"tombstone": [], "push": [], "not_shared": 0, "pending": 0}, "plan: None inputs")
 
 
 # ---- contact revocation: select_contacts_to_tombstone (pm_mng-q5u.1) ------

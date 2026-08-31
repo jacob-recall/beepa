@@ -393,11 +393,13 @@ class Uplink:
         db.execute(
             "CREATE TABLE IF NOT EXISTS proposal_map ("
             "master_event_id TEXT PRIMARY KEY, local_event_id TEXT)")
-        # §12 phase 5 contact mirror (Task 6): the per-handle up-direction record
-        # — which store version was last mirrored for a handle and under which
-        # master state_key. Belt-and-suspenders alongside the contact_cursor
-        # watermark (com.jkali.contact state events are already idempotent by
-        # state_key, so a replay overwrites rather than duplicates).
+        # §12 phase 5 contact mirror: the per-handle up-direction record — which
+        # store version was last mirrored for a handle and under which master
+        # state_key. This IS the mirror's memory: each pass diffs the desired
+        # shared-and-live set against it (reconcile.plan_contact_mirror); rows
+        # are written/deleted only after the master's 2xx. (com.jkali.contact
+        # state events are idempotent by state_key, so a replay overwrites
+        # rather than duplicates.)
         db.execute(
             "CREATE TABLE IF NOT EXISTS contact_mirror ("
             "source TEXT, network_id TEXT, mirrored_version INTEGER, "
@@ -1109,26 +1111,40 @@ class Uplink:
     # -- contact mirror (§12 phase 5, Task 6, LOCAL contacts.db -> MASTER) ---
     # Address-book contacts (PII) leave the machine ONLY when consent says so.
     # HARD LIMITS enforced here:
-    #   - a handle whose SOURCE resolves NOT shared (consent.resolve_contact_share
-    #     over com.jkali.contact_share_policy) is SKIPPED before any network call
-    #     and never PUT to the master;
-    #   - contact_cursor advances to a row's version ONLY after the master PUT
-    #     returns 2xx (self.master raises MasterUnreachable otherwise, leaving the
-    #     cursor unmoved for a next-pass retry) — exactly-once, no loss on outage;
+    #   - each pass is a DIFF of the desired set (rows that are live AND whose
+    #     SOURCE resolves shared under consent.resolve_contact_share over
+    #     com.jkali.contact_share_policy) against contact_mirror (what the master
+    #     already holds), planned by the pure reconcile.plan_contact_mirror. A
+    #     handle that resolves NOT shared is in neither leg of the plan and never
+    #     reaches a network call; enabling a source therefore BACKFILLS its
+    #     already-imported contacts, and disabling it tombstones them;
+    #   - tombstones are applied BEFORE pushes: revocation is never queued
+    #     behind a backfill;
+    #   - a contact_mirror row is written (push) or deleted (tombstone) ONLY
+    #     after the master PUT returns 2xx (self.master raises MasterUnreachable
+    #     / HTTPError otherwise, before any local write) — the next pass simply
+    #     re-plans the same handle: exactly-once, no loss on outage, no
+    #     duplicate (the state PUT keys on sha1(source|network_id));
     #   - the contacts room is created ONCE, power-leveled so the manager can only
     #     READ (state_default 100, manager at 0 -> no com.jkali.contact write);
     #   - never log a contact value (network_id / display_name) — counts only.
     def read_contact_profiles(self):
-        """The raw profiles list from com.jkali.contact_profiles (or []).
+        """The raw profiles list from com.jkali.contact_profiles.
 
-        handle_owner() re-normalizes it, so this stays a thin read. Absent or an
-        HTTP error -> [] (no groupings)."""
+        handle_owner() re-normalizes it, so this stays a thin read.
+        Absent (404) -> [] (no groupings, relink normally).
+        Any OTHER error -> None: the caller must NOT treat that as "no
+        groupings" — doing so would unlink every handle and version-bump the
+        whole address book on a transient local-homeserver blip, then re-link
+        and bump it all again once the read recovers (a double full re-push)."""
         path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
                 + "/account_data/" + CONTACT_PROFILES_TYPE)
         try:
             data = self.local("GET", path)
-        except urllib.error.HTTPError:
-            return []
+        except urllib.error.HTTPError as e:
+            return [] if e.code == 404 else None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return None
         profiles = data.get("profiles") if isinstance(data, dict) else None
         return profiles if isinstance(profiles, list) else []
 
@@ -1187,8 +1203,10 @@ class Uplink:
                     + "/state/m.space.child/" + urllib.parse.quote(mcr, safe=""),
                     {"via": [self._server_name(cfg.master_user)]})
         self.meta_set("master_contacts_room", mcr)
-        # A fresh master room means nothing is mirrored yet: reset the cursor and
-        # the per-handle mirror record so everything is re-pushed into the new room.
+        # A fresh master room means nothing is mirrored yet: clear the per-handle
+        # mirror record so the next pass's diff re-pushes everything shared into
+        # the new room. (contact_cursor is a legacy meta key from the old
+        # forward-only mirror; deleting it is intentional cleanup, nothing reads it.)
         self.db.execute("DELETE FROM meta WHERE k='contact_cursor'")
         self.db.execute("DELETE FROM contact_mirror")
         self.db.commit()
@@ -1228,35 +1246,45 @@ class Uplink:
         return state_key
 
     def mirror_contacts(self):
-        """Mirror shared address-book contacts up to the master, exactly-once.
+        """Mirror shared address-book contacts up to the master as a per-pass
+        DIFF of desired-shared-and-live vs mirrored (pm_mng-q5u.2).
 
         Called each reconcile pass AFTER the conversation reconcile.
           (a) Recompute contacts.db's derived person_id cache from the
               authoritative account-data grouping (com.jkali.contact_profiles via
               handle_owner). A re-link becomes a version bump that then flows to
               the master as a normal update; set_person_id only bumps when the
-              link actually changed.
-          (b) For each store row newer than contact_cursor whose SOURCE resolves
-              to shared, upsert a com.jkali.contact state event (soft-deleted ->
-              tombstone). A row that resolves NOT shared is skipped BEFORE any
-              network call and never leaves the machine.
-          (c) contact_cursor advances to a row's version only after the PUT's 2xx
-              (or immediately for a no-network skip). On MasterUnreachable the
-              exception propagates before the cursor is advanced past the unsent
-              row, so the next pass resumes there with no loss and no duplicate.
-          (d) Revocation reconcile (pm_mng-q5u.1): diff the DESIRED shared-and-
-              live handle set against what is already on the master
-              (contact_mirror) and tombstone the difference — a contact whose
-              source flipped to PRIVATE, or whose row was deleted, is removed
-              from the manager's view rather than left behind. The mirror row is
-              dropped only after the master confirms the tombstone (same
-              2xx-then-advance discipline); a re-shared handle reappears."""
+              link actually changed. If the profiles read fails for any reason
+              other than "absent", this step AND the push leg are skipped this
+              pass (a push without profiles would stamp person_display null and
+              never be corrected); tombstones still run.
+          (b) Plan: reconcile.plan_contact_mirror over every row of every known
+              source (SOURCE_ID_TO_LABEL) against the COMPLETE contact_mirror
+              table. A row whose source resolves NOT shared is in neither leg
+              and never leaves the machine. A mirrored handle that is no longer
+              live-and-shared (source flipped private, row soft-deleted, source
+              renamed/removed) is tombstoned. A live-and-shared row that is not
+              mirrored, or is mirrored at a DIFFERENT version, is pushed — so
+              enabling a source backfills its already-imported contacts, and a
+              rebuilt contacts.db (versions restart at 1) re-syncs rather than
+              leaving stale PII on the master. Pushes are capped per pass
+              (reconcile.PUSH_CAP); the remainder is re-planned next pass.
+          (c) Apply tombstones FIRST (revocation never waits behind a backfill),
+              then pushes. Each contact_mirror write happens only after the
+              master's 2xx; MasterUnreachable / HTTPError propagate before it,
+              so the next pass re-plans the same handle — no loss, no
+              duplicate (state_key = sha1(source|network_id))."""
         room = self.ensure_contacts_room()
         if not room:
             return
         if not os.path.exists(self.cfg.contacts_db):
             return  # the importer has not produced a store yet -> nothing to mirror
         profiles = self.read_contact_profiles()
+        profiles_ok = profiles is not None
+        if not profiles_ok:
+            log.warning("contacts: profiles read failed (not 404) — skipping relink "
+                        "and pushes this pass; tombstones still apply")
+            profiles = []
         id_to_dn = {p["id"]: p["displayName"] for p in _normalize_profiles_handles(profiles)}
         policy = self.read_contact_policy()
         conn = contacts_store.open_store(self.cfg.contacts_db)
@@ -1265,91 +1293,51 @@ class Uplink:
             # Only touch the store when the link actually changed (keeps the
             # two-writer contacts.db writes short).
             relinked = 0
-            for source in SOURCE_ID_TO_LABEL:
-                for row in contacts_store.shared_since(conn, source, 0):
-                    owner = handle_owner(profiles, source, row["network_id"])
-                    if row["person_id"] != owner:
-                        if contacts_store.set_person_id(conn, source, row["network_id"], owner):
-                            relinked += 1
-            # (b/c) Select + push rows newer than the cursor, in global version
-            # order (contact_cursor is a single monotonic version across sources).
-            cursor = int(self.meta_get("contact_cursor", "0") or "0")
+            if profiles_ok:
+                for source in SOURCE_ID_TO_LABEL:
+                    for row in contacts_store.shared_since(conn, source, 0):
+                        owner = handle_owner(profiles, source, row["network_id"])
+                        if row["person_id"] != owner:
+                            if contacts_store.set_person_id(conn, source, row["network_id"], owner):
+                                relinked += 1
+            # (b) Plan the diff over fresh rows (relink may have bumped versions)
+            # and the complete mirror table.
             rows = []
             for source in SOURCE_ID_TO_LABEL:
-                rows.extend(contacts_store.shared_since(conn, source, cursor))
-            rows.sort(key=lambda r: r["version"])
-            shared_versions = {
-                r["version"]
-                for r in reconcile.select_contacts_to_mirror(rows, cursor, policy)
-            }
-            pushed = tombstoned = skipped = 0
-            for row in rows:
-                v = row["version"]
-                if v in shared_versions:
-                    # SHARED: PUT (may raise MasterUnreachable -> cursor unmoved).
-                    sk = self._put_contact(room, row, id_to_dn)
-                    if row["deleted"]:
-                        # A shared-source delete is a tombstone. Drop the mirror
-                        # record (not INSERT OR REPLACE) so the revocation pass
-                        # below treats the handle as already-removed and never
-                        # re-tombstones it — the same "record dropped after the
-                        # master 2xx" discipline as the reconcile pass.
-                        self.db.execute(
-                            "DELETE FROM contact_mirror WHERE source=? AND network_id=?",
-                            (row["source"], row["network_id"]))
-                        self.db.commit()
-                        tombstoned += 1
-                    else:
-                        self.db.execute(
-                            "INSERT OR REPLACE INTO contact_mirror "
-                            "(source, network_id, mirrored_version, master_state_key) "
-                            "VALUES (?,?,?,?)",
-                            (row["source"], row["network_id"], v, sk))
-                        self.db.commit()
-                        pushed += 1
-                else:
-                    # NOT shared: never sent. No network call was made.
-                    skipped += 1
-                # Advance only after this row was handled (confirmed PUT or skip).
-                self.meta_set("contact_cursor", str(v))
-            # Revocation reconcile (pm_mng-q5u.1): the push path above is
-            # forward-only and can only tombstone a delete it happens to see past
-            # the cursor on a still-shared source. A source (or global) contact-
-            # share policy that flips to PRIVATE bumps no row version, so an
-            # already-mirrored contact would otherwise stay on the master forever
-            # — a consent violation. So each pass ALSO diffs the desired
-            # shared-and-live set against what is already mirrored and removes the
-            # difference: for every contact_mirror handle whose source no longer
-            # resolves shared (or whose row was deleted), push a {deleted: true}
-            # tombstone and, on the master's 2xx, drop the mirror row so it is not
-            # re-tombstoned. Re-enabling sharing re-pushes the handle (a version
-            # bump flows via the cursor path; the pure-backfill case is q5u.2).
-            mirrored = {(r[0], r[1]) for r in self.db.execute(
-                "SELECT source, network_id FROM contact_mirror").fetchall()}
-            live_shared = set()
-            for source in SOURCE_ID_TO_LABEL:
-                if not consent.resolve_contact_share(source, policy).get("shared"):
-                    continue  # source not shared -> none of its handles are live-shared
-                for row in contacts_store.shared_since(conn, source, 0):
-                    if not row["deleted"]:
-                        live_shared.add((source, row["network_id"]))
-            revoked = 0
-            for (source, network_id) in reconcile.select_contacts_to_tombstone(
-                    mirrored, live_shared):
-                # Reuse the exact tombstone-send path (_put_contact's deleted
-                # branch); it raises MasterUnreachable before returning on an
-                # outage, so the row below is dropped ONLY after the master 2xx.
+                rows.extend(contacts_store.shared_since(conn, source, 0))
+            mirrored = {(r[0], r[1]): r[2] for r in self.db.execute(
+                "SELECT source, network_id, mirrored_version FROM contact_mirror").fetchall()}
+            plan = reconcile.plan_contact_mirror(rows, mirrored, policy, SOURCE_ID_TO_LABEL.keys())
+            # (c) Tombstones first. _put_contact's deleted branch raises before
+            # returning on an outage, so the mirror row is dropped ONLY after
+            # the master's 2xx; a dropped row leaves `mirrored` and is never
+            # re-tombstoned, and a later re-share simply re-pushes it.
+            tombstoned = pushed = 0
+            for (source, network_id) in plan["tombstone"]:
                 self._put_contact(room, {"source": source, "network_id": network_id,
                                          "deleted": 1}, id_to_dn)
                 self.db.execute(
                     "DELETE FROM contact_mirror WHERE source=? AND network_id=?",
                     (source, network_id))
                 self.db.commit()
-                revoked += 1
-            if relinked or pushed or tombstoned or skipped or revoked:
-                log.info("contacts: relinked=%d pushed=%d tombstoned=%d revoked=%d "
-                         "skipped=%d (cursor now %s)", relinked, pushed, tombstoned,
-                         revoked, skipped, self.meta_get("contact_cursor", "0"))
+                tombstoned += 1
+            pending = plan["pending"]
+            if profiles_ok:
+                for row in plan["push"]:
+                    sk = self._put_contact(room, row, id_to_dn)
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO contact_mirror "
+                        "(source, network_id, mirrored_version, master_state_key) "
+                        "VALUES (?,?,?,?)",
+                        (row["source"], row["network_id"], row["version"], sk))
+                    self.db.commit()
+                    pushed += 1
+            else:
+                pending += len(plan["push"])
+            if relinked or pushed or tombstoned or plan["not_shared"] or pending:
+                log.info("contacts: relinked=%d pushed=%d tombstoned=%d not_shared=%d "
+                         "pending=%d", relinked, pushed, tombstoned, plan["not_shared"],
+                         pending)
         finally:
             conn.close()
 

@@ -53,6 +53,19 @@ store in sync. Python 3.9+ stdlib only (`sqlite3`, `subprocess`, `json`,
       `dropped_ambiguous` so it's observable, not silently lost. See bd
       issue `pm_mng-syy` for the real fix (a proper phone-number library
       with per-contact region hints instead of one global region guess).
+  - **Leaves Contacts.app the way it found it.** `people()` launches
+    Contacts.app; the script records `Contacts.running()` *before* that
+    call and quits the app afterwards only if it was not running — an
+    hourly launchd job must not leave a GUI app open in the user's session.
+  - **No `//` comments inside `_JXA_SCRIPT`.** Passed via `osascript -e`,
+    a script containing `//` line comments is SIGKILLed on macOS 26.6
+    (bisected 2026-08-30; the same text from a file runs fine). The unit
+    test guards this; explain the script in Python comments above it.
+  - **Timeout.** `_OSASCRIPT_TIMEOUT = 600` s (was 60): ~3 Apple Events per
+    person, so a few-thousand-entry book can take minutes. A launch race
+    (Contacts.app still quitting from a previous run) can surface as a
+    single `osascript exited 1` after the 2-minute Apple-event timeout;
+    that run fails closed and the next hourly tick succeeds.
   - `import_once(db_path) -> dict` reads, flattens to per-identifier
     `seen` rows, and calls `upsert_contacts(conn, "imessage", seen)`.
     Returns `upsert_contacts`'s `added`/`updated`/`soft_deleted` plus
@@ -124,8 +137,13 @@ python3 tests/unit/import_macos.test.py
 python3 agents/contacts/import_macos.py
 sqlite3 agents/contacts/contacts.db 'select count(*) from contacts'
 
-# install as a launchd job (repeats hourly):
-launchctl load agents/contacts/com.jkali.contacts-import.plist
+# install as a launchd job (repeats hourly) — setup.sh does this (copies the
+# plist to ~/Library/LaunchAgents and loads it, alongside the connect helpers);
+# by hand it is the same two steps:
+cp agents/contacts/com.jkali.contacts-import.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.jkali.contacts-import.plist
+launchctl list | grep contacts-import      # loaded?
+tail -1 agents/contacts/logs/import.log    # one counts-only line per run
 ```
 
 ## How to change this safely

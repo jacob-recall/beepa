@@ -1,4 +1,4 @@
-# tests/ — 19 unit tests, all wired into tests/run.sh + the 12-scenario integration harness
+# tests/ — 20 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -8,7 +8,8 @@ explicit, named test — see the scenario list below.
 
 ```
 tests/
-  run.sh                          runs all 19 unit tests (9 node + 9 python) — see below
+  run.sh                          runs all 20 unit tests (9 node + 11 python)
+                                  + the consent conformance harness — see below
   unit/
     consent.test.js               shared/model/consent.js — every precedence case
     master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
@@ -28,6 +29,10 @@ tests/
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
     uplink_proposals.test.py      proposal handling
     uplink_sources.test.py        source-space derivation
+    enroll_password_derivation.test.py  master derived-password scheme (no stored passwords)
+  conformance/
+    consent_conformance.py        JS vs Python consent resolvers on ~84k vectors (exhaustive+fuzz)
+    consent_eval.mjs              pure dispatcher onto the real shared/model/consent.js exports
   integration/
     run.sh                        wrapper: `python3 tests/integration/harness.py "$@"`
     harness.py                    drives 2 real homeservers + the real uplink.py subprocess
@@ -95,7 +100,7 @@ the source the same way `shared/ui/sources.js` does), sets consent via
 account-data, runs the **real** `agents/uplink/uplink.py` as a subprocess,
 and asserts on MASTER homeserver state.
 
-**The 12 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
+**The 13 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
 requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
 
 1. `1_share_one_conversation` — share → mirror room appears with correct
@@ -127,6 +132,11 @@ requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
 12. `12_contact_share_and_propose` — a shared contact profile reaches the
     master's contacts index, and a manager-authored proposal against that
     contact reaches the right teammate's proposals room.
+13. `13_contact_backfill_on_enable` — the contact mirror is a per-pass
+    diff, not a forward-only cursor: contacts imported while sharing was
+    off are **backfilled** when the source is switched on; a later import's
+    new contact flows; switching the source off tombstones all of them;
+    switching it back on re-pushes them.
 
 `tests/integration/test_enroll.py` separately proves the v1.5 enrollment
 flow end to end (valid/reused/expired/invalid code) against the running
@@ -141,7 +151,7 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh runs all 19 (9 node + 9 python):
+# tests/run.sh runs all 20 (9 node + 11 python) + the consent conformance harness:
 tests/run.sh
 
 # --- integration (needs BOTH stacks up first) ---
@@ -155,7 +165,7 @@ TEAMMATES="alice bob" master/provision.sh
 # 2. the throwaway test-user hub:
 docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml up -d
 
-# 3. run all 12 scenarios, or filter by name substring:
+# 3. run all 13 scenarios, or filter by name substring:
 tests/integration/run.sh
 tests/integration/run.sh 3_offline          # just the catch-up scenario
 

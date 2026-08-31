@@ -16,4 +16,10 @@ eq(resolveContactShare('imessage', normalizeContactPolicy({global:'yolo', source
 eq(normalizeContactPolicy({global:'private', sources:['share-all','private-all']}), {global:'private', sources:{}}, 'array sources -> {}');
 eq(normalizeContactPolicy({global:'private', sources:['share-all','private-all']}), normalizeContactPolicy({global:'private'}), 'array sources same as no sources');
 eq(resolveContactShare('imessage', normalizeContactPolicy({global:'private', sources:['share-all']})), {shared:false, reason:'private'}, 'array sources resolves like empty -> private');
+// PINNED (consent-conformance plan, deny-drop decision): a malformed source id
+// drops its private-all rule and falls through to a global share-all. Do NOT
+// change one side only — see the conformance harness.
+eq(resolveContactShare(5, {global:'share-all', sources:{'5':'private-all'}}),
+   {shared:true, reason:'all contacts'},
+   'pinned: non-string source drops the private-all rule -> global share-all');
 console.log('ok contact_consent');

@@ -109,14 +109,24 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   concatenated into a URL path. `consent.js`'s `overridePath()` and
   `contacts.js`'s room-id normalization both do this — keep doing it in any
   new storage helper.
-- **JS ↔ Python consent parity is a hard requirement.** `model/consent.js`
-  and `agents/uplink/consent.py` must resolve identically on every input:
-  same precedence order, same reason strings (`'explicit'`, `'excluded'`,
-  `'all <source>'`, `'profile: <name>'`, `'private'`), same normalization
-  (unknown states collapse to the safe default, never pass through). A
-  change to one without the matching change to the other is a shipped
-  authorization bug — the uplink (Python) is what actually decides whether
-  a conversation leaves the machine.
+- **JS ↔ Python consent parity is a hard requirement, and the conformance
+  harness is its authority.** `model/consent.js` and
+  `agents/uplink/consent.py` must resolve identically on every input: same
+  precedence order, same reason strings (`'explicit'`, `'excluded'`,
+  `'all <source>'`, `'profile: <name>'`, `'private'`), same normalization,
+  and the SAME input canonicalisation (the shared type gates: plain-object /
+  non-empty-string / `SOURCE_KEY_RE` own-property lookups /
+  `CONSENT_ROOMID_RE` — see the table in
+  `docs/superpowers/plans/2026-08-30-consent-conformance.md`). Parity is
+  proven on every test run by `tests/conformance/consent_conformance.py`
+  (~84k exhaustive + fuzz vectors through BOTH real modules; any differing
+  output or crash on either side is a red build, and a `DECISION DIFFERS`
+  class is the leak class). A change to one file without the matching change
+  to the other is a shipped authorization bug — the uplink (Python) is what
+  actually decides whether a conversation leaves the machine. Two boundary
+  rules: `effectiveShared()`/`effective_shared()` is the only value the
+  uplink acts on, and `reason` strings are UI-only — never parse them for
+  authorization.
 
 ## How to run / test
 

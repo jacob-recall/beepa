@@ -52,7 +52,23 @@ DB_PASSWORD="$(grep -E '^MASTER_POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cu
 
 gen_secret() { python3 -c 'import secrets;print(secrets.token_urlsafe(48))'; }
 
-# --- three shared secrets: reuse if present, else mint + persist (0600) ---
+# --- shared secrets: reuse if present, else mint + persist (0600) ---
+# TEAMMATE_PASSWORD_KEY is the ONLY root of every master-side account password
+# (teammates + manager): master/enroll.py derives each password from it with
+# HMAC-SHA256, so no password is ever stored (see master/CLAUDE.md). This
+# script is the single writer of this file; enroll.py/provision.sh only read
+# it and fail loudly if the key is absent.
+#
+# Precedence for the two password keys (unlike the three Synapse secrets,
+# which are file-wins): an explicitly-set env value overrides the file value;
+# an explicitly-set EMPTY TEAMMATE_PASSWORD_KEY_PREV means "omit the _PREV
+# line" (end of a rotation). `source` below clobbers the env variables, so
+# both value and set-ness are captured first.
+ENV_TEAMMATE_PASSWORD_KEY="${TEAMMATE_PASSWORD_KEY-}"
+ENV_TEAMMATE_PASSWORD_KEY_PREV="${TEAMMATE_PASSWORD_KEY_PREV-}"
+ENV_PREV_SET="${TEAMMATE_PASSWORD_KEY_PREV+set}"
+TEAMMATE_PASSWORD_KEY=""
+TEAMMATE_PASSWORD_KEY_PREV=""
 if [ -s "${SECRETS}" ]; then
   # shellcheck disable=SC1090
   source "${SECRETS}"
@@ -61,11 +77,24 @@ fi
 MACAROON_SECRET="${MACAROON_SECRET:-$(gen_secret)}"
 FORM_SECRET="${FORM_SECRET:-$(gen_secret)}"
 REGISTRATION_SHARED_SECRET="${REGISTRATION_SHARED_SECRET:-$(gen_secret)}"
+# current key: non-empty env -> env; else file; else mint. Never emitted empty.
+if [ -n "${ENV_TEAMMATE_PASSWORD_KEY}" ]; then
+  TEAMMATE_PASSWORD_KEY="${ENV_TEAMMATE_PASSWORD_KEY}"
+fi
+TEAMMATE_PASSWORD_KEY="${TEAMMATE_PASSWORD_KEY:-$(gen_secret)}"
+# previous key: set+non-empty env -> env; set+empty -> omit; unset -> file (if any)
+if [ -n "${ENV_PREV_SET}" ]; then
+  TEAMMATE_PASSWORD_KEY_PREV="${ENV_TEAMMATE_PASSWORD_KEY_PREV}"
+fi
 {
   echo "# matrix-master Synapse shared secrets (mode 600, gitignored). Do NOT commit."
   echo "MACAROON_SECRET='${MACAROON_SECRET}'"
   echo "FORM_SECRET='${FORM_SECRET}'"
   echo "REGISTRATION_SHARED_SECRET='${REGISTRATION_SHARED_SECRET}'"
+  echo "TEAMMATE_PASSWORD_KEY='${TEAMMATE_PASSWORD_KEY}'"
+  if [ -n "${TEAMMATE_PASSWORD_KEY_PREV}" ]; then
+    echo "TEAMMATE_PASSWORD_KEY_PREV='${TEAMMATE_PASSWORD_KEY_PREV}'"
+  fi
 } > "${SECRETS}"
 chmod 600 "${SECRETS}"
 

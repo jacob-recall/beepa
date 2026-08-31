@@ -68,29 +68,73 @@ def select_new_events(event_ids, mapped_ids):
     return out
 
 
-def select_contacts_to_mirror(rows, cursor, policy):
-    """Which contact rows must be pushed to the master this pass (§12 phase 5).
+PUSH_CAP = 200  # per-pass push budget; tombstones are never capped
 
-    rows   : store rows (dicts with at least 'source' and 'version'), any order.
-    cursor : the last mirrored global version (contact_cursor); only rows with
-             version > cursor are candidates.
-    policy : a normalized contact-share policy (consent.normalize_contact_policy).
 
-    Returns the candidate rows whose SOURCE resolves to shared under the policy,
-    in ascending version order. A row that resolves NOT shared is OMITTED, so it
-    is never handed to the caller's PUT path and never leaves the machine. This
-    is the consent gate for contacts, kept pure so it is unit-testable without a
-    live homeserver; the daemon still advances its cursor over the skipped rows
-    it does not receive here.
+def plan_contact_mirror(rows, mirrored, policy, sources, push_cap=PUSH_CAP):
+    """Plan one contact-mirror pass: a diff of desired-shared-and-live vs
+    mirrored (§12 phase 5; pm_mng-q5u.2 backfill-on-enable).
+
+    This is THE consent gate for address-book contacts. It replaces the old
+    forward-only contact_cursor, which advanced over not-shared rows and so
+    could never backfill a contact imported BEFORE its source was shared.
+
+    rows     : store rows (dicts: source, network_id, version, deleted, ...),
+               any order, deleted rows included.
+    mirrored : {(source, network_id): mirrored_version} — the COMPLETE
+               contact_mirror table. Deliberately NOT filtered by `sources`:
+               a mirrored handle whose source is unknown/renamed/removed is no
+               longer live-shared and is tombstoned, never stranded on the
+               master.
+    policy   : a normalized contact-share policy (consent.normalize_contact_policy).
+    sources  : the daemon's known mirror sources (SOURCE_ID_TO_LABEL keys).
+               Filters ONLY the rows: a row outside it can never be a push
+               candidate and never counts as live-shared. Adding a store
+               source means adding it there.
+    push_cap : at most this many pushes per pass; the remainder is re-planned
+               next pass, so a first backfill of a large address book resumes
+               naturally without blocking the daemon's loop for minutes.
+
+    Returns {"tombstone": [(source, network_id), sorted],
+             "push":      [rows, ascending version, at most push_cap],
+             "not_shared": live in-`sources` rows that resolved private,
+             "pending":    shared pushes deferred by push_cap}.
+
+    tombstone = mirrored handles minus live-shared handles (select_contacts_to_tombstone).
+    push      = live (deleted=0) rows in `sources` whose source resolves shared
+                AND (not mirrored OR mirrored_version != row version).
+                `!=`, not `<`: version is a per-store change token, not a
+                clock — a rebuilt contacts.db restarts at 1 and `<` would leave
+                stale PII on the master forever.
+    A not-shared row appears in neither list, so it never reaches a PUT.
     """
-    out = []
-    for row in sorted(rows or [], key=lambda r: (r.get("version") or 0)):
-        v = row.get("version")
-        if v is None or v <= cursor:
+    mirrored = dict(mirrored or {})
+    known = set(sources or ())
+    policy = policy or {}
+    live_shared = set()
+    candidates = []
+    not_shared = 0
+    for row in rows or []:
+        source = row.get("source")
+        if source not in known:
             continue
-        if consent.resolve_contact_share(row.get("source"), policy).get("shared"):
-            out.append(row)
-    return out
+        if row.get("deleted"):
+            continue
+        if not consent.resolve_contact_share(source, policy).get("shared"):
+            not_shared += 1
+            continue
+        key = (source, row.get("network_id"))
+        live_shared.add(key)
+        if key not in mirrored or mirrored[key] != row.get("version"):
+            candidates.append(row)
+    candidates.sort(key=lambda r: (r.get("version") or 0))
+    cap = max(0, int(push_cap)) if push_cap is not None else len(candidates)
+    return {
+        "tombstone": select_contacts_to_tombstone(mirrored.keys(), live_shared),
+        "push": candidates[:cap],
+        "not_shared": not_shared,
+        "pending": max(0, len(candidates) - cap),
+    }
 
 
 def select_contacts_to_tombstone(mirrored, currently_shared):

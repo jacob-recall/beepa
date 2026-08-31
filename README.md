@@ -134,6 +134,8 @@ Host-side daemon (`imessage/daemon.py`, launchd agent
 platform-imessage CLI (`imessage/bin/imessage-cli`, pinned build). Chats
 appear in the **iMessage** space; text works both directions; attachments are
 best-effort. New chats arrive as invites.
+- Install: `setup.sh` loads `imessage/com.jkali.imessage-daemon.plist` when
+  `imessage/daemon.json` and `imessage/bin/imessage-cli` exist (INSTALL.md).
 - Status: `launchctl print gui/501/com.jkali.imessage-daemon | grep state`
 - Logs: `imessage/logs/daemon.log` (INFO is deliberately body-free)
 - Restart: `launchctl kickstart -k gui/501/com.jkali.imessage-daemon`

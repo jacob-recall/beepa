@@ -50,10 +50,26 @@ _REGION_CALLING_CODES = {
 # entirely. Unit tests set this; production code leaves it unset (None).
 _RAW_FOR_TEST = None
 
+# osascript wall-clock budget. Each person costs ~3 Apple Events (name, phones,
+# emails); a few-thousand-entry address book can take minutes. The job is
+# hourly and fail-closed, so a long read is safe and a hung one still errors.
+_OSASCRIPT_TIMEOUT = 600
+
+# The fixed JXA script. NO `//` comments inside it: passed through
+# `osascript -e`, a script containing `//` line comments is SIGKILLed on
+# macOS 26.6 (verified by bisection; the same text from a file runs fine), so
+# the explanation lives here instead.
+#   - `Contacts.running()` does not launch the app; `people()` does. The
+#     running-state is captured BEFORE the launching call so the hourly
+#     launchd job can put things back the way it found them and never leaves
+#     Contacts.app open in the user's session.
+#   - Everything is wrapped in try/catch so a single odd record (or a quit
+#     refusal) can't turn a complete read into a failed one.
 _JXA_SCRIPT = """
-ObjC.import('stdlib');
 function run() {
   var Contacts = Application('Contacts');
+  var wasRunning = false;
+  try { wasRunning = Contacts.running(); } catch (e) {}
   var people = Contacts.people();
   var out = [];
   for (var i = 0; i < people.length; i++) {
@@ -76,7 +92,9 @@ function run() {
     } catch (e) {}
     out.push({ name: name, phones: phones, emails: emails });
   }
-  return JSON.stringify(out);
+  var json = JSON.stringify(out);
+  if (!wasRunning) { try { Contacts.quit(); } catch (e) {} }
+  return json;
 }
 """
 
@@ -160,15 +178,25 @@ def _normalize_email(raw):
     return None
 
 
-def _run_osascript():
-    """Runs the inline JXA script. Returns (stdout_text, error_or_None)."""
+# The Contacts read intermittently fails with a non-zero exit after the
+# 2-minute Apple-event timeout (observed 2026-08-30 on macOS 26.6, from a
+# terminal and under launchd alike, with Contacts.app both closed and open;
+# not TCC). One retry after a short pause turns "this hour's import is lost"
+# into a rare event without weakening fail-closed: a read that fails twice
+# still returns an error and touches nothing.
+_RETRY_DELAY = 15
+_time_sleep = __import__("time").sleep  # seam: tests stub it out
+
+
+def _run_osascript_once():
+    """One osascript run. Returns (stdout_text, error_or_None)."""
     try:
         proc = subprocess.run(
             ["osascript", "-l", "JavaScript", "-e", _JXA_SCRIPT],
             shell=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=_OSASCRIPT_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "osascript failed to run: %s" % (type(e).__name__,)
@@ -176,6 +204,16 @@ def _run_osascript():
     if proc.returncode != 0:
         return None, "osascript exited %d" % (proc.returncode,)
     return proc.stdout, None
+
+
+def _run_osascript():
+    """Runs the inline JXA script, retrying ONCE on a failed run.
+    Returns (stdout_text, error_or_None)."""
+    stdout, err = _run_osascript_once()
+    if err is None:
+        return stdout, None
+    _time_sleep(_RETRY_DELAY)
+    return _run_osascript_once()
 
 
 def _load_raw_contacts():

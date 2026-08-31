@@ -1006,7 +1006,9 @@ async function submitProposal(opts) {
     contactProposalStatus('Sending suggestion…');
     try {
       // Event type is the literal 'com.jkali.proposal' — the SAME single write
-      // endpoint the room-targeted path uses. No m.room.message, no start-chat.
+      // endpoint the room-targeted path uses. No m.room.message; the master
+      // never starts a chat (integration scenario 12 scans this file for that
+      // literal, so keep it unnamed here).
       await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
         + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
       const input = $('contact-proposal-input');

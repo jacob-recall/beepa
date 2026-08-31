@@ -16,6 +16,7 @@ This module is PURE: no I/O, no side effects at import. Its output must match
 consent.js byte-for-byte on the same inputs — see tests/unit/consent_py.test.py,
 which mirrors tests/unit/consent.test.js.
 """
+import re
 
 SHARE_POLICY_TYPE = "com.jkali.share_policy"      # global user account-data
 SHARE_OVERRIDE_TYPE = "com.jkali.share_override"  # per-room account-data
@@ -27,12 +28,59 @@ OVERRIDE_STATES = {"share", "private"}
 # fall through to the per-source/global levels".
 PROFILE_STATES = {"share", "private", "inherit"}
 
+# ---------------------------------------------------------------------------
+# INPUT CANONICALISATION — identical gates in shared/model/consent.js (see
+# docs/superpowers/plans/2026-08-30-consent-conformance.md's table; the
+# conformance harness tests/conformance/consent_conformance.py proves parity
+# on ~84k vectors every run). Anything failing a gate is treated as ABSENT
+# (the fall-through value) — note "absent" is safe only relative to the
+# more-specific levels: the per-source level carries a deny (private-all),
+# so a dropped malformed rule can fall through to a global share-all. That
+# reconciles the UI up to what this enforcer already answered; the curated
+# tests pin it. All regexes are matched with END-OF-STRING semantics
+# (re.fullmatch here, ^…$ in JS — Python's `$` also matches before a
+# trailing newline, JS's does not; never switch back to .match with `$`).
+# ---------------------------------------------------------------------------
+
+# A per-source policy key / contact source id. Shape-based (a new bridge id
+# needs no change here); deliberately excludes __proto__-style names. Never
+# tighten it to something a real source id could fail — dropping a key drops
+# a private-all too.
+_SOURCE_KEY_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
+# Room-id shape for overrides_from_sync output keys. Static and server-name
+# agnostic ON PURPOSE — never reuse a server-bound or runtime-configured
+# room-id regex here (JS mirrors this literal as CONSENT_ROOMID_RE).
+_CONSENT_ROOMID_RE = re.compile(r"![^:]+:[A-Za-z0-9.\-:]+")
+
+
+def _plain(x):
+    """The dict itself, or None — the shared 'plain object' gate."""
+    return x if isinstance(x, dict) else None
+
+
+def _nonempty_str(x):
+    return x if isinstance(x, str) and x else None
+
+
+def _source_rule(sources, source_id):
+    """'share-all' | 'private-all' | None for a per-source rule lookup.
+
+    The consent gate for the per-source level: the container must be a dict,
+    the key a valid source id (regex above), present, with an exactly-valid
+    value — anything else is inherit."""
+    if not isinstance(sources, dict):
+        return None
+    if not isinstance(source_id, str) or not _SOURCE_KEY_RE.fullmatch(source_id):
+        return None
+    v = sources.get(source_id)
+    return v if v in ("share-all", "private-all") else None
+
 
 def _source_label_of(convo):
-    """convo.sourceLabel || convo.sourceId || 'source' — never throws."""
-    if not isinstance(convo, dict):
-        return "source"
-    return convo.get("sourceLabel") or convo.get("sourceId") or "source"
+    """A non-empty-string sourceLabel, else non-empty-string sourceId, else
+    'source' — never throws, never coerces a non-string into a reason."""
+    c = _plain(convo) or {}
+    return _nonempty_str(c.get("sourceLabel")) or _nonempty_str(c.get("sourceId")) or "source"
 
 
 def resolve(convo, policy, override, profile=None):
@@ -43,12 +91,13 @@ def resolve(convo, policy, override, profile=None):
     'all <source>' | 'explicit' | 'excluded' | 'profile: <name>' | 'private'.
     Mirrors resolve() in consent.js exactly.
     """
-    pol = policy if isinstance(policy, dict) else {}
-    raw_sources = pol.get("sources")
-    sources = raw_sources if isinstance(raw_sources, dict) else {}
-    source_id = convo.get("sourceId") if isinstance(convo, dict) else None
+    pol = _plain(policy) or {}
+    sources = pol.get("sources")
+    c = _plain(convo) or {}
+    source_id = _nonempty_str(c.get("sourceId"))
 
     # 1. Per-conversation override wins over everything (most specific).
+    #    Only the exact strings count; any other shape is inherit.
     if override == "share":
         return {"shared": True, "reason": "explicit"}
     if override == "private":
@@ -56,21 +105,22 @@ def resolve(convo, policy, override, profile=None):
 
     # 2. Profile level: a shared/private contact profile shares or hides all its
     #    members together, but only 'share'/'private' take effect — 'inherit'
-    #    (or an absent profile) falls through to the source/global levels.
-    if profile:
-        pname = "profile: " + ((profile.get("displayName") if isinstance(profile, dict) else None) or "profile")
-        if profile.get("share") == "share":
+    #    (a non-object profile, or an absent one) falls through.
+    prof = _plain(profile)
+    if prof:
+        pname = "profile: " + (_nonempty_str(prof.get("displayName")) or "profile")
+        if prof.get("share") == "share":
             return {"shared": True, "reason": pname}
-        if profile.get("share") == "private":
+        if prof.get("share") == "private":
             return {"shared": False, "reason": pname}
 
-    # 3. Per-source standing policy.
-    src = sources.get(source_id) if source_id else None
+    # 3. Per-source standing policy (gated: valid key, own entry, exact value).
+    src = _source_rule(sources, source_id)
     if src == "share-all":
         return {"shared": True, "reason": "all " + _source_label_of(convo)}
     if src == "private-all":
         return {"shared": False, "reason": "private"}
-    # (src == 'inherit' or absent -> fall through to global)
+    # (inherit / absent / malformed -> fall through to global)
 
     # 4. Global standing policy.
     if pol.get("global") == "share-all":
@@ -95,12 +145,14 @@ def resolve_all(convos, policy, overrides, profiles=None):
         return []
 
     def get(room_id):
-        if not overrides or room_id is None:
+        # container must be a dict, the key a string (a junk convo id can be
+        # unhashable; JS gates the same way and additionally accepts a Map)
+        if not isinstance(overrides, dict) or not isinstance(room_id, str):
             return None
         return overrides.get(room_id)
 
     def get_profile(room_id):
-        if not profiles or room_id is None:
+        if not isinstance(profiles, dict) or not isinstance(room_id, str):
             return None
         return profiles.get(room_id)
 
@@ -122,9 +174,13 @@ def normalize_policy(p):
     if not isinstance(src, dict):
         src = {}
     g = p.get("global") if isinstance(p, dict) else None
-    global_ = "share-all" if (g in GLOBAL_STATES and g == "share-all") else "private"
+    global_ = "share-all" if g == "share-all" else "private"  # == never throws; Set-membership on an unhashable dict would
     sources = {}
     for k, v in src.items():
+        # key must be a valid source id (drops __proto__-style and junk keys —
+        # same gate as _source_rule, so normalize+resolve agree with JS)
+        if not isinstance(k, str) or not _SOURCE_KEY_RE.fullmatch(k):
+            continue
         if v == "share-all" or v == "private-all":
             sources[k] = v
     return {"global": global_, "sources": sources}
@@ -166,9 +222,11 @@ def normalize_contact_policy(raw):
     if not isinstance(src, dict):
         src = {}
     g = raw.get("global") if isinstance(raw, dict) else None
-    global_ = "share-all" if (g in CONTACT_GLOBAL_STATES and g == "share-all") else "private"
+    global_ = "share-all" if g == "share-all" else "private"  # == never throws; Set-membership on an unhashable dict would
     sources = {}
     for k, v in src.items():
+        if not isinstance(k, str) or not _SOURCE_KEY_RE.fullmatch(k):
+            continue  # same key gate as the conversation dimension
         if v == "share-all" or v == "private-all":
             sources[k] = v
     return {"global": global_, "sources": sources}
@@ -183,16 +241,16 @@ def resolve_contact_share(source, policy):
       3. global 'share-all'       -> shared,     'all contacts'
       4. safe default             -> not shared, 'private'
     """
-    pol = policy if isinstance(policy, dict) else {}
-    raw_sources = pol.get("sources")
-    sources = raw_sources if isinstance(raw_sources, dict) else {}
+    pol = _plain(policy) or {}
 
-    src = sources.get(source) if source else None
+    # same gated lookup as the conversation dimension: valid source id, own
+    # entry, exact value — anything else is inherit
+    src = _source_rule(pol.get("sources"), source)
     if src == "share-all":
         return {"shared": True, "reason": "all " + source + " contacts"}
     if src == "private-all":
         return {"shared": False, "reason": "private"}
-    # (src == 'inherit' or absent -> fall through to global)
+    # (inherit / absent / malformed -> fall through to global)
 
     if pol.get("global") == "share-all":
         return {"shared": True, "reason": "all contacts"}
@@ -208,10 +266,19 @@ def overrides_from_sync(sync_data):
     """
     out = {}
     rooms = sync_data.get("rooms") if isinstance(sync_data, dict) else None
-    join = (rooms or {}).get("join") if isinstance(rooms, dict) else None
-    for rid, room in (join or {}).items():
+    join = rooms.get("join") if isinstance(rooms, dict) else None
+    if not isinstance(join, dict):
+        return out
+    for rid, room in join.items():
+        # output keys are gated by the STATIC room-id shape (parity with JS's
+        # CONSENT_ROOMID_RE; a junk/"__proto__" key never enters the map)
+        if not isinstance(rid, str) or not _CONSENT_ROOMID_RE.fullmatch(rid):
+            continue
         ad = room.get("account_data") if isinstance(room, dict) else None
-        for e in ((ad or {}).get("events") or []):
+        events = ad.get("events") if isinstance(ad, dict) else None
+        if not isinstance(events, list):
+            continue
+        for e in events:
             if isinstance(e, dict) and e.get("type") == SHARE_OVERRIDE_TYPE:
                 v = normalize_override(e.get("content"))
                 if v:

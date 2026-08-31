@@ -98,11 +98,17 @@ lives where, security invariants, and how to run/test each piece:
   pulls proposals down into a dedicated local room, tracks watermark +
   event-map for exactly-once delivery. Its `consent.py` is a byte-parity
   Python port of `shared/model/consent.js` — the two must never drift.
+- `agents/contacts/CLAUDE.md` — the teammate's durable address-book store
+  (`contacts.db`, mode 600) and the hourly macOS Contacts importer
+  (`import_macos.py`, JXA via `osascript`, TCC-prompted, fail-closed).
+  Installed by `setup.sh` as `com.jkali.contacts-import`. The uplink
+  mirrors its rows up only for sources the contact-share policy resolves to
+  shared, as a per-pass diff (backfills on enable, tombstones on revoke).
 - `master/CLAUDE.md` — the always-on master Synapse stack (separate
   compose project `matrix-master`, its own ports), provisioning, and the
   v1.5 enrollment-code flow.
-- `tests/CLAUDE.md` — 19 unit tests, all wired into tests/run.sh (consent
-  parity, uplink reconcile logic, and more), and the 12-scenario
+- `tests/CLAUDE.md` — 20 unit tests + the consent conformance harness, all wired into tests/run.sh (consent
+  parity, uplink reconcile logic, and more), and the 13-scenario
   integration harness that drives two real homeservers end to end.
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)

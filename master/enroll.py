@@ -34,17 +34,48 @@ Operations
       behind the SAME TLS reverse proxy as the CS API, so it adds no new
       public exposure.
 
+  provision-account <localpart> [--manager]
+      Used by provision.sh. Register the account if absent (shared-secret
+      flow), log in with the DERIVED password (below), migrating a legacy
+      stored password or a previous-key derivation to the current one on the
+      way (logout_devices=false, so nobody's existing token dies), drop that
+      account's legacy secret line from .provision-state.local, and print
+      ONLY {"mxid","token","migrated"} as JSON. No password ever crosses argv
+      or a shell variable.
+
+  password <localpart> [--manager]
+      Print the derived password for an account (operator convenience — the
+      manager's console login). It prints a secret: never redirect it to a
+      file and never wire it into `serve` (there is deliberately no HTTP
+      route for it).
+
 Security invariants
 -------------------
+  * NO PASSWORD IS STORED. Every master-side account password is derived:
+        teammate: urlsafe_b64(HMAC-SHA256(KEY, b"beepa-teammate-password-v1\\0" + localpart))[:32]
+        manager : urlsafe_b64(HMAC-SHA256(KEY, b"beepa-manager-password-v1\\0"  + "manager"  ))[:32]
+    KEY = the ASCII bytes of TEAMMATE_PASSWORD_KEY in master/synapse/
+    .secrets.local (mode 600; written ONLY by master/setup.sh — this module
+    never writes that file and fails loudly if the key is absent or short; a
+    missing key never falls through to an empty HMAC key). The key grants
+    exactly the authority the stored passwords used to (login as any master-
+    side account), which REGISTRATION_SHARED_SECRET in the same file already
+    implied. Honest caveats: a key read at time T also compromises accounts
+    created after T; rotation (TEAMMATE_PASSWORD_KEY_PREV, see master/
+    CLAUDE.md) touches every account. Never copy the key anywhere the
+    registration secret is not (not tokens.local, not .env, not a plist).
+    This is the ONLY implementation of the derivation; never re-implement it.
   * The returned token is minted by password-logging-in AS the teammate, so it
     is inherently limited to that teammate: @alice's code can never yield a
     token that writes @bob's rooms — Synapse enforces per-account authorization.
   * Codes are single-use (marked used only AFTER a token is successfully issued,
     so a transient master outage never burns a code), expire after their TTL,
     and only the SHA-256 of a code is ever persisted. Store is mode 600.
-  * Reads teammate passwords from master/.provision-state.local and space ids /
-    base URL / manager mxid from master/tokens.local — both already mode 600,
-    produced by provision.sh. This helper does NOT alter account provisioning.
+  * Reads space ids / base URL / manager mxid from master/tokens.local and
+    space ids / roster from master/.provision-state.local (both mode 600,
+    produced by provision.sh). The state file carries NO secrets any more;
+    a legacy PW_<U> / MANAGER_PW line is read once by provision-account, used
+    to migrate that account to the derived password, and removed.
 
 Env overrides (mainly for tests):
   ENROLL_STORE     path to the code store           (default: master/enrollments.local)
@@ -52,6 +83,7 @@ Env overrides (mainly for tests):
   ENROLL_TTL       default code lifetime in seconds  (default: 600)
 """
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -135,18 +167,17 @@ def known_teammates():
 
 
 def _teammate_facts(teammate):
-    """(mxid, space, password) for a provisioned teammate, or raise EnrollError."""
+    """(mxid, space) for a provisioned teammate, or raise EnrollError.
+
+    No password: it is derived at login time (derive_password). A teammate is
+    "provisioned" iff tokens.local carries their mxid + space."""
     up = teammate.upper()
     toks = _tokens()
-    st = _state()
     mxid = toks.get("MASTER_%s_USER" % up)
     space = toks.get("MASTER_SPACE_%s" % up)
-    # provision.sh persists each teammate password as PW_<U> (and this module's
-    # add_teammate appends the same key), so read that exact key — not <U>_PW.
-    pw = st.get("PW_%s" % up)
-    if not mxid or not space or not pw:
+    if not mxid or not space:
         raise EnrollError("unknown or unprovisioned teammate: %s" % teammate)
-    return mxid, space, pw
+    return mxid, space
 
 
 # ------------------------------------------------------------------ code store
@@ -215,6 +246,187 @@ def _login(cs_base, localpart, password):
         return json.loads(r.read())["access_token"]
 
 
+# --------------------------------------------------------- derived passwords
+# See the module docstring's "NO PASSWORD IS STORED" invariant. This is the
+# single implementation of the derivation; provision.sh calls it through the
+# provision-account / password subcommands, never through a shell copy.
+_KEY_MIN_LEN = 32
+_LOCALPART_RE = re.compile(r"[a-z0-9]{1,64}")
+_PW_DOMAINS = {
+    "teammate": b"beepa-teammate-password-v1\x00",
+    "manager": b"beepa-manager-password-v1\x00",
+}
+
+
+def _password_keys():
+    """(current_key_bytes, prev_key_bytes_or_None) from synapse/.secrets.local.
+
+    A missing or short current key raises — never derive from a weak/empty
+    key (that would make every password computable from the localpart alone).
+    """
+    s = _parse_shell_vars(SECRETS_FILE)
+    cur = s.get("TEAMMATE_PASSWORD_KEY") or ""
+    if len(cur) < _KEY_MIN_LEN:
+        raise EnrollError("TEAMMATE_PASSWORD_KEY missing or too short in "
+                          "master/synapse/.secrets.local — run master/setup.sh")
+    prev = s.get("TEAMMATE_PASSWORD_KEY_PREV") or ""
+    return cur.encode("ascii"), (prev.encode("ascii") if len(prev) >= _KEY_MIN_LEN else None)
+
+
+def derive_password(kind, localpart, key=None):
+    """The account's password: urlsafe_b64(HMAC-SHA256(key, domain+localpart))[:32].
+
+    kind is 'teammate' or 'manager' (distinct HMAC domains, so a teammate
+    literally named 'manager' could never share the manager's password — and
+    is rejected anyway). localpart must match [a-z0-9]{1,64}; anything else
+    is rejected, never normalised (a lowercased/trimmed variant would derive
+    a DIFFERENT password than the one the account was created with).
+    """
+    if kind not in _PW_DOMAINS:
+        raise EnrollError("unknown password kind: %r" % (kind,))
+    if not isinstance(localpart, str) or not _LOCALPART_RE.fullmatch(localpart):
+        raise EnrollError("invalid localpart (use lowercase letters and digits)")
+    if kind == "teammate" and localpart == "manager":
+        raise EnrollError("localpart 'manager' is reserved for the manager kind")
+    if kind == "manager" and localpart != "manager":
+        raise EnrollError("manager kind derives only for localpart 'manager'")
+    if key is None:
+        key = _password_keys()[0]
+    mac = hmac.new(key, _PW_DOMAINS[kind] + localpart.encode("ascii"),
+                   hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode("ascii")[:32]
+
+
+def _try_login(cs_base, localpart, password):
+    """_login, but a 401/403 (wrong password) returns None instead of raising."""
+    try:
+        return _login(cs_base, localpart, password)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None
+        raise
+
+
+def _change_password(cs_base, token, localpart, old_password, new_password):
+    """Rotate one account's password via the CS API, full UIA.
+
+    logout_devices=False ALWAYS: this is a storage-format migration / key
+    rotation, not a credential-compromise response — every token the account
+    already holds (enrolled uplinks, the manager console, tokens.local) must
+    keep working. The UIA auth uses the OLD password (the one that just
+    logged in).
+    """
+    url = cs_base + "/_matrix/client/v3/account/password"
+    headers = {"Authorization": "Bearer " + token}
+    body = {"new_password": new_password, "logout_devices": False}
+    status, resp = _request("POST", url, headers=headers,
+                            data=json.dumps(body).encode())
+    if status == 200:
+        return
+    if status != 401:
+        raise EnrollError("password change refused (HTTP %d)" % status)
+    try:
+        session = json.loads(resp)["session"]
+    except (ValueError, KeyError, TypeError):
+        raise EnrollError("password change: malformed UIA challenge")
+    body["auth"] = {
+        "type": "m.login.password",
+        "identifier": {"type": "m.id.user", "user": localpart},
+        "password": old_password,
+        "session": session,
+    }
+    status, _resp = _request("POST", url, headers=headers,
+                             data=json.dumps(body).encode())
+    if status != 200:
+        raise EnrollError("password change failed (HTTP %d)" % status)
+
+
+def _remove_shell_vars(path, keys):
+    """Drop the given keys from a KEY='value' file, preserving everything else.
+
+    Missing file or none of the keys present -> no-op (no rewrite)."""
+    existing = _parse_shell_vars(path)
+    if not any(k in existing for k in keys):
+        return
+    try:
+        with open(path) as f:
+            first = f.readline().rstrip("\n")
+    except FileNotFoundError:
+        return
+    header = first if first.startswith("#") else "# mode 600, gitignored. Do NOT commit."
+    for k in keys:
+        existing.pop(k, None)
+    lines = [header]
+    for k, v in existing.items():
+        lines.append("%s='%s'" % (k, v))
+    payload = ("\n".join(lines) + "\n").encode()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(payload)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def provision_account(localpart, manager=False):
+    """Register-if-absent + login for one account, migrating to the derived
+    password if the account still carries a legacy or previous-key one.
+
+    Order (crash-safe: every step is idempotent and the state file is only
+    touched after the server-side rotation is confirmed):
+      1. register with the DERIVED password via the shared-secret flow
+         (skip if the account exists);
+      2. try login with the derived password — the steady state;
+      3. else try the previous key's derivation (rotation), then the legacy
+         stored password (PW_<U>/MANAGER_PW in .provision-state.local; for
+         the manager also the MANAGER_PW env var) — on success, rotate to
+         the derived password (_change_password, logout_devices=False) and
+         re-login with the derived value to prove the rotation took;
+      4. drop the account's legacy secret line from the state file;
+      5. return {"mxid", "token", "migrated"} — the ONLY output.
+    """
+    kind = "manager" if manager else "teammate"
+    derived = derive_password(kind, localpart)
+    cs_base = _cs_base()
+    _register_account(cs_base, _shared_secret(), localpart, derived)
+    mxid = "@%s:%s" % (localpart, _server_name())
+
+    token = _try_login(cs_base, localpart, derived)
+    migrated = False
+    if token is None:
+        _cur, prev = _password_keys()
+        candidates = []
+        if prev is not None:
+            candidates.append(derive_password(kind, localpart, key=prev))
+        st = _state()
+        legacy = st.get("MANAGER_PW") if manager else st.get("PW_%s" % _key(localpart))
+        if legacy:
+            candidates.append(legacy)
+        if manager and os.environ.get("MANAGER_PW"):
+            candidates.append(os.environ["MANAGER_PW"])
+        for old in candidates:
+            tok = _try_login(cs_base, localpart, old)
+            if tok is not None:
+                _change_password(cs_base, tok, localpart, old, derived)
+                token = _login(cs_base, localpart, derived)  # prove it took
+                migrated = True
+                break
+        if token is None:
+            raise EnrollError(
+                "cannot log in as @%s: neither the derived password, a "
+                "previous-key derivation, nor a legacy stored password works. "
+                "If this account predates key-derived passwords, its password "
+                "is unknown — reset it server-side or re-create the account."
+                % localpart)
+
+    _remove_shell_vars(STATE_FILE,
+                       ["MANAGER_PW"] if manager else ["PW_%s" % _key(localpart)])
+    return {"mxid": mxid, "token": token, "migrated": migrated}
+
+
 def exchange(code):
     """Redeem a code -> scoped enrollment dict. Marks the code used on success.
 
@@ -232,10 +444,11 @@ def exchange(code):
         raise EnrollError("enrollment code expired")
 
     teammate = rec["teammate"]
-    mxid, space, pw = _teammate_facts(teammate)
+    mxid, space = _teammate_facts(teammate)
     cs_base = _cs_base()
     manager = _tokens().get("MASTER_MANAGER_USER", "")
-    token = _login(cs_base, teammate, pw)  # fresh, scoped to this teammate
+    # fresh token, scoped to this teammate; the password is derived, not stored
+    token = _login(cs_base, teammate, derive_password("teammate", teammate))
 
     # burn the code only now that issuance succeeded
     rec["used_at"] = int(time.time())
@@ -455,11 +668,13 @@ def add_teammate(token, username, enroll_url=None):
 
     if user not in known_teammates():
         secret = _shared_secret()
-        password = secrets.token_urlsafe(24)
+        password = derive_password("teammate", user)  # derived, never stored
         created = _register_account(cs_base, secret, user, password)
         if not created:
-            # Account exists on the server but we hold no password/space for it
-            # (not console-managed). We cannot safely mint without its facts.
+            # Account exists on the server but we hold no space/roster entry
+            # for it (not console-managed). Deliberately refuse rather than
+            # silently adopt it — even though the derived password might now
+            # log it in, an unmanaged account's provenance is unknown.
             raise EnrollError(
                 "@%s:%s already exists but is not managed here" % (user, server))
         tok = _login(cs_base, user, password)      # fresh, scoped to this user
@@ -467,7 +682,6 @@ def add_teammate(token, username, enroll_url=None):
         U = _key(user)
         st = _state()
         _upsert_shell_vars(STATE_FILE, {
-            "PW_%s" % U: password,
             "SPACE_%s" % U: space,
             "TEAMMATES": _roster_add(st.get("TEAMMATES", ""), user),
         }, "# matrix-master provisioning state (mode 600, gitignored). Do NOT commit.")
@@ -628,7 +842,34 @@ def main(argv=None):
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8019)
 
+    pa = sub.add_parser("provision-account",
+                        help="register-if-absent + login (migrating to the "
+                             "derived password); prints {mxid, token, migrated}")
+    pa.add_argument("localpart")
+    pa.add_argument("--manager", action="store_true")
+
+    pw = sub.add_parser("password",
+                        help="print the DERIVED password for an account "
+                             "(secret: never redirect to a file)")
+    pw.add_argument("localpart")
+    pw.add_argument("--manager", action="store_true")
+
     args = ap.parse_args(argv)
+    if args.cmd == "provision-account":
+        try:
+            print(json.dumps(provision_account(args.localpart, manager=args.manager)))
+        except (EnrollError, urllib.error.URLError, OSError) as e:
+            sys.stderr.write("enroll: provision-account %s: %s\n" % (args.localpart, e))
+            return 2
+        return 0
+    if args.cmd == "password":
+        try:
+            print(derive_password("manager" if args.manager else "teammate",
+                                  args.localpart))
+        except EnrollError as e:
+            sys.stderr.write("enroll: %s\n" % e)
+            return 2
+        return 0
     if args.cmd == "mint":
         try:
             print(mint(args.teammate, args.ttl))

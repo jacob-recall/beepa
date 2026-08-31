@@ -30,9 +30,11 @@ fi
 LA_DIR="${HOME}/Library/LaunchAgents"
 mkdir -p "${LA_DIR}"
 
-# install_agent <plist_src> <label> <health_url>
+# install_agent <plist_src> <label> [health_url]
+# health_url is optional: a one-shot/timer job (no listener) passes "" and
+# skips the liveness probe.
 install_agent() {
-  local src="$1" label="$2" health="$3"
+  local src="$1" label="$2" health="${3:-}"
   local dest="${LA_DIR}/$(basename "${src}")"
   mkdir -p "$(dirname "${src}")/logs"
   if [ ! -f "${src}" ] || ! command -v launchctl >/dev/null 2>&1; then
@@ -48,6 +50,7 @@ install_agent() {
     return
   fi
   # Best-effort liveness (health is side-effect-free — reads no cookies).
+  [ -n "${health}" ] || return 0
   sleep 1
   if command -v curl >/dev/null 2>&1 && curl -fsS "${health}" >/dev/null 2>&1; then
     log "  ${label} is up (${health})"
@@ -61,6 +64,38 @@ install_agent "${HERE}/gmessages-connect/com.jkali.gmessages-connect.plist" \
 install_agent "${HERE}/session-connect/com.jkali.session-connect.plist" \
   "com.jkali.session-connect"   "http://127.0.0.1:8021/connect/health"
 
+# macOS Contacts importer (agents/contacts/): hourly one-shot launchd job that
+# reads Contacts.app into the local, mode-600 contacts.db. Nothing leaves the
+# machine until the app's contact-share panel says so (default: private).
+# The FIRST run triggers the standard macOS "osascript wants access to your
+# Contacts" prompt — that prompt is the consent surface; click Allow. A
+# background launchd run can't answer it, so if it was missed/denied, enable
+# osascript under System Settings > Privacy & Security > Contacts and run
+# `python3 agents/contacts/import_macos.py` once by hand.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  log "macOS may now ask for Contacts access for 'osascript' — click Allow."
+  install_agent "${HERE}/agents/contacts/com.jkali.contacts-import.plist" \
+    "com.jkali.contacts-import" ""
+
+  # iMessage appservice daemon (imessage/daemon.py): a KeepAlive launchd
+  # agent, macOS only. It needs two things this script does NOT create —
+  # its secrets file and the pinned Beeper CLI build — so it is loaded only
+  # when both exist; otherwise say exactly what is missing and carry on
+  # (every other network is unaffected).
+  IMSG_CFG="${HERE}/imessage/daemon.json"
+  IMSG_CLI="${HERE}/imessage/bin/imessage-cli"
+  if [ -f "${IMSG_CFG}" ] && [ -x "${IMSG_CLI}" ]; then
+    install_agent "${HERE}/imessage/com.jkali.imessage-daemon.plist" \
+      "com.jkali.imessage-daemon" ""
+  else
+    log "skip com.jkali.imessage-daemon — prerequisites missing:"
+    [ -f "${IMSG_CFG}" ] || log "  - ${IMSG_CFG}: copy imessage/daemon.json.example and fill as_token/hs_token" \
+      "from synapse/imessage-registration.yaml, user_id, self_handle, cli_path (chmod 600)"
+    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI}: the pinned platform-imessage CLI build (see README.md 'iMessage bridge')"
+    log "  then re-run setup.sh to load it."
+  fi
+fi
+
 cat >&2 <<DONE
 
 [setup] Done. One-click connect is on.
@@ -68,5 +103,9 @@ cat >&2 <<DONE
   - Use the Connect buttons for WhatsApp / Google Messages / Instagram /
     LinkedIn / X — sign in once per network, no terminal, no paste.
   - Join the manager's org (optional): agents/uplink/link.sh <enroll-url> <code>
+  - Contacts (macOS): imported hourly into agents/contacts/contacts.db; share
+    them from the app's contact-share panel (default: private).
+  - iMessage (macOS): com.jkali.imessage-daemon is loaded when
+    imessage/daemon.json + imessage/bin/imessage-cli exist (see above).
   - Stop a helper:  launchctl unload '${LA_DIR}/com.jkali.session-connect.plist'
 DONE

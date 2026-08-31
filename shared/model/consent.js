@@ -32,10 +32,58 @@ const OVERRIDE_STATES = new Set(['share', 'private']);
 // fall through to the per-source/global levels".
 const PROFILE_STATES = new Set(['share', 'private', 'inherit']);
 
+// ---------------------------------------------------------------------------
+// INPUT CANONICALISATION — identical gates in agents/uplink/consent.py (see
+// docs/superpowers/plans/2026-08-30-consent-conformance.md's table; the
+// conformance harness tests/conformance/consent_conformance.py proves parity
+// on ~84k vectors every run). Anything failing a gate is treated as ABSENT
+// (the fall-through value) — note "absent" is safe only relative to the
+// more-specific levels: the per-source level carries a deny (private-all),
+// so a dropped malformed rule can fall through to a global share-all; the
+// curated tests pin that. All regexes use end-of-STRING anchoring (`^…$`
+// here; re.fullmatch in Python — Python's `$` also matches before a trailing
+// newline, which is why Python must never use .match with `$`).
+// ---------------------------------------------------------------------------
+
+// A per-source policy key / contact source id. Shape-based (a new bridge id
+// needs no change here); excludes __proto__-style names. Never tighten it to
+// something a real source id could fail — dropping a key drops a private-all.
+const SOURCE_KEY_RE = /^[a-z][a-z0-9]{0,31}$/;
+// Room-id shape for overridesFromSync output keys. Static and server-name
+// agnostic ON PURPOSE — never swap in shared/matrix/client.js's ROOMID_RE,
+// which configureMatrixBase() rebinds to a server name at runtime.
+const CONSENT_ROOMID_RE = /^![^:]+:[A-Za-z0-9.\-:]+$/;
+
+// The shared "plain object" gate (a dict in Python): object, not null, not an
+// array. A Map is deliberately NOT plain here — container Map handling lives
+// only in resolveAll's accessors.
+function plainObject(x) {
+  return (x !== null && typeof x === 'object' && !Array.isArray(x) && !(x instanceof Map)) ? x : null;
+}
+
+function nonEmptyString(x) {
+  return (typeof x === 'string' && x) ? x : null;
+}
+
+// 'share-all' | 'private-all' | null for a per-source rule lookup — THE
+// consent gate for the per-source level: plain-object container, valid source
+// id, OWN property (hardens against prototype pollution and keys like
+// 'constructor'), exactly-valid value. Anything else is inherit.
+function sourceRule(sources, sourceId) {
+  if (!plainObject(sources)) return null;
+  if (typeof sourceId !== 'string' || !SOURCE_KEY_RE.test(sourceId)) return null;
+  if (!Object.prototype.hasOwnProperty.call(sources, sourceId)) return null;
+  const v = sources[sourceId];
+  return (v === 'share-all' || v === 'private-all') ? v : null;
+}
+
 // A conversation's source label, for a human-readable "all <source>" reason.
-// Falls back to the source id, then a generic token; never throws.
+// Only a non-empty STRING label counts; falls back to a non-empty-string
+// source id, then a generic token; never throws, never coerces junk into the
+// reason string.
 function sourceLabelOf(convo) {
-  return (convo && (convo.sourceLabel || convo.sourceId)) || 'source';
+  const c = plainObject(convo) || {};
+  return nonEmptyString(c.sourceLabel) || nonEmptyString(c.sourceId) || 'source';
 }
 
 // ===========================================================================
@@ -51,28 +99,30 @@ function sourceLabelOf(convo) {
 // Returns { shared: boolean, reason: 'all <source>'|'explicit'|'excluded'
 //           |'profile: <name>'|'private' }.
 function resolve(convo, policy, override, profile) {
-  const pol = policy || {};
-  const sources = (pol.sources && typeof pol.sources === 'object') ? pol.sources : {};
-  const sourceId = convo && convo.sourceId;
+  const pol = plainObject(policy) || {};
+  const c = plainObject(convo) || {};
+  const sourceId = nonEmptyString(c.sourceId);
 
   // 1. Per-conversation override wins over everything (most specific).
+  //    Only the exact strings count; any other shape is inherit.
   if (override === 'share') return { shared: true, reason: 'explicit' };
   if (override === 'private') return { shared: false, reason: 'excluded' };
 
   // 2. Profile level: a shared/private contact profile shares or hides all its
   //    members together, but only 'share'/'private' take effect — 'inherit'
-  //    (or an absent profile) falls through to the source/global levels.
-  if (profile) {
-    const pname = 'profile: ' + (profile.displayName || 'profile');
-    if (profile.share === 'share') return { shared: true, reason: pname };
-    if (profile.share === 'private') return { shared: false, reason: pname };
+  //    (a non-object profile, or an absent one) falls through.
+  const prof = plainObject(profile);
+  if (prof) {
+    const pname = 'profile: ' + (nonEmptyString(prof.displayName) || 'profile');
+    if (prof.share === 'share') return { shared: true, reason: pname };
+    if (prof.share === 'private') return { shared: false, reason: pname };
   }
 
-  // 3. Per-source standing policy.
-  const src = sourceId ? sources[sourceId] : undefined;
+  // 3. Per-source standing policy (gated: valid key, own entry, exact value).
+  const src = sourceRule(pol.sources, sourceId);
   if (src === 'share-all') return { shared: true, reason: 'all ' + sourceLabelOf(convo) };
   if (src === 'private-all') return { shared: false, reason: 'private' };
-  // (src === 'inherit' or absent -> fall through to global)
+  // (inherit / absent / malformed -> fall through to global)
 
   // 4. Global standing policy: Share-All also covers conversations arriving
   //    later while it is on (spec §4.1).
@@ -98,16 +148,23 @@ function effectiveShared(convo, policy, override, profile) {
 // Returns [{ convo, shared, reason }, ...] in input order.
 function resolveAll(convos, policy, overrides, profiles) {
   const list = Array.isArray(convos) ? convos : [];
+  // Containers: a real Map (instanceof, never duck-typed — a JSON object with
+  // an own "get" key is a plain object), a function (profiles only), or a
+  // plain object with OWN-property lookup. Keys must be strings (Python gates
+  // identically on its dict form; Map/function forms are JS-only and outside
+  // the conformance harness's JSON domain — curated tests cover them).
   const get = (id) => {
-    if (!overrides) return undefined;
-    if (typeof overrides.get === 'function') return overrides.get(id);
-    return overrides[id];
+    if (typeof id !== 'string') return undefined;
+    if (overrides instanceof Map) return overrides.get(id);
+    if (!plainObject(overrides)) return undefined;
+    return Object.prototype.hasOwnProperty.call(overrides, id) ? overrides[id] : undefined;
   };
   const getProfile = (id) => {
-    if (!profiles || id == null) return undefined;
+    if (typeof id !== 'string') return undefined;
     if (typeof profiles === 'function') return profiles(id);
-    if (typeof profiles.get === 'function') return profiles.get(id);
-    return profiles[id];
+    if (profiles instanceof Map) return profiles.get(id);
+    if (!plainObject(profiles)) return undefined;
+    return Object.prototype.hasOwnProperty.call(profiles, id) ? profiles[id] : undefined;
   };
   return list.map((convo) => {
     const id = convo && convo.id;
@@ -130,6 +187,11 @@ function normalizePolicy(p) {
   const global = (p && GLOBAL_STATES.has(p.global) && p.global === 'share-all') ? 'share-all' : 'private';
   const sources = {};
   for (const k of Object.keys(src)) {
+    // key must be a valid source id (drops __proto__-style and junk keys —
+    // same gate as sourceRule, so normalize+resolve agree with Python; it
+    // also makes the plain assignment below safe: no key that survives the
+    // regex can be a prototype-mutating name)
+    if (!SOURCE_KEY_RE.test(k)) continue;
     const v = src[k];
     if (v === 'share-all' || v === 'private-all') sources[k] = v; // drop 'inherit'/junk
   }
@@ -195,11 +257,20 @@ async function writeShareOverride(roomId, state) {
 // plain object { <roomId>: 'share'|'private' } (rooms set to inherit omitted).
 function overridesFromSync(syncData) {
   const out = {};
-  const join = (syncData && syncData.rooms && syncData.rooms.join) || {};
+  const rooms = plainObject(syncData) ? syncData.rooms : null;
+  const join = plainObject(rooms) ? plainObject(rooms.join) : null;
+  if (!join) return out;
   for (const rid of Object.keys(join)) {
-    const ad = join[rid] && join[rid].account_data;
-    for (const e of ((ad && ad.events) || [])) {
-      if (e && e.type === SHARE_OVERRIDE_TYPE) {
+    // output keys are gated by the STATIC room-id shape (parity with
+    // Python's _CONSENT_ROOMID_RE; a junk/"__proto__" key never enters the
+    // map, which also makes the plain assignment below safe)
+    if (!CONSENT_ROOMID_RE.test(rid)) continue;
+    const room = plainObject(join[rid]);
+    const ad = room ? plainObject(room.account_data) : null;
+    const events = ad && Array.isArray(ad.events) ? ad.events : null;
+    if (!events) continue;
+    for (const e of events) {
+      if (plainObject(e) && e.type === SHARE_OVERRIDE_TYPE) {
         const v = normalizeOverride(e.content);
         if (v) out[rid] = v; else delete out[rid];
       }
@@ -230,6 +301,7 @@ function normalizeContactPolicy(raw) {
   const global = (raw && CONTACT_GLOBAL_STATES.has(raw.global) && raw.global === 'share-all') ? 'share-all' : 'private';
   const sources = {};
   for (const k of Object.keys(src)) {
+    if (!SOURCE_KEY_RE.test(k)) continue; // same key gate as the conversation dimension
     const v = src[k];
     if (v === 'share-all' || v === 'private-all') sources[k] = v; // drop 'inherit'/junk
   }
@@ -245,13 +317,14 @@ function normalizeContactPolicy(raw) {
 //   3. global 'share-all'       -> shared,     reason 'all contacts'
 //   4. safe default             -> not shared, reason 'private'
 function resolveContactShare(source, policy) {
-  const pol = policy || {};
-  const sources = (pol.sources && typeof pol.sources === 'object') ? pol.sources : {};
+  const pol = plainObject(policy) || {};
 
-  const src = source ? sources[source] : undefined;
+  // same gated lookup as the conversation dimension: valid source id, own
+  // entry, exact value — anything else is inherit
+  const src = sourceRule(pol.sources, source);
   if (src === 'share-all') return { shared: true, reason: 'all ' + source + ' contacts' };
   if (src === 'private-all') return { shared: false, reason: 'private' };
-  // (src === 'inherit' or absent -> fall through to global)
+  // (inherit / absent / malformed -> fall through to global)
 
   if (pol.global === 'share-all') return { shared: true, reason: 'all contacts' };
 

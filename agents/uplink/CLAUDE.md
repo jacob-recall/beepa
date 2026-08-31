@@ -25,11 +25,26 @@ Phase 2/3/4.
   3. `ensure_proposal_rooms()` / `pull_proposals()` — v2: idempotently
      create the per-teammate master + local proposals rooms, then pull new
      manager-authored `com.jkali.proposal` events down into the local one.
+  4. `mirror_contacts()` — called inside `reconcile()`: mirrors the
+     teammate's address book (`agents/contacts/contacts.db`, written by the
+     hourly macOS importer) into a dedicated per-teammate master contacts
+     room as `com.jkali.contact` state events, one per handle. Each pass is
+     a **diff** (`reconcile.plan_contact_mirror`) of the desired set — rows
+     that are live *and* whose source resolves shared under the separate
+     contact-share policy (`consent.resolve_contact_share`) — against the
+     `contact_mirror` table: tombstones first (mirrored but no longer
+     live-shared), then pushes (live-shared but not mirrored, or mirrored at
+     a different version), capped per pass (`reconcile.PUSH_CAP`). So
+     switching a source on **backfills** its already-imported contacts, a
+     later import's new rows flow on the next pass, switching it off
+     tombstones them, and switching it back on re-pushes them.
   SQLite state (`state.db`, chmod 600) holds `mirror_rooms`
   (`local_room_id → master_room_id, source, last_synced_pos`), `event_map`
   (`local_event_id → master_event_id`, the up-direction idempotency guard),
   `proposal_map` (`master_event_id → local_event_id`, the down-direction
-  one), and `meta` (sync tokens, discovered proposal room ids).
+  one), `contact_mirror` (`(source, network_id) → mirrored_version,
+  master_state_key` — the contact mirror's memory), and `meta` (sync
+  tokens, discovered proposal/contacts room ids).
 - `consent.py` — pure Python port of `shared/model/consent.js`. **Must stay
   byte-parity with it** — same 4-level precedence, same reason strings, same
   normalization. This is what the daemon actually enforces at runtime, so a
@@ -40,8 +55,10 @@ Phase 2/3/4.
   delete / keep sets from desired-shared vs. existing mirrors),
   `select_new_events()` (the idempotency filter over `event_map`),
   `next_watermark()` (advance only when `confirmed=True` — i.e. only after
-  the master has 200'd). Unit-tested in
-  `tests/unit/uplink_reconcile.test.py`.
+  the master has 200'd), and `plan_contact_mirror()` /
+  `select_contacts_to_tombstone()` (the contact mirror's per-pass diff —
+  the consent gate for address-book PII, see the invariant below).
+  Unit-tested in `tests/unit/uplink_reconcile.test.py`.
 - `enroll_client.py` — teammate-side half of the v1.5 enrollment flow
   (`master/enroll.py` is the master side). Exchanges a one-time code for
   scoped master credentials over the loopback/TLS-fronted exchange
@@ -59,9 +76,13 @@ Phase 2/3/4.
 - **Consent boundary lives in `consent.py`, and `consent.py` must match
   `shared/model/consent.js` byte-for-byte.** `desired_shared()` is the only
   place that decides whether a room mirrors; it always goes through
-  `consent.effective_shared()`, never a hand-rolled check. If you change
-  the precedence or default anywhere, change it in **both** files and rerun
-  both `tests/unit/consent.test.js` and `tests/unit/consent_py.test.py`.
+  `consent.effective_shared()`, never a hand-rolled check (the `reason`
+  string is UI-only — never parse it for authorization). If you change the
+  precedence, default, or any input gate anywhere, change it in **both**
+  files and rerun `tests/unit/consent.test.js`, `tests/unit/consent_py.test.py`
+  **and `tests/conformance/consent_conformance.py`** — the conformance
+  harness proves parity on ~84k exhaustive+fuzz vectors and is the
+  authority; any differing output or crash on either side is a red build.
 - **Revocation deletes, it does not just stop updating.** `delete_mirror()`
   removes the master space-child link, kicks the manager, and leaves the
   room — a CS-API client (not a Synapse admin) cannot server-side-purge a
@@ -94,6 +115,25 @@ Phase 2/3/4.
   never sends to it itself, it only carries it down for the teammate's own
   guarded local send path (`shared/ui/chat.js`'s `sendConvoMessage`) to
   re-validate against the live joined set.
+- **Address-book contacts leave the machine only through
+  `reconcile.plan_contact_mirror`, and only as a per-pass diff.** The
+  planner is the consent gate for contact PII: a row is a push candidate
+  only if it is live, its source is in the daemon's known-source allowlist
+  (`SOURCE_ID_TO_LABEL` — adding a store source means adding it there), and
+  `consent.resolve_contact_share` says shared; a not-shared row is in
+  neither leg and never reaches a network call. The tombstone leg diffs the
+  **complete, unfiltered** `contact_mirror` table against live-shared, so
+  a mirrored handle whose source was renamed/removed is tombstoned, never
+  stranded. Tombstones are applied before pushes (revocation never waits
+  behind a backfill). `contact_mirror` is written (push) or deleted
+  (tombstone) only after the master's 2xx; push compares versions with
+  `!=`, not `<` (a rebuilt `contacts.db` restarts at 1). If the profiles
+  read fails for any reason other than 404, relink and pushes are skipped
+  that pass and tombstones still run. Backfill volume relies on the
+  master's loosened `rc_message` (`master/setup.sh`). The
+  `sha1(source|network_id)` state key is pseudonymous (E.164 is a small
+  enumerable domain), not confidential; tombstones legitimately transmit
+  keys of handles that were already on the master.
 - **Media re-upload has a size cap and always falls back safely.**
   `_reupload_media()` returns `None` (→ v1 placeholder, never dropped or
   blocked) on any failure: bad/missing/encrypted mxc, over

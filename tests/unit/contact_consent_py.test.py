@@ -13,4 +13,10 @@ eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"
 eq(consent.normalize_contact_policy({"global":"private","sources":["share-all","private-all"]}), {"global":"private","sources":{}}, "array sources -> {}")
 eq(consent.normalize_contact_policy({"global":"private","sources":["share-all","private-all"]}), consent.normalize_contact_policy({"global":"private"}), "array sources same as no sources")
 eq(consent.resolve_contact_share("imessage", consent.normalize_contact_policy({"global":"private","sources":["share-all"]})), {"shared":False,"reason":"private"}, "array sources resolves like empty -> private")
+# PINNED (consent-conformance plan, deny-drop decision): a malformed source id
+# drops its private-all rule and falls through to a global share-all. Do NOT
+# change one side only — see the conformance harness.
+eq(consent.resolve_contact_share(5, {"global":"share-all","sources":{"5":"private-all"}}),
+   {"shared":True,"reason":"all contacts"},
+   "pinned: non-string source drops the private-all rule -> global share-all")
 print("ok contact_consent_py")

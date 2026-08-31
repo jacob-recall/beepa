@@ -55,13 +55,23 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
 # else the single real user "jkali".
 read -r -a TEAMMATES <<< "${ENV_TEAMMATES:-${TEAMMATES:-jkali}}"
 
-gen_pw() { python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))'; }
+# Passwords are DERIVED, never stored: master/enroll.py provision-account
+# registers/logs-in each account from TEAMMATE_PASSWORD_KEY (synapse/
+# .secrets.local, written by master/setup.sh) and migrates any legacy stored
+# password on the way. MANAGER_PW in the environment is only a legacy-
+# migration input for a manager account that predates derivation; it is never
+# defaulted and never persisted. The manager's console login password is
+# `python3 master/enroll.py password manager --manager`.
+ENROLL_PY="${HERE}/enroll.py"
 
-# The manager is the human-facing master login; default it to the simple
-# 'password' (overridable via env). Teammate slots (the uplink authenticates as
-# them with a token, no human login) get random passwords, persisted so re-runs
-# don't reset them.
-MANAGER_PW="${MANAGER_PW:-password}"
+# provision-account prints {"mxid","token","migrated"} on stdout; nothing
+# secret crosses argv or a shell variable. Plain assignment (never
+# `local x=$(...)`, which masks the exit status) + validated fields.
+provision_account() {
+  # $1 = localpart, $2 = optional --manager; prints the JSON on stdout
+  /usr/bin/python3 "${ENROLL_PY}" provision-account "$1" ${2:+"$2"}
+}
+json_field() { python3 -c 'import sys,json;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 
 # --- wait for Synapse health ---
 log "waiting for Synapse CS API at ${CS_BASE} ..."
@@ -71,34 +81,8 @@ for i in $(seq 1 60); do
   sleep 2
 done
 
-# --- create an account (idempotent) via register_new_matrix_user ---
-register() {
-  local user="$1" pass="$2" out
-  log "registering @${user}:${SERVER} (skip if exists)"
-  if out=$("${COMPOSE[@]}" exec -T synapse \
-        register_new_matrix_user -c "${HS_YAML}" \
-        -u "${user}" -p "${pass}" --no-admin http://localhost:8008 2>&1); then
-    log "  created @${user}:${SERVER}"
-  else
-    if printf '%s' "${out}" | grep -qiE 'already taken|already exists'; then
-      log "  @${user}:${SERVER} already exists — ok"
-    else
-      fail "register @${user} failed: ${out}"
-    fi
-  fi
-}
-
-# --- password login for an access token via the CS API ---
-login_token() {
-  local user="$1" pass="$2" resp token
-  resp=$(curl -fsS -XPOST "${CS_BASE}/_matrix/client/v3/login" \
-    -H 'Content-Type: application/json' \
-    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"${user}\"},\"password\":\"${pass}\",\"initial_device_display_name\":\"master-provision\"}") \
-    || fail "login @${user} failed"
-  token=$(printf '%s' "${resp}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])') \
-    || fail "no access_token for @${user}"
-  printf '%s' "${token}"
-}
+# (register/login_token removed: master/enroll.py provision-account owns
+# registration + login + password migration — see the block above.)
 
 # --- does a recorded room still exist with the teammate joined? ---
 space_valid() {
@@ -136,18 +120,27 @@ JSON
 }
 
 # =========================== run ===========================
-register "${MANAGER_LP}" "${MANAGER_PW}"
-MANAGER_TOKEN=$(login_token "${MANAGER_LP}" "${MANAGER_PW}")
+log "provisioning @${MANAGER_LP}:${SERVER} (derived password; migrating any legacy one)"
+acct=$(provision_account "${MANAGER_LP}" --manager) || fail "manager provisioning failed — see enroll.py stderr above"
+MANAGER_TOKEN=$(printf '%s' "${acct}" | json_field token) || fail "manager: no token in provision-account output"
+[ -n "${MANAGER_TOKEN}" ] || fail "manager: empty token"
+[ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${MANAGER_LP}: migrated to derived password (existing sessions kept)"
 
-# Per-teammate: password (persisted), account, token, space. bash 3.2 has no
-# associative arrays, so dynamic var names go through eval (values are our own
-# generated tokens/ids, never external input).
+# Per-teammate: account+token via provision-account (derived password, legacy
+# migrated + its PW_ line dropped from the state file), then the space. bash
+# 3.2 has no associative arrays, so dynamic var names go through eval (values
+# are our own tokens/room ids, never external input).
 for t in "${TEAMMATES[@]}"; do
+  case "${t}" in
+    manager) fail "roster entry 'manager' is reserved" ;;
+    *[!a-z0-9]*|'') fail "invalid roster entry '${t}' (use lowercase letters and digits)" ;;
+  esac
   U=$(upper "$t")
-  eval "pw=\${PW_${U}:-}"
-  [ -z "${pw}" ] && { pw=$(gen_pw); eval "PW_${U}=\${pw}"; }
-  register "$t" "${pw}"
-  tok=$(login_token "$t" "${pw}")
+  log "provisioning @${t}:${SERVER}"
+  acct=$(provision_account "$t") || fail "provisioning @${t} failed — see enroll.py stderr above"
+  tok=$(printf '%s' "${acct}" | json_field token) || fail "@${t}: no token in provision-account output"
+  [ -n "${tok}" ] || fail "@${t}: empty token"
+  [ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${t}: migrated to derived password (existing sessions kept)"
   eval "TOKEN_${U}=\${tok}"
   eval "sp=\${SPACE_${U}:-}"
   if space_valid "${tok}" "${sp}"; then
@@ -158,14 +151,13 @@ for t in "${TEAMMATES[@]}"; do
   fi
 done
 
-# --- persist state (600): manager pw + each teammate pw + space id ---
+# --- persist state (600): roster + space ids. NO SECRETS: passwords are
+# derived from TEAMMATE_PASSWORD_KEY, never written anywhere. ---
 {
   echo "# matrix-master provisioning state (mode 600, gitignored). Do NOT commit."
-  echo "MANAGER_PW='${MANAGER_PW}'"
   echo "TEAMMATES='${TEAMMATES[*]}'"
   for t in "${TEAMMATES[@]}"; do
-    U=$(upper "$t"); eval "pw=\${PW_${U}}"; eval "sp=\${SPACE_${U}:-}"
-    echo "PW_${U}='${pw}'"
+    U=$(upper "$t"); eval "sp=\${SPACE_${U}:-}"
     [ -n "${sp}" ] && echo "SPACE_${U}='${sp}'"
   done
 } > "${STATE_FILE}"

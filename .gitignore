@@ -53,3 +53,7 @@ gmessages-connect/logs/
 
 # IG/LI/X connect helper logs (launchd) — never commit
 session-connect/logs/
+
+# macOS Contacts importer logs (launchd) — counts only, but keep runtime
+# logs out of git regardless (the store itself is covered by *.db)
+agents/contacts/logs/

@@ -6,9 +6,11 @@
 #
 # The endpoint binds 127.0.0.1 only; in production it sits behind the same TLS
 # reverse proxy as the master CS API, so it adds no new public surface. It
-# reads the shared secret / teammate facts from the already-mode-600 files
-# under master/ (synapse/.secrets.local, tokens.local, .provision-state.local).
-# See master/enroll.py and master/CLAUDE.md.
+# reads the shared secret + password-derivation key from synapse/.secrets.local
+# and teammate facts from tokens.local (both mode 600). No passwords are
+# stored anywhere; they are derived per login (master/CLAUDE.md). This
+# service's stdout/stderr land in launchd logs — nothing here may ever print
+# a password or key. See master/enroll.py.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"

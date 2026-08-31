@@ -1,5 +1,5 @@
 #!/bin/sh
-# Integration suite for the uplink one-way sync (the 12 Phase-2 scenarios).
+# Integration suite for the uplink one-way sync (the 13 scenarios).
 #
 # Prereqs (both are SEPARATE from the live matrix-wa hub, which this suite never
 # touches):
@@ -11,7 +11,7 @@
 #          -f tests/integration/docker-compose.test.yml up -d
 #
 # Then:  tests/integration/run.sh   [scenario-filter ...]
-# e.g.:  tests/integration/run.sh            # all 8
+# e.g.:  tests/integration/run.sh            # all 13
 #        tests/integration/run.sh 3_offline  # just the catch-up scenario
 set -e
 export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"

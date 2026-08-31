@@ -252,6 +252,16 @@ eq([r["shared"] for r in resolve_all(convos, policy, None)], [False, False, Fals
 eq(resolve(convo("x"), {}, None, {"displayName": "Ann", "share": "share"})["reason"], "profile: Ann", "reason: profile share interpolates")
 eq(resolve(convo("x"), {}, None, {"displayName": "Ann", "share": "private"})["reason"], "profile: Ann", "reason: profile private interpolates")
 
+# PINNED (consent-conformance plan, deny-drop decision): a malformed
+# per-source rule is treated as ABSENT even when it says private-all, so a
+# numeric sourceId falls through to a global share-all. This reconciles the
+# UI up to what this enforcer already answered — do NOT "fix" it to private
+# on one side only; change both files and the conformance harness together.
+eq(resolve({"id": "!r:l", "sourceId": 5},
+           {"global": "share-all", "sources": {"5": "private-all"}}, None),
+   {"shared": True, "reason": "all source"},
+   "pinned: non-string sourceId drops the private-all rule -> global share-all")
+
 print("\n%d passed, %d failed" % (_pass, _fail))
 if _fail:
     sys.stderr.write("\nFailures:\n")

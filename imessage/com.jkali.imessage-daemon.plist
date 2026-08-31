@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.jkali.imessage-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Developer/CommandLineTools/usr/bin/python3</string>
+        <string>/Users/jkali/work/pm_mng/imessage/daemon.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/jkali/work/pm_mng</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>15</integer>
+    <key>Umask</key><integer>63</integer>
+    <key>StandardOutPath</key><string>/Users/jkali/work/pm_mng/imessage/logs/daemon.log</string>
+    <key>StandardErrorPath</key><string>/Users/jkali/work/pm_mng/imessage/logs/daemon.err</string>
+</dict>
+</plist>

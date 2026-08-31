@@ -90,7 +90,7 @@ services:
 
   mautrix-twitter:
     # X (Twitter) DM bridge. Cookie/session login like Instagram & LinkedIn.
-    image: dock.mau.dev/mautrix/twitter:latest@sha256:a780515de3c7fa8f410e2d6355d4c69a0c439742c40bafeec8a3d8e61a94cbc4
+    image: dock.mau.dev/mautrix/twitter:latest@sha256:3d744f87953e1441eac229e4440debd46831e0b8a34a0cc13f2a57b11e237b44
     restart: unless-stopped
     environment:
       UID: "${HOST_UID:-501}"

@@ -35,7 +35,7 @@ VARS="$(grep -rhoE '\$\{('"${KNOWN}"')\}' "${TPL}" \
 # --- DB password comes from .env (single source of truth) -----------------
 [ -f "${ENV_FILE}" ] || { log "FATAL: ${ENV_FILE} missing (setup.sh mints it first)"; exit 1; }
 # shellcheck disable=SC1090
-DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
 [ -n "${DB_PASSWORD}" ] || { log "FATAL: POSTGRES_PASSWORD not set in .env"; exit 1; }
 export DB_PASSWORD
 

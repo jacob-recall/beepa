@@ -46,7 +46,9 @@ fi
 PORT_BUSY=0
 for p in "${HOST_PORTS[@]}"; do
   if command -v lsof >/dev/null 2>&1; then
-    owner="$(lsof -nP -iTCP:"${p}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1, $2}')"
+    # `|| true`: a FREE port makes lsof exit non-zero, which under `set -o
+    # pipefail` would fail this assignment and (with `set -e`) kill the script.
+    owner="$(lsof -nP -iTCP:"${p}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1, $2}' || true)"
   else
     owner=""
   fi
@@ -58,7 +60,7 @@ for p in "${HOST_PORTS[@]}"; do
     PORT_BUSY=1
   fi
 done
-[ "${PORT_BUSY}" = 0 ] && log "ports ${HOST_PORTS[*]}: all free"
+if [ "${PORT_BUSY}" = 0 ]; then log "ports ${HOST_PORTS[*]}: all free"; fi
 
 # --------------------------------------------------------------------------
 # Step 1 + 2 — bring up the stack, install the one-click Connect helpers

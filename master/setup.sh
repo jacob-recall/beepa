@@ -47,7 +47,7 @@ mkdir -p "${SYN_DIR}" "${MEDIA_DIR}"
 # --- DB password from .env (must match the Postgres container) ---
 [ -f "${ENV_FILE}" ] || fail "missing ${ENV_FILE} (set MASTER_POSTGRES_PASSWORD)"
 # shellcheck disable=SC1090
-DB_PASSWORD="$(grep -E '^MASTER_POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+DB_PASSWORD="$(grep -E '^MASTER_POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
 [ -n "${DB_PASSWORD}" ] || fail "MASTER_POSTGRES_PASSWORD not set in ${ENV_FILE}"
 
 gen_secret() { python3 -c 'import secrets;print(secrets.token_urlsafe(48))'; }

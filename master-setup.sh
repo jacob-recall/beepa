@@ -82,11 +82,11 @@ LA_DIR="${HOME}/Library/LaunchAgents"; mkdir -p "${LA_DIR}" "${HERE}/master/logs
 PLIST_SRC="${HERE}/master/com.jkali.master-enroll.plist"
 PLIST_DST="${LA_DIR}/com.jkali.master-enroll.plist"
 if [ -f "${PLIST_SRC}" ] && command -v launchctl >/dev/null 2>&1; then
-  if ! grep -q "${HERE}/master/run-enroll.sh" "${PLIST_SRC}"; then
-    log "WARNING: ${PLIST_SRC} points at a different path than ${HERE} — the enroll"
-    log "         service may not start. Edit the plist's ProgramArguments/WorkingDirectory."
-  fi
   cp "${PLIST_SRC}" "${PLIST_DST}"
+  # Rewrite the author's baked-in absolute path to THIS clone's path so the
+  # launchd service starts wherever the master was cloned.
+  sed -i '' "s#/Users/jkali/work/pm_mng#${HERE}#g" "${PLIST_DST}" 2>/dev/null \
+    || sed -i "s#/Users/jkali/work/pm_mng#${HERE}#g" "${PLIST_DST}"
   launchctl unload "${PLIST_DST}" 2>/dev/null || true
   if launchctl load "${PLIST_DST}" 2>/dev/null; then log "loaded com.jkali.master-enroll"
   else log "could not launchctl load; run: launchctl load '${PLIST_DST}'"; fi

@@ -89,6 +89,11 @@ install_agent() {
     return
   fi
   cp "${src}" "${dest}"
+  # The tracked plists ship with the author's absolute path baked in; rewrite it
+  # to THIS clone's path so the launchd service works wherever the teammate
+  # cloned (otherwise every native daemon points at a nonexistent path and dies).
+  sed -i '' "s#/Users/jkali/work/pm_mng#${HERE}#g" "${dest}" 2>/dev/null \
+    || sed -i "s#/Users/jkali/work/pm_mng#${HERE}#g" "${dest}"
   launchctl unload "${dest}" 2>/dev/null || true
   if launchctl load "${dest}" 2>/dev/null; then
     log "loaded ${label}"

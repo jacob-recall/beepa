@@ -61,6 +61,14 @@ for a in session-connect gmessages-connect uplink contacts-import imessage-daemo
   [ -f "${p}" ] && rm -f "${p}" && log "removed agent com.jkali.${a}"
 done
 
+# Orphaned helper processes that outlived their launchd unload (e.g. one started
+# by a killed installer run, or a crash-looper) can keep holding 8020/8021 — the
+# exact way a stale process ends up owning a port a later preflight must catch.
+for proc in session-connect/connect_server.py gmessages-connect/connect_server.py \
+            imessage/daemon.py agents/uplink/uplink.py; do
+  pkill -f "${proc}" 2>/dev/null && log "killed orphan: ${proc}" || true
+done
+
 # --- 3. Tailscale exposure ---
 if command -v tailscale >/dev/null 2>&1; then
   tailscale serve reset 2>/dev/null && log "tailscale serve reset"
@@ -75,12 +83,18 @@ rm -rf "${HERE}/agents/uplink/uplink.env.local" "${HERE}/agents/uplink/local.env
        "${HERE}/agents/uplink/state.db" "${HERE}/agents/uplink/logs" "${HERE}/hub/.local-user.local"
 rm -rf "${HERE}/agents/contacts/contacts.db" "${HERE}/agents/contacts/logs"
 rm -rf "${HERE}/session-connect/logs" "${HERE}/gmessages-connect/logs"
+# Per-app loopback state: passwordless session tokens + the helper's published port.
+rm -f "${HERE}/apps/user/session.local.json" "${HERE}/apps/master/session.local.json" \
+      "${HERE}/apps/user/connect.local.json"
 log "removed generated hub + master config/secrets/state"
 
 # --- 5. iMessage: built binary + Beeper clone + local state ---
 rm -rf "${HERE}/imessage/bin" "${HERE}/imessage/platform-imessage" "${HERE}/imessage/daemon.json" \
        "${HERE}/imessage/logs" "${HERE}/imessage/tmp"
 rm -f "${HERE}"/imessage/*.db
+# Python bytecode caches the stdlib helpers leave behind (reset uses explicit
+# rm, not `git clean -X`, so these need their own sweep).
+find "${HERE}" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 log "removed iMessage binary + Beeper source clone"
 
 # --- 6. safety: restore any TRACKED file the rm's caught (e.g. a logs/.gitignore

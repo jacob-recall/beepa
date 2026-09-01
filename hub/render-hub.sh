@@ -103,24 +103,33 @@ LOGEOF
   log "wrote synapse/localhost.log.config"
 fi
 
-# Signing key: generate once; never regenerate a good one. `[ ! -s ]` (empty OR
-# missing) self-heals a 0-byte key left by an earlier failed run. Generate into a
-# temp and KEEP it only if it is non-empty — the Synapse image's generator can
-# exit 0 yet write nothing (an amd64 image on arm64 without Rosetta), which used
-# to leave an unbootable 0-byte key. Fall back to a pure-python ed25519 key so a
-# missing/emulation-broken Docker never blocks the hub from booting.
+# Signing key: generate once; never regenerate a good one.
+#   (a) `[ ! -s ]` (empty OR missing) self-heals a 0-byte key left by an
+#       interrupted run — `[ ! -f ]` treated an empty file as present and
+#       skipped forever, booting Synapse with an invalid key.
+#   (b) Generate into a temp and `mv` on success — `> "${SIGN}"` creates the
+#       file at redirect time, so a Ctrl-C mid-pull left a 0-byte key at the
+#       real path.
+#   (c) Pull the image as its OWN visible step, and DON'T silence the generate.
+#       Folded into `docker run … 2>/dev/null`, the ~500MB first-run pull is a
+#       silent multi-minute download that reads as a hang.
+# Plus a pure-python ed25519 fallback so a missing/emulation-broken Docker (an
+# amd64 image on arm64 without Rosetta can exit 0 yet write nothing) never blocks.
 SIGN="${OUT_ROOT}/synapse/localhost.signing.key"
 if [ ! -s "${SIGN}" ]; then
   rm -f "${SIGN}"
   tmp="$(mktemp)"
-  if command -v docker >/dev/null 2>&1 \
-     && docker run --rm --entrypoint generate_signing_key "${SYN_IMAGE}" -o /dev/stdout > "${tmp}" 2>/dev/null \
-     && [ -s "${tmp}" ]; then
+  if command -v docker >/dev/null 2>&1; then
+    log "ensuring the Synapse image is present (first run downloads ~500MB — this is not a hang)…"
+    docker pull "${SYN_IMAGE}" || log "WARN: image pull failed; the generate below may retry it"
+    docker run --rm --entrypoint generate_signing_key "${SYN_IMAGE}" -o /dev/stdout > "${tmp}" || true
+  fi
+  if [ ! -s "${tmp}" ]; then
+    python3 "${HERE}/hub/_gen_signing_key.py" > "${tmp}" 2>/dev/null || true   # docker missing/broken
+  fi
+  if [ -s "${tmp}" ]; then
     mv "${tmp}" "${SIGN}"; chmod 600 "${SIGN}"
-    log "generated synapse/localhost.signing.key (via Synapse image)"
-  elif python3 "${HERE}/hub/_gen_signing_key.py" > "${tmp}" 2>/dev/null && [ -s "${tmp}" ]; then
-    mv "${tmp}" "${SIGN}"; chmod 600 "${SIGN}"
-    log "generated synapse/localhost.signing.key (pure-python fallback)"
+    log "generated synapse/localhost.signing.key"
   else
     rm -f "${tmp}"
     log "WARN: could not generate a signing key — Synapse will not boot until one exists."

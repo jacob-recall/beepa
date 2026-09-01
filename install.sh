@@ -43,27 +43,41 @@ else
   log "macOS: found (iMessage bridge is available)"
 fi
 
+# Authoritative and privilege-free: actually try to bind. `lsof` without root
+# can't see a socket owned by another user, so a foreign-held port reports
+# "free" and the first real bind then crash-loops on EADDRINUSE. Try both v4 and
+# v6 (a dual-stack listener can hold one and not the other); count ONLY
+# EADDRINUSE as busy, and skip a family the host doesn't support (e.g. IPv6 off),
+# so a v6-disabled machine isn't reported as busy everywhere.
+port_busy() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import socket, sys, errno
+p = int(sys.argv[1])
+for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        s = socket.socket(fam, socket.SOCK_STREAM)
+    except OSError:
+        continue                       # family unsupported — not a conflict
+    try:
+        s.bind((addr, p))              # no SO_REUSEADDR: don't mask a live listener
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.EADDRINUSE:
+            sys.exit(1)                # busy
+    finally:
+        s.close()
+sys.exit(0)                            # free
+PY
+}
+
 PORT_BUSY=0
 for p in "${HOST_PORTS[@]}"; do
-  # Privilege-independent check: try to bind 127.0.0.1:p ourselves. An
-  # unprivileged `lsof` cannot see a listener owned by another user (e.g. a
-  # root-owned process), so it would falsely report an occupied port as free.
-  # A bind attempt fails with EADDRINUSE whenever anything — any owner — already
-  # holds the address this stack would bind. SO_REUSEADDR is set so a lingering
-  # TIME_WAIT from a previous run of this stack does not count as busy.
-  if ! python3 - "$p" 2>/dev/null <<'PY'
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close()      # bound -> free
-except OSError:
-    sys.exit(1)                                             # in use (any owner)
-PY
-  then
-    log "port ${p} is already in use — OK if that's this stack from a previous run;"
-    log "  otherwise free it (an active listener here, possibly root-owned, will"
-    log "  make the matching helper crash-loop with EADDRINUSE)."
+  if ! port_busy "${p}"; then
+    owner="$(lsof -nP -iTCP:"${p}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1, $2}' || true)"
+    if [ -n "${owner}" ]; then
+      log "port ${p} in use (${owner}) — OK if that's this stack from a previous run"
+    else
+      log "port ${p} is IN USE by a process this user cannot see (try: sudo lsof -nP -iTCP:${p} -sTCP:LISTEN)"
+    fi
     PORT_BUSY=1
   fi
 done

@@ -45,18 +45,25 @@ fi
 
 PORT_BUSY=0
 for p in "${HOST_PORTS[@]}"; do
-  if command -v lsof >/dev/null 2>&1; then
-    # `|| true`: a FREE port makes lsof exit non-zero, which under `set -o
-    # pipefail` would fail this assignment and (with `set -e`) kill the script.
-    owner="$(lsof -nP -iTCP:"${p}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1, $2}' || true)"
-  else
-    owner=""
-  fi
-  if [ -n "${owner}" ]; then
-    # A prior run of this same stack (docker-proxy / com.docker.backend, or
-    # this repo's own launchd helpers) owning the port is expected and fine —
-    # only warn, since re-running is meant to be safe.
-    log "port ${p} is already in use (${owner}) — OK if that's this stack from a previous run"
+  # Privilege-independent check: try to bind 127.0.0.1:p ourselves. An
+  # unprivileged `lsof` cannot see a listener owned by another user (e.g. a
+  # root-owned process), so it would falsely report an occupied port as free.
+  # A bind attempt fails with EADDRINUSE whenever anything — any owner — already
+  # holds the address this stack would bind. SO_REUSEADDR is set so a lingering
+  # TIME_WAIT from a previous run of this stack does not count as busy.
+  if ! python3 - "$p" 2>/dev/null <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close()      # bound -> free
+except OSError:
+    sys.exit(1)                                             # in use (any owner)
+PY
+  then
+    log "port ${p} is already in use — OK if that's this stack from a previous run;"
+    log "  otherwise free it (an active listener here, possibly root-owned, will"
+    log "  make the matching helper crash-loop with EADDRINUSE)."
     PORT_BUSY=1
   fi
 done

@@ -52,8 +52,19 @@ if ! docker info >/dev/null 2>&1; then
 fi
 log "docker: installed and running"
 for p in 8018 8019; do
-  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"${p}" -sTCP:LISTEN >/dev/null 2>&1; then
-    log "port ${p} already in use — OK if that's this master stack from a previous run"
+  # bind-test, not lsof: unprivileged lsof can't see a listener owned by another
+  # user, so it would miss an occupied port. A bind attempt catches any owner.
+  if ! python3 - "$p" 2>/dev/null <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close()
+except OSError:
+    sys.exit(1)
+PY
+  then
+    log "port ${p} already in use — OK if that's this master stack from a previous run, otherwise free it"
   fi
 done
 

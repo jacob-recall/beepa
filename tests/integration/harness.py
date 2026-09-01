@@ -870,6 +870,7 @@ MASTER_WRITE_ALLOWLIST = {
         r"^/_matrix/client/v3/logout$",
         r"^/_matrix/client/v3/rooms//join$",     # auto-join of a gated invite
         r"^/admin/add-teammate$",                # ENROLL_BASE + '/admin/add-teammate'
+        r"^/admin/delete-teammate$",             # ENROLL_BASE + '/admin/delete-teammate'
     ],
     "PUT": [
         r"^/_matrix/client/v3/rooms//send/com\.jkali\.proposal/$",

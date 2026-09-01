@@ -16,10 +16,10 @@
 // patterns those modules use (content whitelist, recency sort, a tailing
 // long-poll) locally instead. See apps/master/CLAUDE.md for the full account.
 //
-// The one app-local module it does import is ./invites.js — a pure, zero-import
-// leaf holding the identity/trust predicates (create-sender ≡ space label) that
-// gate BOTH auto-join and rendering. Trust decisions live there so a unit test
-// can hold them still; this file only performs what that leaf decides.
+// The app-local modules it imports are ./invites.js (identity/trust predicates
+// that gate auto-join and rendering) and ./hidden.js (per-browser hide-teammate
+// filter — convenience UI state, never authorization). Both are pure leaves so
+// a unit test can hold them still; this file only performs what they decide.
 //
 // NO composer, NO send call, anywhere in this file.
 
@@ -29,6 +29,10 @@ import { S } from '../../shared/state.js';
 import {
   localpart, spaceLabelFor, invitesToJoin, acceptedSpaces, verifiedChildIds, ROOM_SHAPE_RE,
 } from './invites.js';
+import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers } from './hidden.js';
+
+// Per-browser hidden-teammate labels (localStorage). Convenience only.
+const HIDDEN_KEY = 'beepa_hidden_teammates';
 
 // The MASTER homeserver base (same origin the transport is pointed at below).
 // Authenticated media (Synapse default) cannot be fetched by a bare <img src>
@@ -36,11 +40,10 @@ import {
 // as bytes with S.token and shown via an object URL (CSP allows img/media blob:).
 const MASTER_BASE = 'http://127.0.0.1:8018';
 
-// The master enroll/admin service (master/enroll.py serve). The ONLY thing
-// this app calls here is the manager-authenticated POST /admin/add-teammate —
-// an admin provisioning action, NOT a Matrix send path and NOT a proposal. The
-// service itself verifies the caller is @manager:master before doing anything.
-// CSP connect-src is extended by exactly this origin for this one call.
+// The master enroll/admin service (master/enroll.py serve). Manager-authenticated
+// POSTs: /admin/add-teammate and /admin/delete-teammate. Neither is a Matrix
+// send path nor a proposal. The service verifies the caller is @manager:master
+// before doing anything. CSP connect-src is extended by exactly this origin.
 const ENROLL_BASE = 'http://127.0.0.1:8019';
 
 // The two custom room-state types the uplink stamps on a teammate's dedicated
@@ -105,6 +108,7 @@ const MS = {
   // How many items the identity gate hid on the last refresh (surfaced in the
   // sidebar, so a verification failure is visible instead of silent data loss).
   skippedUnverified: { spaces: 0, children: 0 },
+  hidden: new Set(),   // teammate labels this browser omits from lists
 };
 
 setOnUnauthorized(forgetSession);
@@ -468,7 +472,6 @@ async function refreshAll() {
   // it is O(contacts) over data already in memory (no extra /sync), and its
   // own try/catch means a failure here never affects rendering below.
   persistContactsIndex().catch(() => {});
-  renderTeammateNav();
   renderUnverifiedNote();
   // The open room can disappear mid-session (the teammate un-shared it, or it
   // failed re-verification). Close the proposal path rather than leaving a
@@ -481,8 +484,11 @@ async function refreshAll() {
   if (MS.activeView === 'recent') renderRecent();
   else if (MS.activeView === 'search') renderSearch();
   else if (MS.activeView === 'contacts') renderContacts();
+  else if (MS.activeView === 'teammates') renderTeammatesList();
   else if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0) {
-    renderTeammate(MS.activeView.slice('teammate:'.length));
+    const label = MS.activeView.slice('teammate:'.length);
+    if (MS.hidden.has(label)) navTo('recent');
+    else renderTeammate(label);
   }
 }
 
@@ -648,33 +654,200 @@ function renderRecent() {
   const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
-  if (!MS.feed.length) { list.appendChild(elEmpty('No shared conversations yet.')); return; }
-  for (const item of groupByProfile(MS.feed.slice(0, 200))) list.appendChild(buildListItem(item));
+  const feed = visibleFeed(MS.feed, MS.hidden);
+  if (!feed.length) { list.appendChild(elEmpty('No shared conversations yet.')); return; }
+  for (const item of groupByProfile(feed.slice(0, 200))) list.appendChild(buildListItem(item));
 }
 
 // Sidebar teammate rows (mockup 1f left rail): initials avatar + name + a
 // count of that teammate's shared conversations. Purely presentational over
 // already-fetched MS.byUser; the count is just that teammate's convo list length.
-function renderTeammateNav() {
-  const nav = $('teammates-popover');
-  if (!nav) return;
-  nav.replaceChildren();
-  for (const [label, convos] of MS.byUser) {
-    const key = 'teammate:' + label;
-    const btn = el('button', 'settings-menu-item teammate-row');
-    btn.type = 'button';
-    btn.dataset.navkey = key;
-    btn.appendChild(el('span', 'teammate-avatar', initials(label)));
-    btn.appendChild(el('span', 'teammate-name', label));
-    btn.appendChild(el('span', 'teammate-count', String(convos.length)));
-    // At-a-glance "which platforms has this teammate shared" (union of their
-    // mirror rooms + shared contact handles) — same badge row shape used in
-    // the per-teammate view below, wrapped onto its own line under the name.
-    btn.appendChild(buildUserPlatformsRow(label));
-    btn.addEventListener('click', () => { closePopovers(); navTo(key); });
-    nav.appendChild(btn);
+function renderTeammatesList() {
+  const list = $('list-body');
+  if (!list) return;
+  list.replaceChildren();
+  const visible = visibleUsers(MS.byUser, MS.hidden);
+  if (!visible.length && !MS.hidden.size) {
+    list.appendChild(elEmpty('No teammates yet.'));
+    return;
   }
-  setActiveNav(MS.activeView);
+  for (const [label, convos] of visible) list.appendChild(buildTeammateRow(label, convos, false));
+  if (MS.hidden.size) {
+    const head = el('div', 'profile-header');
+    head.appendChild(el('span', 'profile-name', 'Hidden'));
+    list.appendChild(head);
+    for (const label of MS.hidden) {
+      list.appendChild(buildTeammateRow(label, MS.byUser.get(label) || [], true));
+    }
+  }
+}
+
+// Same .convo schema as feed/contact rows: avatar, title+preview, platform
+// badges, trailing kebab (Hide/Show + Delete). Click opens that teammate's
+// conversations; kebab actions do not navigate.
+function buildTeammateRow(label, convos, isHiddenRow) {
+  const row = el('div', 'convo' + (isHiddenRow ? ' teammate-hidden' : ''));
+  row.appendChild(el('div', 'avatar', initials(label)));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', sanitizeLine(label)));
+  const n = convos.length;
+  meta.appendChild(el('div', 'preview',
+    n ? (n + ' conversation' + (n === 1 ? '' : 's')) : 'nothing shared yet'));
+  row.appendChild(meta);
+  const platforms = computeUserPlatforms(label);
+  if (platforms.length) {
+    const platRow = el('span', 'profile-platforms');
+    for (const src of platforms) platRow.appendChild(buildPlatBadge(src));
+    row.appendChild(platRow);
+  }
+  row.appendChild(buildTeammateKebab(label, isHiddenRow));
+  if (!isHiddenRow) {
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    const open = () => navTo('teammate:' + label);
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+  }
+  return row;
+}
+
+function closeTeammateKebabs() {
+  document.querySelectorAll('.share-menu:not(.hidden)').forEach((m) => m.classList.add('hidden'));
+}
+
+function buildTeammateKebab(label, isHiddenRow) {
+  const holder = el('span', 'share-controls');
+  const kebab = el('button', 'share-kebab', '\u22EE');
+  kebab.type = 'button';
+  kebab.title = 'More';
+  kebab.setAttribute('aria-label', 'Actions for ' + label);
+  kebab.setAttribute('aria-haspopup', 'menu');
+  const menu = el('div', 'share-menu hidden');
+  menu.setAttribute('role', 'menu');
+  const hideBtn = el('button', 'share-menu-link', isHiddenRow ? 'Show' : 'Hide');
+  hideBtn.type = 'button';
+  hideBtn.setAttribute('role', 'menuitem');
+  hideBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeTeammateKebabs();
+    if (isHiddenRow) showTeammate(label);
+    else hideTeammate(label);
+  });
+  const delBtn = el('button', 'share-menu-link teammate-delete', 'Delete');
+  delBtn.type = 'button';
+  delBtn.setAttribute('role', 'menuitem');
+  delBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeTeammateKebabs();
+    confirmDeleteTeammate(label).then((ok) => {
+      if (ok) deleteTeammate(label).catch((err) => {
+        window.alert('Could not delete: ' + String((err && err.message) || err));
+      });
+    });
+  });
+  menu.appendChild(hideBtn);
+  menu.appendChild(delBtn);
+  const stop = (e) => e.stopPropagation();
+  kebab.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const open = !menu.classList.contains('hidden');
+    closeTeammateKebabs();
+    if (!open) menu.classList.remove('hidden');
+  });
+  kebab.addEventListener('keydown', stop);
+  menu.addEventListener('click', stop);
+  menu.addEventListener('keydown', stop);
+  holder.appendChild(kebab);
+  holder.appendChild(menu);
+  holder.addEventListener('click', stop);
+  if (!window.__teammateKebabCloser) {
+    window.__teammateKebabCloser = true;
+    document.addEventListener('click', closeTeammateKebabs);
+  }
+  return holder;
+}
+
+function confirmDeleteTeammate(label) {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('teammate-del-backdrop');
+    if (existing) existing.remove();
+    const backdrop = el('div', 'dialog-backdrop');
+    backdrop.id = 'teammate-del-backdrop';
+    const dlg = el('div', 'dialog');
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.appendChild(el('div', 'dialog-title', 'Delete ' + sanitizeLine(label) + '?'));
+    dlg.appendChild(el('p', 'dialog-body',
+      'This deactivates their master account and removes them from this console. You cannot re-add the same username.'));
+    const actions = el('div', 'dialog-actions');
+    const cancel = el('button', 'btn', 'Cancel');
+    cancel.type = 'button';
+    const ok = el('button', 'btn danger', 'Delete');
+    ok.type = 'button';
+    const finish = (val) => {
+      document.removeEventListener('keydown', onKey);
+      backdrop.remove();
+      resolve(val);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') finish(false); };
+    cancel.addEventListener('click', (e) => { e.stopPropagation(); finish(false); });
+    ok.addEventListener('click', (e) => { e.stopPropagation(); finish(true); });
+    backdrop.addEventListener('click', () => finish(false));
+    dlg.addEventListener('click', (e) => e.stopPropagation());
+    actions.appendChild(cancel);
+    actions.appendChild(ok);
+    dlg.appendChild(actions);
+    backdrop.appendChild(dlg);
+    document.body.appendChild(backdrop);
+    document.addEventListener('keydown', onKey);
+    ok.focus();
+  });
+}
+
+async function deleteTeammate(label) {
+  const res = await fetch(ENROLL_BASE + '/admin/delete-teammate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (S.token || '') },
+    body: JSON.stringify({ username: label }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + res.status));
+  MS.hidden = unhide(MS.hidden, label);
+  saveHidden();
+  if (MS.activeView === 'teammate:' + label) navTo('teammates');
+  try { await refreshAll(); } catch (e) { /* list may already be empty */ }
+  if (MS.activeView === 'teammates') renderTeammatesList();
+}
+
+function loadHidden() {
+  try { return parseHidden(localStorage.getItem(HIDDEN_KEY)); }
+  catch (e) { return new Set(); }
+}
+function saveHidden() {
+  try { localStorage.setItem(HIDDEN_KEY, dumpHidden(MS.hidden)); } catch (e) {}
+}
+function applyHidden() {
+  saveHidden();
+  if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0
+      && MS.hidden.has(MS.activeView.slice('teammate:'.length))) {
+    navTo('recent');
+    return;
+  }
+  if (MS.activeView === 'recent') renderRecent();
+  else if (MS.activeView === 'search') renderSearch();
+  else if (MS.activeView === 'contacts') renderContacts();
+  else if (MS.activeView === 'teammates') renderTeammatesList();
+}
+function hideTeammate(label) {
+  MS.hidden = hide(MS.hidden, label);
+  applyHidden();
+}
+function showTeammate(label) {
+  MS.hidden = unhide(MS.hidden, label);
+  applyHidden();
 }
 
 // Up to two initials from a teammate label, for the round avatar chip.
@@ -710,7 +883,7 @@ function renderSearch() {
   if (!out) return;
   out.replaceChildren();
   if (!q) { out.appendChild(elEmpty('Type to search across every teammate.')); return; }
-  const rows = MS.feed.filter(c =>
+  const rows = visibleFeed(MS.feed, MS.hidden).filter(c =>
     c.title.toLowerCase().includes(q) || (c.preview || '').toLowerCase().includes(q)
       || (c.userLabel || '').toLowerCase().includes(q));
   if (!rows.length) { out.appendChild(elEmpty('No conversations match "' + q + '".')); return; }
@@ -1355,7 +1528,7 @@ function renderContacts() {
   const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
-  const items = groupContactsView(MS.contacts, MS.feed, q);
+  const items = groupContactsView(visibleContacts(MS.contacts, MS.hidden), visibleFeed(MS.feed, MS.hidden), q);
   if (!items.length) {
     list.appendChild(elEmpty(q ? 'No contacts match "' + q + '".'
       : 'No shared contacts yet.'));
@@ -1429,8 +1602,9 @@ function showSection(id) {
   for (const s of document.querySelectorAll('#content .view')) s.classList.toggle('hidden', s.id !== id);
 }
 function setActiveNav(key) {
-  for (const b of document.querySelectorAll('.navitem, .teammate-row')) {
-    b.classList.toggle('active', b.dataset.navkey === key);
+  const rail = (typeof key === 'string' && key.indexOf('teammate:') === 0) ? 'teammates' : key;
+  for (const b of document.querySelectorAll('.navitem')) {
+    b.classList.toggle('active', b.dataset.navkey === key || b.dataset.navkey === rail);
   }
 }
 function showWorkspace(twoPane) {
@@ -1455,14 +1629,10 @@ function showListSearch(show) {
   if (input) input.classList.toggle('hidden', !show);
 }
 function closePopovers() {
-  for (const id of ['settings-popover', 'teammates-popover']) {
-    const n = $(id);
-    if (n) n.classList.add('hidden');
-  }
-  for (const id of ['nav-settings-toggle', 'nav-teammates-toggle']) {
-    const b = $(id);
-    if (b) b.setAttribute('aria-expanded', 'false');
-  }
+  const n = $('settings-popover');
+  if (n) n.classList.add('hidden');
+  const b = $('nav-settings-toggle');
+  if (b) b.setAttribute('aria-expanded', 'false');
 }
 function togglePopover(popId, btnId) {
   const pop = $(popId);
@@ -1505,6 +1675,11 @@ function navTo(key) {
     showListSearch(false);
     setDetailMode('empty');
     renderContacts();
+  } else if (key === 'teammates') {
+    showWorkspace(true);
+    showListSearch(false);
+    setDetailMode('empty');
+    renderTeammatesList();
   } else if (key === 'addteam') {
     showWorkspace(false);
     setDetailMode('admin');
@@ -1592,6 +1767,7 @@ async function enterApp() {
   $('whoami').textContent = S.userId;
   $('view-signin').classList.add('hidden');
   $('shell').classList.remove('hidden');
+  MS.hidden = loadHidden();
   try { await refreshAll(); } catch (e) { /* stays empty on error */ }
   navTo('recent');
   if (MS.pollTimer) clearInterval(MS.pollTimer);
@@ -1632,13 +1808,10 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     navContacts.dataset.navkey = 'contacts';
     navContacts.addEventListener('click', () => navTo('contacts'));
   }
-  const tt = $('nav-teammates-toggle');
-  if (tt && !tt.dataset.wired) {
-    tt.dataset.wired = '1';
-    tt.addEventListener('click', (e) => {
-      e.stopPropagation();
-      togglePopover('teammates-popover', 'nav-teammates-toggle');
-    });
+  const navTeammates = $('nav-teammates');
+  if (navTeammates) {
+    navTeammates.dataset.navkey = 'teammates';
+    navTeammates.addEventListener('click', () => navTo('teammates'));
   }
   const st = $('nav-settings-toggle');
   if (st && !st.dataset.wired) {
@@ -1653,10 +1826,11 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   if (!window.__masterPopoverCloser) {
     window.__masterPopoverCloser = true;
     document.addEventListener('click', (e) => {
-      const pops = ['settings-popover', 'teammates-popover'];
-      if (pops.every(id => { const n = $(id); return !n || n.classList.contains('hidden'); })) return;
-      if (pops.some(id => { const n = $(id); return n && n.contains(e.target); })) return;
-      if (['nav-settings-toggle', 'nav-teammates-toggle'].some(id => { const b = $(id); return b && b.contains(e.target); })) return;
+      const pop = $('settings-popover');
+      if (!pop || pop.classList.contains('hidden')) return;
+      if (pop.contains(e.target)) return;
+      const btn = $('nav-settings-toggle');
+      if (btn && btn.contains(e.target)) return;
       closePopovers();
     });
   }

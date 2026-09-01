@@ -20,7 +20,6 @@
   min-width: 220px; padding: 8px 0; border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0,0,0,0.28);
 }
-.teammates-popover { bottom: auto; top: 120px; max-height: 320px; overflow-y: auto; }
 .settings-menu-item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 10px 14px; border: none; background: transparent; font: inherit; cursor: pointer; }
 .settings-signout { font-size: 12px; opacity: 0.75; border-top: 1px solid color-mix(in srgb, #fff 8%, transparent); margin-top: 4px; padding-top: 12px; }
 .settings-user { padding: 10px 14px; font-size: 12px; word-break: break-all; }
@@ -43,28 +42,27 @@
 #room-head { display: flex; align-items: center; gap: 12px; padding: 10px 16px; flex: 0 0 auto; }
 #room-back { width: 32px; height: 32px; flex: none; }
 #room-messages { flex: 1; min-height: 0; overflow-y: auto; }
-#convo-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--color-muted); pointer-events: none; }
+#convo-placeholder { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--color-muted); pointer-events: none; }
 #msgr-convo.no-selection #detail-room { display: none; }
-#msgr-convo.no-selection:not(:has(#detail-admin:not(.hidden))) #convo-placeholder { display: flex; }
-#msgr-convo:not(.no-selection) #convo-placeholder { display: none; }
+#msgr-convo.no-selection:not(:has(.detail-panel:not(.hidden))) #convo-placeholder { display: flex; }
+#workspace.admin-only #convo-placeholder { display: none !important; }
 
 .detail-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .detail-panel-head { padding: 12px 16px; font-weight: 600; }
 .admin-scroll { flex: 1; overflow-y: auto; padding: 16px; }
 
-.teammate-row { border-radius: 0; flex-wrap: wrap; }
-.teammate-avatar { width: 28px; height: 28px; flex: none; border-radius: 50%; line-height: 28px; text-align: center; font-size: 11px; font-weight: 600; }
-.teammate-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.teammate-count { font-size: 11px; margin-left: auto; }
+.teammate-hidden { opacity: 0.7; }
+.share-menu-link.teammate-delete { color: #ea0038; }
+.share-controls .share-menu-link { text-align: left; padding: 6px 8px; }
+.dialog-backdrop { z-index: 50; }
 .profile-group { margin: 0; }
 .profile-header { padding: 8px 16px; }
 .profile-members .convo { padding-left: 24px; }
 .profile-platforms { display: inline-flex; gap: 4px; margin-left: 8px; }
 
 /* Per-teammate "which platforms has this person shared" summary (badge row
-   reused from .plat-badge everywhere else). In the teammates popover it
-   wraps onto its own line under the name/count; in the per-teammate list
-   view it sits as a small header above the conversation list. */
+   reused from .plat-badge everywhere else). Sits as a small header above the
+   conversation list in the per-teammate view. */
 .user-platforms-row { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; padding-left: 36px; }
 .user-platforms-empty { font-size: 11px; padding-left: 0; }
 .user-platforms-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 8px 16px; }
@@ -78,14 +76,20 @@
 .proposal-footer { display: flex; align-items: center; gap: 12px; padding: 12px 16px; }
 #proposal-compose { padding: 0 16px 16px; }
 .proposal-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; }
-.addteam-card { max-width: 420px; }
-.code-display { margin-top: 12px; padding: 16px; text-align: center; border-radius: 8px; }
-.code-value { font: 700 22px ui-monospace, Menlo, monospace; letter-spacing: 0.12em; }
-.addteam-cmd { display: block; margin-top: 8px; padding: 10px; word-break: break-all; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.addteam-card { max-width: 420px; width: 100%; min-width: 0; overflow: hidden; }
+#addteam-result { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.code-display, .addteam-cmd {
+  margin: 0; padding: 10px; border-radius: 8px;
+  max-width: 100%; min-width: 0; box-sizing: border-box;
+  overflow-wrap: anywhere; word-break: break-all;
+}
+.code-display { text-align: center; }
+.code-value { font: 700 15px/1.4 ui-monospace, Menlo, monospace; letter-spacing: 0.04em; overflow-wrap: anywhere; word-break: break-all; }
+.addteam-cmd { display: block; font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.4; }
 
 @media (max-width: 720px) {
   #list-pane { flex-basis: 100%; max-width: 100%; }
   #msgr-convo { position: absolute; inset: 0; z-index: 5; }
   #msgr-convo.no-selection { display: none; }
-  .settings-popover, .teammates-popover { left: 8px; right: 8px; min-width: 0; }
+  .settings-popover { left: 8px; right: 8px; min-width: 0; }
 }

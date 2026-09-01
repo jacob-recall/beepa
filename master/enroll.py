@@ -25,10 +25,13 @@ Operations
           POST /enroll/exchange {"code":…}        -> 200 {enrollment json} | 403
           POST /admin/add-teammate {"username":…} -> 200 {username, code,
                enroll_url, redeem_cmd} | 401/403 (not the manager) | 400
-      /admin/add-teammate requires Authorization: Bearer <manager token> and
-      provisions a brand-new teammate slot (register account + read-only space
-      + append to tokens.local/.provision-state.local) then mints a one-time
-      code — see add_teammate(). CORS on the admin + exchange endpoints allows
+          POST /admin/delete-teammate {"username":…} -> 200 {username, deleted}
+               | 401/403 (not the manager) | 400
+      /admin/*-teammate requires Authorization: Bearer <manager token>.
+      add provisions a brand-new teammate slot (register + space + roster)
+      then mints a one-time code — see add_teammate(). delete deactivates
+      that account, leaves its rooms as the manager, and drops it from the
+      roster — see delete_teammate(). CORS on the admin + exchange endpoints allows
       ONLY the console origin http://127.0.0.1:8011 (never "*"); OPTIONS
       preflight is handled. Bound to loopback only; in production it sits
       behind the SAME TLS reverse proxy as the CS API, so it adds no new
@@ -93,6 +96,7 @@ import secrets
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -632,6 +636,20 @@ def _roster_add(roster_str, user):
     return " ".join(parts)
 
 
+def _roster_remove(roster_str, user):
+    """Drop every copy of user from a space-separated roster string."""
+    return " ".join(p for p in (roster_str.split() if roster_str else []) if p != user)
+
+
+def _burn_teammate_codes(teammate):
+    """Drop every enrollment-code record for this teammate (used or not)."""
+    store = _load_store()
+    codes = store.get("codes") or {}
+    store["codes"] = {h: rec for h, rec in codes.items()
+                      if rec.get("teammate") != teammate}
+    _save_store(store)
+
+
 def _upsert_shell_vars(path, updates, header):
     """Rewrite a KEY='value' shell-var file mode 600, preserving EVERY existing
     key (so existing teammates like jkali are never clobbered) and setting/
@@ -714,6 +732,112 @@ def add_teammate(token, username, enroll_url=None):
             "enroll_url": enroll_url, "redeem_cmd": redeem_cmd}
 
 
+def _deactivate_account(cs_base, token, localpart, password):
+    """Deactivate the signed-in account (CS API + UIA password), same shape as
+    _change_password. erase=True asks Synapse to GDPR-erase where it can."""
+    url = cs_base + "/_matrix/client/v3/account/deactivate"
+    headers = {"Authorization": "Bearer " + token}
+    body = {"erase": True}
+    status, resp = _request("POST", url, headers=headers,
+                            data=json.dumps(body).encode())
+    if status == 200:
+        return
+    if status != 401:
+        raise EnrollError("deactivate refused (HTTP %d)" % status)
+    try:
+        session = json.loads(resp)["session"]
+    except (ValueError, KeyError, TypeError):
+        raise EnrollError("deactivate: malformed UIA challenge")
+    body["auth"] = {
+        "type": "m.login.password",
+        "identifier": {"type": "m.id.user", "user": localpart},
+        "password": password,
+        "session": session,
+    }
+    status, _resp = _request("POST", url, headers=headers,
+                             data=json.dumps(body).encode())
+    if status != 200:
+        raise EnrollError("deactivate failed (HTTP %d)" % status)
+
+
+def _leave_teammate_rooms(cs_base, manager_token, mxid):
+    """Leave every joined room whose m.room.create sender is this teammate.
+
+    Best-effort: a failed leave on one room does not abort the rest. The
+    manager is PL 0 in these rooms and can still leave them.
+    """
+    headers = {"Authorization": "Bearer " + manager_token}
+    status, body = _request(
+        "GET", cs_base + "/_matrix/client/v3/joined_rooms", headers=headers)
+    if status != 200:
+        return
+    try:
+        rooms = json.loads(body).get("joined_rooms") or []
+    except (ValueError, TypeError):
+        return
+    for rid in rooms:
+        if not isinstance(rid, str) or not rid.startswith("!"):
+            continue
+        enc = urllib.parse.quote(rid, safe="")
+        st, ev = _request(
+            "GET", cs_base + "/_matrix/client/v3/rooms/" + enc + "/state/m.room.create",
+            headers=headers)
+        if st != 200:
+            continue
+        try:
+            sender = json.loads(ev).get("sender")
+        except (ValueError, TypeError):
+            continue
+        if sender != mxid:
+            continue
+        _request("POST", cs_base + "/_matrix/client/v3/rooms/" + enc + "/leave",
+                 headers=headers, data=b"{}")
+
+
+def delete_teammate(token, username):
+    """Manager-authenticated: deactivate a console-managed teammate + drop roster.
+
+    Order: (1) prove the caller is the manager; (2) username must be a
+    known roster localpart, never 'manager'; (3) try to log in as that
+    teammate and deactivate (already-deactivated -> skip); (4) manager
+    leaves rooms that teammate created; (5) drop tokens.local /
+    .provision-state.local keys and burn enrollment codes.
+    """
+    _require_manager(token)
+
+    user = (username or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9]{1,64}", user or ""):
+        raise EnrollError("invalid username (use lowercase letters and digits)")
+    if user == "manager":
+        raise EnrollError("username 'manager' is reserved")
+    if user not in known_teammates():
+        raise EnrollError("unknown or unprovisioned teammate: %s" % user)
+
+    cs_base = _cs_base()
+    mxid = "@%s:%s" % (user, _server_name())
+    password = derive_password("teammate", user)
+    teammate_tok = _try_login(cs_base, user, password)
+    if teammate_tok:
+        _deactivate_account(cs_base, teammate_tok, user, password)
+    _leave_teammate_rooms(cs_base, token, mxid)
+
+    U = _key(user)
+    toks = _tokens()
+    st = _state()
+    _remove_shell_vars(TOKENS_FILE, [
+        "MASTER_%s_USER" % U, "MASTER_%s_TOKEN" % U, "MASTER_SPACE_%s" % U,
+    ])
+    _upsert_shell_vars(TOKENS_FILE, {
+        "MASTER_TEAMMATES": _roster_remove(toks.get("MASTER_TEAMMATES", ""), user),
+    }, "# matrix-master access tokens — mode 600, gitignored. Do NOT commit.")
+    _remove_shell_vars(STATE_FILE, ["SPACE_%s" % U, "PW_%s" % U])
+    _upsert_shell_vars(STATE_FILE, {
+        "TEAMMATES": _roster_remove(st.get("TEAMMATES", ""), user),
+    }, "# matrix-master provisioning state (mode 600, gitignored). Do NOT commit.")
+    _burn_teammate_codes(user)
+    return {"username": user, "deleted": True}
+
+
 # ------------------------------------------------------------------ HTTP serve
 def _make_handler():
     from http.server import BaseHTTPRequestHandler
@@ -761,7 +885,7 @@ def _make_handler():
             return "http://127.0.0.1:%d" % DEFAULT_SERVE_PORT
 
         def do_OPTIONS(self):
-            if self.path in ("/admin/add-teammate", "/enroll/exchange"):
+            if self.path in ("/admin/add-teammate", "/admin/delete-teammate", "/enroll/exchange"):
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -781,6 +905,9 @@ def _make_handler():
         def do_POST(self):
             if self.path == "/admin/add-teammate":
                 self._admin_add_teammate()
+                return
+            if self.path == "/admin/delete-teammate":
+                self._admin_delete_teammate()
                 return
             if self.path != "/enroll/exchange":
                 self._json(404, {"error": "not found"})
@@ -819,6 +946,24 @@ def _make_handler():
                 self._json(400, {"error": str(e)}, cors=True)
             except Exception as e:              # e.g. master unreachable mid-provision
                 self._json(502, {"error": "add-teammate failed: %s" % e}, cors=True)
+
+        def _admin_delete_teammate(self):
+            token = self._bearer()
+            try:
+                data = self._read_json_body()
+            except (ValueError, TypeError):
+                self._json(400, {"error": "malformed request"}, cors=True)
+                return
+            username = data.get("username") if isinstance(data, dict) else None
+            try:
+                result = delete_teammate(token, username)
+                self._json(200, result, cors=True)
+            except HttpError as e:
+                self._json(e.status, {"error": str(e)}, cors=True)
+            except EnrollError as e:
+                self._json(400, {"error": str(e)}, cors=True)
+            except Exception as e:
+                self._json(502, {"error": "delete-teammate failed: %s" % e}, cors=True)
 
     return Handler
 

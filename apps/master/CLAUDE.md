@@ -87,7 +87,7 @@ now a deliberate, documented duplication, not an oversight.
   redirecting it somewhere new.
 - **The write surface is exactly `{POST /login, POST /logout, POST
   /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn}, POST
-  ENROLL_BASE/admin/add-teammate}`** — asserted at build time by
+  ENROLL_BASE/admin/add-teammate, POST ENROLL_BASE/admin/delete-teammate}`** — asserted at build time by
   `harness.py`'s scenario 7, which scans **every `*.js` in this directory**
   (not just `main.js`) and matches each non-GET call against that allowlist,
   on the *concatenated string literals* of the path expression (no call in

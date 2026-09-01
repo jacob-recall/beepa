@@ -327,8 +327,33 @@ def _make_handler():
 
 def serve(host, port):
     from http.server import HTTPServer  # single-threaded: serial, no state race
-    httpd = HTTPServer((host, port), _make_handler())
-    sys.stderr.write("[connect] serving on http://%s:%d (loopback)\n" % (host, port))
+    # A managed Mac can have the default port held by a foreign (often root-owned)
+    # process; try a small fallback range so the helper doesn't crash-loop on
+    # EADDRINUSE. The security boundary is the loopback HOST (127.0.0.1) — never
+    # 0.0.0.0 — not the specific port.
+    httpd, chosen = None, port
+    for p in range(port, port + 5):
+        try:
+            httpd = HTTPServer((host, p), _make_handler())
+            chosen = p
+            break
+        except OSError as e:
+            sys.stderr.write("[connect] port %d unavailable (%s); trying next\n" % (p, e))
+    if httpd is None:
+        sys.stderr.write("[connect] no free port in %d-%d; exiting\n" % (port, port + 4))
+        return 1
+    # Publish the chosen loopback base where the app (served same-origin from
+    # :8011) can read it, so the browser knows which port to fetch — the CSP
+    # whitelists the whole range. Best-effort; the app falls back to the default.
+    try:
+        pf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "apps", "user", "connect.local.json")
+        with open(pf, "w") as f:
+            f.write('{"base": "http://127.0.0.1:%d"}\n' % chosen)
+        os.chmod(pf, 0o600)
+    except OSError:
+        pass
+    sys.stderr.write("[connect] serving on http://%s:%d (loopback)\n" % (host, chosen))
     sys.stderr.flush()
     try:
         httpd.serve_forever()
@@ -336,6 +361,7 @@ def serve(host, port):
         pass
     finally:
         httpd.server_close()
+    return 0
 
 
 def main(argv=None):
@@ -343,8 +369,7 @@ def main(argv=None):
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args(argv)
-    serve(args.host, args.port)
-    return 0
+    return serve(args.host, args.port) or 0
 
 
 if __name__ == "__main__":

@@ -48,7 +48,8 @@ step for X and a read-only number-enrichment endpoint.
   always one profile's session and can't mix two accounts.
 - `connect_server.py` — the loopback helper (mirrors
   `gmessages-connect/connect_server.py` and `master/enroll.py serve`):
-  single-threaded `HTTPServer` on **exactly `127.0.0.1:8021`**, silent
+  single-threaded `HTTPServer` on `127.0.0.1` (port 8021, or the first
+  free port in 8021-8025 if held), silent
   access log, CORS preflight locked to the app's own origin.
 - `run-connect.sh` + `com.jkali.session-connect.plist` — the launchd
   service (`RunAtLoad`, `KeepAlive`, `Umask 63` = 0o77). `run-connect.sh`
@@ -107,8 +108,12 @@ ever returned (F6) — the credential never touches a Matrix room.
   application/json`; (c) `X-Beepa-Connect: 1`. (b)+(c) are non-simple
   headers, forcing a cross-origin page into a CORS preflight that fails,
   since the server only ever echoes the one allowed origin.
-- **Loopback only.** Binds exactly `127.0.0.1:8021` — never `0.0.0.0` or
-  `""`.
+- **Loopback only.** Binds `127.0.0.1` — never `0.0.0.0` or `""`. The port is
+  8021, falling back to the first free port in **8021–8025** if the default is
+  held by a foreign process (common on managed Macs), and the chosen loopback
+  base is published to `apps/user/connect.local.json` so the app knows which
+  port to fetch (the CSP whitelists the whole range). The **host** (127.0.0.1)
+  is the security boundary, not the specific port.
 - **F5 — `GET /connect/health` has zero side effects and no CORS.** No path
   reads cookies, the Keychain, or the bridge at import, on `start`, on a
   timer, or from health — only an authorized `POST` does.

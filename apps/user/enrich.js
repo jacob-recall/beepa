@@ -20,9 +20,26 @@ import { convosBySource, feedModel } from '../../shared/state.js';
 import { SOURCES, PHONE_RE } from '../../shared/ui/sources.js';
 import { sanitizeLine } from '../../shared/ui/el.js';
 
-// Same loopback helper + guarded headers the connect flows use.
-const SESSION_CONNECT_BASE = 'http://127.0.0.1:8021';
+// Same loopback helper + guarded headers the connect flows use. The helper may
+// have fallen back from 8021 to 8022-8025 (if the default was taken); it
+// publishes its chosen base in apps/user/connect.local.json (same-origin).
+// Discover + cache it; fall back to the default so a missing file is harmless.
 const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
+let _sessionConnectBase = null;
+async function sessionConnectBase() {
+  if (_sessionConnectBase) return _sessionConnectBase;
+  try {
+    const r = await fetch('connect.local.json', { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      if (j && typeof j.base === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(j.base)) {
+        _sessionConnectBase = j.base; return _sessionConnectBase;
+      }
+    }
+  } catch (e) { /* fall back to the default below */ }
+  _sessionConnectBase = 'http://127.0.0.1:8021';
+  return _sessionConnectBase;
+}
 
 let mergeDone = false;        // becomes true after the ONE real pass (rooms present)
 let mergeAttempts = 0;        // retry budget while the feed is still seeding
@@ -62,7 +79,7 @@ async function autoMergeContacts() {
 
     let numbers;
     try {
-      const r = await fetch(SESSION_CONNECT_BASE + '/enrich/numbers',
+      const r = await fetch((await sessionConnectBase()) + '/enrich/numbers',
         { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
       if (!r.ok) return;                              // non-2xx -> do nothing
       const body = await r.json().catch(() => null);

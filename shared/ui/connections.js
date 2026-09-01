@@ -316,7 +316,26 @@ async function runGmessagesConnect(btn, out, fallback) {
 // helper returns its cookie blob for us to submit through the SAME guarded
 // management-room path the paste box uses (sendSecretToMgmt + immediate
 // redact). If the helper is unreachable, we reveal the paste box as fallback.
-const SESSION_CONNECT_BASE = 'http://127.0.0.1:8021';
+// The connect helper binds 127.0.0.1:8021, falling back to 8022-8025 if that
+// port is held by another process; it publishes its chosen loopback base in
+// apps/user/connect.local.json (fetched same-origin via CSP 'self'). Discover +
+// cache it; a missing/invalid file falls back to the default so the normal case
+// is unchanged. The CSP whitelists the whole range so any chosen port is allowed.
+let _sessionConnectBase = null;
+async function sessionConnectBase() {
+  if (_sessionConnectBase) return _sessionConnectBase;
+  try {
+    const r = await fetch('connect.local.json', { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      if (j && typeof j.base === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(j.base)) {
+        _sessionConnectBase = j.base; return _sessionConnectBase;
+      }
+    }
+  } catch (e) { /* fall back to the default below */ }
+  _sessionConnectBase = 'http://127.0.0.1:8021';
+  return _sessionConnectBase;
+}
 const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
 
 // Degrade to the paste flow: arm the bot's login mode FIRST (the mgmt-room
@@ -340,7 +359,7 @@ async function runSessionConnect(net, siteUrl, warnEl, pasteEl, onDone, loginCmd
   window.open(siteUrl, '_blank', 'noopener');
   let start;
   try {
-    const r = await fetch(SESSION_CONNECT_BASE + '/connect/' + net + '/start',
+    const r = await fetch((await sessionConnectBase()) + '/connect/' + net + '/start',
       { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
     start = await r.json().catch(() => ({}));
     if (!r.ok) {
@@ -467,7 +486,7 @@ function promptSessionInput(net, start, warnEl, onDone) {
     for (const [, inp] of inputs) inp.value = '';   // clear the credential immediately
     S.busy = true; setButtonsDisabled(true); submit.disabled = true;
     try {
-      const r = await fetch(SESSION_CONNECT_BASE + '/connect/' + net + '/input',
+      const r = await fetch((await sessionConnectBase()) + '/connect/' + net + '/input',
         { method: 'POST', headers: SESSION_CONNECT_HEADERS,
           body: JSON.stringify({ login_id: start.login_id, step_id: start.step_id, values }) });
       const res = await r.json().catch(() => ({}));

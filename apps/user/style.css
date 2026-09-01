@@ -118,6 +118,9 @@
 #msgr-convo.no-selection #detail-contact.hidden { display: none !important; }
 #msgr-convo.no-selection:not(:has(#detail-proposal:not(.hidden))):not(:has(#detail-contact:not(.hidden))):not(:has(#detail-admin:not(.hidden))) #convo-placeholder { display: flex; }
 #msgr-convo:not(.no-selection) #convo-placeholder { display: none; }
+/* Settings is single-pane (#workspace.admin-only) and fills the pane with the
+   settings hub — never let the "Select a conversation." placeholder hover over it. */
+#workspace.admin-only #convo-placeholder { display: none !important; }
 #convo-back { display: none; }
 
 .detail-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }

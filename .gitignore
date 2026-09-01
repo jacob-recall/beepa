@@ -53,6 +53,10 @@ uplink.env.local
 hub/.local-user.local
 agents/uplink/local.env.local
 
+# Passwordless auto-login session tokens served on loopback — 600, never commit
+apps/user/session.local.json
+apps/master/session.local.json
+
 # Uplink daemon logs (launchd) — never commit
 agents/uplink/logs/
 

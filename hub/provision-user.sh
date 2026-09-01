@@ -86,4 +86,28 @@ fi
 chmod 600 "${OUT}"
 
 log "done — @${LP}:localhost ready; LOCAL_* written to ${OUT#"${HERE}/"} (600)"
-log "APP LOGIN  ->  username: ${LP}   password: ${LOCAL_PASSWORD}"
+
+# Passwordless auto-login for apps/user: mint a SEPARATE app-session token (its
+# own device, so signing out never touches the uplink's token) and write it
+# where the app fetches it (apps/user/session.local.json, gitignored, 600).
+# Best-effort — the app falls back to the login form if this is absent/invalid.
+APP_TOKEN="$(python3 - "${HS}" "${LP}" "${LOCAL_PASSWORD}" <<'PY'
+import sys, json, urllib.request
+hs, lp, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+body = json.dumps({"type":"m.login.password","identifier":{"type":"m.id.user","user":lp},
+                   "password":pw,"initial_device_display_name":"beepa-user-app"}).encode()
+try:
+    print(json.load(urllib.request.urlopen(urllib.request.Request(
+        hs+"/_matrix/client/v3/login", data=body, headers={"Content-Type":"application/json"}))).get("access_token",""))
+except Exception:
+    pass
+PY
+)"
+if [ -n "${APP_TOKEN}" ]; then
+  APP_SESSION="${HERE}/apps/user/session.local.json"
+  ( umask 077; printf '{"user_id":"@%s:localhost","access_token":"%s"}\n' "${LP}" "${APP_TOKEN}" > "${APP_SESSION}" )
+  chmod 600 "${APP_SESSION}"
+  log "passwordless login enabled for apps/user (no password screen)"
+else
+  log "APP LOGIN (fallback) -> username: ${LP}   password: ${LOCAL_PASSWORD}"
+fi

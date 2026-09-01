@@ -329,10 +329,28 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter') { e.preventDefault(); sendConvoMessage(); }
   });
 
-  // restore session
-  try {
-    const t = sessionStorage.getItem('hub_token'), u = sessionStorage.getItem('hub_user');
-    if (t && u) { S.token = t; S.userId = u; enterApp(); return; }
-  } catch (e) {}
-  showAuth(false);
+  // restore session, else auto-login from a provisioned local session file
+  (async () => {
+    try {
+      const t = sessionStorage.getItem('hub_token'), u = sessionStorage.getItem('hub_user');
+      if (t && u) { S.token = t; S.userId = u; await enterApp(); return; }
+    } catch (e) {}
+    // Passwordless local login: setup.sh writes apps/user/session.local.json
+    // (gitignored, served only on loopback) with the already-provisioned token,
+    // so this single-user local hub has no login screen. Same-origin fetch, so
+    // it stays within the app's CSP connect-src 'self'. Falls back to the login
+    // form if the file is absent or its token is invalid.
+    try {
+      const r = await fetch('session.local.json', { cache: 'no-store' });
+      if (r.ok) {
+        const s = await r.json();
+        if (s && s.access_token && s.user_id) {
+          S.token = s.access_token; S.userId = s.user_id;
+          try { sessionStorage.setItem('hub_token', S.token); sessionStorage.setItem('hub_user', S.userId); } catch (e) {}
+          await enterApp(); return;
+        }
+      }
+    } catch (e) {}
+    showAuth(false);
+  })();
 });

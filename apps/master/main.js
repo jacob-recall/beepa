@@ -1712,10 +1712,28 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     ptpl.value = '';
   });
 
-  try {
-    const t = sessionStorage.getItem('master_token'), u = sessionStorage.getItem('master_user');
-    if (t && u) { S.token = t; S.userId = u; enterApp(); return; }
-  } catch (e) {}
-  $('shell').classList.add('hidden');
-  $('view-signin').classList.remove('hidden');
+  // restore session, else auto-login from a provisioned local session file
+  (async () => {
+    try {
+      const t = sessionStorage.getItem('master_token'), u = sessionStorage.getItem('master_user');
+      if (t && u) { S.token = t; S.userId = u; await enterApp(); return; }
+    } catch (e) {}
+    // Passwordless local login (see apps/user): master-setup.sh writes
+    // apps/master/session.local.json with the manager token. Loopback-only,
+    // same-origin fetch (CSP connect-src 'self'). GET only — no non-GET call is
+    // added here, so harness scenario 7's write-surface scan is unaffected.
+    try {
+      const r = await fetch('session.local.json', { cache: 'no-store' });
+      if (r.ok) {
+        const s = await r.json();
+        if (s && s.access_token && s.user_id) {
+          S.token = s.access_token; S.userId = s.user_id;
+          try { sessionStorage.setItem('master_token', S.token); sessionStorage.setItem('master_user', S.userId); } catch (e) {}
+          await enterApp(); return;
+        }
+      }
+    } catch (e) {}
+    $('shell').classList.add('hidden');
+    $('view-signin').classList.remove('hidden');
+  })();
 });

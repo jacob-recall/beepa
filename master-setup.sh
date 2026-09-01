@@ -91,6 +91,30 @@ log "master Synapse is up (127.0.0.1:8018)"
 step "Step 5/6 — provision manager + teammate accounts and spaces"
 TEAMMATES="${TEAMMATES}" "${HERE}/master/provision.sh"
 
+# Passwordless auto-login for the manager console: mint a console-session token
+# and write it where apps/master fetches it (apps/master/session.local.json,
+# gitignored, 600). Best-effort — the console falls back to the login form.
+MPW="$(python3 "${HERE}/master/enroll.py" password manager --manager 2>/dev/null || true)"
+if [ -n "${MPW}" ]; then
+  MTOK="$(python3 - "${MPW}" <<'PY'
+import sys, json, urllib.request
+pw = sys.argv[1]
+body = json.dumps({"type":"m.login.password","identifier":{"type":"m.id.user","user":"manager"},
+                   "password":pw,"initial_device_display_name":"beepa-master-console"}).encode()
+try:
+    print(json.load(urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:8018/_matrix/client/v3/login", data=body, headers={"Content-Type":"application/json"}))).get("access_token",""))
+except Exception:
+    pass
+PY
+)"
+  if [ -n "${MTOK}" ]; then
+    ( umask 077; printf '{"user_id":"@manager:master","access_token":"%s"}\n' "${MTOK}" > "${HERE}/apps/master/session.local.json" )
+    chmod 600 "${HERE}/apps/master/session.local.json"
+    log "passwordless login enabled for apps/master (no password screen)"
+  fi
+fi
+
 # --------------------------------------------------------------------------
 step "Step 6/6 — start the enrollment service (launchd) + expose over Tailscale"
 LA_DIR="${HOME}/Library/LaunchAgents"; mkdir -p "${LA_DIR}" "${HERE}/master/logs"

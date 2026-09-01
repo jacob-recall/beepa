@@ -26,14 +26,21 @@ TEAMMATES="${TEAMMATES:-jkali}"
 
 # --------------------------------------------------------------------------
 step "Preflight"
-# Install Docker Desktop via Homebrew if missing, then launch + wait for it.
+# If the docker CLI isn't on PATH but Docker Desktop IS installed, use its
+# bundled CLI (avoids a pointless, failing `brew install --cask` when the app
+# already exists but its CLI was never symlinked).
+if ! command -v docker >/dev/null 2>&1 && [ -x /Applications/Docker.app/Contents/Resources/bin/docker ]; then
+  export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
+fi
 if ! command -v docker >/dev/null 2>&1; then
-  log "Docker not found."
-  if command -v brew >/dev/null 2>&1; then
-    log "installing Docker Desktop via Homebrew…"
+  if [ -d /Applications/Docker.app ]; then
+    [ "$(uname -s 2>/dev/null)" = "Darwin" ] && open -a Docker 2>/dev/null || true
+    fail "Docker Desktop is installed but its CLI isn't available. Launch it, wait for it to start, then re-run master-setup.sh."
+  elif command -v brew >/dev/null 2>&1; then
+    log "Docker not found — installing Docker Desktop via Homebrew…"
     brew install --cask docker || fail "brew install failed — install Docker Desktop manually: https://www.docker.com/products/docker-desktop/"
   else
-    fail "Homebrew not found. Install Docker Desktop, then re-run: https://www.docker.com/products/docker-desktop/"
+    fail "Docker not found and Homebrew unavailable. Install Docker Desktop, then re-run: https://www.docker.com/products/docker-desktop/"
   fi
 fi
 if ! docker info >/dev/null 2>&1; then

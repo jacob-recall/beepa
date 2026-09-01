@@ -24,13 +24,23 @@ log() { printf '[setup] %s\n' "$*" >&2; }
 # helper), so if it can't come up we stop with clear guidance rather than fail
 # opaquely later.
 ensure_docker() {
+  # If the docker CLI isn't on PATH but Docker Desktop IS installed, use its
+  # bundled CLI (common: the app exists but its CLI was never symlinked to
+  # /usr/local/bin) — this avoids a pointless, failing `brew install --cask`.
+  if ! command -v docker >/dev/null 2>&1 && [ -x /Applications/Docker.app/Contents/Resources/bin/docker ]; then
+    export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
+  fi
   if ! command -v docker >/dev/null 2>&1; then
-    log "Docker not found."
-    if command -v brew >/dev/null 2>&1; then
-      log "installing Docker Desktop via Homebrew (brew install --cask docker)…"
+    if [ -d /Applications/Docker.app ]; then
+      log "Docker Desktop is installed but its CLI isn't available. Launching it —"
+      log "accept any prompt, wait for it to start, then re-run setup.sh."
+      [ "$(uname -s 2>/dev/null)" = "Darwin" ] && open -a Docker 2>/dev/null || true
+      exit 1
+    elif command -v brew >/dev/null 2>&1; then
+      log "Docker not found — installing Docker Desktop via Homebrew…"
       brew install --cask docker || { log "brew install failed — install Docker Desktop manually then re-run: https://www.docker.com/products/docker-desktop/"; exit 1; }
     else
-      log "Homebrew not found. Install Docker Desktop, then re-run setup.sh:"
+      log "Docker not found and Homebrew unavailable. Install Docker Desktop, then re-run:"
       log "  https://www.docker.com/products/docker-desktop/"
       exit 1
     fi

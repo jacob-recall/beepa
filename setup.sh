@@ -192,7 +192,7 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   else
     log "skip com.jkali.imessage-daemon — not ready yet:"
     [ -f "${IMSG_CFG}" ] || log "  - ${IMSG_CFG} missing (hub/render-hub.sh renders it)"
-    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI} missing (imessage/build-cli.sh builds it; needs Xcode CLT)"
+    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI} missing — imessage/build-cli.sh should have built it; see ITS output above for the real reason (Swift toolchain missing, a polluted CPATH breaking the Darwin module, a clone/network failure, …). Do NOT assume it's Xcode CLT."
     [ "${IMSG_HANDLE_UNSET}" = 1 ] && log "  - set self_handle (your iMessage phone/email) in ${IMSG_CFG}, and grant the CLI Full Disk Access"
     log "  then re-run setup.sh to load it."
   fi

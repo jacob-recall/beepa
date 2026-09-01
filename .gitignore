@@ -22,6 +22,10 @@ imessage/tmp/
 imessage/bin/
 imessage/platform-imessage/
 
+# Python bytecode caches (from running the stdlib helper scripts)
+__pycache__/
+*.pyc
+
 # Harness state and worktrees
 .claude/
 

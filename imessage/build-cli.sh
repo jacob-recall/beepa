@@ -39,7 +39,16 @@ fi
   # `swift build` and fail compilation; strip those editor-only blocks first.
   python3 "${HERE}/imessage/strip-previews.py" "${SRC}/src"
   log "building imessage-cli with Swift (first build downloads deps; can take a few minutes)…"
-  swift build -c release --product imessage-cli
+  # Clear C/C++/ObjC include-path env vars for the build. A polluted CPATH (e.g.
+  # a toolchain that prepends its own ncurses `include/` — seen with
+  # ~/.cache/nebula-toolchain) makes clang resolve the macOS SDK's
+  # `#include <unctrl.h>` to the wrong header, which redeclares `unctrl`
+  # incompatibly and kills the Swift `Darwin` module ("could not build
+  # Objective-C module 'Darwin'"). The first package compiled (often Rainbow)
+  # takes the blame, but ANY Swift package fails identically. Unsetting these for
+  # just this build survives re-runs and needs no change to the user's shell.
+  env -u CPATH -u LIBRARY_PATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+    swift build -c release --product imessage-cli
 ) || { log "swift build failed — see output above; iMessage skipped, other networks unaffected"; exit 0; }
 
 BIN="${SRC}/.build/release/imessage-cli"

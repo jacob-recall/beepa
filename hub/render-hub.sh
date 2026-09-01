@@ -103,16 +103,28 @@ LOGEOF
   log "wrote synapse/localhost.log.config"
 fi
 
-# Signing key: generate once via the pinned Synapse image; never regenerate.
+# Signing key: generate once; never regenerate a good one. `[ ! -s ]` (empty OR
+# missing) self-heals a 0-byte key left by an earlier failed run. Generate into a
+# temp and KEEP it only if it is non-empty — the Synapse image's generator can
+# exit 0 yet write nothing (an amd64 image on arm64 without Rosetta), which used
+# to leave an unbootable 0-byte key. Fall back to a pure-python ed25519 key so a
+# missing/emulation-broken Docker never blocks the hub from booting.
 SIGN="${OUT_ROOT}/synapse/localhost.signing.key"
-if [ ! -f "${SIGN}" ]; then
-  if command -v docker >/dev/null 2>&1; then
-    docker run --rm --entrypoint generate_signing_key "${SYN_IMAGE}" -o /dev/stdout \
-      > "${SIGN}" 2>/dev/null && chmod 600 "${SIGN}" \
-      && log "generated synapse/localhost.signing.key" \
-      || { log "WARN: signing-key generation failed; run once: docker run --rm --entrypoint generate_signing_key ${SYN_IMAGE} -o /dev/stdout > synapse/localhost.signing.key"; rm -f "${SIGN}"; }
+if [ ! -s "${SIGN}" ]; then
+  rm -f "${SIGN}"
+  tmp="$(mktemp)"
+  if command -v docker >/dev/null 2>&1 \
+     && docker run --rm --entrypoint generate_signing_key "${SYN_IMAGE}" -o /dev/stdout > "${tmp}" 2>/dev/null \
+     && [ -s "${tmp}" ]; then
+    mv "${tmp}" "${SIGN}"; chmod 600 "${SIGN}"
+    log "generated synapse/localhost.signing.key (via Synapse image)"
+  elif python3 "${HERE}/hub/_gen_signing_key.py" > "${tmp}" 2>/dev/null && [ -s "${tmp}" ]; then
+    mv "${tmp}" "${SIGN}"; chmod 600 "${SIGN}"
+    log "generated synapse/localhost.signing.key (pure-python fallback)"
   else
-    log "WARN: docker not found; cannot generate signing key yet"
+    rm -f "${tmp}"
+    log "WARN: could not generate a signing key — Synapse will not boot until one exists."
+    log "  Fix: docker run --rm --entrypoint generate_signing_key ${SYN_IMAGE} -o /dev/stdout > synapse/localhost.signing.key"
   fi
 fi
 

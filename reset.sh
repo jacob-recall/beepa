@@ -83,10 +83,17 @@ rm -rf "${HERE}/imessage/bin" "${HERE}/imessage/platform-imessage" "${HERE}/imes
 rm -f "${HERE}"/imessage/*.db
 log "removed iMessage binary + Beeper source clone"
 
-# --- 6. safety: no TRACKED file should have been deleted ---
+# --- 6. safety: restore any TRACKED file the rm's caught (e.g. a logs/.gitignore
+#        dir-keeper) — only generated/ignored state should actually be gone ---
+deleted="$(git -C "${HERE}" diff --name-only --diff-filter=D 2>/dev/null || true)"
+if [ -n "${deleted}" ]; then
+  printf '%s\n' "${deleted}" | while IFS= read -r f; do
+    [ -n "$f" ] && git -C "${HERE}" checkout -- "$f" 2>/dev/null || true
+  done
+  log "restored tracked dir-keeper(s): $(printf '%s ' ${deleted})"
+fi
 if git -C "${HERE}" status --short 2>/dev/null | grep -qE '^ ?D '; then
-  log "WARNING: a TRACKED file was deleted — investigate:"
-  git -C "${HERE}" status --short | grep -E '^ ?D ' >&2
+  log "WARNING: a tracked file is still deleted — check 'git status'"
 else
   log "clean — only generated/ignored files were removed ✓"
 fi

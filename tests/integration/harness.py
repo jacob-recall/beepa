@@ -245,7 +245,9 @@ def set_policy(token, user_id, policy):
 
 
 def set_override(token, user_id, room_id, state):
-    """state in {'share','private'} or None to clear (inherit).
+    """state in {'share','direct','private'} (direct-share-level plan, D1) or
+    None to clear back to the (unset ->) private default — there is no more
+    'inherit': an absent or unrecognized override always resolves private.
 
     Room account-data lives under the user path
     /user/{userId}/rooms/{roomId}/account_data/{type} (this is exactly what
@@ -255,6 +257,19 @@ def set_override(token, user_id, room_id, state):
           "/_matrix/client/v3/user/" + urllib.parse.quote(user_id, safe="")
           + "/rooms/" + urllib.parse.quote(room_id, safe="")
           + "/account_data/com.jkali.share_override", content)
+
+
+def get_override_raw(token, user_id, room_id):
+    """The raw com.jkali.share_override content for one room, or None if
+    absent/cleared (used by the D0 migration scenario to observe the
+    materialized override)."""
+    try:
+        return local(token, "GET",
+                     "/_matrix/client/v3/user/" + urllib.parse.quote(user_id, safe="")
+                     + "/rooms/" + urllib.parse.quote(room_id, safe="")
+                     + "/account_data/com.jkali.share_override")
+    except MxError:
+        return None
 
 
 def set_profiles(token, user_id, profiles):
@@ -714,84 +729,171 @@ def scenario_4_master_offline():
     return ok, ev
 
 
-def scenario_5_share_all_standing():
-    """Per-source share-all for iMessage -> all current iMessage rooms mirror up
-    AND a newly-created iMessage room auto-mirrors; a per-conversation private
-    override on one iMessage room keeps it OUT."""
+def scenario_5_explicit_share_and_migration():
+    """Ports the removed standing-policy 'share-all' scenario to the explicit
+    per-conversation override model (D1), plus the D0 upgrade path it
+    introduced.
+
+    Part A — explicit multi-room share + exclusion (what the old scenario
+    proved: several conversations can be shared together, and one stays OUT
+    despite sharing the same source). Under the explicit model there is no
+    more 'share-all', so this is now a bulk explicit 'share' write (the
+    actual shape of apps/user's bulk action, D3) on two rooms plus an
+    explicit 'private' override on a third. It also proves the flip side of
+    the old behavior: a standing policy used to auto-mirror a room created
+    *later*; under the explicit model NOTHING does that any more — a brand
+    new room with no override stays private until it gets its own explicit
+    override, which is asserted both ways (absent -> private, then set ->
+    mirrors).
+
+    Part B — D0 migration (the upgrade path the removed standing policy
+    needed): rewinds one already-mirrored room to a simulated PRE-S1 state
+    (override cleared back to absent, an old-style share-all standing policy
+    restored, the one-time migration flag rewound in state.db) and restarts
+    the SAME uplink instance against the SAME state.db. D0's S1 acceptance:
+    the room keeps the SAME master_room_id (no delete/re-create — zero
+    revocation observed) AND ends with an explicit `migrated: true` 'share'
+    override materialized in account-data.
+    """
     e = fresh_env("s5")
     imsg_space = create_space(e["tuser_tok"], "iMessage")
     li_space = create_space(e["tuser_tok"], "LinkedIn")
-    a = make_convo(e, imsg_space, "iMsg A")
-    b = make_convo(e, imsg_space, "iMsg B (excluded)")
-    li = make_convo(e, li_space, "LinkedIn C")
-    for rid in (a, b, li):
+    a = make_convo(e, imsg_space, "iMsg A (bulk share)")
+    b = make_convo(e, imsg_space, "iMsg B (bulk share)")
+    c = make_convo(e, imsg_space, "iMsg C (excluded)")
+    li = make_convo(e, li_space, "LinkedIn D (never touched)")
+    for rid in (a, b, c, li):
         post_msg(e["contact_tok"], rid, "seed for " + rid[:8])
-    # Standing policy: share ALL iMessage; LinkedIn stays inherit->private.
-    set_policy(e["tuser_tok"], e["tuser_id"],
-               {"global": "private", "sources": {"imessage": "share-all"}})
-    # Per-conversation exclusion on one iMessage room.
-    set_override(e["tuser_tok"], e["tuser_id"], b, "private")
+    # Bulk explicit share on two rooms; explicit exclusion on a third sharing
+    # the same source; the LinkedIn room gets no override at all (stays the
+    # unset/private default).
+    set_override(e["tuser_tok"], e["tuser_id"], a, "share")
+    set_override(e["tuser_tok"], e["tuser_id"], b, "share")
+    set_override(e["tuser_tok"], e["tuser_id"], c, "private")
 
+    ev = []
+    ok = True
     proc = start_uplink(e)
     try:
-        # a mirrors (share-all), b excluded, li not iMessage -> not mirrored.
-        wait_until(lambda: mirror_of(e["db_path"], a), timeout=45, desc="s5 A mirror")
-        time.sleep(4)  # allow reconcile to consider b and li
-        a_mirror = mirror_of(e["db_path"], a)
-        b_mirror = mirror_of(e["db_path"], b)
+        a_row = wait_until(lambda: mirror_of(e["db_path"], a), timeout=45, desc="s5 A mirror")
+        b_row = wait_until(lambda: mirror_of(e["db_path"], b), timeout=45, desc="s5 B mirror")
+        time.sleep(4)  # allow reconcile to consider c and li
+        c_mirror = mirror_of(e["db_path"], c)
         li_mirror = mirror_of(e["db_path"], li)
+        both_shared = a_row is not None and b_row is not None
+        ev.append("bulk_A_and_B_mirrored=%s" % both_shared)
+        ok = ok and both_shared
+        ev.append("C_excluded=%s LinkedIn_untouched_stays_private=%s"
+                  % (c_mirror is None, li_mirror is None))
+        ok = ok and c_mirror is None and li_mirror is None
 
-        # Now a NEW iMessage room arrives under the standing policy.
-        c = make_convo(e, imsg_space, "iMsg D (new arrival)")
-        post_msg(e["contact_tok"], c, "brand new imessage thread")
-        c_mirror = wait_until(lambda: mirror_of(e["db_path"], c), timeout=45,
-                              desc="s5 auto-share new room")
+        # A brand-new room, same source, NO override: under the explicit
+        # model nothing auto-mirrors it any more (the removed behavior).
+        d = make_convo(e, imsg_space, "iMsg E (new arrival, no override yet)")
+        post_msg(e["contact_tok"], d, "brand new imessage thread")
+        time.sleep(4)
+        d_mirror_before = mirror_of(e["db_path"], d)
+        ev.append("new_room_stays_private_without_override=%s" % (d_mirror_before is None))
+        ok = ok and d_mirror_before is None
+        # ...but an explicit override on it DOES mirror it (reconcile keeps
+        # picking up newly-written explicit levels every pass).
+        set_override(e["tuser_tok"], e["tuser_id"], d, "share")
+        d_row = wait_until(lambda: mirror_of(e["db_path"], d), timeout=45,
+                           desc="s5 new room mirrors once explicitly shared")
+        ev.append("new_room_mirrors_once_explicit=%s" % (d_row is not None))
+        ok = ok and d_row is not None
     finally:
         stop_uplink(proc)
 
-    ok = (a_mirror is not None and b_mirror is None and li_mirror is None
-          and c_mirror is not None)
-    ev = ("A_mirrored=%s B_excluded=%s LinkedIn_not_shared=%s new_room_auto=%s"
-          % (a_mirror is not None, b_mirror is None, li_mirror is None,
-             c_mirror is not None))
-    return ok, ev
+    # -- Part B: D0 migration acceptance, against the SAME state.db ---------
+    a_master_before = a_row[0]
+    # Rewind room `a` to a simulated pre-S1 state: clear its explicit
+    # override (back to absent — nothing "was set", as pre-S1 account-data
+    # never had this event type at all), restore an old-style standing
+    # policy that would have shared it under the retained inherit-semantics
+    # resolver, and rewind the one-time migration flag so migrate_explicit_
+    # levels() runs again as if for the first time.
+    set_override(e["tuser_tok"], e["tuser_id"], a, None)
+    set_policy(e["tuser_tok"], e["tuser_id"],
+               {"global": "private", "sources": {"imessage": "share-all"}})
+    db = sqlite3.connect(e["db_path"])
+    try:
+        db.execute("DELETE FROM meta WHERE k='migrated_explicit_levels'")
+        db.commit()
+    finally:
+        db.close()
+
+    proc2 = start_uplink(e)
+    try:
+        migrated_override = wait_until(
+            lambda: get_override_raw(e["tuser_tok"], e["tuser_id"], a) or None,
+            timeout=45, desc="s5 migrated override materialized")
+        migrated_flag = wait_until(lambda: meta_get(e["db_path"], "migrated_explicit_levels"),
+                                   timeout=45, desc="s5 migration flag set")
+        a_master_after = (mirror_of(e["db_path"], a) or (None,))[0]
+        # Give the same pass a moment to have evaluated (and NOT executed)
+        # any deletion before checking liveness.
+        time.sleep(3)
+        alice_joined = a_master_before in master(
+            MASTER_ALICE_TOKEN, "GET", "/_matrix/client/v3/joined_rooms")["joined_rooms"]
+        still_alive = master_room_alive(a_master_before) and alice_joined
+        still_child = a_master_before in space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
+    finally:
+        stop_uplink(proc2)
+
+    migrated_ok = (migrated_override.get("state") == "share"
+                  and migrated_override.get("migrated") is True)
+    ev.append("migrated_override=%s(want state=share migrated=True)" % migrated_override)
+    ok = ok and migrated_ok
+    ev.append("migration_flag_set=%s" % (migrated_flag == "1"))
+    ok = ok and migrated_flag == "1"
+    same_room = a_master_after == a_master_before
+    ev.append("same_master_room_id(no_delete_recreate)=%s (before=%s after=%s)"
+              % (same_room, a_master_before, a_master_after))
+    ok = ok and same_room
+    ev.append("mirror_still_alive_and_grouped=%s (alive=%s child=%s)"
+              % (still_alive and still_child, still_alive, still_child))
+    ok = ok and still_alive and still_child
+    return ok, "; ".join(ev)
 
 
 def scenario_6_revoke_levels():
-    """Revoke at each level (clear per-conversation share; set source
-    private-all; set global private) -> the corresponding master mirror room(s)
-    are removed from the manager's view."""
+    """Revoke at each level -> the corresponding master mirror room(s) are
+    removed from the manager's view.
+
+    Ports the old 3-tier standing-policy revocation scenario (per-conv clear,
+    per-source private-all, global private) to the explicit model (D1), which
+    has exactly ONE level knob per room: the per-conversation override. What
+    the old scenario actually proved — "however a room came to be shared,
+    setting it un-shared fully revokes the master copy" — is preserved here
+    against the two real entry points a room can be shared through: 'share'
+    and the new, higher-stakes 'direct' (worth its own dedicated revocation
+    coverage, since a `direct` room is also carrying the uplink's auto-send
+    capability, D2 — revoking it must remove that capability along with the
+    mirror)."""
     e = fresh_env("s6")
     imsg_space = create_space(e["tuser_tok"], "iMessage")
     li_space = create_space(e["tuser_tok"], "LinkedIn")
-    # r_conv: shared by explicit per-conversation override (revoke by clearing).
-    r_conv = make_convo(e, imsg_space, "Revoke-by-conv")
-    # r_src: shared by source share-all iMessage (revoke by source private-all).
-    r_src = make_convo(e, imsg_space, "Revoke-by-source")
-    # r_glob: LinkedIn room shared only via global share-all (revoke by global private).
-    r_glob = make_convo(e, li_space, "Revoke-by-global")
-    for rid in (r_conv, r_src, r_glob):
+    r_share = make_convo(e, imsg_space, "Revoke-from-share")
+    r_direct = make_convo(e, li_space, "Revoke-from-direct")
+    for rid in (r_share, r_direct):
         post_msg(e["contact_tok"], rid, "seed " + rid[:8])
-    # Start with everything shared: global share-all covers all; plus explicit
-    # share on r_conv. (global share-all already shares r_src and r_glob too.)
-    set_policy(e["tuser_tok"], e["tuser_id"],
-               {"global": "share-all", "sources": {}})
-    set_override(e["tuser_tok"], e["tuser_id"], r_conv, "share")
+    set_override(e["tuser_tok"], e["tuser_id"], r_share, "share")
+    set_override(e["tuser_tok"], e["tuser_id"], r_direct, "direct")
 
     proc = start_uplink(e)
     ev = []
     ok = True
     try:
-        m_conv = wait_until(lambda: mirror_of(e["db_path"], r_conv), timeout=45, desc="s6 conv")
-        m_src = wait_until(lambda: mirror_of(e["db_path"], r_src), timeout=45, desc="s6 src")
-        m_glob = wait_until(lambda: mirror_of(e["db_path"], r_glob), timeout=45, desc="s6 glob")
-        room_conv, room_src, room_glob = m_conv[0], m_src[0], m_glob[0]
-        # All three are mirrored: each is a child of space:alice (the manager's
+        m_share = wait_until(lambda: mirror_of(e["db_path"], r_share), timeout=45, desc="s6 share")
+        m_direct = wait_until(lambda: mirror_of(e["db_path"], r_direct), timeout=45, desc="s6 direct")
+        room_share, room_direct = m_share[0], m_direct[0]
+        # Both are mirrored: each is a child of space:alice (the manager's
         # grouping) AND @alice (the uplink) is joined to write it.
         time.sleep(2)
         kids0 = space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
-        all_up = all(r in kids0 for r in (room_conv, room_src, room_glob))
-        ev.append("initially_all_mirrored=%s" % all_up)
+        all_up = all(r in kids0 for r in (room_share, room_direct))
+        ev.append("initially_both_mirrored=%s" % all_up)
         ok = ok and all_up
 
         # Observable revocation signal (delete_mirror per uplink.py: clear the
@@ -814,34 +916,23 @@ def scenario_6_revoke_levels():
                     and master_rid not in space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
                     and not alice_joined(master_rid))
 
-        # (1) REVOKE per-conversation: set r_conv private (most-specific override
-        # beats the global share-all that would otherwise keep it shared).
-        set_override(e["tuser_tok"], e["tuser_id"], r_conv, "private")
-        wait_until(lambda: mirror_of(e["db_path"], r_conv) is None, timeout=45,
-                   desc="s6 conv revoked")
-        conv_gone = revoked(r_conv, room_conv)
-        ev.append("conv_revoked=%s" % conv_gone)
-        ok = ok and conv_gone
+        # (1) REVOKE the 'share' room: override -> private.
+        set_override(e["tuser_tok"], e["tuser_id"], r_share, "private")
+        wait_until(lambda: mirror_of(e["db_path"], r_share) is None, timeout=45,
+                   desc="s6 share revoked")
+        share_gone = revoked(r_share, room_share)
+        ev.append("share_revoked=%s" % share_gone)
+        ok = ok and share_gone
 
-        # (2) REVOKE per-source: set iMessage source to private-all (overrides
-        # global share-all for r_src).
-        set_policy(e["tuser_tok"], e["tuser_id"],
-                   {"global": "share-all", "sources": {"imessage": "private-all"}})
-        wait_until(lambda: mirror_of(e["db_path"], r_src) is None, timeout=45,
-                   desc="s6 src revoked")
-        src_gone = revoked(r_src, room_src)
-        ev.append("source_revoked=%s" % src_gone)
-        ok = ok and src_gone
-
-        # (3) REVOKE global: set global to private. r_glob (LinkedIn, shared only
-        # via global share-all) drops out.
-        set_policy(e["tuser_tok"], e["tuser_id"],
-                   {"global": "private", "sources": {"imessage": "private-all"}})
-        wait_until(lambda: mirror_of(e["db_path"], r_glob) is None, timeout=45,
-                   desc="s6 glob revoked")
-        glob_gone = revoked(r_glob, room_glob)
-        ev.append("global_revoked=%s" % glob_gone)
-        ok = ok and glob_gone
+        # (2) REVOKE the 'direct' room: override -> private. Also the room
+        # that was carrying the auto-send capability, so this is the more
+        # consequential of the two revocations.
+        set_override(e["tuser_tok"], e["tuser_id"], r_direct, "private")
+        wait_until(lambda: mirror_of(e["db_path"], r_direct) is None, timeout=45,
+                   desc="s6 direct revoked")
+        direct_gone = revoked(r_direct, room_direct)
+        ev.append("direct_revoked=%s" % direct_gone)
+        ok = ok and direct_gone
     finally:
         stop_uplink(proc)
     return ok, "; ".join(ev)
@@ -1408,15 +1499,22 @@ def scenario_11_profile_span_platforms():
     """§12 phase 5 unified contacts: a contact profile spanning TWO platforms.
 
     Link an iMessage room + a LinkedIn room (+ a 2nd iMessage room) to ONE
-    contact profile and set the profile to `share`. Global stays private and no
-    per-source policy is set, so the ONLY thing that shares these rooms is the
-    profile level (proving the new level works and beats the default). Expect:
+    contact profile. Ported for D1: a profile's own `share` field no longer
+    causes conversation mirroring at all (conversation sharing is explicit-
+    only — profile/source/global inheritance was removed from that path).
+    What this scenario actually proves survives unchanged: a shared contact
+    profile still GROUPS conversations across platforms with the same
+    com.jkali.profile stamp — it just now requires each member room to carry
+    its OWN explicit 'share' override to be shared, same as any other room.
+    So: explicit 'share' on the iMessage AND LinkedIn rooms (the profile
+    itself stays `share` too, for storage-shape parity with the real
+    account-data document, but is inert for the mirror decision). Expect:
       * BOTH the iMessage room and the LinkedIn room mirror up, and each mirror
         carries the SAME com.jkali.profile {id, displayName} — so the master can
         group this one person's threads across platforms;
       * a per-conversation `private` override on the 3rd member keeps it OUT
-        (per-conv override still wins over the profile) and, being unmirrored,
-        it never gets a profile stamp.
+        (no override ever makes it 'share' — it is simply never shared) and,
+        being unmirrored, it never gets a profile stamp.
     """
     e = fresh_env("s11")
     imsg_space = create_space(e["tuser_tok"], "iMessage")
@@ -1429,13 +1527,17 @@ def scenario_11_profile_span_platforms():
 
     prof_id = "cp_dana_" + uniq("id")
     prof_name = "Dana Lewis"
-    # One profile, three linked rooms across two sources, set to SHARE.
+    # One profile, three linked rooms across two sources (grouping only —
+    # D1 dropped any effect this had on mirroring).
     set_profiles(e["tuser_tok"], e["tuser_id"], {"profiles": [{
         "id": prof_id, "displayName": prof_name,
         "roomIds": [im, li, excluded], "share": "share",
     }]})
-    # Global + per-source stay at the safe default (nothing set) so the profile
-    # is the sole cause of sharing. Per-conversation private on the 3rd member.
+    # The two grouped members each need their OWN explicit share; the 3rd
+    # member gets an explicit private override (and would stay unshared even
+    # without one — there is no more inheritance to override).
+    set_override(e["tuser_tok"], e["tuser_id"], im, "share")
+    set_override(e["tuser_tok"], e["tuser_id"], li, "share")
     set_override(e["tuser_tok"], e["tuser_id"], excluded, "private")
 
     proc = start_uplink(e)
@@ -1489,7 +1591,8 @@ def scenario_12_contact_share_and_propose():
     that leg is asserted at the proposal-shape level here; SC.A's manual
     self-test (PLAN-IMSG-STARTCHAT.md) is the real send-path acceptance check.
 
-    Assertions:
+    Assertions (the LinkedIn room carries its OWN explicit 'share' override,
+    D1 — the profile groups it, it no longer mirrors it):
       1. The self-number's com.jkali.contact state event lands in the master
          contacts room carrying the SAME person_id as the profile's mirrored
          room's com.jkali.profile stamp (cross-platform grouping, visible on
@@ -1535,6 +1638,11 @@ def scenario_12_contact_share_and_propose():
     li_space = create_space(e["tuser_tok"], "LinkedIn")
     li_room = make_convo(e, li_space, "Self Person (LinkedIn)")
     post_msg(e["contact_tok"], li_room, "seed for s12 cross-platform profile")
+
+    # D1: a profile's own `share` no longer mirrors its member room — the
+    # room needs its own explicit override (contact-share, asserted below via
+    # com.jkali.contact_share_policy, is a separate, untouched dimension).
+    set_override(e["tuser_tok"], e["tuser_id"], li_room, "share")
 
     prof_id = "cp_self_" + uniq("id")
     prof_name = "Self Person"
@@ -1788,12 +1896,150 @@ def scenario_13_contact_backfill_on_enable():
     return ok, "; ".join(ev)
 
 
+# ---------------------------------------------------------------- F2 empirical probe
+# The direct-share-level plan's F2 finding asks whether a real mautrix bridge,
+# on receiving a message posted by the teammate's OWN account into a portal
+# room whose body happens to start with '!' (e.g. "!wa help"), would execute
+# it as an admin command rather than relay it as ordinary chat text. This
+# throwaway TEST-USER hub (tests/integration/docker-compose.test.yml, compose
+# project matrix-synctest, 127.0.0.1:8028) is a BARE Synapse — no bridge
+# container of any kind runs against it (confirmed: `docker ps` under that
+# compose project shows only postgres + synapse) — so the probe cannot be
+# executed here and this harness does not improvise a fake bridge to answer
+# it. NOT EXECUTABLE IN CI. The defense ships regardless of how the
+# hypothesis resolves: `_direct_send_gate()`'s sanitization step (D2.2)
+# refuses to auto-send any body whose first non-whitespace character is '!',
+# so the uplink's one send path can never hand a bridge a command-shaped
+# string, whatever that bridge would do with one. A real answer to the
+# hypothesis needs a live mautrix bridge (e.g. the matrix-wa stack's
+# mautrix-whatsapp, which this harness must never touch) exercised manually,
+# outside CI.
+
+
+def scenario_14_direct_proposal_autosend():
+    """Direct proposal round-trip (D2/D2b, wire contract in the plan). A
+    manager proposal targeting a 'direct' room is auto-sent by the uplink
+    with no review click; the same shape against a 'share' room is untouched.
+
+    Order matters here: the FIRST proposal pulled by a fresh uplink is always
+    a cold start (D2.3 — no prior `since`/dedup map), which routes the WHOLE
+    batch to the inbox regardless of level, so state loss can never replay
+    history as real sends. This scenario deliberately uses the negative
+    ('share') leg's proposal AS that cold-start primer (proving its own
+    'ordinary draft, no send' assertion in the same step), THEN posts the
+    'direct' proposal once a `since` token and a non-empty proposal_map exist
+    — an ordinary incremental pull, exactly what D2 requires before it will
+    ever auto-send.
+    """
+    e = fresh_env("s14")
+    imsg_space = create_space(e["tuser_tok"], "iMessage")
+    direct_room = make_convo(e, imsg_space, "Direct Target")
+    share_room = make_convo(e, imsg_space, "Share Target")
+    for rid in (direct_room, share_room):
+        post_msg(e["contact_tok"], rid, "seed for " + rid[:8])
+    set_override(e["tuser_tok"], e["tuser_id"], direct_room, "direct")
+    set_override(e["tuser_tok"], e["tuser_id"], share_room, "share")
+
+    ev = []
+    ok = True
+    proc = start_uplink(e)
+    try:
+        wait_until(lambda: mirror_of(e["db_path"], direct_room), timeout=45,
+                   desc="s14 direct mirror")
+        wait_until(lambda: mirror_of(e["db_path"], share_room), timeout=45,
+                   desc="s14 share mirror")
+        mpr = wait_until(lambda: meta_get(e["db_path"], "master_proposals_room"),
+                         timeout=45, desc="s14 master proposals room")
+        lpr = wait_until(lambda: meta_get(e["db_path"], "local_proposals_room"),
+                         timeout=45, desc="s14 local proposals room")
+        master(MASTER_MANAGER_TOKEN, "POST",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/join", {})
+
+        # -- negative leg first (also the cold-start primer, see docstring) --
+        marker_share = "SHAREPROP-" + uniq("sp")
+        prop_share = {
+            "target_room": share_room, "body": marker_share,
+            "created_by": MASTER_MANAGER_USER, "origin_ts": int(time.time() * 1000),
+        }
+        master(MASTER_MANAGER_TOKEN, "PUT",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+              + "/send/com.jkali.proposal/" + uniq("prop"), prop_share)
+        share_recs = wait_until(
+            lambda: [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                     if (p.get("content") or {}).get("body") == marker_share] or None,
+            timeout=45, desc="s14 share proposal reaches inbox")
+        share_content = (share_recs[0].get("content") or {}) if share_recs else {}
+        share_ordinary = (not share_content.get("com.jkali.auto_sent")
+                          and not share_content.get("com.jkali.send_ambiguous"))
+        ev.append("share_proposal_ordinary_draft=%s" % share_ordinary)
+        ok = ok and share_ordinary
+        share_no_send = not [
+            m for m in local_events_of_type(e["tuser_tok"], share_room, "m.room.message")
+            if (m.get("content") or {}).get("body") == marker_share]
+        ev.append("share_room_no_message_sent=%s" % share_no_send)
+        ok = ok and share_no_send
+
+        # -- positive leg: now an ordinary incremental pull (since is set, --
+        # -- proposal_map is non-empty) — auto-send is eligible.           --
+        marker = "DIRECT-" + uniq("d")
+        prop_direct = {
+            "target_room": direct_room, "body": marker,
+            "created_by": MASTER_MANAGER_USER, "origin_ts": int(time.time() * 1000),
+        }
+        master(MASTER_MANAGER_TOKEN, "PUT",
+              "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+              + "/send/com.jkali.proposal/" + uniq("prop"), prop_direct)
+
+        # Exactly one m.room.message auto-sent into the REAL local
+        # conversation, carrying the cosmetic provenance field.
+        sent = wait_until(
+            lambda: [m for m in local_events_of_type(e["tuser_tok"], direct_room, "m.room.message")
+                     if (m.get("content") or {}).get("body") == marker] or None,
+            timeout=45, desc="s14 auto-sent message appears in the conversation")
+        ev.append("auto_sent_message_count=%d(want 1)" % len(sent))
+        ok = ok and len(sent) == 1
+        cosmetic = ((sent[0].get("content") or {}).get("com.jkali.auto_sent_from_proposal")
+                   if sent else None)
+        ev.append("cosmetic_provenance_field=%r" % cosmetic)
+        ok = ok and bool(cosmetic)
+
+        # The local proposals room holds exactly ONE record for this
+        # proposal, and it is the non-actionable com.jkali.auto_sent:true one
+        # (never a plain pending draft alongside it).
+        recs = [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                if (p.get("content") or {}).get("body") == marker]
+        ev.append("inbox_record_count=%d(want 1)" % len(recs))
+        ok = ok and len(recs) == 1
+        rec = (recs[0].get("content") or {}) if recs else {}
+        auto_sent_shape_ok = (rec.get("com.jkali.auto_sent") is True
+                              and bool(rec.get("sent_event_id"))
+                              and not rec.get("com.jkali.send_ambiguous"))
+        ev.append("inbox_record_is_non_actionable_auto_sent=%s (auto_sent=%s sent_event_id=%s)"
+                  % (auto_sent_shape_ok, rec.get("com.jkali.auto_sent"), rec.get("sent_event_id")))
+        ok = ok and auto_sent_shape_ok
+
+        # A second, identical pull produces NO duplicate: several more loop
+        # cycles must leave both counts at exactly one.
+        time.sleep(8)
+        sent2 = [m for m in local_events_of_type(e["tuser_tok"], direct_room, "m.room.message")
+                if (m.get("content") or {}).get("body") == marker]
+        recs2 = [p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                if (p.get("content") or {}).get("body") == marker]
+        no_dup = len(sent2) == 1 and len(recs2) == 1
+        ev.append("no_duplicate_after_second_pull=%s (sent=%d inbox=%d)"
+                  % (no_dup, len(sent2), len(recs2)))
+        ok = ok and no_dup
+    finally:
+        stop_uplink(proc)
+    return ok, "; ".join(ev)
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
     ("3_offline_online_catchup", scenario_3_offline_catchup),
     ("4_master_offline_buffer", scenario_4_master_offline),
-    ("5_share_all_standing_policy", scenario_5_share_all_standing),
+    ("5_explicit_share_and_migration", scenario_5_explicit_share_and_migration),
     ("6_revoke_each_level", scenario_6_revoke_levels),
     ("7_read_only_manager", scenario_7_read_only),
     ("8_cross_user_isolation", scenario_8_cross_user_isolation),
@@ -1802,6 +2048,7 @@ SCENARIOS = [
     ("11_profile_span_platforms", scenario_11_profile_span_platforms),
     ("12_contact_share_and_propose", scenario_12_contact_share_and_propose),
     ("13_contact_backfill_on_enable", scenario_13_contact_backfill_on_enable),
+    ("14_direct_proposal_autosend", scenario_14_direct_proposal_autosend),
 ]
 
 

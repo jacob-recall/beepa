@@ -1,4 +1,4 @@
-# tests/ — 30 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
+# tests/ — 30 unit tests + the consent conformance harness, all wired into tests/run.sh + the 14-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -134,8 +134,15 @@ the source the same way `shared/ui/sources.js` does), sets consent via
 account-data, runs the **real** `agents/uplink/uplink.py` as a subprocess,
 and asserts on MASTER homeserver state.
 
-**The 13 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
-requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
+**The 14 scenarios** (`SCENARIOS` in `harness.py`), each mapping to a named
+requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5, extended by the
+direct-share-level plan's S5. Conversation sharing is EXPLICIT-ONLY (D1): a
+scenario that used to lean on a standing share-all/private-all policy for
+CONVERSATIONS now writes explicit per-room `com.jkali.share_override` levels
+instead — `set_policy()` (the old global/per-source standing policy) still
+exists in the harness ONLY for the separate, untouched contact-sharing
+dimension (scenarios 12/13) and for scenario 5's D0-migration leg, which
+deliberately simulates a PRE-S1 install:
 
 1. `1_share_one_conversation` — share → mirror room appears with correct
    history, order, alignment, source badge.
@@ -145,11 +152,22 @@ requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
    and no duplicates.
 4. `4_master_offline_buffer` — master unreachable → buffer + backoff →
    delivers once master is back, watermark not advanced meanwhile.
-5. `5_share_all_standing_policy` — Share-All (global or per-source) also
-   covers a conversation arriving *later*; a per-conversation `private`
-   exception still stays out.
-6. `6_revoke_each_level` — unshare at any consent level → master copy
-   revoked (space-child removed, manager kicked, room left).
+5. `5_explicit_share_and_migration` — ports the removed standing-policy
+   share-all scenario to the explicit model: a bulk explicit `share` write
+   across several rooms, an explicit `private` exclusion on another sharing
+   the same source, and proof that a brand-new room no longer auto-mirrors
+   under any standing policy (it stays private until it gets its own
+   override, then mirrors once explicitly shared). Also exercises D0: an
+   already-mirrored room is rewound to a simulated pre-S1 state (override
+   cleared, an old-style share-all policy restored, the migration flag
+   rewound) and the SAME uplink instance is restarted against the SAME
+   state.db — the S1 acceptance is the SAME `master_room_id` throughout
+   (zero delete/re-create) and an explicit `migrated: true` `'share'`
+   override materialized.
+6. `6_revoke_each_level` — ports the removed 3-tier standing-policy
+   revocation scenario: revoking a `share` room and revoking a `direct` room
+   (the two real per-room levels left under the explicit model) both fully
+   revoke the master copy (space-child removed, manager kicked, room left).
 7. `7_read_only_manager` — manager attempts to send: rejected by power
    level **and** impossible because `apps/master/` ships no composer.
 8. `8_cross_user_isolation` — user A's token cannot write user B's rooms.
@@ -161,8 +179,10 @@ requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
     type — never a mirror room, never `m.room.message`.
 11. `11_profile_span_platforms` — unified contacts: a shared contact
     profile's conversations across ≥2 platforms mirror up stamped with
-    `com.jkali.profile`, so the master groups them under one person; a
-    per-conversation `private` still excludes a member conversation.
+    `com.jkali.profile`, so the master groups them under one person (each
+    member room still needs its OWN explicit `share` override, D1 — the
+    profile groups, it no longer mirrors); a per-conversation `private`
+    override still excludes a member conversation.
 12. `12_contact_share_and_propose` — a shared contact profile reaches the
     master's contacts index, and a manager-authored proposal against that
     contact reaches the right teammate's proposals room.
@@ -171,6 +191,21 @@ requirement from PLAN-MASTER-SYNC.md §13 / IMPL P2.5:
     off are **backfilled** when the source is switched on; a later import's
     new contact flows; switching the source off tombstones all of them;
     switching it back on re-pushes them.
+14. `14_direct_proposal_autosend` — direct-share-level plan D2/D2b: a
+    manager proposal against a `direct` room is auto-sent by the uplink with
+    no review click — exactly one `m.room.message` lands in the real local
+    conversation carrying the cosmetic `com.jkali.auto_sent_from_proposal`
+    field, the local proposals room holds exactly ONE record for it and it
+    is the non-actionable `com.jkali.auto_sent: true` one, and a second
+    identical pull produces no duplicate. Negative leg: the same proposal
+    shape against a `share` room lands as an ordinary actionable draft and
+    NO message is sent. The F2 mautrix command-scope probe (does a bridge
+    execute a `!`-prefixed auto-sent body as an admin command?) is
+    documented as NOT EXECUTABLE against this harness — see the comment
+    immediately above `scenario_14_direct_proposal_autosend` in
+    `harness.py`: the throwaway TEST-USER hub is a bare Synapse with no
+    bridge container, and the defense (`_direct_send_gate()`'s leading-`!`
+    refusal, D2.2) ships regardless of the hypothesis.
 
 `tests/integration/test_enroll.py` separately proves the v1.5 enrollment
 flow end to end (valid/reused/expired/invalid code) against the running
@@ -199,7 +234,7 @@ TEAMMATES="alice bob" master/provision.sh
 # 2. the throwaway test-user hub:
 docker compose -p matrix-synctest -f tests/integration/docker-compose.test.yml up -d
 
-# 3. run all 13 scenarios, or filter by name substring:
+# 3. run all 14 scenarios, or filter by name substring:
 tests/integration/run.sh
 tests/integration/run.sh 3_offline          # just the catch-up scenario
 

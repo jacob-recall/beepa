@@ -2,10 +2,11 @@
 
 **ID:** direct-share-level
 **Date:** 2026-09-02
-**Status:** r5 — three verifier rounds complete (all blockers dispositioned
-FIX and folded in; round-3's three were mechanical completions applied without
-a further round per review-cap policy); security-review findings integrated
-with dispositions (§Security review). PRESENTED FOR USER APPROVAL.
+**Status:** IMPLEMENTED 2026-09-02 — user-approved; S1 6dd3ecf, S2 ae96444,
+S3 4164293, S4 979e2e9, S5 (this commit). S1 and S3 verified by fresh-context
+adversarial verifiers (CONFIRMED); integration 14/14 incl. the direct
+round-trip scenario. Activation per teammate: restart the uplink daemon, then
+set a conversation to Direct via the confirmed control.
 
 ## Outcome
 

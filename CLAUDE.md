@@ -112,8 +112,8 @@ lives where, security invariants, and how to run/test each piece:
 - `master/CLAUDE.md` — the always-on master Synapse stack (separate
   compose project `matrix-master`, its own ports), provisioning, and the
   v1.5 enrollment-code flow.
-- `tests/CLAUDE.md` — 20 unit tests + the consent conformance harness, all wired into tests/run.sh (consent
-  parity, uplink reconcile logic, and more), and the 13-scenario
+- `tests/CLAUDE.md` — unit tests + the consent conformance harness, all wired into tests/run.sh (consent
+  parity, uplink reconcile logic, and more), and the 14-scenario
   integration harness that drives two real homeservers end to end.
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)

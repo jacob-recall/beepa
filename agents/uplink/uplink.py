@@ -758,7 +758,14 @@ class Uplink:
         space_source = {}
         child_of = {}
         for rid, room in join.items():
-            state_events = ((room.get("state") or {}).get("events")) or []
+            # State from BOTH the `state` block and `timeline`: /sync delivers
+            # state only up to the start of the timeline window, so a recently
+            # added m.space.child (e.g. a portal linked after the last events)
+            # arrives in `timeline` and would otherwise be invisible here —
+            # leaving a shared room "sourceless" and silently unmirrored. Same
+            # guard the iMessage daemon and apps/master parseSnapshot use.
+            state_events = ((((room.get("state") or {}).get("events")) or [])
+                            + (((room.get("timeline") or {}).get("events")) or []))
             name = None
             children = []
             for e in state_events:
@@ -806,7 +813,11 @@ class Uplink:
     def full_sync(self):
         """A bounded full /sync of the LOCAL hs: state + account-data + recent."""
         flt = json.dumps({
-            "room": {"timeline": {"limit": 1}, "state": {"lazy_load_members": False}},
+            # timeline 20 (not 1): /sync partitions state at the timeline start,
+            # so recent state events (space-child links, renames) ride in the
+            # timeline block; a 1-event window can strand a link in the gap and
+            # leave a shared room sourceless. sources_from_sync scans both.
+            "room": {"timeline": {"limit": 20}, "state": {"lazy_load_members": False}},
         })
         return self.local("GET", "/_matrix/client/v3/sync",
                            query={"filter": flt, "timeout": "0"}, timeout=120)

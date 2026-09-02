@@ -80,10 +80,34 @@ for key, rel in CONFIGS.items():
 # --- 2. templatize each source file (longest values first) ----------------
 order = sorted(secrets.items(), key=lambda kv: len(kv[1]), reverse=True)
 
+# The local-account mxid the six bridges grant permissions to is parameterized
+# (${LOCAL_MXID}) so a teammate's install isn't hardcoded to the author's
+# account. It is NOT a secret — scrub it by exact string, and ONLY in the files
+# that grant it (bridge configs + the gmessages appservice user-regex), so an
+# unrelated mention could never be caught. LIVE_MXID comes from .env's
+# LOCAL_LOCALPART (default 'jkali'), matching what hub/render-hub.sh renders.
+def _env_localpart():
+    try:
+        with open(os.path.join(ROOT, ".env")) as f:
+            for line in f:
+                if line.startswith("LOCAL_LOCALPART="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "jkali"
+LIVE_MXID = "@%s:localhost" % _env_localpart()
+MXID_FILES = {
+    "meta/config.yaml", "twitter/config.yaml", "gmessages/config.yaml",
+    "linkedin/config.yaml", "whatsapp/config.yaml",
+    "gmessages/registration.yaml", "synapse/gmessages-registration.yaml",
+}
+
 def templatize(rel):
     text = read(rel)
     for ph, val in order:
         text = text.replace(val, "${%s}" % ph)
+    if rel in MXID_FILES:
+        text = text.replace(LIVE_MXID, "${LOCAL_MXID}")
     dest = os.path.join(TPL, rel + ".tmpl")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w") as f:

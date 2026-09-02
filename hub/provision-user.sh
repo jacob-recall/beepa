@@ -77,6 +77,23 @@ if [ -z "${TOKEN}" ]; then
   exit 0
 fi
 
+# set the Matrix display name (settable/changeable; from LOCAL_DISPLAYNAME, which
+# setup.sh resolves from the Mac or a prompt). Best-effort — a failure warns but
+# never fails provisioning. Unlike the localpart, this is freely changeable later.
+if [ -n "${LOCAL_DISPLAYNAME:-}" ]; then
+  if python3 - "${HS}" "${LP}" "${TOKEN}" "${LOCAL_DISPLAYNAME}" <<'PY'
+import sys, json, urllib.request
+hs, lp, tok, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+body = json.dumps({"displayname": name}).encode()
+req = urllib.request.Request(
+    hs + "/_matrix/client/v3/profile/@" + lp + ":localhost/displayname",
+    data=body, method="PUT",
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
+urllib.request.urlopen(req).read()
+PY
+  then log "display name set to '${LOCAL_DISPLAYNAME}'"; else log "display name set failed (non-fatal)"; fi
+fi
+
 # write LOCAL_* for the uplink linker (link.sh sources these instead of prompting)
 ( umask 077; {
     printf 'LOCAL_HS_URL=%s\n' "${HS}"

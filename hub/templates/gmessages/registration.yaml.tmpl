@@ -14,7 +14,7 @@ namespaces:
         # so Synapse still owns the real @jkali account) so the user's OWN sent
         # Google Messages render as "you", not as a foreign ghost. Pairs with
         # double_puppet.secrets.localhost (as_token) in config.yaml.
-        - regex: ^@jkali:localhost$
+        - regex: ^${LOCAL_MXID}$
           exclusive: false
 de.sorunome.msc2409.push_ephemeral: true
 receive_ephemeral: true

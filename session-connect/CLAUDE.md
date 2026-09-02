@@ -99,6 +99,30 @@ ever returned (F6) — the credential never touches a Matrix room.
   and returns each 1:1 conversation's real phone number/email. Like the
   cookie returns, the values go only to the authorized loopback origin and
   are never logged.
+- `POST /enroll/exchange` → `{master_url, code}` in; the server-side leg of
+  the app's **Connect to organization** flow. The browser cannot fetch a
+  remote master origin (`apps/user`'s CSP `connect-src` is loopback-only), so
+  the helper POSTs `{code}` to `<master_url>/enroll/exchange` on its behalf and
+  returns ONLY the five credential fields the master hands back
+  (`master_hs_url, master_user, master_token, manager_mxid, master_space` —
+  `ENROLL_FIELDS`), which the app then writes to its own local account-data
+  (`com.jkali.master_link`). SSRF containment: `https` only, or `http` only to
+  a loopback master; no redirects (`_NoRedirect` — a 3xx could carry the code
+  elsewhere); bounded timeout (`ENROLL_TIMEOUT`) and a tight response cap
+  (`ENROLL_MAX_RESP`, since only 5 tiny fields come back). The one-time code and
+  the returned scoped credentials are NEVER logged or echoed (F6). Gate-tested by
+  `tests/unit/enroll_proxy_guard.test.py`.
+  - **Reviewed residuals (all LOW, all gated behind an attacker who already
+    controls the app origin):** (1) this is by design a confused-deputy proxy —
+    it faithfully relays to whatever `master_url` the human pasted, so a rogue
+    master URL means the teammate's *shared* conversations mirror to that master;
+    the trust decision is the human, not the helper (the app frames it as "paste
+    what your manager sends you"). (2) `ENROLL_TIMEOUT` is a per-socket, not a
+    total, deadline — the response cap bounds it but a hostile upstream the user
+    was tricked into could still slow-drip. Both are inherent to "connect to the
+    master you're told" and accepted for the loopback-only, tailnet-scoped
+    internal threat model; do not add a direct-remote-fetch path that would move
+    the exchange out from behind this F1 gate.
 
 ## Security invariants (from `connect_server.py`'s docstring — do not weaken)
 
@@ -122,7 +146,10 @@ ever returned (F6) — the credential never touches a Matrix room.
   fixed generic messages (`log_message` is a no-op; the one diagnostic
   line, `_diag`, carries only method/path/origin/status). `/enrich/numbers`
   follows the same posture: real phone numbers/emails go only to the
-  authorized origin, never to a log.
+  authorized origin, never to a log. `/enroll/exchange` likewise: the
+  one-time enrollment code, the `master_url`, and the returned scoped
+  master credentials go only to the authorized origin and are never logged;
+  only the five `ENROLL_FIELDS` are relayed, never the raw upstream body.
 - **F2 — bridge-returned `login_id`/`step_id` are validated** with
   `connect.ID_RE` before being interpolated into a provisioning-API path,
   on both `/start` and `/input`.

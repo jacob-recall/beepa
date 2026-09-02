@@ -30,6 +30,15 @@ numbers / emails: like the cookie return, they go ONLY to the authorized
 loopback origin and are NEVER logged (F6). The resolver is SELECT-only — no
 write happens anywhere on this path.
 
+POST /enroll/exchange (F1-gated) is the server-side leg of the app's "Connect
+to organization" flow. The browser cannot fetch a REMOTE master origin (the
+app's CSP connect-src is loopback-only), so it hands us {master_url, code} and
+we POST {code} to <master_url>/enroll/exchange here, returning ONLY the five
+known credential fields (ENROLL_FIELDS). SSRF containment: only https (or http
+to a loopback master), no redirects (a 3xx could carry the code elsewhere),
+bounded timeout. The one-time code and the returned scoped credentials are
+NEVER logged (F6) — the app writes them into its own local account-data.
+
 Security invariants (do not weaken) — identical to gmessages-connect:
   * Binds EXACTLY 127.0.0.1:8021 — loopback only, never 0.0.0.0 / "".
   * F1 — every do_POST is gated by _authorized() BEFORE any side effect: (a)
@@ -52,6 +61,8 @@ import json
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 
 import connect  # session-connect/connect.py — same dir; imported side-effect-free
 
@@ -67,10 +78,26 @@ import number_resolver  # agents/enrich/number_resolver.py — SELECT-only, fail
 APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
 SERVER_NETWORKS = ("twitter", "linkedin", "instagram")
 ENRICH_NUMBERS_PATH = "/enrich/numbers"
+ENROLL_EXCHANGE_PATH = "/enroll/exchange"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8021
 MAX_BODY = 64 * 1024  # /input bodies are tiny (a passcode); cap defensively.
+ENROLL_TIMEOUT = 15   # seconds — per-socket timeout on the outbound exchange
+ENROLL_MAX_RESP = 16 * 1024  # the exchange returns 5 tiny fields; cap tightly so
+                             # a rogue master can't slow-drip 64KB to stall the
+                             # single-threaded helper (review residual, LOW).
+# Fields the master's /enroll/exchange returns; we relay ONLY these, never the
+# raw upstream body (F6). Must match master/enroll.py's exchange() response.
+ENROLL_FIELDS = ("master_hs_url", "master_user", "master_token",
+                 "manager_mxid", "master_space")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects on the enroll exchange: a redirect could carry the
+    one-time code to a different host. Any 3xx becomes a failure instead."""
+    def redirect_request(self, *a, **k):
+        return None
 
 _PATH_RE = re.compile(r"^/connect/([a-z]+)/(start|input)$")
 
@@ -169,7 +196,9 @@ def _make_handler():
 
         def do_OPTIONS(self):
             if self._origin() is not None and (
-                    self._route()[0] is not None or self.path == ENRICH_NUMBERS_PATH):
+                    self._route()[0] is not None
+                    or self.path == ENRICH_NUMBERS_PATH
+                    or self.path == ENROLL_EXCHANGE_PATH):
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -199,6 +228,12 @@ def _make_handler():
                 self._discard_body()
                 self._enrich_numbers()
                 return
+            if self.path == ENROLL_EXCHANGE_PATH:
+                if not self._authorized():   # F1: gate BEFORE any outbound call
+                    return
+                body = self._read_json_body()   # reads + drains the body itself
+                self._enroll_exchange(body)
+                return
             name, verb = self._route()
             if name is None:
                 self._json(404, {"error": "not found"})
@@ -225,6 +260,49 @@ def _make_handler():
                 self._json(500, {"error": "Could not resolve numbers."}, cors=True)
                 return
             self._json(200, {"numbers": numbers}, cors=True)
+
+        # ---- server-side leg of the GUI "Connect to organization" flow ----
+        def _enroll_exchange(self, body):
+            # The browser CANNOT fetch a remote master origin — apps/user's CSP
+            # connect-src is loopback-only by design. So the app hands us
+            # {master_url, code} and we perform the master's /enroll/exchange on
+            # its behalf, over the network the CSP can't police. F6 posture: the
+            # one-time code and the returned credentials are NEVER logged; we
+            # return ONLY the five known credential fields (ENROLL_FIELDS),
+            # never the raw upstream body.
+            murl = (body or {}).get("master_url")
+            code = (body or {}).get("code")
+            if not isinstance(murl, str) or not isinstance(code, str) or not murl or not code:
+                self._json(400, {"status": "failed"}, cors=True); return
+            murl = murl.rstrip("/")
+            try:
+                u = urllib.parse.urlparse(murl)
+            except ValueError:
+                self._json(400, {"status": "failed"}, cors=True); return
+            host = (u.hostname or "").lower()
+            loopback = host in ("127.0.0.1", "localhost", "::1")
+            # SSRF containment: https to the (user-chosen, tailnet) master, or
+            # http ONLY to a loopback master for local testing — no other shape.
+            if not host or not (u.scheme == "https" or (u.scheme == "http" and loopback)):
+                self._json(400, {"status": "failed"}, cors=True); return
+            payload = json.dumps({"code": code}).encode()
+            req = urllib.request.Request(
+                murl + "/enroll/exchange", data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
+            # No redirects (a 3xx could carry the code to another host); bounded time.
+            opener = urllib.request.build_opener(_NoRedirect())
+            try:
+                with opener.open(req, timeout=ENROLL_TIMEOUT) as r:
+                    raw = r.read(ENROLL_MAX_RESP + 1)
+                data = json.loads(raw.decode("utf-8"))
+            except BaseException:      # unreachable, TLS error, 4xx/5xx, bad JSON
+                self._json(502, {"status": "failed"}, cors=True); return
+            if not isinstance(data, dict):
+                self._json(502, {"status": "failed"}, cors=True); return
+            out = {k: data.get(k) for k in ENROLL_FIELDS}
+            if not out.get("master_token") or not out.get("master_hs_url"):
+                self._json(502, {"status": "failed"}, cors=True); return
+            self._json(200, out, cors=True)
 
         # ---- turn a bridge step response into what the browser gets back ----
         # complete -> {status:complete, account}; user_input -> {status:

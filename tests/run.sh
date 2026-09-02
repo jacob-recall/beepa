@@ -22,6 +22,7 @@ python3 tests/unit/enroll_password_derivation.test.py
 python3 tests/conformance/consent_conformance.py
 python3 tests/unit/uplink_proposal_sanitize.test.py
 python3 tests/unit/number_resolver.test.py
+python3 tests/unit/enroll_proxy_guard.test.py
 python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_proposals.test.py
 python3 tests/unit/uplink_sources.test.py

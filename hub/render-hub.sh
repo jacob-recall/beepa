@@ -39,6 +39,14 @@ DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -
 [ -n "${DB_PASSWORD}" ] || { log "FATAL: POSTGRES_PASSWORD not set in .env"; exit 1; }
 export DB_PASSWORD
 
+# --- LOCAL_MXID: the mxid the six bridges grant permissions to. A plain value
+#     from .env's LOCAL_LOCALPART (like DB_PASSWORD), NOT a minted secret — so it
+#     is passed explicitly below and never written to .hub-secrets.local. Default
+#     'jkali' preserves the historical identity for an unconfigured .env. ---
+LOCAL_LOCALPART="$(grep -E '^LOCAL_LOCALPART=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
+LOCAL_MXID="@${LOCAL_LOCALPART:-jkali}:localhost"
+export LOCAL_MXID
+
 # --- load existing secrets, mint any missing (never in --verify) ----------
 # On a fresh clone synapse/ does not exist yet (the render loop makes it later),
 # so ensure the secrets dir exists before we read or write .hub-secrets.local.
@@ -71,7 +79,7 @@ while IFS= read -r tmpl; do
   rel="${tmpl#"${TPL}/"}"; dest="${OUT_ROOT}/${rel%.tmpl}"
   mkdir -p "$(dirname "${dest}")"
   # shellcheck disable=SC2086
-  python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD ${VARS}
+  python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD LOCAL_MXID ${VARS}
   chmod 600 "${dest}"
   count=$((count+1))
 done < <(find "${TPL}" -name '*.tmpl' | sort)

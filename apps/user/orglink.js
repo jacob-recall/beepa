@@ -24,6 +24,28 @@ import { S } from '../../shared/state.js';
 const LINK_TYPE = 'com.jkali.master_link';
 const DEFAULT_ENROLL = 'http://127.0.0.1:8019';
 
+// The exchange to a REMOTE master can't be a direct browser fetch — apps/user's
+// CSP connect-src is loopback-only by design. So we hand {master_url, code} to
+// the local session-connect helper (already in the CSP's 8021-8025 range) and it
+// performs the master's /enroll/exchange server-side. Helper discovery + F1
+// headers mirror the proven copy in apps/user/enrich.js / shared/ui/connections.js.
+const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
+let _sessionConnectBase = null;
+async function sessionConnectBase() {
+  if (_sessionConnectBase) return _sessionConnectBase;
+  try {
+    const r = await fetch('connect.local.json', { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      if (j && typeof j.base === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(j.base)) {
+        _sessionConnectBase = j.base; return _sessionConnectBase;
+      }
+    }
+  } catch (e) { /* fall back to the default below */ }
+  _sessionConnectBase = 'http://127.0.0.1:8021';
+  return _sessionConnectBase;
+}
+
 function adPath() {
   return '/_matrix/client/v3/user/' + encodeURIComponent(S.userId) + '/account_data/' + LINK_TYPE;
 }
@@ -82,7 +104,7 @@ export async function initOrgLinkUI() {
 
   const note = el('p', 'muted');
   note.style.cssText = 'margin-top:var(--space-3,13px);font-size:12px;';
-  note.appendChild(el('span', '', 'One-time setup / remote master: run this on this machine, then Connect: '));
+  note.appendChild(el('span', '', 'Any master (local or remote) works from here. If the connect helper isn’t running on this machine, enroll from a terminal instead: '));
   const cmd = el('code', '');
   cmd.style.cssText = 'display:block;margin-top:6px;padding:6px 10px;background:var(--color-neutral-100,#f9f4ed);border-radius:8px;';
   cmd.textContent = "bash agents/uplink/link.sh '<master-url>' '<code>'";
@@ -119,17 +141,20 @@ export async function initOrgLinkUI() {
     connectBtn.disabled = true; connectBtn.textContent = 'Connecting…';
     let creds = null;
     try {
-      const res = await fetch(base + '/enroll/exchange', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code }),
+      // Via the loopback helper (not a direct cross-origin fetch): it does the
+      // master exchange server-side and returns only the credential fields.
+      const helper = await sessionConnectBase();
+      const res = await fetch(helper + '/enroll/exchange', {
+        method: 'POST', headers: SESSION_CONNECT_HEADERS,
+        body: JSON.stringify({ master_url: base, code }),
       });
       if (!res.ok) {
-        showWarn('Code rejected (' + res.status + '). It may be used, expired, or wrong.');
+        showWarn('Code rejected or master unreachable (' + res.status + '). It may be used, expired, or wrong — or the connect helper isn’t running (see the command below).');
         return;
       }
       creds = await res.json();
     } catch (e) {
-      showWarn('Could not reach the master at that URL (check the address, or run the command below on this machine). ' + String(e.message || e));
+      showWarn('Could not reach the local connect helper. Make sure setup.sh has run on this machine, or use the command below. ' + String(e.message || e));
       return;
     } finally {
       connectBtn.disabled = false;

@@ -63,6 +63,37 @@ ensure_docker
 # run; NEVER overwrite an existing one — that would change the DB password out
 # from under an existing Postgres volume.
 ENV_FILE="${HERE}/.env"
+
+# Resolve the LOCAL identity (localpart + display name) ONCE, at first install.
+# The localpart is what the six bridges grant permissions to (rendered into their
+# configs by hub/render-hub.sh), so it is fixed for the life of an install —
+# changing it later means re-logging-in every bridge. Default from the Mac
+# (`id -un` / `id -F`); override by pre-setting LOCAL_LOCALPART/LOCAL_DISPLAYNAME
+# or by answering the prompt on a TTY. An existing .env's identity is
+# authoritative and is NEVER rotated.
+slugify_localpart() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._=/-]+/-/g; s/^[-_]+//; s/-+$//'
+}
+if [ -f "${ENV_FILE}" ] && grep -q '^LOCAL_LOCALPART=' "${ENV_FILE}"; then
+  LOCAL_LOCALPART="$(grep -E '^LOCAL_LOCALPART=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+  LOCAL_DISPLAYNAME="$(grep -E '^LOCAL_DISPLAYNAME=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
+  log "identity: @${LOCAL_LOCALPART}:localhost (from existing .env — unchanged)"
+else
+  LOCAL_LOCALPART="${LOCAL_LOCALPART:-$(slugify_localpart "$(id -un 2>/dev/null || echo user)")}"
+  [ -n "${LOCAL_LOCALPART}" ] || LOCAL_LOCALPART="user"
+  LOCAL_DISPLAYNAME="${LOCAL_DISPLAYNAME:-$(id -F 2>/dev/null || echo "${LOCAL_LOCALPART}")}"
+  [ -n "${LOCAL_DISPLAYNAME}" ] || LOCAL_DISPLAYNAME="${LOCAL_LOCALPART}"
+  if [ -t 0 ]; then
+    printf '[setup] Local account name (localpart) [%s]: ' "${LOCAL_LOCALPART}" >&2
+    read -r _lp || true; [ -n "${_lp:-}" ] && LOCAL_LOCALPART="$(slugify_localpart "${_lp}")"
+    printf '[setup] Your display name [%s]: ' "${LOCAL_DISPLAYNAME}" >&2
+    read -r _dn || true; [ -n "${_dn:-}" ] && LOCAL_DISPLAYNAME="${_dn}"
+  fi
+  log "identity: @${LOCAL_LOCALPART}:localhost  (display: ${LOCAL_DISPLAYNAME})"
+fi
+export LOCAL_LOCALPART LOCAL_DISPLAYNAME
+
 if [ ! -f "${ENV_FILE}" ]; then
   if command -v openssl >/dev/null 2>&1; then
     PW="$(openssl rand -hex 32)"
@@ -73,15 +104,19 @@ if [ ! -f "${ENV_FILE}" ]; then
       printf 'POSTGRES_PASSWORD=%s\n' "${PW}"
       printf 'HOST_UID=%s\n' "$(id -u)"
       printf 'HOST_GID=%s\n' "$(id -g)"
+      printf 'LOCAL_LOCALPART=%s\n' "${LOCAL_LOCALPART}"
+      printf 'LOCAL_DISPLAYNAME=%s\n' "${LOCAL_DISPLAYNAME}"
     } > "${ENV_FILE}" )
   chmod 600 "${ENV_FILE}"
-  log "created .env (fresh Postgres password; HOST_UID=$(id -u) HOST_GID=$(id -g))"
+  log "created .env (fresh Postgres password; HOST_UID=$(id -u) HOST_GID=$(id -g); identity @${LOCAL_LOCALPART}:localhost)"
 else
-  # Existing .env: leave the password alone; just ensure the UID/GID lines exist
-  # so the container user matches whoever owns the bind mounts.
+  # Existing .env: leave the password AND the identity alone; just ensure the
+  # UID/GID + identity lines exist (append if a pre-identity .env is missing them).
   grep -q '^HOST_UID=' "${ENV_FILE}" || printf 'HOST_UID=%s\n' "$(id -u)" >> "${ENV_FILE}"
   grep -q '^HOST_GID=' "${ENV_FILE}" || printf 'HOST_GID=%s\n' "$(id -g)" >> "${ENV_FILE}"
-  log ".env present — password unchanged; host UID/GID ensured"
+  grep -q '^LOCAL_LOCALPART=' "${ENV_FILE}" || printf 'LOCAL_LOCALPART=%s\n' "${LOCAL_LOCALPART}" >> "${ENV_FILE}"
+  grep -q '^LOCAL_DISPLAYNAME=' "${ENV_FILE}" || printf 'LOCAL_DISPLAYNAME=%s\n' "${LOCAL_DISPLAYNAME}" >> "${ENV_FILE}"
+  log ".env present — password + identity unchanged; host UID/GID ensured"
 fi
 
 # --- 0b. render the hub config from tracked templates (idempotent) ---
@@ -153,6 +188,18 @@ install_agent "${HERE}/gmessages-connect/com.jkali.gmessages-connect.plist" \
   "com.jkali.gmessages-connect" "http://127.0.0.1:8020/connect/health"
 install_agent "${HERE}/session-connect/com.jkali.session-connect.plist" \
   "com.jkali.session-connect"   "http://127.0.0.1:8021/connect/health"
+
+# Uplink daemon (agents/uplink/): install it now so it runs IDLE and begins
+# mirroring the moment you enroll from the app (Settings > Connect to
+# organization) — no terminal step. It polls the local hub's account-data for
+# com.jkali.master_link and idles (logs "not connected", sleeps) until it
+# appears. Needs the LOCAL_* creds provision-user.sh just wrote; skip if neither
+# creds file exists yet so KeepAlive can't crash-loop a credential-less daemon.
+if [ -f "${HERE}/agents/uplink/local.env.local" ] || [ -f "${HERE}/agents/uplink/uplink.env.local" ]; then
+  install_agent "${HERE}/agents/uplink/com.jkali.uplink.plist" "com.jkali.uplink" ""
+else
+  log "skip com.jkali.uplink — no hub creds yet; it loads on a re-run after provisioning succeeds."
+fi
 
 # macOS Contacts importer (agents/contacts/): hourly one-shot launchd job that
 # reads Contacts.app into the local, mode-600 contacts.db. Nothing leaves the

@@ -112,11 +112,11 @@ input:focus-visible, .input:focus-visible { border-color: var(--color-accent); o
 }
 .view-head .muted, .view-head p, .feed-head .muted { color: var(--color-muted); }
 .view-head input, #home-search, #source-search, #directory-search, #search-input,
-#console-input, #convo-input {
+#console-input, #convo-input, #proposal-input, #contact-proposal-input {
   background: var(--color-neutral-200); color: var(--color-text);
   border: none; border-radius: 8px; padding: 8px 14px;
 }
-.view-head input:focus-visible, #home-search:focus-visible, #convo-input:focus-visible {
+.view-head input:focus-visible, #home-search:focus-visible, #convo-input:focus-visible, #proposal-input:focus-visible, #contact-proposal-input:focus-visible {
   outline: 2px solid var(--color-accent); outline-offset: 0;
 }
 
@@ -249,11 +249,11 @@ input:focus-visible, .input:focus-visible { border-color: var(--color-accent); o
 .msg-meta .msg-sender { font-weight: 600; color: var(--color-accent-600); }
 .msg-row.sent .msg-meta .msg-sender { color: var(--color-muted); }
 
-#convo-compose {
+#convo-compose, #proposal-compose, #contact-proposal-compose {
   background: var(--color-neutral-200); border-top: 1px solid var(--color-divider);
   padding: 10px 16px; gap: 8px;
 }
-#convo-compose input {
+#convo-compose input, #proposal-compose input, #contact-proposal-compose input {
   background: var(--color-surface); border-radius: 8px; border: none;
 }
 #convo-placeholder { color: var(--color-muted); }

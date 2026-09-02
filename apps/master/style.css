@@ -72,10 +72,11 @@
 #list-head { display: flex; flex-direction: column; gap: 8px; }
 #contacts-export { align-self: flex-start; }
 
-#proposal-pane { flex: 0 0 auto; }
-.proposal-footer { display: flex; align-items: center; gap: 12px; padding: 12px 16px; }
-#proposal-compose { padding: 0 16px 16px; }
-.proposal-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; }
+#proposal-pane, #contact-proposal-pane { flex: 0 0 auto; }
+#proposal-compose, #contact-proposal-compose { display: flex; gap: 8px; padding: 10px 16px; align-items: center; }
+#proposal-compose input, #contact-proposal-compose input { flex: 1; }
+#proposal-compose button, #contact-proposal-compose button { width: auto; margin: 0; flex: 0 0 auto; white-space: nowrap; }
+#proposal-status, #contact-proposal-status { padding: 0 16px 10px; font-size: 13px; }
 .addteam-card { max-width: 420px; width: 100%; min-width: 0; overflow: hidden; }
 #addteam-result { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .code-display, .addteam-cmd {

@@ -1100,21 +1100,8 @@ function setupProposalComposer(rec) {
   proposalStatus('');
   const input = $('proposal-input');
   if (input) input.value = '';
-  const tmpl = $('proposal-template');
-  if (tmpl) tmpl.checked = false;
-  // Collapsed by default each time a room is opened (mockup 1g: a footer note
-  // + "Suggest a reply" button; the compose fields expand only on request).
-  const compose = $('proposal-compose');
-  if (compose) compose.classList.add('hidden');
   if (!ctx) { pane.classList.add('hidden'); return; }
   pane.classList.remove('hidden');
-  const note = $('proposal-note');
-  if (note) {
-    note.textContent = "You can't send in this conversation. A suggestion goes to "
-      + sanitizeLine(ctx.label) + "'s inbox as a draft — they decide whether to send it.";
-  }
-  $('proposal-target-label').textContent = sanitizeLine(rec.name || ctx.target);
-  loadTemplates(ctx.proposalsRoom).catch(() => {});
 }
 
 function proposalStatus(text, isError) {
@@ -1123,35 +1110,6 @@ function proposalStatus(text, isError) {
   s.textContent = text || '';
   s.classList.toggle('hidden', !text);
   s.classList.toggle('error', !!isError);
-}
-
-// Read existing reusable templates (com.jkali.proposal events with template:true)
-// from this teammate's proposals room and offer them in a picker. Pure read.
-async function loadTemplates(proposalsRoom) {
-  const sel = $('proposal-templates');
-  if (!sel) return;
-  sel.replaceChildren();
-  const opt0 = el('option', null, 'Insert a saved template…');
-  opt0.value = '';
-  sel.appendChild(opt0);
-  if (!ROOMID_RE.test(proposalsRoom) || !MS.proposalsRoomSet.has(proposalsRoom)) return;
-  try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom) + '/messages?dir=b&limit=100';
-    const data = await api('GET', q);
-    const chunk = Array.isArray(data.chunk) ? data.chunk : [];
-    const seen = new Set();
-    for (const e of chunk) {
-      if (!e || e.type !== 'com.jkali.proposal' || !e.content) continue;
-      if (e.content.template !== true) continue;
-      const body = typeof e.content.body === 'string' ? e.content.body : '';
-      if (!body || seen.has(body)) continue;
-      seen.add(body);
-      const label = body.length > 60 ? body.slice(0, 57) + '…' : body;
-      const opt = el('option', null, sanitizeLine(label));
-      opt.value = body;                                 // full body via .value (not HTML)
-      sel.appendChild(opt);
-    }
-  } catch (e) { /* templates are optional; leave just the placeholder */ }
 }
 
 // Pure builder for a PERSON-targeted proposal's content (extracted so a unit
@@ -1254,14 +1212,12 @@ async function submitProposal(opts) {
   const input = $('proposal-input');
   const body = (input && input.value ? input.value : '').trim();
   if (!body) { proposalStatus('Type a suggestion first.', true); return; }
-  const isTemplate = !!($('proposal-template') && $('proposal-template').checked);
   const content = {
     target_room: target,
     body,
     created_by: S.userId,
     origin_ts: Date.now(),
   };
-  if (isTemplate) content.template = true;
   const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
   proposalStatus('Sending suggestion…');
   try {
@@ -1270,10 +1226,7 @@ async function submitProposal(opts) {
     await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
       + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
     if (input) input.value = '';
-    if ($('proposal-template')) $('proposal-template').checked = false;
-    proposalStatus('Suggestion sent to ' + sanitizeLine(ctx.label || 'teammate')
-      + ' for review. It was not sent to anyone externally.');
-    if (isTemplate) loadTemplates(proposalsRoom).catch(() => {});
+    proposalStatus('Suggested.');
   } catch (e) {
     proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
   }
@@ -1569,11 +1522,6 @@ function selectContact(ct) {
   }
   const input = $('contact-proposal-input');
   if (input) input.value = '';
-  const note = $('contact-proposal-note');
-  if (note) {
-    note.textContent = "You can't send. A suggestion goes to " + sanitizeLine(ct.label || 'the teammate')
-      + "'s inbox as a draft — they decide whether to send it.";
-  }
   const proposalsRoom = ct.label ? MS.proposalsByUser.get(ct.label) : null;
   const send = $('contact-proposal-send');
   if (send) send.disabled = !proposalsRoom;
@@ -1862,28 +1810,22 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   });
   const contactSend = $('contact-proposal-send');
   if (contactSend) contactSend.addEventListener('click', () => { submitContactProposal().catch(() => {}); });
+  const contactInput = $('contact-proposal-input');
+  if (contactInput) contactInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitContactProposal().catch(() => {}); }
+  });
   $('room-back').addEventListener('click', () => {
     stopTail();
     setDetailMode('empty');
     navTo(MS.activeView === 'room' ? 'recent' : MS.activeView);
   });
 
-  // Expand/collapse the proposal compose fields (pure CSS class toggle — no
-  // write path here; the only write is submitProposal(), wired separately below).
-  const ptoggle = $('proposal-toggle');
-  if (ptoggle) ptoggle.addEventListener('click', () => {
-    const compose = $('proposal-compose');
-    if (compose) compose.classList.toggle('hidden');
-  });
-
   // Compose-proposal wiring (the one write path — a proposal, not a send).
   const psend = $('proposal-send');
   if (psend) psend.addEventListener('click', () => { submitProposal().catch(() => {}); });
-  const ptpl = $('proposal-templates');
-  if (ptpl) ptpl.addEventListener('change', () => {
-    const input = $('proposal-input');
-    if (input && ptpl.value) { input.value = ptpl.value; input.focus(); }
-    ptpl.value = '';
+  const pinput = $('proposal-input');
+  if (pinput) pinput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitProposal().catch(() => {}); }
   });
 
   // restore session, else auto-login from a provisioned local session file

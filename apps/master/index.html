@@ -6,8 +6,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa Console</title>
 <link rel="stylesheet" href="../../shared/style/organic.css?v=wa4">
-<link rel="stylesheet" href="style.css?v=wa8">
-<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa4">
+<link rel="stylesheet" href="style.css?v=wa10">
+<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa10">
 </head>
 <body>
 <section id="view-signin">
@@ -79,28 +79,11 @@
             <div id="room-messages"></div>
             <div id="room-status" class="convo-status hidden"></div>
             <div id="proposal-pane" class="hidden">
-              <div class="proposal-footer">
-                <p id="proposal-note" class="proposal-note"></p>
-                <button id="proposal-toggle" type="button" class="btn btn-primary proposal-toggle-btn">Suggest a reply</button>
+              <div id="proposal-compose">
+                <input id="proposal-input" placeholder="Message" spellcheck="true" autocomplete="off">
+                <button id="proposal-send" type="button" class="primary">Suggest a reply</button>
               </div>
-              <div id="proposal-compose" class="hidden">
-                <div class="proposal-head">
-                  <span class="proposal-kicker">Suggest a message</span>
-                  <span class="proposal-hint">Proposal only — teammate reviews and sends from their account.</span>
-                </div>
-                <div class="proposal-row">
-                  <span class="proposal-to muted">To conversation:</span>
-                  <span id="proposal-target-label" class="proposal-target"></span>
-                </div>
-                <textarea id="proposal-input" class="input" rows="3" placeholder="Write a suggested message…" spellcheck="true"></textarea>
-                <div class="proposal-controls">
-                  <select id="proposal-templates" class="input" aria-label="Insert a saved template"></select>
-                  <label class="proposal-tmpl"><input id="proposal-template" type="checkbox"> Save as template</label>
-                  <span class="spacer"></span>
-                  <button id="proposal-send" type="button" class="btn btn-primary proposal-btn">Suggest</button>
-                </div>
-                <div id="proposal-status" class="proposal-status hidden"></div>
-              </div>
+              <div id="proposal-status" class="proposal-status hidden"></div>
             </div>
           </div>
           <div id="detail-admin" class="detail-panel hidden">
@@ -134,19 +117,13 @@
             </header>
             <div class="admin-scroll">
               <div id="contact-rooms" class="convo-list"></div>
-              <div id="contact-proposal-pane" class="proposal-compose-static">
-                <div class="proposal-head">
-                  <span class="proposal-kicker">Propose a message</span>
-                  <span class="proposal-hint">Proposal only — teammate reviews and sends from their account.</span>
-                </div>
-                <p id="contact-proposal-note" class="proposal-note"></p>
-                <textarea id="contact-proposal-input" class="input" rows="3" placeholder="Write a suggested message…" spellcheck="true"></textarea>
-                <div class="proposal-controls">
-                  <span class="spacer"></span>
-                  <button id="contact-proposal-send" type="button" class="btn btn-primary proposal-btn">Propose</button>
-                </div>
-                <div id="contact-proposal-status" class="proposal-status hidden"></div>
+            </div>
+            <div id="contact-proposal-pane">
+              <div id="contact-proposal-compose">
+                <input id="contact-proposal-input" placeholder="Message" spellcheck="true" autocomplete="off">
+                <button id="contact-proposal-send" type="button" class="primary">Suggest a reply</button>
               </div>
+              <div id="contact-proposal-status" class="proposal-status hidden"></div>
             </div>
           </div>
           <div id="convo-placeholder">Select a conversation.</div>
@@ -156,6 +133,6 @@
   </main>
 </div>
 
-<script type="module" src="main.js"></script>
+<script type="module" src="main.js?v=wa10"></script>
 </body>
 </html>

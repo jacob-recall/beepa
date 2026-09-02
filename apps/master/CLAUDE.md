@@ -11,7 +11,7 @@ contacts) — and, as of V2, the single place the manager can write a
 
 - `index.html` / `style.css` — the shell. **There is no message-composer
   input element anywhere in `index.html`** except the one dedicated
-  proposal-compose textarea (`#proposal-input`), which is clearly labeled
+  proposal-compose input (`#proposal-input`), which is clearly labeled
   and writes only `com.jkali.proposal` (see below) — it is not, and must
   never become, a way to post `m.room.message`.
 - `main.js` — everything else: sign-in, the master-homeserver snapshot

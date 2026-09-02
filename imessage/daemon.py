@@ -385,39 +385,95 @@ def cli_json(*args, timeout=60):
         raise RuntimeError("engine output too large")
     return _extract_json(p.stdout.decode("utf-8", "replace"))
 
+_AX_PROMPTED = {"done": False}
+
+def _ax_trusted(prompt=False):
+    """This process's macOS Accessibility trust, via AXIsProcessTrusted. macOS
+    attributes the CLI's Accessibility to its launchd-launched ancestor — this
+    very python3 — so the daemon's OWN status is exactly what the engine's
+    mutating preflight will see. prompt=True calls AXIsProcessTrustedWithOptions
+    with the prompt option, which REGISTERS python3 as a row in System Settings
+    > Privacy & Security > Accessibility and shows the system grant dialog (the
+    only way to make the row appear without the user clicking '+'). Fail-open:
+    if this introspection breaks, sends proceed and the engine's own error path
+    still catches a real missing grant."""
+    try:
+        import ctypes
+        AS = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        AS.AXIsProcessTrusted.restype = ctypes.c_bool
+        if not prompt:
+            return bool(AS.AXIsProcessTrusted())
+        CF = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        CF.CFDictionaryCreate.restype = ctypes.c_void_p
+        CF.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+            ctypes.c_void_p, ctypes.c_void_p]
+        key = ctypes.c_void_p.in_dll(AS, "kAXTrustedCheckOptionPrompt")
+        yes = ctypes.c_void_p.in_dll(CF, "kCFBooleanTrue")
+        keys = (ctypes.c_void_p * 1)(key)
+        vals = (ctypes.c_void_p * 1)(yes)
+        opts = CF.CFDictionaryCreate(None, keys, vals, 1, None, None)
+        AS.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+        AS.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+        return bool(AS.AXIsProcessTrustedWithOptions(opts))
+    except Exception as e:
+        log.info("ax introspection failed (%s) — assuming trusted", type(e).__name__)
+        return True
+
+def _engine_mut(args, timeout):
+    """Run a MUTATING engine command (send/react/edit/create-chat). All mutating
+    ops need macOS Accessibility, which macOS attributes to the daemon's python3
+    (the launchd-launched host — same pattern as Beeper granting Beeper Desktop).
+    Pre-check it here and fail FAST when missing: register python3 in the
+    Accessibility list + show the system dialog (once per daemon run), and open
+    System Settings directly on that pane via the allowlisted, rate-capped
+    cmd_open (B-1/B-7) — granting becomes one toggle, not a hunt. The engine's
+    own error output is still checked as a fallback. list-argv, shell=False —
+    M-20 preserved."""
+    if not _ax_trusted():
+        log.info("accessibility missing (grant the daemon's python3) — opening pane")
+        if not _AX_PROMPTED["done"]:
+            _AX_PROMPTED["done"] = True
+            threading.Thread(target=_ax_trusted, kwargs={"prompt": True},
+                             daemon=True).start()
+        cmd_open("accessibility")
+        return False
+    try:
+        p = subprocess.run([CLI, *args], capture_output=True,
+                           timeout=timeout, shell=False)
+        ok, out = p.returncode == 0, (p.stdout or b"") + (p.stderr or b"")
+    except subprocess.TimeoutExpired as e:
+        ok, out = False, (e.stdout or b"") + (e.stderr or b"")
+        log.info("engine timeout (mutating op)")
+    if not ok and b"Accessibility" in out:
+        log.info("engine blocked on missing Accessibility grant")
+        cmd_open("accessibility")
+    return ok
+
 def engine_send(chat_id, text):
-    p = subprocess.run([CLI, "--no-events", "send", chat_id, text],
-                       capture_output=True, timeout=60, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "send", chat_id, text], 60)
 
 def engine_send_file(chat_id, path):
-    p = subprocess.run([CLI, "--no-events", "send-file", chat_id, path],
-                       capture_output=True, timeout=120, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "send-file", chat_id, path], 120)
 
 def engine_react(msg_id, reaction):
-    p = subprocess.run([CLI, "--no-events", "react", msg_id, reaction],
-                       capture_output=True, timeout=60, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "react", msg_id, reaction], 60)
 
 def engine_unreact(msg_id, reaction):
-    p = subprocess.run([CLI, "--no-events", "unreact", msg_id, reaction],
-                       capture_output=True, timeout=60, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "unreact", msg_id, reaction], 60)
 
 def engine_edit(msg_id, text):
-    p = subprocess.run([CLI, "--no-events", "edit", msg_id, text],
-                       capture_output=True, timeout=60, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "edit", msg_id, text], 60)
 
 def engine_create_chat(handle, message):
     """SC-4: create a new iMessage chat. `handle` is a separate positional
     (already regex-validated + leading-dash-guarded); `message` is ONE
     "--message="-prefixed token so a leading-dash message cannot bind as a flag.
     No "--" terminator (it would break --message). list-argv, shell=False (M-20)."""
-    p = subprocess.run([CLI, "--no-events", "create-chat", handle, "--message=" + message],
-                       capture_output=True, timeout=60, shell=False)
-    return p.returncode == 0
+    return _engine_mut(["--no-events", "create-chat", handle, "--message=" + message], 60)
 
 # ---------------------------------------------------------------- attachments (M-4)
 def decode_asset_url(src):

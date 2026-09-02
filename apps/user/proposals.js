@@ -6,11 +6,11 @@
 import { ROOMID_RE, api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook } from '../../shared/ui/chat.js';
-import { addConvoRowDecorator, buildPlatBadge } from '../../shared/ui/rows.js';
+import { buildPlatBadge } from '../../shared/ui/rows.js';
 import { sendCmd, validHandle } from '../../shared/ui/sources.js';
 import { confirmModal } from '../../shared/ui/connections.js';
 import { setProposalsViewHook, setDetailMode } from '../../shared/ui/nav.js';
-import { feedRelTime, renderHome } from '../../shared/ui/search.js';
+import { feedRelTime } from '../../shared/ui/search.js';
 import { S, feedModel } from '../../shared/state.js';
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
@@ -213,10 +213,6 @@ async function sendIdentifierProposal(p, text, err, btn) {
 // After send/reject: drop the draft from the list. Stay in the open chat if
 // we just sent into one; identifier detail is the only pane we close.
 let focusListAfterHandle = false;
-function chatsListShowing() {
-  const btn = $('list-mode-chats');
-  return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
-}
 function afterHandled(p) {
   if (selectedId === p.eventId) {
     selectedId = null;
@@ -224,7 +220,6 @@ function afterHandled(p) {
   }
   updateCount(pendingList().length);
   if (proposalsListShowing()) renderList();
-  else if (chatsListShowing()) renderHome();
   if (focusListAfterHandle) {
     focusListAfterHandle = false;
     queueMicrotask(() => {
@@ -261,7 +256,7 @@ function buildRow(p, dismissed) {
   const open = () => select(p, dismissed);
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  if (!dismissed) attachQuickActions(row, p, false);
+  if (!dismissed) attachQuickActions(row, p);
   return row;
 }
 
@@ -405,7 +400,6 @@ async function refresh() {
     if (!S.openRoomId) setDetailMode('empty');
   }
   if (proposalsListShowing()) renderList();
-  else if (chatsListShowing()) renderHome();
 }
 
 let pollTimer = null;
@@ -413,13 +407,7 @@ function proposalsListShowing() {
   const btn = $('list-mode-proposals');
   return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
 }
-function decorateFeedRow(row, convo) {
-  if (!convo || !convo.id) return;
-  const p = pendingForRoom(allProposals, loadHandled(), convo.id);
-  if (p) attachQuickActions(row, p, true);
-}
-
-function attachQuickActions(row, p, prefillOnClick) {
+function attachQuickActions(row, p) {
   const wrap = el('span', 'proposal-quick');
   const yes = el('button', 'proposal-quick-yes', '✓');
   yes.type = 'button';
@@ -444,9 +432,7 @@ function attachQuickActions(row, p, prefillOnClick) {
   wrap.appendChild(yes);
   wrap.appendChild(no);
   wrap.addEventListener('click', stop);
-  const kebab = row.querySelector('.share-controls');
-  if (kebab) row.insertBefore(wrap, kebab);
-  else row.appendChild(wrap);
+  row.appendChild(wrap);
 
   row.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' || e.target !== row) return;
@@ -455,22 +441,10 @@ function attachQuickActions(row, p, prefillOnClick) {
     focusListAfterHandle = true;
     sendProposal(p, p.body, null, null);
   }, true);
-
-  if (prefillOnClick) {
-    row.addEventListener('click', () => {
-      const g = rowGesture(p, 'click');
-      if (g.action === 'open' && g.prefill) {
-        queueMicrotask(() => {
-          if (S.openRoomId === p.targetRoom) prefillComposer(g.prefill);
-        });
-      }
-    });
-  }
 }
 
 function initProposalsUI() {
   setProposalsViewHook(renderProposalsView);
-  addConvoRowDecorator(decorateFeedRow);
   setAfterSendHook((roomId) => {
     const p = pendingForRoom(allProposals, loadHandled(), roomId);
     if (!p) return;

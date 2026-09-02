@@ -12,15 +12,7 @@ import { feedModel, runtime } from '../state.js';
 // registers a callback here instead, same pattern as setOnUnauthorized
 // (shared/matrix/client.js). Left unset, rows render exactly as before.
 let convoRowDecorator = null;
-const extraConvoRowDecorators = [];
 function setConvoRowDecorator(fn) { convoRowDecorator = typeof fn === 'function' ? fn : null; }
-function addConvoRowDecorator(fn) {
-  if (typeof fn === 'function') extraConvoRowDecorators.push(fn);
-}
-function decorateConvoRow(row, rec) {
-  if (convoRowDecorator) convoRowDecorator(row, rec);
-  for (const d of extraConvoRowDecorators) d(row, rec);
-}
 
 // HF-6/HF-7: badge derived ONLY from the record's sourceId (which space the
 // room is in) — never a bridged field. A CSS-classed pill carrying the source
@@ -63,7 +55,7 @@ function buildFeedRow(r) {
   const open = () => openConvo(r.id);                 // CV.2: native hub conversation view
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  decorateConvoRow(row, { id: r.id, sourceId: r.sourceId });
+  if (convoRowDecorator) convoRowDecorator(row, { id: r.id, sourceId: r.sourceId });
   return row;
 }
 
@@ -94,9 +86,9 @@ function buildConvoRow(c, withBadge) {
   const open = () => openConvo(c.id);                 // CV.2: native hub conversation view
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  decorateConvoRow(row, c);
+  if (convoRowDecorator) convoRowDecorator(row, c);
   return row;
 }
 function elEmpty(text) { return el('div', 'list-empty', text); }
 
-export { buildPlatBadge, buildFeedRow, setActiveConvoRow, buildConvoRow, elEmpty, setConvoRowDecorator, addConvoRowDecorator };
+export { buildPlatBadge, buildFeedRow, setActiveConvoRow, buildConvoRow, elEmpty, setConvoRowDecorator };

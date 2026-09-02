@@ -1,10 +1,23 @@
 // Plain-node test for shared/model/consent.js — no framework.
 // Run: node tests/unit/consent.test.js  (or via docker, see tests/run.sh)
 // Exits 0 on all-pass, nonzero (via process.exitCode) on any failure.
+//
+// THE EXPLICIT THREE-LEVEL MODEL (direct-share-level plan, D1). A conversation
+// mirrors on its own per-conversation level and nothing else:
+//   'share' -> shared, 'direct' -> shared, 'private' -> not shared,
+//   ABSENT OR ANY UNRECOGNIZED VALUE -> not shared.
+// The contact profile / per-source policy / global policy inputs are accepted
+// by resolve() and deliberately IGNORED; every case below that passes a
+// share-all policy or a shared profile alongside an unset override is there to
+// prove exactly that.
+//
+// tests/unit/consent_py.test.py mirrors this file case-for-case against
+// agents/uplink/consent.py — the resolver the uplink actually enforces with.
+// Add a case to one, add it to the other in the same change.
 
 import {
-  resolve, effectiveShared, resolveAll,
-  normalizePolicy, normalizeOverride,
+  resolve, effectiveShared, effectiveLevel, resolveAll,
+  normalizePolicy, normalizeOverride, overridesFromSync,
 } from '../../shared/model/consent.js';
 
 let pass = 0;
@@ -26,162 +39,175 @@ function convo(sourceId, sourceLabel) {
   return { id: '!' + sourceId + ':local', sourceId, sourceLabel: sourceLabel || sourceId };
 }
 
+// Every "loud" standing-policy input the old model would have shared on. Each
+// is passed alongside an unset/unknown override below; none may share anything.
+const LOUD_POLICY = { global: 'share-all', sources: { imessage: 'share-all' } };
+const LOUD_PROFILE = { displayName: 'Dana Lewis', share: 'share' };
+const DENY_POLICY = { global: 'private', sources: { imessage: 'private-all' } };
+const DENY_PROFILE = { displayName: 'Dana Lewis', share: 'private' };
+
 // ---------------------------------------------------------------------------
-// 1. Global default (no policy, no overrides) -> private
+// 1. Absent override -> private, whatever any other level says (NO INHERITANCE)
 // ---------------------------------------------------------------------------
 {
   const c = convo('imessage', 'iMessage');
-  eq(resolve(c, {}, undefined), { shared: false, reason: 'private' }, 'default: no policy at all');
+  eq(resolve(c, {}, undefined), { shared: false, reason: 'private' }, 'unset: no policy at all');
   eq(resolve(c, { global: 'private', sources: {} }, undefined),
-    { shared: false, reason: 'private' }, 'default: explicit global private');
-  eq(effectiveShared(c, {}, undefined), false, 'default: effectiveShared false');
+    { shared: false, reason: 'private' }, 'unset: explicit global private');
+  eq(resolve(c, { global: 'share-all', sources: {} }, undefined),
+    { shared: false, reason: 'private' }, 'unset: global share-all does NOT share');
+  eq(resolve(c, { global: 'private', sources: { imessage: 'share-all' } }, undefined),
+    { shared: false, reason: 'private' }, 'unset: per-source share-all does NOT share');
+  eq(resolve(c, LOUD_POLICY, undefined, LOUD_PROFILE),
+    { shared: false, reason: 'private' }, 'unset: shared profile + both share-all levels do NOT share');
+  eq(resolve(c, LOUD_POLICY, null, LOUD_PROFILE),
+    { shared: false, reason: 'private' }, 'null override: still private under every share-all');
+  eq(effectiveShared(c, LOUD_POLICY, undefined, LOUD_PROFILE), false,
+    'unset: effectiveShared false under every share-all');
 }
 
 // ---------------------------------------------------------------------------
-// 2. Global share-all -> shared for every source, including ones with no
-//    per-source entry, with reason "all <source>"
+// 2. 'share' -> shared/explicit, whatever any other level says
 // ---------------------------------------------------------------------------
 {
-  const policy = { global: 'share-all', sources: {} };
-  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
-    { shared: true, reason: 'all iMessage' }, 'global share-all: iMessage');
-  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
-    { shared: true, reason: 'all LinkedIn' }, 'global share-all: LinkedIn');
-  // falls back to sourceId label when no sourceLabel given
-  eq(resolve({ id: '!x:local', sourceId: 'whatsapp' }, policy, undefined),
-    { shared: true, reason: 'all whatsapp' }, 'global share-all: label falls back to sourceId');
-  // falls back to generic token when neither present
-  eq(resolve({ id: '!x:local' }, policy, undefined),
-    { shared: true, reason: 'all source' }, 'global share-all: generic fallback label');
+  const c = convo('imessage', 'iMessage');
+  eq(resolve(c, {}, 'share'), { shared: true, reason: 'explicit' }, 'share: empty policy');
+  eq(resolve(c, DENY_POLICY, 'share'), { shared: true, reason: 'explicit' },
+    'share: per-source private-all cannot exclude an explicit share');
+  eq(resolve(c, DENY_POLICY, 'share', DENY_PROFILE), { shared: true, reason: 'explicit' },
+    'share: a private profile cannot exclude an explicit share');
+  eq(resolve(c, {}, { state: 'share' }), { shared: true, reason: 'explicit' },
+    'share: object form { state } is accepted');
+  eq(effectiveShared(c, DENY_POLICY, 'share', DENY_PROFILE), true, 'share: effectiveShared true');
 }
 
 // ---------------------------------------------------------------------------
-// 3. Per-source share-all shares only that source, including a conversation
-//    of that source arriving later (standing policy) — global stays private.
+// 3. 'direct' -> shared, reason 'direct' (the NEW level; still just "mirrored"
+//    as far as this resolver is concerned — auto-send is a separate gate)
 // ---------------------------------------------------------------------------
 {
-  const policy = { global: 'private', sources: { imessage: 'share-all' } };
-  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
-    { shared: true, reason: 'all iMessage' }, 'per-source share-all: matching source shared');
-  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
-    { shared: false, reason: 'private' }, 'per-source share-all: other source stays private (global default)');
-  // "newly arrived" conversation of the share-all source — same policy object,
-  // conversation object constructed independently -> still shared (standing policy).
-  const laterArrival = convo('imessage', 'iMessage');
-  eq(resolve(laterArrival, policy, undefined),
-    { shared: true, reason: 'all iMessage' }, 'per-source share-all: standing policy covers later-arriving convo');
+  const c = convo('imessage', 'iMessage');
+  eq(resolve(c, {}, 'direct'), { shared: true, reason: 'direct' }, 'direct: empty policy');
+  eq(resolve(c, DENY_POLICY, 'direct', DENY_PROFILE), { shared: true, reason: 'direct' },
+    'direct: not excludable by policy or profile');
+  eq(resolve(c, {}, { state: 'direct' }), { shared: true, reason: 'direct' },
+    'direct: object form { state } is accepted');
+  eq(effectiveShared(c, {}, 'direct'), true, 'direct: effectiveShared true');
 }
 
 // ---------------------------------------------------------------------------
-// 4. Per-source private-all overrides global share-all
+// 4. 'private' -> not shared/excluded, whatever any other level says
 // ---------------------------------------------------------------------------
 {
-  const policy = { global: 'share-all', sources: { linkedin: 'private-all' } };
-  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
-    { shared: false, reason: 'private' }, 'per-source private-all beats global share-all');
-  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
-    { shared: true, reason: 'all iMessage' }, 'per-source private-all: other sources still shared via global');
-}
-
-// per-source 'inherit' falls through to global (both directions)
-{
-  eq(resolve(convo('imessage'), { global: 'share-all', sources: { imessage: 'inherit' } }, undefined),
-    { shared: true, reason: 'all imessage' }, 'per-source inherit falls through to global share-all');
-  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'inherit' } }, undefined),
-    { shared: false, reason: 'private' }, 'per-source inherit falls through to global private');
+  const c = convo('imessage', 'iMessage');
+  eq(resolve(c, {}, 'private'), { shared: false, reason: 'excluded' }, 'private: empty policy');
+  eq(resolve(c, LOUD_POLICY, 'private', LOUD_PROFILE), { shared: false, reason: 'excluded' },
+    'private: beats shared profile and both share-all levels');
+  eq(resolve(c, {}, { state: 'private' }), { shared: false, reason: 'excluded' },
+    'private: object form { state } is accepted');
+  eq(effectiveShared(c, LOUD_POLICY, 'private', LOUD_PROFILE), false, 'private: effectiveShared false');
 }
 
 // ---------------------------------------------------------------------------
-// 5. Per-conversation override 'private' excludes despite any higher-level
-//    share-all (global and/or per-source).
+// 5. THE UNKNOWN-VALUE INVARIANT (F8): absent or ANY unrecognized value is
+//    private — even under the loudest possible share-all policy + a shared
+//    profile. This class has its own generator in the conformance harness.
 // ---------------------------------------------------------------------------
 {
-  eq(resolve(convo('imessage'), { global: 'share-all', sources: {} }, 'private'),
-    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite global share-all');
-  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, 'private'),
-    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite per-source share-all');
-  eq(resolve(convo('imessage'), { global: 'share-all', sources: { imessage: 'share-all' } }, 'private'),
-    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite BOTH share-all levels');
-}
-
-// ---------------------------------------------------------------------------
-// 6. Per-conversation override 'share' includes despite default-private
-//    (no policy share-all anywhere, and despite per-source private-all).
-// ---------------------------------------------------------------------------
-{
-  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'share'),
-    { shared: true, reason: 'explicit' }, 'per-conv share includes despite default-private');
-  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'private-all' } }, 'share'),
-    { shared: true, reason: 'explicit' }, 'per-conv share includes despite per-source private-all');
-  eq(resolve(convo('imessage'), {}, 'share'),
-    { shared: true, reason: 'explicit' }, 'per-conv share includes despite empty policy');
-}
-
-// ---------------------------------------------------------------------------
-// "share everything except one thread": global share-all + one excluded convo
-// ---------------------------------------------------------------------------
-{
-  const policy = { global: 'share-all', sources: {} };
-  const excluded = convo('imessage', 'iMessage');
-  const others = [convo('imessage', 'iMessage'), convo('linkedin', 'LinkedIn'), convo('whatsapp', 'WhatsApp')];
-  eq(resolve(excluded, policy, 'private'), { shared: false, reason: 'excluded' }, 'share-everything-except-one: excluded thread');
-  for (const c of others) {
-    eq(resolve(c, policy, undefined), { shared: true, reason: 'all ' + c.sourceLabel },
-      'share-everything-except-one: other thread ' + c.sourceId + ' still shared');
+  const UNKNOWN = [
+    undefined, null, '', 'inherit', 'junk', 'shared', 'Share', 'SHARE', 'share ', ' share',
+    'Direct', 'DIRECT', 'direct ', 'share-all', 'private-all', 'auto', '__proto__',
+    'constructor', 0, 1, 5, true, false, [], {}, ['share'], ['direct'],
+    { state: 'inherit' }, { state: 'junk' }, { state: null }, { state: 5 }, { state: ['share'] },
+    { State: 'share' }, { level: 'share' }, { state: 'share-all' },
+    // NFKC lookalikes, a zero-width space, a NUL suffix, a NBSP: exact-match
+    // canaries against a future trim()/normalize() on one side only.
+    '\uff53hare', 'sh\u200bare', 'share\u0000', 'direct\u0000', 'private\u00a0',
+  ];
+  for (const v of UNKNOWN) {
+    const label = 'unknown-override ' + JSON.stringify(v === undefined ? '<undefined>' : v);
+    eq(resolve(convo('imessage', 'iMessage'), LOUD_POLICY, v, LOUD_PROFILE),
+      { shared: false, reason: 'private' }, label + ': private under every share-all');
+    eq(effectiveLevel(v), 'private', label + ': effectiveLevel private');
+    eq(effectiveShared(convo('imessage'), LOUD_POLICY, v, LOUD_PROFILE), false,
+      label + ': effectiveShared false');
   }
 }
 
 // ---------------------------------------------------------------------------
-// "all iMessage but not LinkedIn": per-source share-all + per-source private-all
+// 6. effectiveLevel: the three levels, from both storage forms
 // ---------------------------------------------------------------------------
 {
-  const policy = { global: 'private', sources: { imessage: 'share-all', linkedin: 'private-all' } };
-  eq(resolve(convo('imessage', 'iMessage'), policy, undefined),
-    { shared: true, reason: 'all iMessage' }, 'all-imessage-not-linkedin: iMessage shared');
-  eq(resolve(convo('linkedin', 'LinkedIn'), policy, undefined),
-    { shared: false, reason: 'private' }, 'all-imessage-not-linkedin: LinkedIn private');
-  eq(resolve(convo('whatsapp', 'WhatsApp'), policy, undefined),
-    { shared: false, reason: 'private' }, 'all-imessage-not-linkedin: unrelated source stays default private');
+  eq(effectiveLevel('share'), 'share', 'effectiveLevel: share');
+  eq(effectiveLevel('direct'), 'direct', 'effectiveLevel: direct');
+  eq(effectiveLevel('private'), 'private', 'effectiveLevel: private');
+  eq(effectiveLevel({ state: 'share' }), 'share', 'effectiveLevel: object share');
+  eq(effectiveLevel({ state: 'direct' }), 'direct', 'effectiveLevel: object direct');
+  eq(effectiveLevel({ state: 'private' }), 'private', 'effectiveLevel: object private');
+  eq(effectiveLevel(undefined), 'private', 'effectiveLevel: absent -> private');
+  eq(effectiveLevel({ state: 'share', migrated: true }), 'share',
+    'effectiveLevel: the migration marker does not disturb the level');
 }
 
 // ---------------------------------------------------------------------------
-// effectiveShared mirrors resolve().shared across all four precedence levels
+// 7. "share everything except one thread" is now a per-conversation job: the
+//    standing policy shares nothing, so only the explicitly-set rooms mirror.
 // ---------------------------------------------------------------------------
 {
-  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, undefined), true, 'effectiveShared: global share-all');
-  eq(effectiveShared(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined), true, 'effectiveShared: per-source share-all');
-  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: { imessage: 'private-all' } }, undefined), false, 'effectiveShared: per-source private-all beats global');
-  eq(effectiveShared(convo('imessage'), { global: 'share-all' }, 'private'), false, 'effectiveShared: per-conv private beats global share-all');
-  eq(effectiveShared(convo('imessage'), {}, 'share'), true, 'effectiveShared: per-conv share beats default');
+  const policy = { global: 'share-all', sources: {} };
+  eq(resolve(convo('imessage', 'iMessage'), policy, 'private'), { shared: false, reason: 'excluded' },
+    'except-one: the excluded thread is private');
+  for (const c of [convo('imessage'), convo('linkedin'), convo('whatsapp')]) {
+    eq(resolve(c, policy, undefined), { shared: false, reason: 'private' },
+      'except-one: unset thread ' + c.sourceId + ' is private, NOT swept in by share-all');
+    eq(resolve(c, policy, 'share'), { shared: true, reason: 'explicit' },
+      'except-one: thread ' + c.sourceId + ' shares only when set explicitly');
+  }
 }
 
 // ---------------------------------------------------------------------------
-// resolveAll: batch resolve, both plain-object and Map overrides, in input order
+// 8. resolveAll: batch resolve, plain-object and Map overrides, input order;
+//    policy/profiles arguments are accepted and ignored.
 // ---------------------------------------------------------------------------
 {
-  const policy = { global: 'private', sources: { imessage: 'share-all' } };
   const convos = [
     { id: '!a:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
     { id: '!b:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
     { id: '!c:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
+    { id: '!d:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
   ];
-  const overridesObj = { '!c:local': 'share' };
-  const resObj = resolveAll(convos, policy, overridesObj);
-  eq(resObj.map(r => r.shared), [true, false, true], 'resolveAll: plain-object overrides shape');
-  eq(resObj.map(r => r.reason), ['all iMessage', 'private', 'explicit'], 'resolveAll: plain-object overrides reasons');
-  eq(resObj.map(r => r.convo.id), ['!a:local', '!b:local', '!c:local'], 'resolveAll: preserves input order');
+  const overridesObj = { '!a:local': 'share', '!c:local': 'direct', '!d:local': 'private' };
+  const resObj = resolveAll(convos, LOUD_POLICY, overridesObj);
+  eq(resObj.map(r => r.shared), [true, false, true, false], 'resolveAll: plain-object overrides');
+  eq(resObj.map(r => r.reason), ['explicit', 'private', 'direct', 'excluded'], 'resolveAll: reasons');
+  eq(resObj.map(r => r.convo.id), ['!a:local', '!b:local', '!c:local', '!d:local'],
+    'resolveAll: preserves input order');
 
-  const overridesMap = new Map([['!c:local', 'private']]);
-  const resMap = resolveAll(convos, policy, overridesMap);
-  eq(resMap.map(r => r.shared), [true, false, false], 'resolveAll: Map overrides shape');
-  eq(resMap.map(r => r.reason), ['all iMessage', 'private', 'excluded'], 'resolveAll: Map overrides reasons');
+  const resMap = resolveAll(convos, LOUD_POLICY, new Map([['!a:local', 'private'], ['!b:local', 'share']]));
+  eq(resMap.map(r => r.shared), [false, true, false, false], 'resolveAll: Map overrides');
+  eq(resMap.map(r => r.reason), ['excluded', 'explicit', 'private', 'private'], 'resolveAll: Map reasons');
 
-  eq(resolveAll(convos, policy, undefined).map(r => r.shared), [true, false, false], 'resolveAll: no overrides at all');
-  eq(resolveAll(null, policy, undefined), [], 'resolveAll: non-array convos -> empty list, no throw');
+  eq(resolveAll(convos, LOUD_POLICY, undefined).map(r => r.shared), [false, false, false, false],
+    'resolveAll: no overrides -> all private despite a share-all policy');
+  const profiles = { '!a:local': LOUD_PROFILE, '!b:local': LOUD_PROFILE };
+  eq(resolveAll(convos, LOUD_POLICY, undefined, profiles).map(r => r.shared),
+    [false, false, false, false], 'resolveAll: a shared profiles map shares nothing');
+  eq(resolveAll(null, LOUD_POLICY, undefined), [], 'resolveAll: non-array convos -> empty list, no throw');
+
+  // PARITY REGRESSION (found by the conformance harness): the override key is
+  // read ONLY from a plain-object convo. `convo && convo.id` yielded "" for the
+  // empty-string convo, which matched an override stored under "" and shared a
+  // conversation the Python enforcer resolved private.
+  const degenerate = [{ id: '', sourceId: '' }, '', 0, null, [], { id: 5 }];
+  eq(resolveAll(degenerate, LOUD_POLICY, { '': 'share' }).map(r => r.shared),
+    [true, false, false, false, false, false],
+    'resolveAll: only a plain-object convo can match an override key');
 }
 
 // ---------------------------------------------------------------------------
-// normalizePolicy: unknown global collapses to private; only share-all/private-all survive
+// 9. normalizePolicy: unchanged. The standing policy still round-trips through
+//    storage (the account-data event still exists) — it just no longer decides
+//    anything on the conversation path.
 // ---------------------------------------------------------------------------
 {
   eq(normalizePolicy(undefined), { global: 'private', sources: {} }, 'normalizePolicy: undefined input');
@@ -197,154 +223,93 @@ function convo(sourceId, sourceLabel) {
   // one, not walked as {'0':..,'1':..} — matches Python's isinstance(dict).
   eq(normalizePolicy({ global: 'private', sources: ['share-all', 'private-all'] }),
     { global: 'private', sources: {} }, 'normalizePolicy: array sources -> {} (same as no sources)');
-  eq(normalizePolicy({ global: 'private', sources: ['share-all', 'private-all'] }),
-    normalizePolicy({ global: 'private', sources: {} }),
-    'normalizePolicy: array sources resolves identically to empty sources');
 }
 
 // ---------------------------------------------------------------------------
-// Array-shaped `sources` resolves the same as no sources (both -> fall through
-// to global). Guards the JS↔Python parity fix (arrays are typeof 'object').
-// ---------------------------------------------------------------------------
-{
-  const arrPolicy = { global: 'private', sources: ['share-all', 'private-all'] };
-  eq(resolve(convo('imessage', 'iMessage'), arrPolicy, undefined),
-    { shared: false, reason: 'private' }, 'resolve: array sources -> private (same as empty)');
-  eq(resolve(convo('imessage', 'iMessage'), arrPolicy, undefined),
-    resolve(convo('imessage', 'iMessage'), { global: 'private', sources: {} }, undefined),
-    'resolve: array sources resolves identically to empty sources');
-}
-
-// ---------------------------------------------------------------------------
-// normalizeOverride: only 'share'/'private' survive; object or bare-string form
+// 10. normalizeOverride: 'share'/'direct'/'private' survive; everything else is
+//     null (== no recognized level stored == private).
 // ---------------------------------------------------------------------------
 {
   eq(normalizeOverride(undefined), null, 'normalizeOverride: undefined -> null');
   eq(normalizeOverride(null), null, 'normalizeOverride: null -> null');
   eq(normalizeOverride({}), null, 'normalizeOverride: empty object -> null');
   eq(normalizeOverride('share'), 'share', 'normalizeOverride: bare string share');
+  eq(normalizeOverride('direct'), 'direct', 'normalizeOverride: bare string direct');
   eq(normalizeOverride('private'), 'private', 'normalizeOverride: bare string private');
   eq(normalizeOverride('inherit'), null, 'normalizeOverride: bare string inherit -> null');
   eq(normalizeOverride({ state: 'share' }), 'share', 'normalizeOverride: object form share');
+  eq(normalizeOverride({ state: 'direct' }), 'direct', 'normalizeOverride: object form direct');
   eq(normalizeOverride({ state: 'private' }), 'private', 'normalizeOverride: object form private');
   eq(normalizeOverride({ state: 'inherit' }), null, 'normalizeOverride: object form inherit -> null');
   eq(normalizeOverride({ state: 'junk' }), null, 'normalizeOverride: object form junk -> null');
+  eq(normalizeOverride({ state: 'share', migrated: true }), 'share',
+    'normalizeOverride: the D0 migration marker rides along untouched');
 }
 
 // ---------------------------------------------------------------------------
-// Reason string exhaustiveness: every branch's exact reason value
+// 11. overridesFromSync: carries all three levels; PINNED — a later junk value
+//     DELETES an earlier valid one for the same room (a cleared/garbled event
+//     must not leave a stale share behind), and the room then resolves private.
 // ---------------------------------------------------------------------------
 {
-  eq(resolve(convo('x'), {}, undefined).reason, 'private', 'reason: default private');
-  eq(resolve(convo('x'), { global: 'share-all' }, undefined).reason, 'all x', 'reason: global share-all interpolates source');
-  eq(resolve(convo('x'), { global: 'private', sources: { x: 'share-all' } }, undefined).reason, 'all x', 'reason: per-source share-all interpolates source');
-  eq(resolve(convo('x'), { global: 'share-all', sources: { x: 'private-all' } }, undefined).reason, 'private', 'reason: per-source private-all -> "private"');
-  eq(resolve(convo('x'), {}, 'share').reason, 'explicit', 'reason: per-conv share -> "explicit"');
-  eq(resolve(convo('x'), { global: 'share-all' }, 'private').reason, 'excluded', 'reason: per-conv private -> "excluded"');
+  const ov = (content) => ({ type: 'com.jkali.share_override', content });
+  const sync = { rooms: { join: {
+    '!a:local': { account_data: { events: [ov({ state: 'share' })] } },
+    '!b:local': { account_data: { events: [ov('private')] } },
+    '!c:local': { account_data: { events: [ov({ state: 'direct' })] } },
+    '!d:local': { account_data: { events: [ov({ state: 'inherit' })] } },
+    '!e:local': { account_data: { events: [ov({ state: 'share', migrated: true })] } },
+    '!f:local': { account_data: { events: [{ type: 'm.tag', content: {} }] } },
+  } } };
+  eq(overridesFromSync(sync),
+    { '!a:local': 'share', '!b:local': 'private', '!c:local': 'direct', '!e:local': 'share' },
+    'overridesFromSync: keeps share/direct/private, omits inherit + unrelated types');
+
+  const clobber = { rooms: { join: {
+    '!a:local': { account_data: { events: [ov({ state: 'share' }), ov({ state: 'junk' })] } },
+    '!b:local': { account_data: { events: [ov({ state: 'direct' }), ov({})] } },
+    '!c:local': { account_data: { events: [ov({ state: 'share' }), ov({ state: 'private' })] } },
+  } } };
+  eq(overridesFromSync(clobber), { '!c:local': 'private' },
+    'PINNED overridesFromSync: a later junk/empty event deletes the earlier valid key');
+  eq(resolve({ id: '!a:local', sourceId: 'imessage' }, LOUD_POLICY,
+    overridesFromSync(clobber)['!a:local'], LOUD_PROFILE),
+    { shared: false, reason: 'private' },
+    'PINNED: a key deleted by a junk value resolves private, never inherited-shared');
+
+  eq(overridesFromSync({ rooms: { join: { 'not-a-room': { account_data: { events: [ov('share')] } } } } }),
+    {}, 'overridesFromSync: non-room-shaped keys never enter the map');
+  eq(overridesFromSync(null), {}, 'overridesFromSync: junk input -> {}, no throw');
 }
 
-// ===========================================================================
-// PROFILE LEVEL (§12 phase 5) — precedence: per-conv override > profile >
-// per-source > global > private. profile arg is { displayName, share }.
-// ===========================================================================
-
-// P1. A shared profile shares its members, even with global private + no source.
+// ---------------------------------------------------------------------------
+// 12. Reason string exhaustiveness: every branch's exact value. `reason` is
+//     UI-only — authorization reads `shared` / effectiveLevel().
+// ---------------------------------------------------------------------------
 {
-  const prof = { displayName: 'Dana Lewis', share: 'share' };
-  eq(resolve(convo('imessage', 'iMessage'), { global: 'private', sources: {} }, undefined, prof),
-    { shared: true, reason: 'profile: Dana Lewis' }, 'profile share: shares member despite default-private');
-  eq(resolve(convo('linkedin', 'LinkedIn'), { global: 'private', sources: {} }, undefined, prof),
-    { shared: true, reason: 'profile: Dana Lewis' }, 'profile share: shares a member on a different source too (same person, 2 platforms)');
-  eq(resolve({ id: '!x:local', sourceId: 'imessage' }, {}, undefined, { share: 'share' }),
-    { shared: true, reason: 'profile: profile' }, 'profile share: name falls back to generic "profile"');
+  eq(resolve(convo('x'), {}, undefined).reason, 'private', 'reason: unset -> "private"');
+  eq(resolve(convo('x'), { global: 'share-all' }, undefined).reason, 'private',
+    'reason: global share-all no longer produces an "all <source>" reason');
+  eq(resolve(convo('x'), {}, 'share').reason, 'explicit', 'reason: share -> "explicit"');
+  eq(resolve(convo('x'), {}, 'direct').reason, 'direct', 'reason: direct -> "direct"');
+  eq(resolve(convo('x'), { global: 'share-all' }, 'private').reason, 'excluded', 'reason: private -> "excluded"');
+  eq(resolve(convo('x'), {}, undefined, { displayName: 'Ann', share: 'share' }).reason, 'private',
+    'reason: a shared profile no longer produces a "profile: <name>" reason');
 }
 
-// P2. Profile beats per-source (both directions).
+// ---------------------------------------------------------------------------
+// 13. Hostile/degenerate convo shapes never throw and never share (the convo is
+//     ignored entirely, so only the override can decide).
+// ---------------------------------------------------------------------------
 {
-  // profile private beats per-source share-all
-  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined,
-    { displayName: 'Dana', share: 'private' }),
-    { shared: false, reason: 'profile: Dana' }, 'profile private beats per-source share-all');
-  // profile share beats per-source private-all
-  eq(resolve(convo('imessage'), { global: 'private', sources: { imessage: 'private-all' } }, undefined,
-    { displayName: 'Dana', share: 'share' }),
-    { shared: true, reason: 'profile: Dana' }, 'profile share beats per-source private-all');
-  // profile private beats global share-all
-  eq(resolve(convo('imessage'), { global: 'share-all', sources: {} }, undefined,
-    { displayName: 'Dana', share: 'private' }),
-    { shared: false, reason: 'profile: Dana' }, 'profile private beats global share-all');
+  for (const c of [null, undefined, 5, 'imessage', [], {}, { id: '!r:l', sourceId: 5 },
+    { id: '!r:l', sourceId: '__proto__' }]) {
+    eq(resolve(c, LOUD_POLICY, undefined, LOUD_PROFILE), { shared: false, reason: 'private' },
+      'hostile convo ' + JSON.stringify(c === undefined ? '<undefined>' : c) + ': private');
+    eq(resolve(c, DENY_POLICY, 'share', DENY_PROFILE), { shared: true, reason: 'explicit' },
+      'hostile convo ' + JSON.stringify(c === undefined ? '<undefined>' : c) + ': explicit share still holds');
+  }
 }
-
-// P3. Per-conversation override still wins over the profile (both directions).
-{
-  // per-conv private excludes a member of a SHARED profile
-  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'private',
-    { displayName: 'Dana', share: 'share' }),
-    { shared: false, reason: 'excluded' }, 'per-conv private excludes despite profile share');
-  // per-conv share includes despite a private profile
-  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, 'share',
-    { displayName: 'Dana', share: 'private' }),
-    { shared: true, reason: 'explicit' }, 'per-conv share includes despite profile private');
-}
-
-// P4. profile 'inherit' (or absent) falls through to source/global.
-{
-  eq(resolve(convo('imessage', 'iMessage'), { global: 'share-all', sources: {} }, undefined, { displayName: 'D', share: 'inherit' }),
-    { shared: true, reason: 'all iMessage' }, 'profile inherit falls through to global share-all');
-  eq(resolve(convo('imessage', 'iMessage'), { global: 'private', sources: { imessage: 'share-all' } }, undefined, { displayName: 'D', share: 'inherit' }),
-    { shared: true, reason: 'all iMessage' }, 'profile inherit falls through to per-source share-all');
-  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, undefined, { displayName: 'D', share: 'inherit' }),
-    { shared: false, reason: 'private' }, 'profile inherit + nothing else -> private');
-  eq(resolve(convo('imessage'), { global: 'private', sources: {} }, undefined, null),
-    { shared: false, reason: 'private' }, 'no profile at all -> unchanged private');
-}
-
-// P5. effectiveShared threads the profile arg.
-{
-  eq(effectiveShared(convo('imessage'), { global: 'private', sources: {} }, undefined, { share: 'share' }), true, 'effectiveShared: profile share');
-  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, undefined, { share: 'private' }), false, 'effectiveShared: profile private beats global share-all');
-  eq(effectiveShared(convo('imessage'), { global: 'share-all', sources: {} }, 'private', { share: 'share' }), false, 'effectiveShared: per-conv private beats profile share');
-}
-
-// P6. resolveAll with a per-room profiles map (a profile spanning 2 platforms;
-//     one member carries a per-conversation private override and drops out).
-{
-  const policy = { global: 'private', sources: {} };
-  const convos = [
-    { id: '!im:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
-    { id: '!li:local', sourceId: 'linkedin', sourceLabel: 'LinkedIn' },
-    { id: '!ex:local', sourceId: 'imessage', sourceLabel: 'iMessage' },
-    { id: '!un:local', sourceId: 'whatsapp', sourceLabel: 'WhatsApp' }, // no profile
-  ];
-  const P = { displayName: 'Dana Lewis', share: 'share' };
-  const profiles = { '!im:local': P, '!li:local': P, '!ex:local': P };
-  const overrides = { '!ex:local': 'private' }; // per-conv exclusion on one member
-  const res = resolveAll(convos, policy, overrides, profiles);
-  eq(res.map(r => r.shared), [true, true, false, false], 'resolveAll+profile: 2 platforms shared, excluded member out, non-member private');
-  eq(res.map(r => r.reason), ['profile: Dana Lewis', 'profile: Dana Lewis', 'excluded', 'private'], 'resolveAll+profile: reasons');
-  // Map form of the profiles argument works too.
-  const resMap = resolveAll(convos, policy, overrides, new Map([['!im:local', P], ['!li:local', P], ['!ex:local', P]]));
-  eq(resMap.map(r => r.shared), [true, true, false, false], 'resolveAll+profile: Map profiles argument');
-  // no profiles argument -> behaves as before (all private under this policy)
-  eq(resolveAll(convos, policy, undefined).map(r => r.shared), [false, false, false, false], 'resolveAll: no profiles arg unchanged');
-}
-
-// P7. profile reason exhaustiveness.
-{
-  eq(resolve(convo('x'), {}, undefined, { displayName: 'Ann', share: 'share' }).reason, 'profile: Ann', 'reason: profile share interpolates name');
-  eq(resolve(convo('x'), {}, undefined, { displayName: 'Ann', share: 'private' }).reason, 'profile: Ann', 'reason: profile private interpolates name');
-}
-
-// PINNED (consent-conformance plan, deny-drop decision): a malformed
-// per-source rule is treated as ABSENT even when it says private-all, so a
-// numeric sourceId falls through to a global share-all. This reconciles the
-// UI up to what the Python enforcer already answered — do NOT "fix" it to
-// private on one side only; change both files and the conformance harness
-// together.
-eq(resolve({ id: '!r:l', sourceId: 5 },
-           { global: 'share-all', sources: { '5': 'private-all' } }, undefined),
-   { shared: true, reason: 'all source' },
-   'pinned: non-string sourceId drops the private-all rule -> global share-all');
 
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${fail} failed`);

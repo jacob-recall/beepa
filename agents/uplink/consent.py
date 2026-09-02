@@ -1,31 +1,49 @@
 """Pure consent resolver — Python port of shared/model/consent.js.
 
-PLAN-MASTER-SYNC.md §4 + §12 phase 5. Layered, most-specific-wins:
-  1. per-conversation override  : 'share' | 'private'          (absent = inherit)
-  2. profile (contact profile)  : 'share' | 'private'          ('inherit' = fall through)
-  3. per-source policy          : 'share-all' | 'private-all'  (absent = inherit)
-  4. global standing policy     : 'share-all' | 'private'      (default 'private')
-Safe default: PRIVATE. Nothing is shared unless a level explicitly says so.
+PLAN-MASTER-SYNC.md §4, as amended by the direct-share-level plan (D1).
+CONVERSATION SHARING IS EXPLICIT-ONLY: a conversation carries exactly ONE
+per-conversation level and nothing else can share it:
+  'share'   -> mirrored; manager suggestions wait in the proposal inbox
+  'direct'  -> mirrored; the uplink auto-sends a manager proposal into the
+               conversation (the auto-send code itself lands in a later slice)
+  'private' -> not mirrored (the default)
+ABSENT OR ANY UNRECOGNIZED VALUE RESOLVES 'private' — a stated invariant with
+its own conformance vector class. A stored override this code does not
+recognize must never be able to share a conversation.
 
-The profile level lets a whole contact profile (one person's conversations
-across sources) share or hide together, while a per-conversation override still
-wins over it. resolve() takes only the resolved {displayName, share} for the
-conversation's profile so it stays pure and byte-identical to consent.js.
+There is NO inheritance on the conversation path any more: contact-profile
+share-state, the per-source policy and the global standing policy do NOT affect
+whether a conversation mirrors. resolve() still ACCEPTS those arguments (call
+sites + conformance vectors) and deliberately ignores them. The layered,
+most-specific-wins model survives only in the SEPARATE contact-sharing
+dimension at the bottom of this file, which is untouched.
+
+The one-time migration that materializes previously-inherited shares into
+explicit 'share' overrides lives in uplink.py (D0) and keeps its own copy of
+the old inherit-semantics resolver for that single purpose — deliberately NOT
+here, so this file has exactly one model.
 
 This module is PURE: no I/O, no side effects at import. Its output must match
 consent.js byte-for-byte on the same inputs — see tests/unit/consent_py.test.py,
-which mirrors tests/unit/consent.test.js.
+which mirrors tests/unit/consent.test.js, and the conformance harness.
 """
 import re
 
 SHARE_POLICY_TYPE = "com.jkali.share_policy"      # global user account-data
 SHARE_OVERRIDE_TYPE = "com.jkali.share_override"  # per-room account-data
+# Model-version marker (D0/F7): written to LOCAL user account-data by the uplink
+# once the explicit-levels migration has completed, so the teammate UI knows the
+# daemon no longer honors standing policies.
+CONSENT_MODEL_TYPE = "com.jkali.consent_model"
+CONSENT_MODEL_EXPLICIT = 2
 
 GLOBAL_STATES = {"share-all", "private"}
 SOURCE_STATES = {"share-all", "private-all", "inherit"}
-OVERRIDE_STATES = {"share", "private"}
-# Profile share-state (from a contact profile). 'inherit' means "no opinion —
-# fall through to the per-source/global levels".
+# The THREE explicit conversation levels. Anything else (including the old
+# 'inherit', an absent event, or junk) is 'private' — see effective_level().
+OVERRIDE_STATES = {"share", "direct", "private"}
+# Profile share-state. Retained for the contact-profile storage shape ONLY:
+# since D1 a profile's share-state has NO effect on conversation mirroring.
 PROFILE_STATES = {"share", "private", "inherit"}
 
 # ---------------------------------------------------------------------------
@@ -58,10 +76,6 @@ def _plain(x):
     return x if isinstance(x, dict) else None
 
 
-def _nonempty_str(x):
-    return x if isinstance(x, str) and x else None
-
-
 def _source_rule(sources, source_id):
     """'share-all' | 'private-all' | None for a per-source rule lookup.
 
@@ -76,58 +90,37 @@ def _source_rule(sources, source_id):
     return v if v in ("share-all", "private-all") else None
 
 
-def _source_label_of(convo):
-    """A non-empty-string sourceLabel, else non-empty-string sourceId, else
-    'source' — never throws, never coerces a non-string into a reason."""
-    c = _plain(convo) or {}
-    return _nonempty_str(c.get("sourceLabel")) or _nonempty_str(c.get("sourceId")) or "source"
+def effective_level(override):
+    """The conversation's explicit level: 'private' | 'share' | 'direct'.
+
+    Accepts the raw account-data content (object form {'state': ...} or a bare
+    string) as well as an already-normalized token, so the uplink's fresh
+    point-read and the resolver can share one gate. ABSENT OR UNRECOGNIZED =>
+    'private' — the invariant this whole model rests on. Mirrors
+    effectiveLevel() in consent.js.
+    """
+    return normalize_override(override) or "private"
 
 
 def resolve(convo, policy, override, profile=None):
     """Resolve one conversation's effective shared-state AND the reason.
 
-    profile is {"displayName", "share"} for the room's contact profile, or None.
-    Returns {"shared": bool, "reason": str} where reason is one of
-    'all <source>' | 'explicit' | 'excluded' | 'profile: <name>' | 'private'.
-    Mirrors resolve() in consent.js exactly.
+    convo / policy / profile are IGNORED (D1: no inheritance on the
+    conversation path); they stay in the signature so existing call sites and
+    the conformance vectors keep working. Returns {"shared": bool, "reason":
+    str} where reason is one of 'explicit' | 'direct' | 'excluded' | 'private'.
+    `reason` is UI-only — never parse it for authorization. Mirrors resolve()
+    in consent.js exactly.
     """
-    pol = _plain(policy) or {}
-    sources = pol.get("sources")
-    c = _plain(convo) or {}
-    source_id = _nonempty_str(c.get("sourceId"))
-
-    # 1. Per-conversation override wins over everything (most specific).
-    #    Only the exact strings count; any other shape is inherit.
-    if override == "share":
+    level = effective_level(override)
+    if level == "share":
         return {"shared": True, "reason": "explicit"}
-    if override == "private":
-        return {"shared": False, "reason": "excluded"}
-
-    # 2. Profile level: a shared/private contact profile shares or hides all its
-    #    members together, but only 'share'/'private' take effect — 'inherit'
-    #    (a non-object profile, or an absent one) falls through.
-    prof = _plain(profile)
-    if prof:
-        pname = "profile: " + (_nonempty_str(prof.get("displayName")) or "profile")
-        if prof.get("share") == "share":
-            return {"shared": True, "reason": pname}
-        if prof.get("share") == "private":
-            return {"shared": False, "reason": pname}
-
-    # 3. Per-source standing policy (gated: valid key, own entry, exact value).
-    src = _source_rule(sources, source_id)
-    if src == "share-all":
-        return {"shared": True, "reason": "all " + _source_label_of(convo)}
-    if src == "private-all":
-        return {"shared": False, "reason": "private"}
-    # (inherit / absent / malformed -> fall through to global)
-
-    # 4. Global standing policy.
-    if pol.get("global") == "share-all":
-        return {"shared": True, "reason": "all " + _source_label_of(convo)}
-
-    # 5. Safe default: private.
-    return {"shared": False, "reason": "private"}
+    if level == "direct":
+        return {"shared": True, "reason": "direct"}
+    # Private either way; the reason distinguishes a deliberate exclusion from
+    # "never set" purely for the UI's wording.
+    return {"shared": False,
+            "reason": "excluded" if normalize_override(override) else "private"}
 
 
 def effective_shared(convo, policy, override, profile=None):
@@ -136,9 +129,9 @@ def effective_shared(convo, policy, override, profile=None):
 
 
 def resolve_all(convos, policy, overrides, profiles=None):
-    """Batch resolve. overrides/profiles may be dicts keyed by room id, or None.
+    """Batch resolve. overrides may be a dict keyed by room id, or None.
 
-    profiles maps room id -> {"displayName", "share"}. Returns a list of
+    policy/profiles are IGNORED (D1). Returns a list of
     {"convo", "shared", "reason"} in input order.
     """
     if not isinstance(convos, list):
@@ -151,15 +144,10 @@ def resolve_all(convos, policy, overrides, profiles=None):
             return None
         return overrides.get(room_id)
 
-    def get_profile(room_id):
-        if not isinstance(profiles, dict) or not isinstance(room_id, str):
-            return None
-        return profiles.get(room_id)
-
     out = []
     for convo in convos:
         rid = convo.get("id") if isinstance(convo, dict) else None
-        r = resolve(convo, policy, get(rid), get_profile(rid))
+        r = resolve(convo, policy, get(rid), None)
         out.append({"convo": convo, "shared": r["shared"], "reason": r["reason"]})
     return out
 
@@ -187,15 +175,20 @@ def normalize_policy(p):
 
 
 def normalize_override(data):
-    """A per-room override -> 'share' | 'private' | None (None == inherit).
+    """A per-room override -> 'share' | 'direct' | 'private' | None.
 
-    Accepts the object form {'state': 'share'} or a bare string. Mirrors
-    normalizeOverride() in JS.
+    Accepts the object form {'state': 'share'} or a bare string. None means
+    "no recognized level stored", which the explicit model resolves to PRIVATE
+    — never to an inherited share. Mirrors normalizeOverride() in JS.
     """
     if not data:
         return None
     v = data if isinstance(data, str) else (data.get("state") if isinstance(data, dict) else None)
-    return v if v in OVERRIDE_STATES else None
+    # The isinstance gate is load-bearing for parity AND for not crashing: JS's
+    # Set.has() simply answers false for a non-string, while `v in <set>` raises
+    # TypeError on an unhashable value (e.g. {"state": ["share"]}), and a crash
+    # in the resolver aborts a whole reconcile pass.
+    return v if isinstance(v, str) and v in OVERRIDE_STATES else None
 
 
 # ===========================================================================
@@ -261,8 +254,11 @@ def resolve_contact_share(source, policy):
 def overrides_from_sync(sync_data):
     """Extract per-room overrides from a /sync response's room account-data.
 
-    Reads only com.jkali.share_override. Returns { room_id: 'share'|'private' }
-    (rooms set to inherit omitted). Mirrors overridesFromSync() in JS.
+    Reads only com.jkali.share_override. Returns
+    { room_id: 'share'|'direct'|'private' }; a room whose stored value is
+    absent/cleared/unrecognized is OMITTED (a later junk event even deletes an
+    earlier valid one — pinned by the unit tests), and an omitted room resolves
+    private. Mirrors overridesFromSync() in JS.
     """
     out = {}
     rooms = sync_data.get("rooms") if isinstance(sync_data, dict) else None

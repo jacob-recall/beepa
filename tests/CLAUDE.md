@@ -1,4 +1,4 @@
-# tests/ — 20 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
+# tests/ — 25 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -8,10 +8,11 @@ explicit, named test — see the scenario list below.
 
 ```
 tests/
-  run.sh                          runs all 20 unit tests (9 node + 11 python)
+  run.sh                          runs all 25 unit tests (11 node + 14 python)
                                   + the consent conformance harness — see below
   unit/
-    consent.test.js               shared/model/consent.js — every precedence case
+    consent.test.js               shared/model/consent.js — the explicit three-level model
+    uplink_migration.test.py      D0 migration to explicit levels + the retained old resolver
     master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
     user_invites.test.js          apps/user/invites.js — the hub's bridge-invite auto-join trust gate
     csp_parity.test.js            CSP header parity across apps
@@ -43,12 +44,23 @@ tests/
 
 ### Unit tests
 
-- `unit/consent.test.js` — plain-node test (no framework) covering every
-  precedence combination for `shared/model/consent.js`'s resolver:
-  per-conversation override wins, profile share/private wins over source/
-  global, per-source `share-all`/`private-all`, global `share-all` as a
-  *standing* policy that also covers a conversation arriving later, and the
-  safe default (`private`) when nothing says otherwise.
+- `unit/consent.test.js` — plain-node test (no framework) for
+  `shared/model/consent.js`'s resolver under the EXPLICIT three-level model
+  (direct-share-level plan, D1): `'share'` and `'direct'` share, `'private'`
+  does not, and **absent or ANY unrecognized value resolves private** — each
+  case run alongside the loudest possible standing policy and a shared contact
+  profile, because those inputs are now accepted and ignored. Also pins
+  `effectiveLevel()`, the junk-value key deletion in `overridesFromSync()`, and
+  the plain-object-only override-key lookup in `resolveAll()`.
+- `unit/uplink_migration.test.py` — D0: the one-time migration that
+  materializes standing-policy shares as explicit `migrated: true` `'share'`
+  overrides. Asserts the S1 acceptance (a pre-S1 state.db with a
+  standing-policy-shared, currently-mirrored room keeps the SAME
+  `master_room_id` and sees **zero `delete_mirror` calls**), idempotency, that
+  an existing explicit override is never rewritten, that an unmirrored room is
+  never widened into a share, that a failed write aborts before the flag and
+  before any deletion, and the F8 pin that the retained old resolver treats a
+  `'direct'` override as INHERIT (so a partial rollback is caught here).
 - `unit/master_invites.test.js` — plain-node test for `apps/master/invites.js`,
   the manager console's identity gate. Fixtures are copied from the REAL
   stripped `invite_state` (create/name/join_rules/member only, no custom
@@ -151,7 +163,7 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh runs all 20 (9 node + 11 python) + the consent conformance harness:
+# tests/run.sh runs all 25 (11 node + 14 python) + the consent conformance harness:
 tests/run.sh
 
 # --- integration (needs BOTH stacks up first) ---

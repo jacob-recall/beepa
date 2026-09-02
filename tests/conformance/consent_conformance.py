@@ -14,11 +14,21 @@ only cover the cases someone thought of. This harness instead:
      every override token x every profile shape x every global token x every
      per-source token x every `sources` container shape x every convo shape
      (incl. hostile ones: missing/empty/non-string labels, prototype-named
-     source ids, non-object convos), and
+     source ids, non-object convos). Since D1 the conversation path is
+     EXPLICIT-ONLY (only the override decides), so most of that cross-product
+     now proves the opposite of what it used to: that the profile / per-source
+     / global inputs are ignored IDENTICALLY on both sides.
+  1b. Carries a dedicated UNKNOWN-VALUE vector class (F8): every unrecognized
+     override shape crossed with the loudest possible standing policy and a
+     shared profile. Those vectors are additionally self-checked — not just
+     compared — because "absent or unrecognized resolves private" is a stated
+     invariant, and two implementations agreeing on a leak would still be a
+     leak.
   2. FUZZES the other entry points (normalize_policy, normalize_override,
-     overrides_from_sync, normalize_contact_policy, resolve_contact_share,
-     resolve_all, effective_shared) with a seeded random JSON generator that
-     mixes valid tokens with junk of every JSON type at every level,
+     effective_level, overrides_from_sync, normalize_contact_policy,
+     resolve_contact_share, resolve_all, effective_shared) with a seeded random
+     JSON generator that mixes valid tokens with junk of every JSON type at
+     every level,
 
 then evaluates the SAME vectors through both implementations (JS in the
 pinned node:20-alpine container, like tests/run.sh) and fails on:
@@ -75,8 +85,9 @@ def _key_pool():
 
 # ------------------------------------------------------------ exhaustive resolve
 # Every structured combination for resolve(convo, policy, override, profile).
-OVERRIDES = [None, "share", "private", "inherit", "junk", "", 5, True, {}, [],
-             {"state": "share"}]
+OVERRIDES = [None, "share", "direct", "private", "inherit", "junk", "", 5, True, {}, [],
+             {"state": "share"}, {"state": "direct"}, {"state": "private"},
+             {"state": "share", "migrated": True}]
 PROFILES = [
     None,
     {"share": "share", "displayName": "Ann"},
@@ -158,6 +169,53 @@ def exhaustive_resolve_vectors():
     return out
 
 
+# ------------------------------------------------ the unknown-value class (F8)
+# "Absent or ANY unrecognized override resolves private" is a stated invariant
+# of the explicit model, so it gets its own vector class AND its own assertion
+# (see check_invariants): every one of these, next to the loudest standing
+# policy and a shared contact profile, must be private on both sides.
+UNKNOWN_OVERRIDES = [
+    None, "", "inherit", "junk", "shared", "Share", "SHARE", "share ", " share",
+    "Direct", "DIRECT", "direct ", "directs", "share-all", "private-all", "auto",
+    "__proto__", "constructor", "toString", 0, 1, 5, -1, True, False, [], {},
+    ["share"], ["direct"], {"state": "inherit"}, {"state": "junk"},
+    {"state": None}, {"state": 5}, {"state": ["share"]}, {"state": {}},
+    {"State": "share"}, {"level": "share"}, {"state": "share-all"},
+    # NFKC lookalikes / zero-width / NUL-suffix / NBSP / non-breaking hyphen:
+    # exact-match canaries against a future trim()/normalize() on one side only.
+    {"state": "sharedirect"}, "\uff53hare", "sh\u200bare", "share\u0000",
+    "direct\u0000", "private\u00a0", "share\u2011all",
+]
+LOUD_POLICIES = [
+    {"global": "share-all", "sources": {"imessage": "share-all"}},
+    {"global": "share-all", "sources": {}},
+    {"global": "private", "sources": {"imessage": "share-all"}},
+    {},
+]
+LOUD_PROFILES = [None, {"share": "share", "displayName": "Ann"}, {"share": "share"}]
+
+
+def unknown_override_vectors():
+    """Every unrecognized override x loud policy x shared profile x convo shape.
+
+    Tagged expect_private so main() can assert the decision itself, not merely
+    that the two implementations agree on it."""
+    out = []
+    for override in UNKNOWN_OVERRIDES:
+        out.append({"kind": "effective_level", "override": override,
+                    "expect_private": True})
+        for convo in CONVOS[:3] + [CONVOS[7], CONVOS[9], None]:
+            for policy in LOUD_POLICIES:
+                for profile in LOUD_PROFILES:
+                    out.append({"kind": "resolve", "convo": convo, "policy": policy,
+                                "override": override, "profile": profile,
+                                "expect_private": True})
+                    out.append({"kind": "effective_shared", "convo": convo,
+                                "policy": policy, "override": override,
+                                "profile": profile, "expect_private": True})
+    return out
+
+
 # ------------------------------------------------------------------- fuzzing
 class Gen:
     def __init__(self, seed):
@@ -208,8 +266,10 @@ class Gen:
         return c
 
     def override(self):
-        return self.pick([None] * 3 + ["share", "private"] * 3 + JUNK_STR + SCALARS
-                         + [{"state": "share"}, {"state": "private"}, {"state": "junk"}, {}, []])
+        return self.pick([None] * 3 + ["share", "private", "direct"] * 3 + JUNK_STR + SCALARS
+                         + [{"state": "share"}, {"state": "private"}, {"state": "direct"},
+                            {"state": "junk"}, {"state": ["share"]},
+                            {"state": "share", "migrated": True}, {}, []])
 
     def profile(self):
         if self.r.random() < 0.35:
@@ -258,6 +318,7 @@ def fuzz_vectors(n, seed):
                     "override": g.override(), "profile": g.profile()})
         out.append({"kind": "normalize_policy", "p": g.policy()})
         out.append({"kind": "normalize_override", "data": g.override()})
+        out.append({"kind": "effective_level", "override": g.override()})
         out.append({"kind": "normalize_contact_policy", "raw": g.policy()})
         out.append({"kind": "resolve_contact_share",
                     "source": g.pick(SOURCE_IDS + SCALARS + [["x"], {}]),
@@ -289,6 +350,8 @@ def eval_py(v):
             return consent.normalize_policy(v["p"])
         if k == "normalize_override":
             return consent.normalize_override(v["data"])
+        if k == "effective_level":
+            return consent.effective_level(v["override"])
         if k == "overrides_from_sync":
             return consent.overrides_from_sync(v["sync"])
         if k == "normalize_contact_policy":
@@ -326,11 +389,44 @@ def canon(x):
     return json.dumps(x, sort_keys=True, separators=(",", ":"))
 
 
+def check_invariants(vectors, py, js):
+    """Self-check the expect_private vectors on BOTH sides.
+
+    Comparison alone cannot catch a shared invariant violation: if both
+    implementations decided an unknown override means 'share', they would agree
+    and the run would be green while every junk override leaked a conversation.
+    So the unknown-value class asserts the DECISION, not just the agreement."""
+    bad = []
+    for i, v in enumerate(vectors):
+        if not v.get("expect_private"):
+            continue
+        for side, r in (("py", py[i]), ("js", js[i])):
+            if v["kind"] == "effective_level":
+                ok = r == "private"
+            elif v["kind"] == "effective_shared":
+                ok = r is False
+            else:  # resolve
+                ok = isinstance(r, dict) and r.get("shared") is False
+            if not ok:
+                bad.append((i, side, v, r))
+    return bad
+
+
 def main():
-    vectors = exhaustive_resolve_vectors() + fuzz_vectors(FUZZ_N, SEED)
+    unknown = unknown_override_vectors()
+    vectors = exhaustive_resolve_vectors() + unknown + fuzz_vectors(FUZZ_N, SEED)
     py = [eval_py(v) for v in vectors]
     js = eval_js(vectors)
     assert len(js) == len(vectors), "node returned %d results for %d vectors" % (len(js), len(vectors))
+
+    violations = check_invariants(vectors, py, js)
+    if violations:
+        print("INVARIANT VIOLATED: an absent/unrecognized override resolved SHARED "
+              "on %d vector/side pair(s) — this is the leak class, not a drift"
+              % len(violations))
+        for i, side, v, r in violations[:10]:
+            print("   - #%d [%s] -> %s\n       %s" % (i, side, canon(r), canon(v)[:400]))
+        sys.exit(1)
 
     mismatches, py_err, js_err = [], 0, 0
     for i, v in enumerate(vectors):
@@ -342,8 +438,10 @@ def main():
         if a != b or pe or je:
             mismatches.append((i, v, py[i], js[i]))
 
-    print("consent conformance: %d vectors (%d exhaustive resolve + %d fuzz), seed=%d"
-          % (len(vectors), len(vectors) - FUZZ_N * 8, FUZZ_N * 8, SEED))
+    n_fuzz = FUZZ_N * 9  # entry points per fuzz iteration (see fuzz_vectors)
+    print("consent conformance: %d vectors (%d exhaustive resolve + %d unknown-value "
+          "+ %d fuzz), seed=%d"
+          % (len(vectors), len(vectors) - n_fuzz - len(unknown), len(unknown), n_fuzz, SEED))
     print("  python errors=%d  js errors=%d  differing/erroring vectors=%d"
           % (py_err, js_err, len(mismatches)))
     if mismatches:

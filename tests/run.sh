@@ -26,4 +26,5 @@ python3 tests/unit/number_resolver.test.py
 python3 tests/unit/enroll_proxy_guard.test.py
 python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_proposals.test.py
+python3 tests/unit/uplink_migration.test.py
 python3 tests/unit/uplink_sources.test.py

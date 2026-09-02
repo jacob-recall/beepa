@@ -8,7 +8,7 @@
 // exported resolver functions, so the Python runner is comparing the two real
 // implementations, not two test doubles.
 import {
-  resolve, effectiveShared, resolveAll, normalizePolicy, normalizeOverride,
+  resolve, effectiveShared, effectiveLevel, resolveAll, normalizePolicy, normalizeOverride,
   overridesFromSync, normalizeContactPolicy, resolveContactShare,
 } from '../../shared/model/consent.js';
 
@@ -24,6 +24,8 @@ function evalOne(v) {
       return normalizePolicy(v.p);
     case 'normalize_override':
       return normalizeOverride(v.data);
+    case 'effective_level':
+      return effectiveLevel(v.override);
     case 'overrides_from_sync':
       return overridesFromSync(v.sync);
     case 'normalize_contact_policy':

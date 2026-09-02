@@ -1,20 +1,31 @@
 // PLAN-MASTER-SYNC §4 — the consent model (the authorization boundary).
 // Shared ES module. Pure resolver + account-data storage helpers. NO DOM.
 //
-// FOUR layered levels, most-specific-wins (spec §4 + §12 phase 5 profile level):
-//   1. per-conversation override  : 'share' | 'private'         (absent = inherit)
-//   2. profile (contact profile)  : 'share' | 'private'         ('inherit' = fall through)
-//   3. per-source policy          : 'share-all' | 'private-all' (absent = inherit)
-//   4. global standing policy     : 'share-all' | 'private'     (default 'private')
-// Anything not covered by a more-specific level falls through to the safe
-// default: PRIVATE. Nothing is shared unless a level explicitly says so.
+// CONVERSATION SHARING IS EXPLICIT-ONLY (direct-share-level plan, D1). A
+// conversation carries exactly ONE per-conversation level, and nothing else
+// can share it:
+//   'share'   -> mirrored to the master; manager suggestions land in the
+//                teammate's proposal inbox for review
+//   'direct'  -> mirrored to the master; the teammate's uplink auto-sends a
+//                manager proposal into the conversation (see the plan's D2 —
+//                the auto-send code itself lands in a later slice)
+//   'private' -> not mirrored (the default)
+// ABSENT OR ANY UNRECOGNIZED VALUE RESOLVES 'private'. That is a stated
+// invariant with its own conformance vector class — a stored override this
+// code does not recognize must never be able to share a conversation.
 //
-// The profile level lets a whole contact profile (one person's conversations
-// across sources) share or hide together, while a per-conversation override
-// still wins over it. The profile share-state lives in
-// com.jkali.contact_profiles (see shared/model/contacts.js); the resolver here
-// takes only the resolved { displayName, share } for the conversation's profile
-// so it stays pure and byte-parity-portable to python.
+// There is NO inheritance on the conversation path any more: contact-profile
+// share-state, the per-source policy and the global standing policy do NOT
+// affect whether a conversation mirrors. resolve() still ACCEPTS those
+// arguments (call-site and conformance-vector compatibility) and deliberately
+// ignores them. The layered, most-specific-wins model survives only in the
+// SEPARATE contact-sharing dimension at the bottom of this file
+// (resolveContactShare / normalizeContactPolicy), which is untouched.
+//
+// The one-time migration that materializes previously-inherited shares into
+// explicit 'share' overrides lives in agents/uplink/uplink.py (D0); it keeps
+// its own copy of the old inherit-semantics resolver for that single purpose,
+// deliberately NOT here.
 
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { S } from '../state.js';
@@ -23,13 +34,22 @@ import { S } from '../state.js';
 // already used for m.tag, push rules, and com.jkali.self_identities.
 const SHARE_POLICY_TYPE = 'com.jkali.share_policy';       // global user account-data
 const SHARE_OVERRIDE_TYPE = 'com.jkali.share_override';   // per-room account-data
+// The model-version marker (D0/F7): written to LOCAL user account-data by the
+// uplink once the explicit-levels migration has completed. Its presence is what
+// tells the teammate UI that the daemon no longer honors standing policies, so
+// the UI can stop offering (and stop claiming to honor) the dead controls.
+const CONSENT_MODEL_TYPE = 'com.jkali.consent_model';
+const CONSENT_MODEL_EXPLICIT = 2;
 
 // ---- valid state tokens ------------------------------------------------------
 const GLOBAL_STATES = new Set(['share-all', 'private']);
 const SOURCE_STATES = new Set(['share-all', 'private-all', 'inherit']);
-const OVERRIDE_STATES = new Set(['share', 'private']);
-// Profile share-state (from a contact profile). 'inherit' means "no opinion —
-// fall through to the per-source/global levels".
+// The THREE explicit conversation levels. Anything else (including the old
+// 'inherit', an absent event, or junk) is 'private' — see effectiveLevel().
+const OVERRIDE_STATES = new Set(['share', 'direct', 'private']);
+// Profile share-state (from a contact profile). Retained for shared/model/
+// contacts.js's storage shape ONLY: since D1 a profile's share-state has NO
+// effect on conversation mirroring.
 const PROFILE_STATES = new Set(['share', 'private', 'inherit']);
 
 // ---------------------------------------------------------------------------
@@ -61,10 +81,6 @@ function plainObject(x) {
   return (x !== null && typeof x === 'object' && !Array.isArray(x) && !(x instanceof Map)) ? x : null;
 }
 
-function nonEmptyString(x) {
-  return (typeof x === 'string' && x) ? x : null;
-}
-
 // 'share-all' | 'private-all' | null for a per-source rule lookup — THE
 // consent gate for the per-source level: plain-object container, valid source
 // id, OWN property (hardens against prototype pollution and keys like
@@ -77,59 +93,36 @@ function sourceRule(sources, sourceId) {
   return (v === 'share-all' || v === 'private-all') ? v : null;
 }
 
-// A conversation's source label, for a human-readable "all <source>" reason.
-// Only a non-empty STRING label counts; falls back to a non-empty-string
-// source id, then a generic token; never throws, never coerces junk into the
-// reason string.
-function sourceLabelOf(convo) {
-  const c = plainObject(convo) || {};
-  return nonEmptyString(c.sourceLabel) || nonEmptyString(c.sourceId) || 'source';
-}
-
 // ===========================================================================
 // PURE RESOLVER — the authorization decision. No I/O, no DOM.
 // ===========================================================================
 
+// The conversation's explicit level: 'private' | 'share' | 'direct'.
+// Accepts the raw account-data content (object form { state } or a bare
+// string) as well as an already-normalized token, so the uplink's fresh
+// point-read and the UI can both call it without a second gate. ABSENT OR
+// UNRECOGNIZED => 'private' — the invariant this whole model rests on.
+function effectiveLevel(override) {
+  return normalizeOverride(override) || 'private';
+}
+
 // Resolve one conversation's effective shared-state AND the reason for it.
-//   convo    : { sourceId, sourceLabel, ... }
-//   policy   : { global: 'share-all'|'private', sources: { <id>: state } }
-//   override : 'share' | 'private' | undefined  (this room's per-conv override)
-//   profile  : { displayName, share } | null/undefined  (the room's contact
-//              profile, if any; share 'share'|'private'|'inherit')
-// Returns { shared: boolean, reason: 'all <source>'|'explicit'|'excluded'
-//           |'profile: <name>'|'private' }.
+//   convo    : { sourceId, sourceLabel, ... }   IGNORED (see D1)
+//   policy   : the standing-policy object       IGNORED (see D1)
+//   override : 'share' | 'direct' | 'private' | undefined — the ONLY input
+//   profile  : the room's contact profile       IGNORED (see D1)
+// Returns { shared: boolean, reason: 'explicit'|'direct'|'excluded'|'private' }.
+// convo/policy/profile stay in the signature so existing call sites and the
+// conformance vectors keep working; they can no longer influence the decision.
+// `reason` is UI-only — never parse it for authorization (that is what
+// `shared` / effectiveLevel() are for).
 function resolve(convo, policy, override, profile) {
-  const pol = plainObject(policy) || {};
-  const c = plainObject(convo) || {};
-  const sourceId = nonEmptyString(c.sourceId);
-
-  // 1. Per-conversation override wins over everything (most specific).
-  //    Only the exact strings count; any other shape is inherit.
-  if (override === 'share') return { shared: true, reason: 'explicit' };
-  if (override === 'private') return { shared: false, reason: 'excluded' };
-
-  // 2. Profile level: a shared/private contact profile shares or hides all its
-  //    members together, but only 'share'/'private' take effect — 'inherit'
-  //    (a non-object profile, or an absent one) falls through.
-  const prof = plainObject(profile);
-  if (prof) {
-    const pname = 'profile: ' + (nonEmptyString(prof.displayName) || 'profile');
-    if (prof.share === 'share') return { shared: true, reason: pname };
-    if (prof.share === 'private') return { shared: false, reason: pname };
-  }
-
-  // 3. Per-source standing policy (gated: valid key, own entry, exact value).
-  const src = sourceRule(pol.sources, sourceId);
-  if (src === 'share-all') return { shared: true, reason: 'all ' + sourceLabelOf(convo) };
-  if (src === 'private-all') return { shared: false, reason: 'private' };
-  // (inherit / absent / malformed -> fall through to global)
-
-  // 4. Global standing policy: Share-All also covers conversations arriving
-  //    later while it is on (spec §4.1).
-  if (pol.global === 'share-all') return { shared: true, reason: 'all ' + sourceLabelOf(convo) };
-
-  // 5. Safe default: private.
-  return { shared: false, reason: 'private' };
+  const level = effectiveLevel(override);
+  if (level === 'share') return { shared: true, reason: 'explicit' };
+  if (level === 'direct') return { shared: true, reason: 'direct' };
+  // Private either way; the reason distinguishes a deliberate exclusion from
+  // "never set" purely for the UI's wording.
+  return { shared: false, reason: normalizeOverride(override) ? 'excluded' : 'private' };
 }
 
 // The boolean the uplink asks for when deciding whether to mirror a room.
@@ -138,37 +131,33 @@ function effectiveShared(convo, policy, override, profile) {
 }
 
 // Resolve a whole list at once (drives the consent summary panel + row badges).
-//   convos    : array of conversation objects (each with an `id` room id + sourceId)
-//   policy    : the global/per-source policy object
+//   convos    : array of conversation objects (each with an `id` room id)
+//   policy    : IGNORED (see D1) — kept so call sites need no change
 //   overrides : per-room overrides keyed by room id — a Map or a plain object,
-//               value 'share'|'private' (absent = inherit).
-//   profiles  : per-room profile share info keyed by room id — a Map, a plain
-//               object, or a function (id) => { displayName, share }; value
-//               { displayName, share } (absent = no profile). Optional.
+//               value 'share'|'direct'|'private' (absent/unknown = private).
+//   profiles  : IGNORED (see D1) — a profile no longer shares a conversation.
 // Returns [{ convo, shared, reason }, ...] in input order.
 function resolveAll(convos, policy, overrides, profiles) {
   const list = Array.isArray(convos) ? convos : [];
-  // Containers: a real Map (instanceof, never duck-typed — a JSON object with
-  // an own "get" key is a plain object), a function (profiles only), or a
-  // plain object with OWN-property lookup. Keys must be strings (Python gates
-  // identically on its dict form; Map/function forms are JS-only and outside
-  // the conformance harness's JSON domain — curated tests cover them).
+  // Container: a real Map (instanceof, never duck-typed — a JSON object with
+  // an own "get" key is a plain object) or a plain object with OWN-property
+  // lookup. Keys must be strings (Python gates identically on its dict form;
+  // the Map form is JS-only and outside the conformance harness's JSON domain
+  // — curated tests cover it).
   const get = (id) => {
     if (typeof id !== 'string') return undefined;
     if (overrides instanceof Map) return overrides.get(id);
     if (!plainObject(overrides)) return undefined;
     return Object.prototype.hasOwnProperty.call(overrides, id) ? overrides[id] : undefined;
   };
-  const getProfile = (id) => {
-    if (typeof id !== 'string') return undefined;
-    if (typeof profiles === 'function') return profiles(id);
-    if (profiles instanceof Map) return profiles.get(id);
-    if (!plainObject(profiles)) return undefined;
-    return Object.prototype.hasOwnProperty.call(profiles, id) ? profiles[id] : undefined;
-  };
   return list.map((convo) => {
-    const id = convo && convo.id;
-    const r = resolve(convo, policy, get(id), getProfile(id));
+    // PARITY (found by the conformance harness): the key must be read only
+    // from a plain-object convo, exactly as Python's
+    // `convo.get("id") if isinstance(convo, dict)` does. `convo && convo.id`
+    // returned "" for the empty-string convo, which then matched an override
+    // stored under "" and shared a conversation Python resolved private.
+    const id = plainObject(convo) ? convo.id : undefined;
+    const r = resolve(convo, policy, get(id), undefined);
     return { convo, shared: r.shared, reason: r.reason };
   });
 }
@@ -198,8 +187,10 @@ function normalizePolicy(p) {
   return { global, sources };
 }
 
-// A per-room override is 'share' | 'private' | null (null == inherit). Accepts
-// either the object form { state: 'share' } or a bare string, tolerating both.
+// A per-room override is 'share' | 'direct' | 'private' | null. Accepts either
+// the object form { state: 'share' } or a bare string, tolerating both.
+// null means "no recognized level stored" — and under the explicit model that
+// resolves to PRIVATE, never to an inherited share (effectiveLevel()).
 function normalizeOverride(data) {
   if (!data) return null;
   const v = typeof data === 'string' ? data : data.state;
@@ -242,19 +233,42 @@ async function writeSharePolicy(policy) {
   return body;
 }
 
-// Write one room's override. state 'share'|'private' sets it; anything else
-// (including null/'inherit') clears it back to inherit (an empty content event,
-// since account-data cannot be deleted). Returns the normalized state or null.
+// Write one room's override. state 'share'|'direct'|'private' sets it;
+// anything else (including null) clears the event to empty content, which the
+// explicit model reads back as PRIVATE (account-data cannot be deleted).
+// Returns the normalized state or null.
 async function writeShareOverride(roomId, state) {
   const s = OVERRIDE_STATES.has(state) ? state : null;
   await api('PUT', overridePath(roomId), s === null ? {} : { state: s });
   return s;
 }
 
+// The consent-model marker (D0/F7). The uplink writes it once the explicit-
+// levels migration has completed; the teammate UI reads it to decide whether
+// the daemon still honors the old standing policies. Returns an integer
+// version (1 = the old inherit model). ANY read failure, absent event, or junk
+// content returns 1 — the UI must never assume the new model on a bad read,
+// because a new-model UI over an old inherit daemon is exactly the skew F7
+// forbids (UI says Private while the daemon still shares).
+async function readConsentModel() {
+  try {
+    const data = await api('GET', '/_matrix/client/v3/user/' +
+      encodeURIComponent(S.userId) + '/account_data/' + CONSENT_MODEL_TYPE);
+    const v = plainObject(data) ? data.version : null;
+    return (typeof v === 'number' && Number.isFinite(v) && v >= CONSENT_MODEL_EXPLICIT)
+      ? CONSENT_MODEL_EXPLICIT : 1;
+  } catch (e) {
+    return 1;
+  }
+}
+
 // Extract per-room overrides from a /sync response's room account-data blocks,
 // so a caller can build the `overrides` map for resolveAll() without a GET per
 // room. Reads only com.jkali.share_override; ignores everything else. Returns a
-// plain object { <roomId>: 'share'|'private' } (rooms set to inherit omitted).
+// plain object { <roomId>: 'share'|'direct'|'private' }; a room whose stored
+// value is absent/cleared/unrecognized is OMITTED (a later junk event even
+// deletes an earlier valid one — pinned by the unit tests), and an omitted room
+// resolves private.
 function overridesFromSync(syncData) {
   const out = {};
   const rooms = plainObject(syncData) ? syncData.rooms : null;
@@ -340,10 +354,11 @@ function contactSharePolicyPath(userId) {
 
 export {
   SHARE_POLICY_TYPE, SHARE_OVERRIDE_TYPE, PROFILE_STATES,
-  resolve, effectiveShared, resolveAll,
+  CONSENT_MODEL_TYPE, CONSENT_MODEL_EXPLICIT,
+  resolve, effectiveShared, effectiveLevel, resolveAll,
   normalizePolicy, normalizeOverride,
   readSharePolicy, writeSharePolicy,
-  writeShareOverride,
+  writeShareOverride, readConsentModel,
   overridesFromSync,
   CONTACT_SHARE_POLICY_TYPE,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,

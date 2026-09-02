@@ -1,15 +1,19 @@
 // PLAN-MASTER-SYNC §5.1 (share controls) / §4.2 (trust guards). apps/user-only:
-// global Share All switch, per-source Share-all-<source> switch, per-row
-// tri-state share toggle (with effective state + reason), and the consent
-// summary panel. Reuses shared/model/consent.js for all resolution + storage;
+// the per-row share toggle (with effective state + reason), the consent summary
+// panel, the contact-share controls, and — only while the daemon has not yet
+// reported the explicit consent model — the legacy global Share All switch and
+// per-source Share-all-<source> switch. Under the explicit model those two are
+// dead and replaced by a banner; see the consent-model guard below.
+// Reuses shared/model/consent.js for all resolution + storage;
 // wires into shared/ui/{rows,search,nav}.js via their app-injection hooks so no
 // shared module needs to know apps/user exists. textContent-only, no innerHTML,
 // no CSP change. Local state + UI ONLY — the uplink (Phase 2) is not built here.
 
 import {
-  resolve, resolveAll,
+  resolve, resolveAll, effectiveLevel,
   readSharePolicy, writeSharePolicy,
   writeShareOverride, overridesFromSync,
+  readConsentModel, CONSENT_MODEL_EXPLICIT,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
 } from '../../shared/model/consent.js';
 import { readProfiles, roomProfileMap } from '../../shared/model/contacts.js';
@@ -31,12 +35,56 @@ let policy = { global: 'private', sources: {} };
 // manager, not which conversations mirror. Its own account-data key, its own
 // default: PRIVATE (empty/absent => not shared). Never conflated with `policy`.
 let contactPolicy = { global: 'private', sources: {} };
-const overrides = new Map(); // roomId -> 'share' | 'private' (absent = inherit)
+// roomId -> the room's explicit level, 'share' | 'direct' | 'private'. A room
+// absent from this map (or carrying a value the model does not recognize) is
+// PRIVATE — it is never inherited from a profile or a standing policy.
+const overrides = new Map();
 // roomId -> { id, displayName, share } for the room's contact profile, if any
-// (§12 phase 5). Populated from shared/model/contacts.js account-data; a
-// profile 'share'/'private' outranks per-source/global but a per-conversation
-// override above still wins (see shared/model/consent.js §4 precedence).
+// (§12 phase 5). Populated from shared/model/contacts.js account-data. Since
+// D1 a profile's share-state does NOT affect whether its conversations mirror
+// — it only groups a person's threads — so this map is passed to the resolver
+// for signature compatibility and is ignored by it.
 let profileMap = {};
+
+// ---- consent-model guard (direct-share-level plan, D0/F7) -------------------
+// Conversation sharing is now EXPLICIT-ONLY in shared/model/consent.js: a
+// conversation mirrors only on its own 'share'/'direct' override, never through
+// a contact profile, a per-source policy or the global Share-All. Those three
+// standing-policy controls below are therefore DEAD — but only once the uplink
+// on this machine has actually migrated (it writes com.jkali.consent_model = 2
+// when its one-time migration completes). Until then an older daemon may still
+// be inheriting, so:
+//   - marker present (v2): the dead conversation controls are removed and an
+//     "updating to explicit levels…" banner takes their place, so this UI can
+//     never show a room as shared on the strength of a policy the daemon has
+//     stopped honoring;
+//   - marker absent (v1): the controls stay, plus a banner warning that the
+//     daemon has not confirmed the new model yet — the UI must not quietly
+//     claim Private while a standing policy may still be mirroring.
+// A failed/absent read is treated as v1 (the conservative direction).
+// The full three-level surface (Share / Direct / Private) ships in the next
+// slice; this slice only removes what can no longer be honored.
+let consentModel = 1;
+function explicitModel() { return consentModel >= CONSENT_MODEL_EXPLICIT; }
+
+// h3 + p.muted, not the share-global-label title/desc pair: settings.css hides
+// `.share-global-label .desc` (and `.share-newly-box > p.muted`) inside
+// #detail-admin, and a banner whose explanation is invisible is worse than no
+// banner. `share-model-banner` is only a styling hook for the next slice.
+function modelBanner(title, text) {
+  const box = el('div', 'share-model-banner');
+  box.appendChild(el('h3', '', title));
+  box.appendChild(el('p', 'muted', text));
+  return box;
+}
+function pendingModelBanner() {
+  return modelBanner('Sharing model is updating…',
+    'Conversations are moving to explicit per-conversation sharing. This app '
+    + 'already resolves sharing that way, but the background sync on this '
+    + 'machine has not confirmed the change yet, so a conversation shown as '
+    + 'private may still be mirrored under a standing policy until it does. '
+    + 'Set anything you want kept private to Private on the conversation itself.');
+}
 
 // §4.2 guard 2 (auto-share visibility): which shared rooms have already been
 // surfaced to the teammate, so only genuinely NEW auto-shares get flagged.
@@ -83,6 +131,8 @@ async function writeContactPolicy(p) {
 }
 
 async function loadConsentState() {
+  // The model marker first: every render below branches on it.
+  try { consentModel = await readConsentModel(); } catch (e) { consentModel = 1; }
   try { policy = await readSharePolicy(); } catch (e) { /* keep previous cache */ }
   try { contactPolicy = await readContactPolicy(); } catch (e) { /* keep previous cache */ }
   try {
@@ -120,8 +170,19 @@ function reasonText(r) {
 
 // ---- sliding tri-state control (kebab rows + per-source headers) ----
 
+// The LEGACY per-conversation cycle, used only while the model marker is
+// absent (an un-migrated daemon may still honor "Auto (inherit)").
 const SHARE_CYCLE = [
   { val: 'inherit', label: 'Auto', override: null },
+  { val: 'share', label: 'Share', override: 'share' },
+  { val: 'private', label: 'Private', override: 'private' },
+];
+
+// Under the explicit model there is no inherit position: a conversation is
+// either explicitly shared or private. ('Direct' is deliberately NOT a cycle
+// position — it gets its own confirmed control in the next slice, so it can
+// never be reached by a pass-through tap.)
+const SHARE_CYCLE_V2 = [
   { val: 'share', label: 'Share', override: 'share' },
   { val: 'private', label: 'Private', override: 'private' },
 ];
@@ -140,11 +201,20 @@ function buildTriStateSlider(cycle, opts) {
   btn.setAttribute('aria-label', ariaLabel);
 
   const track = el('span', 'share-slider-track');
-  track.appendChild(el('span', 'share-slider-thumb'));
+  const thumb = el('span', 'share-slider-thumb');
+  track.appendChild(thumb);
   const segs = el('span', 'share-slider-segs');
   for (const o of cycle) segs.appendChild(el('span', 'share-slider-seg', o.label));
   track.appendChild(segs);
   btn.appendChild(track);
+  // beepa.css sizes the track for THREE positions; the explicit conversation
+  // cycle has two. Size it from the cycle here (CSSOM, same mechanism as the
+  // --idx write below) so the visible segments and the click-mapped thirds/
+  // halves below can never disagree about which position was tapped.
+  if (cycle.length !== 3) {
+    segs.style.gridTemplateColumns = 'repeat(' + cycle.length + ', 1fr)';
+    thumb.style.width = 'calc((100% - 4px) / ' + cycle.length + ')';
+  }
 
   const hint = el('span', 'share-slider-hint');
   btn.appendChild(hint);
@@ -189,13 +259,21 @@ function buildTriStateSlider(cycle, opts) {
 }
 
 function shareCycleIndex(convo) {
+  if (explicitModel()) {
+    // Absent / unrecognized resolves PRIVATE — never fall back to index 0
+    // ("Share"), which would show a private conversation as shared. A stored
+    // 'direct' is shared, so it sits on the Share position until the next
+    // slice gives it its own control; tapping either position only ever
+    // de-escalates it.
+    return effectiveLevel(overrides.get(convo.id)) === 'private' ? 1 : 0;
+  }
   const cur = overrides.get(convo.id) || 'inherit';
   const idx = SHARE_CYCLE.findIndex((o) => o.val === cur);
   return idx >= 0 ? idx : 0;
 }
 
 function buildShareSlider(convo) {
-  return buildTriStateSlider(SHARE_CYCLE, {
+  return buildTriStateSlider(explicitModel() ? SHARE_CYCLE_V2 : SHARE_CYCLE, {
     ariaLabel: 'Sharing for ' + sanitizeLine(convo.title || convo.id),
     getIndex: () => shareCycleIndex(convo),
     getHint: () => reasonText(effectiveFor(convo)),
@@ -342,6 +420,12 @@ function mountSourceSwitch(sourceId) {
   if (!host) return;
   const source = SOURCES.find((s) => s.id === sourceId);
   host.replaceChildren();
+  // Dead under the explicit model: a per-source policy no longer shares any
+  // conversation, so showing the control here would misstate what is shared.
+  if (explicitModel()) {
+    host.appendChild(el('span', 'muted', 'Updating to explicit levels…'));
+    return;
+  }
   if (source) host.appendChild(buildSourcePolicySlider(source));
 }
 
@@ -356,10 +440,13 @@ function renderConsentSummary() {
   const results = resolveAll(convos, policy, overrides, profileMap);
   const shared = results.filter((r) => r.shared);
   const seen = loadSeen();
-  // "Newly" = currently shared, not via an explicit per-conversation share (that
-  // was a deliberate one-at-a-time action, not an auto-share), and not already
-  // surfaced in a previous render of this panel.
-  const newlyShared = shared.filter((r) => r.reason !== 'explicit' && !seen.has(r.convo.id));
+  // "Newly" = currently shared WITHOUT a deliberate per-conversation action,
+  // and not already surfaced in a previous render of this panel. Under the
+  // explicit model that set is always empty — nothing can be auto-shared — and
+  // 'direct' is excluded because it is a deliberate (separately confirmed)
+  // per-conversation choice, not a standing policy sweeping a room in.
+  const newlyShared = shared.filter((r) => r.reason !== 'explicit'
+    && r.reason !== 'direct' && !seen.has(r.convo.id));
 
   if (!shared.length) {
     host.appendChild(el('p', 'muted', 'The manager can currently see: nothing.'));
@@ -569,11 +656,37 @@ function renderContactShareView() {
 }
 
 // Rendered whenever the 'sharing' nav view opens, via setSharingViewHook (nav.js).
+// The two conversation standing-policy controls (global Share-All, per-source
+// cycle) are replaced by a banner once the daemon reports the explicit model —
+// they can no longer share anything, so continuing to show them would claim a
+// sharing state that is not real. The CONTACT-share controls below are a
+// different consent dimension and are unaffected.
 function renderSharingView() {
   const globalHost = $('share-global');
-  if (globalHost) { globalHost.replaceChildren(); globalHost.appendChild(buildGlobalSwitch()); }
+  if (globalHost) {
+    globalHost.replaceChildren();
+    if (explicitModel()) {
+      globalHost.appendChild(modelBanner('Updating to explicit levels…',
+        'Standing "share all" policies no longer share anything: each '
+        + 'conversation is now shared, or private, entirely on its own. Share a '
+        + 'conversation from the ⋯ menu on its row. The full set of levels '
+        + 'arrives in the next update.'));
+    } else {
+      globalHost.appendChild(pendingModelBanner());
+      globalHost.appendChild(buildGlobalSwitch());
+    }
+  }
   const sourcesHost = $('share-sources');
-  if (sourcesHost) { sourcesHost.replaceChildren(); sourcesHost.appendChild(buildSourceSwitches()); }
+  if (sourcesHost) {
+    sourcesHost.replaceChildren();
+    sourcesHost.appendChild(explicitModel()
+      ? modelBanner('Updating to explicit levels…',
+        'Per-source conversation sharing has been removed. Existing shares were '
+        + 'kept: any conversation that a standing policy was sharing has been '
+        + 'written down as an explicit share you can review and change per '
+        + 'conversation.')
+      : buildSourceSwitches());
+  }
   renderConsentSummary();
   renderContactShareView();
 }

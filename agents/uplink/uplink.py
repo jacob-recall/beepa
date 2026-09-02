@@ -15,7 +15,13 @@ Security invariants enforced here:
     applied to LOCAL.
   - Consent boundary: only rooms whose effective state resolves to shared
     (agents/uplink/consent.py, a byte-parity port of shared/model/consent.js)
-    are mirrored. Flip-to-not-shared DELETES the master mirror (revocation).
+    are mirrored. Sharing is EXPLICIT-ONLY: a per-conversation level of
+    'share' or 'direct' mirrors, and absent-or-unrecognized is private —
+    nothing is inherited from a contact profile or a standing policy any more.
+    Flip-to-not-shared DELETES the master mirror (revocation). The one-time
+    migration that materializes previously-inherited shares as explicit
+    overrides is migrate_explicit_levels() (D0); it runs before the first
+    reconcile can evaluate a deletion under the new rules.
   - Idempotency: SQLite event_map prevents duplicate posts across restarts; the
     per-room watermark advances ONLY after the master confirms 200 OK. When the
     master is unreachable the daemon buffers and retries with backoff and does
@@ -129,6 +135,15 @@ PROPOSALS_MARKER = "com.jkali.proposals"    # state marker on a proposals room
 CONTACT_STATE_TYPE = "com.jkali.contact"    # per-handle state event on the contacts room
 CONTACTS_MARKER = "com.jkali.contacts"      # state marker on the contacts room
 
+# D0 (direct-share-level plan): the one-time migration to EXPLICIT per-conversation
+# levels. consent.py no longer inherits from profile/per-source/global policy, so
+# every conversation that was mirrored purely because of a standing policy must be
+# materialized as an explicit 'share' override BEFORE the new resolver is allowed
+# to evaluate deletions — otherwise the first pass after the upgrade would revoke
+# every standing-policy share. The flag lives in state.db `meta`; the marker tells
+# the teammate UI the daemon has stopped honoring standing policies (F7).
+MIGRATED_FLAG = "migrated_explicit_levels"  # meta key, "1" once the pass completed
+
 # Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
 MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
 # Generic Matrix room-id shape (any server_name) — the proposal's target_room is
@@ -158,6 +173,53 @@ MEDIA_LABELS = {"m.image": "Photo", "m.video": "Video", "m.audio": "Audio", "m.f
 DEFAULT_MEDIA_MAX = 25 * 1024 * 1024        # 25 MB re-upload cap (§8.2, v1.5)
 
 log = logging.getLogger("uplink")
+
+
+def legacy_effective_shared(convo, policy, override, profile=None):
+    """The PRE-D1 (inherit-semantics) share decision — kept for D0 ONLY.
+
+    This is a frozen copy of the boolean the old four-level resolver returned:
+      1. per-conversation override, EXACT 'share' / 'private' only
+      2. contact-profile share-state 'share' / 'private'
+      3. per-source policy 'share-all' / 'private-all'
+      4. global standing policy 'share-all'
+      5. safe default: not shared
+    It exists so migrate_explicit_levels() can ask "was this room shared under
+    the OLD rules?" and materialize that answer as an explicit override. It is
+    NEVER consulted for a live mirroring decision — consent.effective_shared()
+    is the only authorization path — and nothing new may call it.
+
+    Note the F8 compat fact this pins: the old code recognized only the exact
+    strings 'share'/'private', so a stored 'direct' override behaves here as
+    INHERIT (falls through to profile/source/global), not as private. That is
+    what a partial rollback to old code would do, and tests/unit/
+    uplink_migration.test.py pins it.
+    """
+    if override == "share":
+        return True
+    if override == "private":
+        return False
+
+    prof = profile if isinstance(profile, dict) else None
+    if prof:
+        if prof.get("share") == "share":
+            return True
+        if prof.get("share") == "private":
+            return False
+
+    pol = policy if isinstance(policy, dict) else {}
+    c = convo if isinstance(convo, dict) else {}
+    sid = c.get("sourceId")
+    sid = sid if isinstance(sid, str) and sid else None
+    # Same gated per-source lookup the old resolver used (valid key, own entry,
+    # exact value) — reuse consent's gate rather than re-deriving it here.
+    src = consent._source_rule(pol.get("sources"), sid)
+    if src == "share-all":
+        return True
+    if src == "private-all":
+        return False
+
+    return pol.get("global") == "share-all"
 
 
 def sanitize_proposal_content(content, sender, event_id, origin_ts):
@@ -579,16 +641,108 @@ class Uplink:
         return self.local("GET", "/_matrix/client/v3/sync",
                            query={"filter": flt, "timeout": "0"}, timeout=120)
 
-    def desired_shared(self, sync_data):
+    # -- D0: one-time migration to explicit per-conversation levels ----------
+    def write_share_override(self, local_room_id, state, migrated=False):
+        """PUT one room's explicit share level into the teammate's OWN room
+        account-data on the LOCAL homeserver (the same event the teammate UI
+        writes). `migrated` stamps the content so apps/user can show the
+        one-time "review migrated shares" list — converting a revocable
+        standing policy into explicit overrides is surfaced, never silent.
+        """
+        if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
+            raise ValueError("invalid room id")
+        if state not in consent.OVERRIDE_STATES:
+            raise ValueError("invalid share level")
+        content = {"state": state}
+        if migrated:
+            content["migrated"] = True
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/rooms/" + urllib.parse.quote(local_room_id, safe="")
+                + "/account_data/" + consent.SHARE_OVERRIDE_TYPE)
+        self.local("PUT", path, content)
+
+    def write_consent_model_marker(self):
+        """Record the consent MODEL VERSION in local user account-data (F7).
+
+        Its presence is what tells apps/user that this daemon no longer honors
+        the per-source / global standing policies, so the UI can stop offering
+        controls it would not honor. Written only after the migration pass has
+        materialized every inherited share.
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + consent.CONSENT_MODEL_TYPE)
+        self.local("PUT", path, {"version": consent.CONSENT_MODEL_EXPLICIT})
+
+    def migrate_explicit_levels(self):
+        """Materialize standing-policy shares as explicit 'share' overrides.
+
+        Runs at most once per state.db (guarded by the MIGRATED_FLAG meta key)
+        and returns {room_id: 'share'} for what it wrote this pass ({} on every
+        later pass). ORDERING IS A HARD REQUIREMENT: reconcile() calls this
+        BEFORE it resolves anything under the new (explicit-only) resolver, so
+        a room kept alive by a standing policy gets its explicit override
+        before any deletion is evaluated. This pass itself performs no master
+        calls at all and therefore cannot delete a mirror.
+
+        A room is migrated iff ALL of:
+          - it is CURRENTLY mirrored (a row in mirror_rooms), and
+          - it is still joined and attributable to a known source, and
+          - it has no explicit per-room override already (an existing override
+            is the teammate's own decision and is never rewritten), and
+          - the OLD inherit-semantics resolver says it was shared.
+
+        A failed write aborts the pass WITHOUT setting the flag (the exception
+        propagates out of reconcile before any delete_mirror can run), so the
+        next pass retries; already-written overrides are simply skipped then.
+        """
+        if self.meta_get(MIGRATED_FLAG) == "1":
+            return {}
+        sync_data = self.full_sync()
+        policy = self.read_policy()
+        overrides = consent.overrides_from_sync(sync_data)
+        source_of = self.sources_from_sync(sync_data)
+        profile_of = self.read_profiles()
+        join = (((sync_data or {}).get("rooms") or {}).get("join")) or {}
+        written = {}
+        for rid in sorted(self.existing_mirror_ids()):
+            if rid in overrides:
+                continue          # already an explicit level — never rewritten
+            if rid not in join:
+                continue          # no longer joined: nothing to preserve
+            src = source_of.get(rid)
+            if not src:
+                continue          # unattributable: the old resolver skipped it too
+            convo = {"id": rid, "sourceId": src,
+                     "sourceLabel": SOURCE_ID_TO_LABEL.get(src, src)}
+            prof = profile_of.get(rid)
+            profile_arg = ({"displayName": prof["displayName"], "share": prof["share"]}
+                           if prof else None)
+            if not legacy_effective_shared(convo, policy, None, profile_arg):
+                continue
+            self.write_share_override(rid, "share", migrated=True)
+            written[rid] = "share"
+        self.write_consent_model_marker()
+        self.meta_set(MIGRATED_FLAG, "1")   # flag LAST: the pass is idempotent
+        log.info("consent model 2 (explicit levels): materialized %d inherited "
+                 "share(s) as explicit overrides", len(written))
+        return written
+
+    def desired_shared(self, sync_data, extra_overrides=None):
         """Return (desired {room_id: bool}, source_of, join, profile_of).
 
-        profile_of maps room_id -> {'id','displayName','share'} for rooms that
-        belong to a contact profile (§12 phase 5). The profile share-state is
-        applied by the 4-level resolver (per-conv override > profile > source >
-        global > private) and also drives the master stamp in create_mirror.
+        Sharing is EXPLICIT-ONLY (D1): only the per-conversation override
+        decides. profile_of is still returned because create_mirror stamps a
+        shared contact profile onto the mirror room for grouping on the master
+        — it no longer affects the share decision.
+
+        extra_overrides is the map D0's migration just wrote; merging it makes
+        this pass independent of whether the /sync snapshot below already
+        reflects those brand-new account-data events.
         """
         policy = self.read_policy()
         overrides = consent.overrides_from_sync(sync_data)
+        if extra_overrides:
+            overrides.update(extra_overrides)
         source_of = self.sources_from_sync(sync_data)
         profile_of = self.read_profiles()
         join = (((sync_data or {}).get("rooms") or {}).get("join")) or {}
@@ -602,13 +756,13 @@ class Uplink:
             profile_arg = ({"displayName": prof["displayName"], "share": prof["share"]}
                            if prof else None)
             desired[rid] = consent.effective_shared(convo, policy, overrides.get(rid), profile_arg)
-        # Visibility (pm_mng-es1): an explicit per-room 'share' the source
-        # detector cannot attribute is a consent decision this daemon cannot
-        # honor — say so instead of silently skipping. Only explicit overrides
-        # are checked (a share-all policy would flag every unbridged room),
-        # and only on change so the loop does not repeat itself every pass.
+        # Visibility (pm_mng-es1): a per-room share level the source detector
+        # cannot attribute is a consent decision this daemon cannot honor — say
+        # so instead of silently skipping. Only on change, so the loop does not
+        # repeat itself every pass.
         sourceless = sorted(rid for rid, st in overrides.items()
-                            if st == "share" and rid in join and not source_of.get(rid))
+                            if st in ("share", "direct") and rid in join
+                            and not source_of.get(rid))
         if sourceless != self._last_sourceless:
             self._last_sourceless = sourceless
             if sourceless:
@@ -619,8 +773,13 @@ class Uplink:
     def reconcile(self):
         # Refresh once per pass; _forward_message (backfill + tail) reads it.
         self.self_mxids = self.read_self_mxids()
+        # D0 ordering invariant: the explicit-levels migration completes (and
+        # sets its flag) BEFORE anything is resolved under the new resolver, so
+        # no delete_mirror can ever run against a not-yet-materialized standing
+        # share. No-op on every pass after the first.
+        migrated = self.migrate_explicit_levels()
         sync_data = self.full_sync()
-        desired, source_of, join, profile_of = self.desired_shared(sync_data)
+        desired, source_of, join, profile_of = self.desired_shared(sync_data, migrated)
         plan = reconcile.reconcile_decisions(desired, self.existing_mirror_ids())
         log.info("reconcile: create=%d delete=%d keep=%d",
                  len(plan["create"]), len(plan["delete"]), len(plan["keep"]))

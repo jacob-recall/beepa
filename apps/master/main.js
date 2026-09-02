@@ -222,7 +222,7 @@ function parseSnapshot(data) {
     const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
                    lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
                    profileId: null, profileDisplayName: null, createSender: null,
-                   isContacts: false, contacts: [] };
+                   isContacts: false, contacts: [], shareLevelContent: null };
     // State from BOTH the `state` block and `timeline` (a newer space's
     // create/name/child events can still be in the timeline window).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
@@ -278,6 +278,14 @@ function parseSnapshot(data) {
         info.profileId = sanitizeLine(e.content.id);
         info.profileDisplayName = typeof e.content.displayName === 'string'
           ? sanitizeLine(e.content.displayName) : null;
+      }
+      // D2b (direct-share-level plan): the uplink stamps/re-stamps this state
+      // event on a mirror room with the teammate's per-conversation level
+      // ('share' | 'direct'). Read-only, raw content kept as-is (including any
+      // junk) — shareLevelLabel() below is the sole place that validates it,
+      // so there is exactly one under-promise-only decision point.
+      if (e.type === 'com.jkali.share_level' && e.state_key === '') {
+        info.shareLevelContent = (e.content && typeof e.content === 'object') ? e.content : null;
       }
       if (e.type === 'm.space.child' && e.state_key && e.content && Object.keys(e.content).length) {
         if (!seenChild.has(e.state_key)) { seenChild.add(e.state_key); info.children.push(e.state_key); }
@@ -1095,6 +1103,22 @@ function proposalTargetFor(rec) {
   return { target, proposalsRoom, label };
 }
 
+// Pure label selection for the draft/proposal affordance (direct-share-level
+// plan D4). Takes the RAW com.jkali.share_level content as read off the
+// mirror room's state (parseSnapshot, above) — never pre-validated — so
+// every failure mode collapses into one branch here: level exactly 'direct'
+// (the uplink's own auto-send gate, D2, is the sole authority on whether a
+// message is actually auto-sent) -> "Send"; anything else — 'share', absent
+// stamp, unrecognized/junk content, non-object content, or this having been
+// left null by a read error upstream — -> "Propose". Under-promise only: a
+// mislabel may show "Propose" for a room the uplink would in fact auto-send,
+// never "Send" for one it would not. Exported for tests/unit/master_share_level.test.js.
+function shareLevelLabel(content) {
+  const level = (content && typeof content === 'object' && typeof content.level === 'string')
+    ? content.level : null;
+  return level === 'direct' ? 'Send' : 'Propose';
+}
+
 function setupProposalComposer(rec) {
   const pane = $('proposal-pane');
   if (!pane) return;
@@ -1102,6 +1126,8 @@ function setupProposalComposer(rec) {
   proposalStatus('');
   const input = $('proposal-input');
   if (input) input.value = '';
+  const send = $('proposal-send');
+  if (send) send.textContent = shareLevelLabel(rec && rec.shareLevelContent);
   if (!ctx) { pane.classList.add('hidden'); return; }
   pane.classList.remove('hidden');
 }
@@ -1827,7 +1853,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal };
+export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {

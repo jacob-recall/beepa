@@ -16,6 +16,7 @@ docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/auto_merge_n
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/proposal_classification.test.js
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/share_bulk_action.test.js
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/direct_send_reconfirm.test.js
+docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/master_share_level.test.js
 python3 tests/unit/contacts_store.test.py
 python3 tests/unit/import_macos.test.py
 python3 tests/unit/contact_consent_py.test.py

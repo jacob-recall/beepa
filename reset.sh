@@ -88,14 +88,25 @@ rm -f "${HERE}/apps/user/session.local.json" "${HERE}/apps/master/session.local.
       "${HERE}/apps/user/connect.local.json"
 log "removed generated hub + master config/secrets/state"
 
-# --- 5. iMessage: built binary + Beeper clone + local state ---
-rm -rf "${HERE}/imessage/bin" "${HERE}/imessage/platform-imessage" "${HERE}/imessage/daemon.json" \
-       "${HERE}/imessage/logs" "${HERE}/imessage/tmp"
+# --- 5. iMessage: regenerated state only. PRESERVE the built binary + Beeper
+#        clone by default. The CLI is AD-HOC signed, so a rebuild produces a NEW
+#        code-signature hash and macOS revokes ALL of its TCC grants (Full Disk
+#        Access, Automation, Accessibility, Contacts) — which silently breaks
+#        sending until every permission is re-granted. Keeping the binary keeps
+#        its hash, so its permissions survive a reset. build-cli.sh already skips
+#        the build when the binary exists, so nothing rebuilds it either.
+#        Set RESET_IMESSAGE_BUILD=1 to force a clean rebuild (re-grant after).
+if [ "${RESET_IMESSAGE_BUILD:-0}" = 1 ]; then
+  rm -rf "${HERE}/imessage/bin" "${HERE}/imessage/platform-imessage"
+  log "removed iMessage binary + Beeper clone (RESET_IMESSAGE_BUILD=1 — re-grant TCC perms after rebuild)"
+else
+  log "preserved iMessage binary + Beeper clone (keeps macOS TCC grants; RESET_IMESSAGE_BUILD=1 forces a rebuild)"
+fi
+rm -rf "${HERE}/imessage/daemon.json" "${HERE}/imessage/logs" "${HERE}/imessage/tmp"
 rm -f "${HERE}"/imessage/*.db
 # Python bytecode caches the stdlib helpers leave behind (reset uses explicit
 # rm, not `git clean -X`, so these need their own sweep).
 find "${HERE}" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
-log "removed iMessage binary + Beeper source clone"
 
 # --- 6. safety: restore any TRACKED file the rm's caught (e.g. a logs/.gitignore
 #        dir-keeper) — only generated/ignored state should actually be gone ---

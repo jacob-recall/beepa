@@ -1,9 +1,17 @@
 // Plain-node test for apps/user/consent.js's PURE bulk-action planner
-// (direct-share-level plan D3/F11, S2 acceptance): "set all conversations in
-// this source to Share/Private" writes only share/private — 'direct' can
-// never be reached this way — and never silently overwrites an existing
-// explicit 'private' override; the caller must list every such conversation
-// in the confirm before writing.
+// (direct-share-level plan D3/F11, S2 acceptance, amended 2026-09-02 by an
+// explicit product-owner-approved reversal of F11's "bulk never offers
+// direct" disposition — see D3 in
+// docs/superpowers/plans/2026-09-02-direct-share-level.md): "set all
+// conversations in this source to Share/Private/Direct" writes only
+// share/private/direct — anything else ('inherit', junk, undefined) is
+// refused — and never silently overwrites an existing explicit 'private'
+// override; the caller must list every such conversation in the confirm
+// before writing. A 'direct' plan is additionally marked
+// `requiresRiskConfirm` and its `ids` enumerate EVERY affected room (not
+// just the explicit-private overwrites), since the caller's confirm for
+// bulk Direct must list every conversation, not only the ones being
+// silently overwritten.
 //
 // Run: docker run --rm -v "$(pwd)":/w -w /w node:20-alpine \
 //        node tests/unit/share_bulk_action.test.js
@@ -21,11 +29,26 @@ const convos = [
   { id: '!c:localhost', title: 'C' },
 ];
 
-// ---- refuses anything but 'share'/'private' — 'direct' NEVER reachable in bulk --
-ok(planBulkShareChange(convos, new Map(), 'direct') === null, 'bulk refuses level "direct"');
+// ---- refuses anything but 'share'/'private'/'direct' --------------------
 ok(planBulkShareChange(convos, new Map(), 'inherit') === null, 'bulk refuses level "inherit"');
 ok(planBulkShareChange(convos, new Map(), 'junk') === null, 'bulk refuses a junk level');
 ok(planBulkShareChange(convos, new Map(), undefined) === null, 'bulk refuses an undefined level');
+
+// ---- 'direct': plans correctly, enumerates ALL affected rooms, still
+// flags explicit-private overwrites, and requires the risk confirm --------
+const overridesMapDirect = new Map([['!a:localhost', 'private'], ['!b:localhost', 'share']]);
+const planDirect = planBulkShareChange(convos, overridesMapDirect, 'direct');
+ok(planDirect && planDirect.level === 'direct', 'plan level is "direct"');
+ok(planDirect && planDirect.ids.length === 3
+  && planDirect.ids.includes('!a:localhost') && planDirect.ids.includes('!b:localhost') && planDirect.ids.includes('!c:localhost'),
+  'direct plan enumerates every convo in the source, not just the overwrites');
+ok(planDirect && planDirect.overwritesPrivate.length === 1 && planDirect.overwritesPrivate[0] === '!a:localhost',
+  'direct plan still flags the convo that is currently explicit private');
+ok(planDirect && planDirect.requiresRiskConfirm === true,
+  'a direct plan is marked as requiring the risk confirm');
+const planShareForContrast = planBulkShareChange(convos, overridesMapDirect, 'share');
+ok(planShareForContrast && planShareForContrast.requiresRiskConfirm !== true,
+  'a share plan is not marked as requiring the risk confirm');
 
 // ---- 'share': writes every convo id, and flags explicit-private overwrites --
 const overridesMap = new Map([['!a:localhost', 'private'], ['!b:localhost', 'share']]);

@@ -388,17 +388,29 @@ function buildShareSlider(convo, afterAdvance) {
 }
 
 // ---- Direct: a separate confirmed control, never a cycle position (F6) ------
-// The ONLY two places allowed to write override 'direct' are this confirm and
-// the identical confirm reused by the migrated-shares review below — both
-// call escalateToDirect(), so there is exactly one write site for the escalation
-// and it is always gated by confirmDirect(). Every other write path in this
-// file (the cycle, the bulk action) is restricted to 'share'/'private'.
-function directConfirmText(convoTitle) {
+// The ONLY places allowed to write override 'direct' are this confirm, the
+// identical confirm reused by the migrated-shares review below, and (as of
+// the 2026-09-02 product-owner-approved reversal of F11's "bulk never offers
+// direct" — see D3 in the plan doc) the bulk action's own confirmed path —
+// all three go through escalateToDirect()/writeShareOverride('direct', …),
+// so there is exactly one write primitive for the escalation and every call
+// site is gated by a confirm carrying the same risk copy. The share
+// cycle (SHARE_CYCLE_V2) still never includes 'direct' as a position — it
+// cannot be reached by a pass-through tap.
+// The risk paragraph is shared verbatim between the single-conversation
+// confirm below and the bulk confirm (2026-09-02 product-owner-approved
+// reversal of F11's "bulk never offers direct" — see D3 and the plan's F11
+// row): only the trailing "into …" reference and the closing question
+// differ between the two call sites, so factor those out rather than
+// duplicating the risk copy.
+function directRiskCopy(intoText) {
   return 'Your manager’s messages will be sent as you, without your review.\n\n'
     + 'A compromised manager session or master server could send messages as you '
-    + 'into “' + convoTitle + '”. Recipients will not be able to tell the '
-    + 'difference between a message you typed and one your manager sent automatically.\n\n'
-    + 'Turn on Direct for this conversation?';
+    + 'into ' + intoText + '. Recipients will not be able to tell the '
+    + 'difference between a message you typed and one your manager sent automatically.';
+}
+function directConfirmText(convoTitle) {
+  return directRiskCopy('“' + convoTitle + '”') + '\n\nTurn on Direct for this conversation?';
 }
 function confirmDirect(convo) {
   return confirmModal('Turn on Direct?', directConfirmText(sanitizeLine(convo.title || convo.id)), false);
@@ -587,14 +599,21 @@ function buildSourceSwitches() {
   return wrap;
 }
 
-// ---- bulk action per source (F11): "set all conversations in this source" --
-// PURE: what a bulk Share/Private write on `convos` would do against the
-// current `overridesMap`. Refuses anything but 'share'/'private' (returns
-// null — 'direct' can NEVER be reached in bulk). `overwritesPrivate` lists
-// every convo id that is CURRENTLY an explicit 'private' override and would
-// be changed by this bulk write — the caller must list these in the confirm
-// before writing; this function only computes the plan, it never writes.
-const BULK_SHARE_LEVELS = new Set(['share', 'private']);
+// ---- bulk action per source (F11, later amended): "set all conversations
+// in this source" ------------------------------------------------------------
+// PURE: what a bulk Share/Private/Direct write on `convos` would do against
+// the current `overridesMap`. Refuses anything not in BULK_SHARE_LEVELS.
+// 'direct' was added to that set by a 2026-09-02 product-owner-approved
+// reversal of F11's original "bulk never offers direct" disposition — see
+// D3 in docs/superpowers/plans/2026-09-02-direct-share-level.md — gated on
+// the caller side by a mandatory full-enumeration risk confirm
+// (`requiresRiskConfirm` below; see bulkSetSourceLevel()). `overwritesPrivate`
+// lists every convo id that is CURRENTLY an explicit 'private' override and
+// would be changed by this bulk write ('share' and 'direct' both widen
+// visibility, so both are checked) — the caller must list these in the
+// confirm before writing; this function only computes the plan, it never
+// writes.
+const BULK_SHARE_LEVELS = new Set(['share', 'private', 'direct']);
 function planBulkShareChange(convos, overridesMap, level) {
   if (!BULK_SHARE_LEVELS.has(level)) return null;
   const get = (id) => (overridesMap instanceof Map
@@ -605,16 +624,54 @@ function planBulkShareChange(convos, overridesMap, level) {
   for (const c of (Array.isArray(convos) ? convos : [])) {
     if (!c || typeof c.id !== 'string' || !c.id) continue;
     ids.push(c.id);
-    if (level === 'share' && get(c.id) === 'private') overwritesPrivate.push(c.id);
+    if ((level === 'share' || level === 'direct') && get(c.id) === 'private') overwritesPrivate.push(c.id);
   }
-  return { level, ids, overwritesPrivate };
+  return { level, ids, overwritesPrivate, requiresRiskConfirm: level === 'direct' };
 }
 
 async function bulkSetSourceLevel(source, level) {
   const convos = convosBySource[source.id] || [];
   const plan = planBulkShareChange(convos, overrides, level);
-  if (!plan) return;                                    // refuses anything but share/private
-  const levelLabel = level === 'share' ? 'Share' : 'Private';
+  if (!plan) return;                                    // refuses anything but share/private/direct
+  const levelLabel = level === 'share' ? 'Share' : (level === 'direct' ? 'Direct' : 'Private');
+
+  if (plan.requiresRiskConfirm) {
+    // Full informed-consent confirm for bulk Direct (product-owner-approved
+    // 2026-09-02 reversal of F11 — see D3): the SAME risk copy as the
+    // single-conversation Direct confirm, PLUS every one of the affected
+    // conversations enumerated by name (not just the explicit-private
+    // overwrites — Direct demands total enumeration, since it is a much
+    // bigger step than Share), PLUS the explicit-model note that this only
+    // touches conversations that exist right now.
+    const names = plan.ids.map((rid) => {
+      const c = convos.find((x) => x.id === rid);
+      return sanitizeLine((c && c.title) || rid);
+    });
+    let text = directRiskCopy('any of these ' + plan.ids.length + ' ' + source.label + ' conversations')
+      + '\n\nThis will turn on Direct for all ' + plan.ids.length + ' ' + source.label
+      + ' conversation(s), listed below in full:\n' + names.join('\n');
+    if (plan.overwritesPrivate.length) {
+      const privateNames = plan.overwritesPrivate.map((rid) => {
+        const c = convos.find((x) => x.id === rid);
+        return sanitizeLine((c && c.title) || rid);
+      });
+      text += '\n\nThese are currently set to Private and will change to Direct:\n' + privateNames.join('\n');
+    }
+    text += '\n\nThis affects only these EXISTING conversations. Any new '
+      + source.label + ' conversation that arrives later stays Private until '
+      + 'you set it explicitly.'
+      + '\n\nTurn on Direct for all of these conversations?';
+    const ok = await confirmModal('Turn on Direct for all ' + source.label + '?', text, false);
+    if (!ok) return;
+    for (const rid of plan.ids) {
+      const convo = convos.find((x) => x.id === rid) || { id: rid };
+      await writeShareOverride(convo.id, 'direct');
+      overrides.set(convo.id, 'direct');
+    }
+    renderSharingView();
+    return;
+  }
+
   let text = 'Set all ' + plan.ids.length + ' ' + source.label + ' conversation(s) to ' + levelLabel + '?';
   // Never silently overwrite an explicit 'private' — list exactly what changes.
   if (plan.overwritesPrivate.length) {
@@ -622,7 +679,7 @@ async function bulkSetSourceLevel(source, level) {
       const c = convos.find((x) => x.id === rid);
       return sanitizeLine((c && c.title) || rid);
     });
-    text += '\n\nThese are currently set to Private and will change to Share:\n' + names.join('\n');
+    text += '\n\nThese are currently set to Private and will change to ' + levelLabel + ':\n' + names.join('\n');
   }
   const ok = await confirmModal('Set all to ' + levelLabel + '?', text, false);
   if (!ok) return;
@@ -639,10 +696,15 @@ function buildBulkShareRow(source) {
   const shareBtn = el('button', 'share-bulk-btn', 'Share');
   shareBtn.type = 'button';
   shareBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'share'));
+  const directBtn = el('button', 'share-bulk-btn', 'Direct');
+  directBtn.type = 'button';
+  directBtn.title = 'Auto-send: your manager’s messages go out without your review';
+  directBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'direct'));
   const privateBtn = el('button', 'share-bulk-btn', 'Private');
   privateBtn.type = 'button';
   privateBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'private'));
   wrap.appendChild(shareBtn);
+  wrap.appendChild(directBtn);
   wrap.appendChild(privateBtn);
   return wrap;
 }

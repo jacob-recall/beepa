@@ -194,6 +194,22 @@ last-stamped level tracked in state.db.
   `private` only — **never `direct`** (F11); never overwrites an existing
   explicit `private` without listing the affected conversations in the
   confirm (F11).
+  **(bulk-direct later enabled by product-owner decision 2026-09-02 with
+  mandatory full-enumeration confirm; see D3):** the product owner
+  explicitly approved reversing this "bulk never offers `direct`"
+  disposition on 2026-09-02. The bulk action now also offers `direct`,
+  gated behind a confirm that (a) lists EVERY conversation the bulk write
+  will change, by name — not just the explicit-`private` overwrites, since
+  `direct` demands total enumeration — (b) carries the same risk copy as
+  the single-conversation Direct confirm (sent as you without review; a
+  compromised manager session or master server can send as you; recipients
+  cannot tell), and (c) states that only conversations that exist right now
+  are affected — a conversation that arrives in the source later stays
+  Private until set explicitly. It still never silently overwrites an
+  existing explicit `private`; those are still called out separately. Every
+  write of `'direct'`, bulk or single, still goes through the same
+  `writeShareOverride`/`escalateToDirect` primitive — the share cycle itself
+  still cannot reach `'direct'` by a pass-through tap.
 - Proposal inbox: classifies `com.jkali.auto_sent: true` records as
   non-actionable history from event content (F5); renders the
   "may already have been sent" ambiguous state distinctly (F4); shows the
@@ -312,7 +328,7 @@ Reviewer: pilotfish:security-reviewer, 2026-09-02 (read-only, pre-approval).
 | F8 | P2 | Plan's downgrade claim wrong: old code treats `'direct'` as inherit, not private | Accepted-and-corrected (D1 compat note, Rollback rewrite, curated pin test) |
 | F9 | P2 | Mgmt-room denylist has no primitive; cited cap constant didn't exist | Mitigated-by-D2.4 (positive mirror-set check) and D2.6 (new persisted constant) |
 | F10 | P2 | Gate ordering; stale consent at send time | Adopted wholesale as D2's order; fresh point-read in D2.5 |
-| F11 | P2 | Bulk action / migration can widen or silently make standing policy permanent | Mitigated-by-D0 (migrated flag + review list) and D3 (bulk: no direct, no silent private overwrite) |
+| F11 | P2 | Bulk action / migration can widen or silently make standing policy permanent | Mitigated-by-D0 (migrated flag + review list) and D3 (bulk: no silent private overwrite) (bulk-direct later enabled by product-owner decision 2026-09-02 with mandatory full-enumeration confirm; see D3) |
 | F12 | P2 | Master-identity rebinding doesn't invalidate proposal state | Mitigated-by-D2.11 (identity-keyed state, suspend until teammate re-ack) |
 | F13 | P2 | Profile `share` copy misleads after inheritance removal | Mitigated-by-D1/D3 copy updates |
 | F14 | P3 | Recipient can't distinguish auto-sent (inherent); provenance field forgeable | Accepted-residual-risk, stated in UI copy; cosmetic local badge added, never touches `from_me` gate |

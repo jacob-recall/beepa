@@ -147,7 +147,15 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   confirm whose copy states that manager messages will be sent as the
   teammate without review, that a master/manager compromise can send as them,
   and that recipients cannot tell the difference. The per-source bulk action
-  offers `share`/`private` only — never `direct`.
+  offers `share`/`direct`/`private` — bulk `direct` was enabled by an
+  explicit 2026-09-02 product-owner decision reversing the plan's original
+  F11 disposition (see D3 in
+  `docs/superpowers/plans/2026-09-02-direct-share-level.md`), and is gated
+  behind a confirm that enumerates EVERY affected conversation by name,
+  carries the same risk copy as the single-conversation confirm, and states
+  that only existing conversations are affected. Every write of `'direct'`
+  (single or bulk) still funnels through `writeShareOverride`/
+  `escalateToDirect` — the cycle itself never reaches it.
 
 ## How to run / test
 

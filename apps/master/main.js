@@ -1028,10 +1028,11 @@ async function openRoom(roomId) {
     // chronological order, so timeline/arrival order is not display order.
     const sorted = chunk.slice().sort((a, c2) => mirrorTs(a) - mirrorTs(c2));
     for (const ev of sorted) renderBubble(ev);
-    if (box) box.scrollTop = box.scrollHeight;
   } catch (e) {
     roomStatus('Could not load messages: ' + String(e.message || e));
   }
+  await loadSuggestionOverlay();
+  if (box) box.scrollTop = box.scrollHeight;
   startTail(roomId);
 }
 
@@ -1061,6 +1062,7 @@ async function startTail(roomId) {
           if (MS.openRoomId !== roomId) break;
           renderBubble(ev);
         }
+        pinSuggestion();
         const box = $('room-messages');
         if (box) box.scrollTop = box.scrollHeight;
       }
@@ -1110,6 +1112,100 @@ function proposalStatus(text, isError) {
   s.textContent = text || '';
   s.classList.toggle('hidden', !text);
   s.classList.toggle('error', !!isError);
+}
+
+// Latest room-targeted proposal for one target_room. Pure. The teammate inbox
+// already keeps only the newest pending draft per room (pendingForRoom); this
+// overlay does the same so the manager sees one editable bubble, not a stack.
+function latestRoomProposal(events, targetRoom) {
+  if (!Array.isArray(events) || typeof targetRoom !== 'string' || !targetRoom) return null;
+  let best = null;
+  for (const e of events) {
+    if (!e || e.type !== 'com.jkali.proposal' || !e.content) continue;
+    if (e.content.target_room !== targetRoom) continue;
+    const body = typeof e.content.body === 'string' ? e.content.body.trim() : '';
+    if (!body) continue;
+    const ts = typeof e.content.origin_ts === 'number' ? e.content.origin_ts
+      : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
+    if (!best || ts > best.ts) best = { body, eventId: e.event_id, ts };
+  }
+  return best;
+}
+
+function pinSuggestion() {
+  const box = $('room-messages');
+  const row = box && box.querySelector('.msg-row.suggested');
+  if (row && row !== box.lastElementChild) box.appendChild(row);
+}
+
+function showSuggestion(body) {
+  const box = $('room-messages');
+  if (!box) return;
+  const text = sanitize(body);
+  if (!text) return;
+  let row = box.querySelector('.msg-row.suggested');
+  if (!row) {
+    row = el('div', 'msg-row sent suggested');
+    const meta = el('div', 'msg-meta');
+    meta.appendChild(el('span', 'msg-role-time', 'suggested'));
+    row.appendChild(meta);
+    const bubble = el('div', 'msg');
+    bubble.appendChild(el('div', 'body'));
+    row.appendChild(bubble);
+    row.addEventListener('dblclick', startSuggestionEdit);
+    box.appendChild(row);
+  }
+  const bodyNode = row.querySelector('.body');
+  if (bodyNode && bodyNode.getAttribute('contenteditable') !== 'true') bodyNode.textContent = text;
+  pinSuggestion();
+  box.scrollTop = box.scrollHeight;
+}
+
+function startSuggestionEdit(e) {
+  const bodyNode = e.currentTarget.querySelector('.body');
+  if (!bodyNode || bodyNode.getAttribute('contenteditable') === 'true') return;
+  const saved = bodyNode.textContent || '';
+  bodyNode.setAttribute('contenteditable', 'true');
+  bodyNode.focus();
+  const range = document.createRange();
+  range.selectNodeContents(bodyNode);
+  const sel = window.getSelection();
+  if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  let done = false;
+  const stop = () => {
+    if (done) return;
+    done = true;
+    bodyNode.removeAttribute('contenteditable');
+    bodyNode.removeEventListener('blur', onBlur);
+    bodyNode.removeEventListener('keydown', onKey);
+  };
+  const onBlur = () => {
+    if (done) return;
+    const next = sanitize(bodyNode.textContent || '').trim();
+    stop();
+    if (!next) { bodyNode.textContent = saved; return; }
+    if (next === saved) return;
+    submitProposal({ body: next }).catch(() => { bodyNode.textContent = saved; });
+  };
+  const onKey = (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); bodyNode.blur(); }
+    if (ev.key === 'Escape') { ev.preventDefault(); bodyNode.textContent = saved; stop(); }
+  };
+  bodyNode.addEventListener('blur', onBlur);
+  bodyNode.addEventListener('keydown', onKey);
+}
+
+async function loadSuggestionOverlay() {
+  const ctx = MS.openProposalCtx;
+  if (!ctx || !ctx.proposalsRoomId || !ctx.targetRoom || !ctx.mirrorRoomId) return;
+  if (!ROOMID_RE.test(ctx.proposalsRoomId) || !MS.proposalsRoomSet.has(ctx.proposalsRoomId)) return;
+  try {
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(ctx.proposalsRoomId) + '/messages?dir=b&limit=100';
+    const data = await api('GET', q);
+    if (MS.openRoomId !== ctx.mirrorRoomId) return;
+    const latest = latestRoomProposal(Array.isArray(data.chunk) ? data.chunk : [], ctx.targetRoom);
+    if (latest) showSuggestion(latest.body);
+  } catch (e) { /* overlay is optional; the write path still works */ }
 }
 
 // Pure builder for a PERSON-targeted proposal's content (extracted so a unit
@@ -1210,7 +1306,8 @@ async function submitProposal(opts) {
     proposalStatus('This conversation has no valid target room.', true); return;
   }
   const input = $('proposal-input');
-  const body = (input && input.value ? input.value : '').trim();
+  const body = (opts && typeof opts.body === 'string' ? opts.body
+    : (input && input.value ? input.value : '')).trim();
   if (!body) { proposalStatus('Type a suggestion first.', true); return; }
   const content = {
     target_room: target,
@@ -1219,14 +1316,14 @@ async function submitProposal(opts) {
     origin_ts: Date.now(),
   };
   const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-  proposalStatus('Sending suggestion…');
   try {
     // NOTE: event type is the literal 'com.jkali.proposal'. This is the only
     // write endpoint in apps/master and it targets ONLY a proposals room.
     await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
       + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
     if (input) input.value = '';
-    proposalStatus('Suggested.');
+    proposalStatus('');
+    showSuggestion(body);
   } catch (e) {
     proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
   }
@@ -1724,12 +1821,13 @@ async function enterApp() {
   MS.pollTimer = setInterval(() => { refreshAll().catch(() => {}); }, 20000);
 }
 
-// buildIdentifierProposalContent is exported so a plain-node unit test can
-// exercise the shape gate in isolation (tests/unit/proposal_identifier.test.js).
-// Exporting it makes this module importable outside the browser, so the one
-// top-level DOM binding below is guarded — importing under node must not touch
-// `document`. In the browser `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent };
+// buildIdentifierProposalContent and latestRoomProposal are exported so a
+// plain-node unit test can exercise the shape gates in isolation
+// (tests/unit/proposal_identifier.test.js). Exporting them makes this module
+// importable outside the browser, so the one top-level DOM binding below is
+// guarded — importing under node must not touch `document`. In the browser
+// `document` always exists and behavior is unchanged.
+export { buildIdentifierProposalContent, latestRoomProposal };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {

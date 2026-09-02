@@ -12,7 +12,7 @@
 //        node tests/unit/proposal_identifier.test.js
 // Exits 0 on all-pass, nonzero (via process.exitCode) on any failure.
 
-import { buildIdentifierProposalContent } from '../../apps/master/main.js';
+import { buildIdentifierProposalContent, latestRoomProposal } from '../../apps/master/main.js';
 
 let pass = 0;
 let fail = 0;
@@ -103,6 +103,23 @@ ok(okSrcUnderscore !== null && okSrcUnderscore.target_source === 'google_message
 // ---- no-arg / empty-arg safety ----
 ok(buildIdentifierProposalContent() === null, 'no args returns null');
 ok(buildIdentifierProposalContent({}) === null, 'empty object returns null');
+
+// ---- latestRoomProposal: newest matching target_room, ignore the rest ----
+ok(latestRoomProposal(null, '!r:x') === null, 'null events returns null');
+ok(latestRoomProposal([], '!r:x') === null, 'empty events returns null');
+ok(latestRoomProposal([{ type: 'com.jkali.proposal', content: { body: 'x' } }], '!r:x') === null,
+  'proposal without target_room ignored');
+const overlayEv = [
+  { type: 'com.jkali.proposal', event_id: '$old', content: { target_room: '!r:x', body: 'old', origin_ts: 1 } },
+  { type: 'm.room.message', content: { body: 'not a proposal' } },
+  { type: 'com.jkali.proposal', event_id: '$oth', content: { target_room: '!other:x', body: 'nope', origin_ts: 99 } },
+  { type: 'com.jkali.proposal', event_id: '$new', content: { target_room: '!r:x', body: '  new  ', origin_ts: 5 } },
+  { type: 'com.jkali.proposal', event_id: '$empty', content: { target_room: '!r:x', body: '   ', origin_ts: 8 } },
+];
+const hit = latestRoomProposal(overlayEv, '!r:x');
+ok(hit && hit.body === 'new', 'picks newest non-empty body for that target_room');
+ok(hit && hit.eventId === '$new', 'returns that event id');
+ok(latestRoomProposal(overlayEv, '!missing:x') === null, 'no match returns null');
 
 if (fail) {
   console.error('proposal_identifier.test.js: ' + fail + ' FAILED, ' + pass + ' passed');

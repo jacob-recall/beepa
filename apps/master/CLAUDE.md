@@ -84,7 +84,9 @@ now a deliberate, documented duplication, not an oversight.
   target and still in the allowlist, target still shape-valid) and writes to
   the **pinned** ids — it never re-resolves the destination. A mid-session
   revocation or label change therefore refuses the write instead of
-  redirecting it somewhere new.
+  redirecting it somewhere new. A successful room-targeted write is shown
+  only in this console as a right-side `suggested` bubble (overlay on the
+  mirror timeline — never an `m.room.message` in the conversation).
 - **The write surface is exactly `{POST /login, POST /logout, POST
   /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn}, POST
   ENROLL_BASE/admin/add-teammate, POST ENROLL_BASE/admin/delete-teammate}`** — asserted at build time by

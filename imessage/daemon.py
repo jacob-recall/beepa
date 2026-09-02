@@ -643,6 +643,31 @@ def ghost_join(uid, room_id):
 
 # ---------------------------------------------------------------- inbound poll
 # Engine JSON field mapping is finalized in slice I3 against real output.
+def sync_portal_name(chat, chat_id):
+    """Keep an existing portal's room name in step with the engine's resolved
+    chat title. Contact names can arrive AFTER portal creation (the CLI only
+    resolves Contacts once granted access), so a portal created early would
+    otherwise show the raw handle forever. Cheap: one meta compare per poll;
+    a Matrix PUT only when the name actually changed. Names are never logged
+    (M-12) — hash only."""
+    room = room_for_chat(chat_id)
+    if not room:
+        return
+    name = clean_name(chat_display_name(chat))
+    if not name:
+        return
+    key = "cname:" + chat_id
+    if meta_get(key) == name:
+        return
+    try:
+        rid = urllib.parse.quote(room, safe="")
+        mx("PUT", f"/_matrix/client/v3/rooms/{rid}/state/m.room.name",
+           {"name": name}, user=BOT_ID)
+        meta_set(key, name)
+        log.info("portal renamed chat=%s", sha(chat_id)[:8])
+    except Exception:
+        log.info("portal rename failed chat=%s", sha(chat_id)[:8])
+
 def poll_once():
     data = cli_json("chats")
     items = data.get("items", []) if isinstance(data, dict) else []
@@ -650,6 +675,7 @@ def poll_once():
         chat_id = str(c.get("id") or "")
         if not chat_id:
             continue
+        sync_portal_name(c, chat_id)
         marker = str(c.get("timestamp") or "")
         key = "cursor:" + chat_id
         if marker and meta_get(key) == marker:
@@ -658,6 +684,29 @@ def poll_once():
         if marker:
             meta_set(key, marker)
 
+CONTACTS_DB = os.path.realpath(os.path.join(BASE, "..", "agents", "contacts", "contacts.db"))
+
+def local_contact_name(handle):
+    """display_name from the teammate's own contacts store (agents/contacts —
+    imported hourly from macOS Contacts by import_macos.py). Used when the
+    engine cannot resolve a name itself: its CNContactStore access follows the
+    TCC responsible process, which under launchd is this python — normally
+    ungranted, so engine titles arrive empty. Read-only, fail-soft: any error
+    (store absent, schema drift) returns None and the raw handle is shown."""
+    if not handle:
+        return None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % CONTACTS_DB, uri=True)
+        try:
+            r = db.execute(
+                "SELECT display_name FROM contacts WHERE network_id=? AND deleted=0",
+                (handle.lower() if "@" in handle else handle,)).fetchone()
+        finally:
+            db.close()
+        return r[0] if r and r[0] else None
+    except Exception:
+        return None
+
 def chat_display_name(chat):
     title = chat.get("title") or ""
     if title:
@@ -665,6 +714,10 @@ def chat_display_name(chat):
     parts = (chat.get("participants") or {}).get("items", [])
     others = [p.get("phoneNumber") or p.get("email") or p.get("id", "")
               for p in parts if not p.get("isSelf")]
+    if len(others) == 1:
+        name = local_contact_name(others[0])
+        if name:
+            return name
     return ", ".join(x for x in others if x) or "Note to self"
 
 def handle_chat_delta(chat, chat_id):

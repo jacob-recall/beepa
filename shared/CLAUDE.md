@@ -19,11 +19,17 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   `configureMatrixBase()` so a page can repoint the transport at a different
   homeserver (used only by `apps/master`). Each HTML page gets its own ES
   module graph, so repointing one page's copy never affects another.
-- `model/consent.js` — the authorization boundary (PLAN §4): the pure
-  4-level resolver `resolve()`/`effectiveShared()`/`resolveAll()`
-  (per-conversation override > contact-profile share > per-source policy >
-  global policy > safe default `private`), normalization helpers, and
-  account-data storage helpers for `com.jkali.share_policy` /
+- `model/consent.js` — the authorization boundary (PLAN §4, as amended by
+  the direct-share-level plan's D1): the pure **explicit-only** conversation
+  resolver `resolve()`/`effectiveShared()`/`effectiveLevel()`/`resolveAll()`.
+  A conversation carries exactly ONE per-conversation level — `share` and
+  `direct` mirror, `private` does not, and **absent or any unrecognized value
+  resolves `private`**. There is no inheritance on the conversation path:
+  contact-profile share-state, the per-source policy and the global standing
+  policy are still accepted as arguments and deliberately ignored. The
+  layered, most-specific-wins model survives only in the SEPARATE
+  contact-sharing dimension (`resolveContactShare`). Plus normalization
+  helpers and account-data storage helpers for `com.jkali.share_policy` /
   `com.jkali.share_override`. **Must stay byte-parity with
   `agents/uplink/consent.py`** — same precedence, same reason strings, same
   normalization. `tests/unit/consent.test.js` and
@@ -112,8 +118,9 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
 - **JS ↔ Python consent parity is a hard requirement, and the conformance
   harness is its authority.** `model/consent.js` and
   `agents/uplink/consent.py` must resolve identically on every input: same
-  precedence order, same reason strings (`'explicit'`, `'excluded'`,
-  `'all <source>'`, `'profile: <name>'`, `'private'`), same normalization,
+  precedence order, same reason strings (conversations: `'explicit'`,
+  `'direct'`, `'excluded'`, `'private'`; contacts: `'all <source> contacts'`,
+  `'all contacts'`, `'private'`), same normalization,
   and the SAME input canonicalisation (the shared type gates: plain-object /
   non-empty-string / `SOURCE_KEY_RE` own-property lookups /
   `CONSENT_ROOMID_RE` — see the table in

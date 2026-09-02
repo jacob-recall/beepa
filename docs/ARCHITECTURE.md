@@ -56,10 +56,12 @@ Entry points:
   validation, `configureMatrixBase()` (used only by the master app to repoint
   at :8018). Per-page module instances keep the two apps isolated.
 - `state.js` — the single mutable state object `S` + shared collections.
-- `model/consent.js` — the **authorization boundary**: a pure 4-level resolver
-  (per-conversation override > contact-profile > per-source > global; default
-  private) + normalization + account-data storage helpers. Verified in parity
-  with the Python port (see Tests below).
+- `model/consent.js` — the **authorization boundary**: for conversations, a
+  pure explicit-only resolver (per-conversation override `share` / `direct` /
+  `private`; absent or unrecognized ⇒ private — no inheritance); contact
+  sharing keeps its own per-source policy resolver. Plus normalization +
+  account-data storage helpers. Verified in parity with the Python port (see
+  Tests below).
 - `model/contacts.js` — contact profiles (`com.jkali.contact_profiles`):
   one person across platforms; a room belongs to at most one profile;
   `normalizeProfiles()` re-validates on every read and write.

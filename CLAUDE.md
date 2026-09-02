@@ -87,17 +87,22 @@ lives where, security invariants, and how to run/test each piece:
 - `apps/user/CLAUDE.md` — the teammate app: share controls, the consent
   summary panel, the contacts UI, and the proposal inbox, all built on
   `shared/`. `sendConvoMessage` (in `shared/ui/chat.js`) is the only path
-  that sends into a conversation; the only other message writes are
-  `sendCmd`/`sendSecretToMgmt` into verified bridge-management rooms.
+  by which this APP sends into a conversation; the only other message writes
+  are `sendCmd`/`sendSecretToMgmt` into verified bridge-management rooms.
+  (The teammate's uplink also sends, for `direct` conversations only — see
+  below.)
 - `apps/master/CLAUDE.md` — the manager's read-only console: no composer,
   no send call anywhere except one narrow, allowlisted proposal-write path.
   Deliberately avoids importing most of `shared/ui/` so the absence of a
   send path is *absent code*, not a hidden button.
-- `agents/uplink/CLAUDE.md` — the outbound-only mirror-up daemon on each
-  teammate's machine: resolves consent, mirrors shared conversations up,
-  pulls proposals down into a dedicated local room, tracks watermark +
-  event-map for exactly-once delivery. Its `consent.py` is a byte-parity
-  Python port of `shared/model/consent.js` — the two must never drift.
+- `agents/uplink/CLAUDE.md` — the mirror-up daemon on each teammate's
+  machine: resolves consent, mirrors shared conversations up, pulls
+  proposals down into a dedicated local room, tracks watermark + event-map
+  for exactly-once delivery. Outbound-only in both directions, and it sends
+  into a conversation in exactly one case: a `direct`-level conversation
+  auto-sends manager proposals behind D2's eleven gates. Its `consent.py` is
+  a byte-parity Python port of `shared/model/consent.js` — the two must
+  never drift.
 - `agents/contacts/CLAUDE.md` — the teammate's durable address-book store
   (`contacts.db`, mode 600) and the hourly macOS Contacts importer
   (`import_macos.py`, JXA via `osascript`, TCC-prompted, fail-closed).
@@ -112,20 +117,32 @@ lives where, security invariants, and how to run/test each piece:
   integration harness that drives two real homeservers end to end.
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)
-stays the source of truth for their own conversations. A teammate's layered
-consent (per-conversation > contact-profile > per-source > global,
-most-specific-wins, default private) decides which conversations the
-uplink mirrors, as an ordinary outbound Matrix client, into per-teammate
-rooms on the always-on master homeserver. The master is a **copy**, never a
-credential or sending capability — the manager reads it through
-`apps/master/`, which cannot send, and may only leave a proposal that the
-teammate reviews and sends themselves from their own account
-(`apps/user/`'s proposal inbox, via the same guarded local send path).
+stays the source of truth for their own conversations. A teammate's
+EXPLICIT per-conversation level — `share`, `direct`, or `private` (the
+default; absent or unrecognized resolves private, and nothing is inherited
+from a contact profile or a standing policy) — decides which conversations
+the uplink mirrors, as an ordinary outbound Matrix client, into per-teammate
+rooms on the always-on master homeserver. The master is a **copy** and never
+holds a teammate credential; the manager reads it through `apps/master/`,
+which cannot send, and may only leave a proposal. For a `share` conversation
+that proposal waits in the teammate's inbox until they send it themselves
+(`apps/user/`, via the same guarded local send path). For a `direct`
+conversation — an explicit, separately-confirmed opt-in per conversation —
+the teammate's own uplink sends it into the conversation with no review
+click, which makes the manager identity a bounded remote send capability on
+that teammate's real accounts for those conversations; what bounds it is
+D2's eleven gates in `agents/uplink/`.
 
 **Security model, in one line per layer:** render whitelist + anti-spoof
-from_me gate (shared UI) → consent resolver as the authorization boundary,
-enforced identically in JS and Python (shared model + uplink) → mirror-room
-power levels pinning the manager to read-only, set at room creation
-(uplink) → no composer / no send code at all in the master app (build-time
-separation) → secrets and state files at 600, master stack isolated from
-the live `matrix-wa` hub on separate ports and volumes.
+from_me gate (shared UI) → explicit per-conversation consent resolver as the
+authorization boundary, enforced identically in JS and Python (shared model
++ uplink) → mirror-room power levels pinning the manager to read-only, set
+at room creation (uplink) → no composer / no send code at all in the master
+app (build-time separation) → the one deliberate send path, the uplink's
+`direct` auto-send, bounded by D2's eleven teammate-side gates (manager
+sender verification, send-grade sanitization, freshness, mirrored-target
+membership, a fresh consent point-read, a persisted rate cap,
+intent-before-dispatch, one non-actionable inbox record either way, a
+pre/post-dispatch failure split, a hash-only audit, and master-identity
+binding that suspends on rebinding) → secrets and state files at 600, master
+stack isolated from the live `matrix-wa` hub on separate ports and volumes.

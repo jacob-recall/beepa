@@ -50,7 +50,16 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
 - `main.js`'s `sendConvoMessage(targetRoom, bodyOverride)` call sites are the
   **only** two ways a message leaves this app: typing + Send/Enter in the
   open conversation, and approving a proposal. Both go through the same
-  guarded function in `shared/ui/chat.js`.
+  guarded function in `shared/ui/chat.js`. **That is a statement about this
+  app, not about the machine:** for a conversation the teammate has set to
+  the `direct` level, `agents/uplink/` sends manager proposals into the
+  conversation itself, with no click here (see `agents/uplink/CLAUDE.md`'s
+  gate list). This app is where the teammate opts into that — a separate
+  confirm, never a cycle position — and where the resulting records are
+  rendered: a `com.jkali.auto_sent` proposal is non-actionable history
+  ("Sent directly"), a `com.jkali.send_ambiguous` one is the labelled "may
+  already have been sent" row, and both are classified **from event content
+  only**, never from `localStorage`. Neither is ever sendable with one click.
 - `style.css` — app-specific styling for the share controls, proposal
   cards, and contact cards (shared layout/typography lives in `shared/`'s
   CSS, loaded by `index.html`).
@@ -126,10 +135,19 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   from account-data / the live consent resolver / the live proposals room.
 - **Consent is always read from `shared/model/consent.js`.** Never
   hand-roll the precedence logic in this app; call `resolve()`/`resolveAll()`.
-- **A profile links a room; it never bypasses per-conversation `private`.**
-  The 4-level precedence (override > profile > source > global) is enforced
-  in the shared resolver, not here — `contacts.js` only sets the *profile*
-  level's `share` field via `setProfileShare()`.
+- **A profile links a room; it never shares one.** Conversation sharing is
+  EXPLICIT-ONLY since the direct-share-level plan's D1: the per-conversation
+  level (`share`/`direct`/`private`, absent-or-unrecognized = private) is the
+  whole decision, and a contact profile's `share` field no longer affects
+  conversation mirroring at all. That resolution lives in the shared
+  resolver, not here — `contacts.js` only sets the *profile* level's `share`
+  field via `setProfileShare()`.
+- **`direct` is never reachable by a pass-through tap.** The share cycle goes
+  `share → private` only; `direct` has its own control behind an explicit
+  confirm whose copy states that manager messages will be sent as the
+  teammate without review, that a master/manager compromise can send as them,
+  and that recipients cannot tell the difference. The per-source bulk action
+  offers `share`/`private` only — never `direct`.
 
 ## How to run / test
 

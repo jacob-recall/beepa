@@ -20,8 +20,8 @@ real proposals:
 Run: python3 tests/unit/uplink_proposals.test.py
 """
 import os
-import sqlite3
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "agents", "uplink"))
 import uplink
@@ -40,14 +40,15 @@ def check(name, cond):
 
 
 def make_uplink(recorded="!props:localhost", mirrors=()):
-    """A minimal Uplink with an in-memory state db and a capturing transport."""
+    """A minimal Uplink over the REAL state.db schema + a capturing transport.
+
+    The schema comes from Uplink._open_db (which also runs the versioned
+    migration) rather than a hand-rolled copy, so a schema change cannot leave
+    these tests passing against a shape the daemon no longer uses.
+    """
     u = object.__new__(uplink.Uplink)
-    u.db = sqlite3.connect(":memory:")
-    u.db.execute("CREATE TABLE mirror_rooms (local_room_id TEXT PRIMARY KEY, "
-                 "master_room_id TEXT UNIQUE, source TEXT, last_synced_pos TEXT)")
-    u.db.execute("CREATE TABLE proposal_map (master_event_id TEXT PRIMARY KEY, "
-                 "local_event_id TEXT)")
-    u.db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+    u.db = uplink.Uplink._open_db(
+        os.path.join(tempfile.mkdtemp(prefix="uplink-props-"), "state.db"))
     for local_id, master_id in mirrors:
         u.db.execute("INSERT INTO mirror_rooms (local_room_id, master_room_id) "
                      "VALUES (?,?)", (local_id, master_id))

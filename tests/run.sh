@@ -30,4 +30,6 @@ python3 tests/unit/enroll_proxy_guard.test.py
 python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_proposals.test.py
 python3 tests/unit/uplink_migration.test.py
+python3 tests/unit/uplink_direct_send.test.py
+python3 tests/unit/uplink_share_level.test.py
 python3 tests/unit/uplink_sources.test.py

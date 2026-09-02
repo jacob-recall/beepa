@@ -91,6 +91,7 @@ def make_uplink(mirrors=(), policy=None, profiles=None, sync=None, migrated=Fals
     u.deleted = []       # every delete_mirror target — must stay empty pre-flag
     u.created = []
     u.synced = []
+    u.stamped = []       # D2b share-level (re-)stamps; master-side, stubbed here
 
     def local(method, path, body=None, query=None, timeout=60):
         if method == "GET":
@@ -119,6 +120,7 @@ def make_uplink(mirrors=(), policy=None, profiles=None, sync=None, migrated=Fals
     # all during the migration, and `deleted` staying empty is the acceptance.
     u.create_mirror = lambda rid, *a, **kw: u.created.append(rid)
     u.delete_mirror = lambda rid: u.deleted.append(rid)
+    u.stamp_share_level = lambda rid, level: u.stamped.append((rid, level))
     u.sync_room = lambda rid: u.synced.append(rid)
     return u
 

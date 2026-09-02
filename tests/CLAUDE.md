@@ -1,4 +1,4 @@
-# tests/ — 25 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
+# tests/ — 30 unit tests + the consent conformance harness, all wired into tests/run.sh + the 13-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -8,7 +8,7 @@ explicit, named test — see the scenario list below.
 
 ```
 tests/
-  run.sh                          runs all 25 unit tests (11 node + 14 python)
+  run.sh                          runs all 30 unit tests (14 node + 16 python)
                                   + the consent conformance harness — see below
   unit/
     consent.test.js               shared/model/consent.js — the explicit three-level model
@@ -29,6 +29,8 @@ tests/
     number_resolver.test.py       phone-number resolution
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
     uplink_proposals.test.py      proposal handling
+    uplink_direct_send.test.py    D2 'direct'-level auto-send gates + S3 schema migration
+    uplink_share_level.test.py    D2b per-mirror com.jkali.share_level stamping
     uplink_sources.test.py        source-space derivation
     enroll_password_derivation.test.py  master derived-password scheme (no stored passwords)
   conformance/
@@ -89,6 +91,26 @@ tests/
   functions: `reconcile_decisions` (create/delete/keep sets),
   `select_new_events` (idempotency filter, including within-batch dedup),
   `next_watermark` (advances only when `confirmed=True`).
+- `unit/uplink_direct_send.test.py` — D2: the `direct` level's auto-send,
+  the one path where code rather than the teammate puts a message into a
+  real conversation. One case per gate and per failure mode: sender
+  mismatch and `master_user`-as-sender refused, `created_by` spoof ignored,
+  `!`-prefixed body refused, control/bidi stripped and 8000 clamp applied to
+  what is actually sent, cold start and stale timestamps routed to the
+  inbox, unmirrored and person-targeted proposals never auto-sent, the
+  `direct → private` flip caught by the send-time point-read, the per-room
+  cap enforced and surviving a restart, an interrupted send recovered as
+  "may already have been sent" with no duplicate (deterministic txn id),
+  identity rebinding suspending auto-send until the ack matches, exactly one
+  inbox artifact per proposal in every path, hash-only logs and audit rows,
+  the S3 schema migration against a pre-S3 state.db, and the one-time
+  proposals-room topic re-PUT.
+- `unit/uplink_share_level.test.py` — D2b: per-room LEVELS through
+  `reconcile_decisions` (`level_is_shared`, so `'private'` can never read as
+  shared through bare truthiness) and `plan_level_restamp`, plus a real
+  `reconcile()` proving a mirror is stamped at creation, re-stamped on
+  promotion AND demotion, backfilled once if it predates the stamp, and
+  otherwise left alone.
 
 ### Integration harness (`tests/integration/harness.py`)
 
@@ -163,7 +185,7 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh runs all 25 (11 node + 14 python) + the consent conformance harness:
+# tests/run.sh runs all 30 (14 node + 16 python) + the consent conformance harness:
 tests/run.sh
 
 # --- integration (needs BOTH stacks up first) ---
@@ -208,6 +230,14 @@ safe to delete between runs.
    layout, re-run the full integration suite — most scenarios assert
    directly on the power levels / space structure it provisions.
 5. If you change the uplink's SQLite schema (`mirror_rooms`/`event_map`/
-   `proposal_map`/`meta` in `agents/uplink/uplink.py`), check
-   `harness.py` for any direct `sqlite3` inspection of the state DB that
-   would need updating too.
+   `proposal_map`/`direct_send_log`/`direct_send_audit`/`meta` in
+   `agents/uplink/uplink.py`), it needs a `Uplink._migrate_db()` block and a
+   `SCHEMA_VERSION` bump — `unit/uplink_direct_send.test.py` drives a db
+   built by the pre-S3 schema through the current code and is where that
+   gets proven. Also check `harness.py` for any direct `sqlite3` inspection
+   of the state DB that would need updating too.
+6. `unit/uplink_direct_send.test.py` is the regression suite for the ONE
+   path where code, not the teammate, sends a real message (the `direct`
+   level's auto-send). Any change to `_direct_send_gate()`/`_auto_send()`
+   belongs in the same commit as a change here; never delete a case to make
+   a change pass.

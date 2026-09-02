@@ -4,8 +4,19 @@
 PLAN-MASTER-SYNC.md §5.4 / §7 / §8. A headless, OUTBOUND-ONLY Matrix client. It
 authenticates to the teammate's LOCAL homeserver (read) and to the MASTER
 homeserver (write, as the teammate's own scoped account). It never listens on a
-socket, never sends to any external network, and never holds a bridge session or
-external send-capability.
+socket and never holds a bridge session or external send-capability.
+
+It sends into a conversation in exactly ONE case (direct-share-level plan, D2):
+a conversation the teammate has explicitly set to the 'direct' level auto-sends
+manager proposals, with no review click, through _auto_send(). That path is
+gated by the eleven checks in _direct_send_gate()/_auto_send() — server-stamped
+manager sender, send-grade sanitization, freshness, mirrored-target membership,
+a FRESH consent point-read at send time, a persisted per-room hourly cap,
+intent-recorded-before-dispatch, exactly one non-actionable inbox record either
+way, a pre/post-dispatch failure split, a durable audit table, and
+master-identity binding that suspends auto-send on any rebinding until the
+teammate re-acks. Any gate failing, and every other level, still lands in the
+teammate's proposal inbox as an ordinary draft they send themselves.
 
 Security invariants enforced here:
   - Outbound only: two urllib clients, no server. Master is written strictly as
@@ -49,6 +60,9 @@ Optional:
                        Reconcile does a full initial /sync of the local hs, so
                        it stays on its own slower cadence while tail/pull spin.
   UPLINK_LOG_LEVEL   INFO|DEBUG           (default: INFO)
+  UPLINK_DIRECT_SEND_ROOM_HOURLY  D2.6 rolling per-room auto-send cap
+                       (default: 20). Persisted in state.db, so it survives
+                       KeepAlive restarts; 0 disables auto-send entirely.
 
 Python 3.9+ stdlib only (urllib + sqlite3). No pip dependencies.
 """
@@ -121,10 +135,44 @@ SELF_IDENTITIES_TYPE = "com.jkali.self_identities"
 # proposal room on the master carries manager-authored com.jkali.proposal events;
 # the uplink pulls each new one DOWN into a DEDICATED LOCAL proposals room it owns
 # on the teammate hub. Both rooms are marked with the com.jkali.proposals state
-# event. Proposals NEVER live in a mirror/conversation room and are NEVER
-# auto-sent — the teammate reviews and sends from their own guarded local path.
+# event. Proposals NEVER live in a mirror/conversation room. A proposal is an
+# ordinary draft the teammate reviews and sends from their own guarded local
+# path, EXCEPT for a conversation explicitly set to the 'direct' level, where
+# the D2 auto-send below sends it and files a non-actionable record instead.
 PROPOSAL_TYPE = "com.jkali.proposal"        # timeline event carrying a suggestion
 PROPOSALS_MARKER = "com.jkali.proposals"    # state marker on a proposals room
+
+# ---- D2 (direct-share-level plan): the auto-send exception ----------------
+# Wire contract pinned by the plan's "Wire contract (S2/S3)" section — apps/user
+# (S2) already renders exactly these fields, so none of them may be renamed or
+# reshaped on one side alone.
+AUTO_SENT_KEY = "com.jkali.auto_sent"          # true on the non-actionable record (D2.8)
+SENT_EVENT_ID_KEY = "sent_event_id"            # the LOCAL event id the send produced
+SEND_AMBIGUOUS_KEY = "com.jkali.send_ambiguous"  # post-dispatch, outcome unknown (D2.9)
+# COSMETIC ONLY (F14): stamped on the auto-sent m.room.message so apps/user can
+# badge the bubble and the mirror carries it up. It is forgeable by anything
+# holding the teammate token and MUST NEVER feed the from_me gate or any other
+# trust decision — nothing in this daemon or the apps reads it back.
+AUTO_SENT_FROM_PROPOSAL_KEY = "com.jkali.auto_sent_from_proposal"
+# D2.11 master-identity binding. Both are LOCAL user account-data on the
+# teammate's own homeserver (never proposal-room events); apps/user's
+# suspensionAffordance()/ackDirectSendSuspension() are the other half.
+DIRECT_SEND_SUSPENDED_TYPE = "com.jkali.direct_send_suspended"
+DIRECT_SEND_ACK_TYPE = "com.jkali.direct_send_ack"
+# D2b: per-mirror share level, read by apps/master to label its draft
+# affordance ("Send" only for 'direct'). Cosmetic on the master side — the
+# authorization is the teammate-side consent point-read in D2.5.
+SHARE_LEVEL_TYPE = "com.jkali.share_level"
+DIRECT_SEND_BODY_MAX = 8000                 # D2.2 send-grade clamp (= sendConvoMessage's)
+DIRECT_SEND_FRESH_MS = 10 * 60 * 1000       # D2.3 replay bound: 10 minutes
+DIRECT_SEND_ROOM_HOURLY = 20                # D2.6 default per-room rolling cap
+DIRECT_SEND_WINDOW_S = 3600                 # D2.6 rolling window
+# D2.2 send-grade sanitization: the SAME character classes as
+# shared/ui/el.js sanitize() — C0 controls except \n (so \t IS stripped),
+# DEL, bidi overrides/isolates, zero-width + directional marks, BOM. Kept as
+# one literal class so a reader can diff it against the JS by eye.
+SEND_STRIP_RE = re.compile(
+    "[\x00-\x09\x0b-\x1f\x7f‪-‮⁦-⁩​-‏﻿]")
 
 # §12 phase 5 contact mirror (Task 6). A DEDICATED per-teammate contacts room on
 # the master carries one com.jkali.contact STATE event per SHARED address-book
@@ -143,6 +191,31 @@ CONTACTS_MARKER = "com.jkali.contacts"      # state marker on the contacts room
 # every standing-policy share. The flag lives in state.db `meta`; the marker tells
 # the teammate UI the daemon has stopped honoring standing policies (F7).
 MIGRATED_FLAG = "migrated_explicit_levels"  # meta key, "1" once the pass completed
+
+# state.db schema version (sqlite PRAGMA user_version). Bump it and add a block
+# to Uplink._migrate_db() for any change to an EXISTING table's shape — the
+# CREATE-IF-NOT-EXISTS init cannot evolve a teammate's already-created db.
+#   0 = pre-S3 (mirror_rooms/event_map/proposal_map/contact_mirror/meta)
+#   1 = D2/D2b: proposal_map.outcome, mirror_rooms.stamped_level,
+#       direct_send_log, direct_send_audit
+SCHEMA_VERSION = 1
+# One-time re-PUT of the two proposal-room topics after the D2 copy change
+# (the old strings asserted an absolute that auto-send breaks, and a topic is
+# only written at room creation).
+TOPIC_COPY_FLAG = "proposal_topics_direct_copy"
+# The room topics BOTH proposals rooms carry. Before D2 each asserted an
+# absolute — that no proposal is ever dispatched without the teammate's click —
+# which the direct level breaks, so they now state the exception instead. A
+# topic is only written at room creation, hence the one-time re-PUT above for
+# installs whose rooms already exist.
+MASTER_PROPOSALS_TOPIC = (
+    "Manager suggestions for this teammate. The teammate reviews each one and "
+    "sends it themselves — EXCEPT in conversations they have set to Direct, "
+    "where their own uplink sends it into the conversation without review.")
+LOCAL_PROPOSALS_TOPIC = (
+    "Suggested messages from the manager. Review each one and send it yourself "
+    "— EXCEPT in conversations you have set to Direct, where your uplink "
+    "already sent it and files the record here after the fact.")
 
 # Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
 MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
@@ -229,9 +302,11 @@ def sanitize_proposal_content(content, sender, event_id, origin_ts):
     and returns None (fail-closed) for anything malformed, so the caller records
     it as handled and never retries:
 
-    - ROOM proposal: `target_room` is a valid room id (SHAPE only — it is a
-      teammate-LOCAL room id the uplink never sends to; the teammate's guarded
-      send path re-validates it against the live joined set). Carries down
+    - ROOM proposal: `target_room` is a valid room id (SHAPE only — a
+      teammate-LOCAL room id, re-validated against the live joined set by
+      whoever eventually sends: the teammate's guarded send path, or — for a
+      'direct' conversation — D2's positive mirror-set membership check, which
+      is the only thing here that lets this daemon send to it). Carries down
       target_room/body/created_by/origin_ts/proposal_source_event/template.
     - PERSON-TARGETED proposal: no target_room, but a `target_identifier` that
       is a valid E.164 handle OR strict email, a `target_source` that is a short
@@ -248,8 +323,13 @@ def sanitize_proposal_content(content, sender, event_id, origin_ts):
     if not isinstance(body, str) or not body.strip():
         return None
 
-    created_by = (c.get("created_by") if isinstance(c.get("created_by"), str)
-                  else (sender or ""))
+    # D2-1 (F16): created_by is COSMETIC and is pinned to the SERVER-STAMPED
+    # sender, never taken from content. A manager-authored proposal is
+    # indistinguishable from one whose content claimed a different author, so a
+    # self-declared created_by must not survive into the teammate's inbox where
+    # it would read as provenance. Nothing anywhere makes a trust decision on
+    # this field — the auto-send gate compares ev["sender"] itself (D2.1).
+    created_by = sender or ""
     ots = c.get("origin_ts") if isinstance(c.get("origin_ts"), int) else origin_ts
 
     target = c.get("target_room")
@@ -291,6 +371,41 @@ def sanitize_proposal_content(content, sender, event_id, origin_ts):
 
     # ---- neither shape valid: fail closed ----
     return None
+
+
+def sanitize_send_body(body):
+    """D2-2: send-grade sanitization of a proposal body, or None to refuse.
+
+    Pure (no I/O, no self) so it is unit-testable. This runs IN ADDITION to
+    sanitize_proposal_content()'s field whitelist, and only on the auto-send
+    path — text that is about to leave the machine as a real message on the
+    teammate's own account, where the master is the untrusted author:
+
+      - strips the SAME character class as shared/ui/el.js sanitize()
+        (SEND_STRIP_RE: C0 controls except newline, DEL, bidi overrides and
+        isolates, zero-width/directional marks, BOM) so a proposal cannot
+        smuggle invisible or direction-flipping text past the teammate;
+      - clamps to DIRECT_SEND_BODY_MAX (8000), the same clamp the teammate's
+        own guarded send path applies;
+      - REFUSES (returns None) any body whose first non-whitespace character
+        is '!' — bridge-command injection defense. mautrix bridges take
+        '!wa …'-style commands from the user's own account in some scopes;
+        rather than depend on how that resolves, no auto-sent message may
+        ever begin with the command sigil. A refusal is not a silent drop:
+        the caller falls back to the ordinary actionable draft, so the
+        teammate still sees the proposal and can send it deliberately.
+
+    Refuses an empty/blank result too (nothing to send after stripping).
+    """
+    if not isinstance(body, str):
+        return None
+    clean = SEND_STRIP_RE.sub("", body)[:DIRECT_SEND_BODY_MAX]
+    stripped = clean.lstrip()
+    if not stripped.strip():
+        return None
+    if stripped.startswith("!"):
+        return None
+    return clean
 
 
 class MasterUnreachable(Exception):
@@ -395,6 +510,11 @@ class Config:
         self.log_level = env.get("UPLINK_LOG_LEVEL", "INFO")
         # v1.5 media re-upload: skip (-> placeholder) anything above this many bytes.
         self.media_max = max(0, int(env.get("UPLINK_MEDIA_MAX", str(DEFAULT_MEDIA_MAX))))
+        # D2.6: rolling per-room hourly auto-send cap. Clamped at 0 (never
+        # negative), so a hostile/typo'd value can only make auto-send rarer,
+        # never unbounded; 0 disables auto-send entirely.
+        self.direct_send_cap = max(0, int(
+            env.get("UPLINK_DIRECT_SEND_ROOM_HOURLY", str(DIRECT_SEND_ROOM_HOURLY))))
 
 
 # --------------------------------------------------------------------- matrix
@@ -425,6 +545,9 @@ class Uplink:
         self.self_mxids = set()   # refreshed at the top of every reconcile()
         self._last_sourceless = None  # change-detector for the sourceless-share warning
         self._last_reconcile = 0.0    # monotonic-enough throttle for reconcile()
+        # D2-11: auto-send is suspended until refresh_direct_send_binding()
+        # (called at the top of ensure_proposal_rooms) says otherwise.
+        self._direct_suspended = True
 
     # -- local (read) and master (write) transports -------------------------
     def local(self, method, path, body=None, query=None, timeout=60):
@@ -468,11 +591,58 @@ class Uplink:
             "master_state_key TEXT, PRIMARY KEY(source, network_id))")
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
+        Uplink._migrate_db(db)
         try:
             os.chmod(path, 0o600)  # secrets/state 600 regardless of umask
         except OSError:
             pass
         return db
+
+    @staticmethod
+    def _migrate_db(db):
+        """Versioned schema migration (sqlite user_version), idempotent.
+
+        The CREATE-IF-NOT-EXISTS block above only ever ADDS tables, so it
+        cannot evolve a table that already exists on a teammate's machine.
+        Everything that changes an existing shape lives here, guarded by
+        `PRAGMA user_version`, and must be safe to run against BOTH a brand-new
+        db (just created above) and a pre-existing pre-S3 one.
+
+        v1 (D2/D2b, direct-share-level plan):
+          - proposal_map.outcome  — the per-proposal outcome state
+            (NULL/'fallback' = ordinary actionable draft in the inbox,
+            'attempted' = auto-send dispatched with the result still unknown,
+            'sent' = auto-sent + non-actionable record filed, 'ambiguous' =
+            post-dispatch failure + labelled record filed). This is what makes
+            the intent-before-send ordering (D2.7) durable across a crash.
+          - mirror_rooms.stamped_level — the last com.jkali.share_level stamped
+            on a mirror, so D2b re-stamps on a change instead of every pass.
+          - direct_send_log   — the persisted rolling rate-cap counter (D2.6).
+          - direct_send_audit — the durable auto-send audit trail (D2.10).
+        Both new tables are hash-only: a room id is stored as room_hash, never
+        in the clear, and no message body is ever recorded.
+        """
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
+        # Column adds are guarded individually: a db created by a LATER
+        # schema-init that already has the column must not fail the ALTER.
+        for table, column, decl in (("proposal_map", "outcome", "TEXT"),
+                                    ("mirror_rooms", "stamped_level", "TEXT")):
+            cols = {r[1] for r in db.execute("PRAGMA table_info(%s)" % table).fetchall()}
+            if column not in cols:
+                db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS direct_send_log ("
+            "ts INTEGER NOT NULL, room_hash TEXT NOT NULL)")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS direct_send_log_room "
+            "ON direct_send_log (room_hash, ts)")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS direct_send_audit ("
+            "ts INTEGER NOT NULL, master_event_id TEXT, room_hash TEXT, outcome TEXT)")
+        db.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)  # int constant, not input
+        db.commit()
 
     def meta_get(self, k, default=None):
         r = self.db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
@@ -728,12 +898,17 @@ class Uplink:
         return written
 
     def desired_shared(self, sync_data, extra_overrides=None):
-        """Return (desired {room_id: bool}, source_of, join, profile_of).
+        """Return (desired {room_id: level}, source_of, join, profile_of).
 
         Sharing is EXPLICIT-ONLY (D1): only the per-conversation override
-        decides. profile_of is still returned because create_mirror stamps a
-        shared contact profile onto the mirror room for grouping on the master
-        — it no longer affects the share decision.
+        decides. D2b: the map carries the per-room LEVEL ('private'|'share'|
+        'direct') rather than a bool, so reconcile() can stamp
+        com.jkali.share_level on the mirror; the mirroring decision itself is
+        unchanged and still goes through consent — level_is_shared(level) is
+        exactly consent.effective_shared()'s answer for the same override.
+        profile_of is still returned because create_mirror stamps a shared
+        contact profile onto the mirror room for grouping on the master — it no
+        longer affects the share decision.
 
         extra_overrides is the map D0's migration just wrote; merging it makes
         this pass independent of whether the /sync snapshot below already
@@ -755,7 +930,15 @@ class Uplink:
             prof = profile_of.get(rid)
             profile_arg = ({"displayName": prof["displayName"], "share": prof["share"]}
                            if prof else None)
-            desired[rid] = consent.effective_shared(convo, policy, overrides.get(rid), profile_arg)
+            override = overrides.get(rid)
+            # The authorization answer stays consent.effective_shared()'s; the
+            # level is only carried alongside it for the D2b stamp. If the two
+            # ever disagreed we keep the RESOLVER's answer and record private,
+            # so a stamp can never widen what is mirrored.
+            level = consent.effective_level(override)
+            if not consent.effective_shared(convo, policy, override, profile_arg):
+                level = "private"
+            desired[rid] = level
         # Visibility (pm_mng-es1): a per-room share level the source detector
         # cannot attribute is a consent decision this daemon cannot honor — say
         # so instead of silently skipping. Only on change, so the loop does not
@@ -793,7 +976,8 @@ class Uplink:
                 stamp = ({"id": prof["id"], "displayName": prof["displayName"]}
                          if prof and prof.get("share") == "share" else None)
                 self.create_mirror(rid, source_of.get(rid),
-                                   self.room_name_from_sync(join.get(rid)), stamp)
+                                   self.room_name_from_sync(join.get(rid)), stamp,
+                                   desired.get(rid))
             except MasterUnreachable:
                 raise
             except urllib.error.HTTPError as e:
@@ -805,21 +989,72 @@ class Uplink:
                 raise
             except urllib.error.HTTPError as e:
                 log.warning("delete_mirror %s failed: %s", rid, e)
+        # D2b: re-stamp com.jkali.share_level on KEPT mirrors whose level
+        # flipped in either direction (share <-> direct), plus the one-time
+        # backfill of mirrors created before this stamp existed. A pure diff
+        # against the last stamped level in state.db, so a steady state writes
+        # nothing. The stamp is cosmetic on the master (it only picks the
+        # console's affordance label); the authorization for an auto-send is
+        # the teammate-side point-read in D2.5, never this state event.
+        for rid, level in reconcile.plan_level_restamp(
+                desired, self.stamped_levels(), plan["keep"]):
+            try:
+                self.stamp_share_level(rid, level)
+            except MasterUnreachable:
+                raise
+            except urllib.error.HTTPError as e:
+                log.warning("share_level re-stamp %s failed: %s", rid, e)
         # Backfill/tail every kept + freshly-created room.
         for rid in sorted(set(plan["create"]) | set(plan["keep"])):
             self.sync_room(rid)
 
     # -- mirror lifecycle ---------------------------------------------------
-    def create_mirror(self, local_room_id, source, name, profile=None):
+    def stamped_levels(self):
+        """{local_room_id: last-stamped com.jkali.share_level} from state.db."""
+        return {r[0]: r[1] for r in self.db.execute(
+            "SELECT local_room_id, stamped_level FROM mirror_rooms").fetchall()}
+
+    def stamp_share_level(self, local_room_id, level):
+        """PUT the D2b com.jkali.share_level state event on this room's mirror.
+
+        Refuses anything but the two sharing levels (a 'private' room has no
+        mirror to stamp) and records the new level in state.db only AFTER the
+        master's 2xx — an outage raises MasterUnreachable first, so the next
+        pass simply re-plans the same re-stamp.
+        """
+        if level not in reconcile.SHARE_LEVELS:
+            raise ValueError("invalid share level")
+        row = self.mirror_for(local_room_id)
+        if not row:
+            return
+        master_room_id = row[0]
+        self.master("PUT", "/_matrix/client/v3/rooms/"
+                    + urllib.parse.quote(master_room_id, safe="")
+                    # empty state_key: the CS-API spells that as the two-segment
+                    # form (no trailing slash), same as an m.room.topic PUT.
+                    + "/state/" + SHARE_LEVEL_TYPE, {"level": level})
+        self.db.execute("UPDATE mirror_rooms SET stamped_level=? WHERE local_room_id=?",
+                        (level, local_room_id))
+        self.db.commit()
+        log.info("share_level stamp %s -> %s", local_room_id, level)
+
+    def create_mirror(self, local_room_id, source, name, profile=None, level=None):
         """Create a mirror room on MASTER, add to space, tag source, invite mgr.
 
         profile (when the room is a member of a SHARED contact profile) is
         {'id','displayName'} and is stamped as a com.jkali.profile state event so
         the master app can group this person's threads across platforms.
+        level (D2b) is the room's share level ('share'|'direct'); it is stamped
+        as com.jkali.share_level at creation and recorded in state.db so
+        reconcile only re-PUTs it when it actually changes. An unrecognized
+        level degrades to 'share' — under-promise: the master console then
+        labels its affordance "Propose", never "Send".
         """
         cfg = self.cfg
+        level = level if level in reconcile.SHARE_LEVELS else "share"
         initial_state = [
             {"type": SOURCE_TAG_TYPE, "state_key": "", "content": {"source": source or "unknown"}},
+            {"type": SHARE_LEVEL_TYPE, "state_key": "", "content": {"level": level}},
             {"type": "m.space.parent", "state_key": cfg.master_space,
              "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
         ]
@@ -853,8 +1088,9 @@ class Uplink:
                     {"via": [self._server_name(cfg.master_user)]})
         self.db.execute(
             "INSERT OR REPLACE INTO mirror_rooms "
-            "(local_room_id, master_room_id, source, last_synced_pos) VALUES (?,?,?,?)",
-            (local_room_id, master_room_id, source, None))
+            "(local_room_id, master_room_id, source, last_synced_pos, stamped_level) "
+            "VALUES (?,?,?,?,?)",
+            (local_room_id, master_room_id, source, None, level))
         self.db.commit()
         log.info("created mirror %s -> %s (source=%s)", local_room_id, master_room_id, source)
         self.backfill(local_room_id, master_room_id)
@@ -1106,8 +1342,13 @@ class Uplink:
     #     a mirror/conversation room is NEVER a target (checked before every PUT);
     #   - the ONLY event type written is com.jkali.proposal — NEVER m.room.message,
     #     so nothing here can ever look like, or become, an outgoing message;
-    #   - nothing is auto-sent to any external network or bridge. The teammate
-    #     reviews the proposal and sends it themselves via the guarded local path.
+    #   - a proposal is written into the local proposals room as an ordinary
+    #     draft the teammate reviews and sends themselves, with ONE exception:
+    #     a conversation the teammate has explicitly set to the 'direct' level
+    #     auto-sends it (D2) behind _direct_send_gate()'s eleven checks, and
+    #     the artifact filed here is then a NON-ACTIONABLE record of that send.
+    #     Person-targeted proposals are never auto-sent, and any gate failure
+    #     falls back to the ordinary draft.
     def ensure_proposal_rooms(self):
         """Idempotently ensure both proposals rooms exist; record their ids.
 
@@ -1122,6 +1363,11 @@ class Uplink:
         one-way mirror-up never considers it (desired_shared skips sourceless
         rooms) and it is never tailed for forwarding (not in mirror_rooms)."""
         cfg = self.cfg
+        # D2-11 FIRST: a master-identity rebinding invalidates the recorded
+        # master proposals room (and the watermark + dedup map) before anything
+        # below reads them, so a new master/manager gets a fresh room and a
+        # cold-start batch rather than inheriting the old identity's state.
+        self._direct_suspended = self.refresh_direct_send_binding()
         # Trust the recorded ids once created (no per-loop aliveness probe — that
         # is needless master/local request load every cycle). Rooms are durable;
         # a purged room would surface as a 404 on the next write and be handled.
@@ -1129,8 +1375,7 @@ class Uplink:
         if not mpr:
             body = {
                 "name": "Proposals",
-                "topic": "Manager suggestions for this teammate. Suggestions only — "
-                         "nothing here is ever sent externally.",
+                "topic": MASTER_PROPOSALS_TOPIC,
                 "preset": "private_chat",
                 "invite": [cfg.manager_mxid],
                 "initial_state": [
@@ -1165,14 +1410,45 @@ class Uplink:
         if not lpr:
             res = self.local("POST", "/_matrix/client/v3/createRoom", {
                 "name": "Proposals from manager",
-                "topic": "Suggested messages from the manager. Review each one and "
-                         "send it yourself — nothing here is sent automatically.",
+                "topic": LOCAL_PROPOSALS_TOPIC,
                 "preset": "private_chat",
                 "initial_state": [{"type": PROPOSALS_MARKER, "state_key": "", "content": {}}],
             })
             lpr = res["room_id"]
             self.meta_set("local_proposals_room", lpr)
             log.info("created local proposals room %s", lpr)
+
+        self.refresh_proposal_topics(mpr, lpr)
+
+    def refresh_proposal_topics(self, master_room, local_room):
+        """One-time re-PUT of both proposals-room topics after the D2 copy change.
+
+        Topics are only written at createRoom, so an install whose rooms already
+        exist would keep asserting the pre-D2 absolute ("nothing here is sent
+        automatically") while auto-send is live — the room's own description
+        would be lying to the teammate. Guarded by a state.db flag so it happens
+        exactly once, and a no-op for freshly created rooms (which already carry
+        the new copy).
+
+        An HTTPError is logged and does NOT block the flag: a permission/API
+        refusal must not re-attempt forever. MasterUnreachable propagates, so a
+        transport outage leaves the flag unset and retries on a later pass.
+        """
+        if self.meta_get(TOPIC_COPY_FLAG) == "1":
+            return
+        try:
+            self.master("PUT", "/_matrix/client/v3/rooms/"
+                        + urllib.parse.quote(master_room, safe="")
+                        + "/state/m.room.topic", {"topic": MASTER_PROPOSALS_TOPIC})
+        except urllib.error.HTTPError as e:
+            log.warning("master proposals topic update failed: %s", e)
+        try:
+            self.local("PUT", "/_matrix/client/v3/rooms/"
+                       + urllib.parse.quote(local_room, safe="")
+                       + "/state/m.room.topic", {"topic": LOCAL_PROPOSALS_TOPIC})
+        except urllib.error.HTTPError as e:
+            log.warning("local proposals topic update failed: %s", e)
+        self.meta_set(TOPIC_COPY_FLAG, "1")
 
     def _sanitize_proposal(self, ev):
         """Whitelist a master proposal event into the local proposal content.
@@ -1189,13 +1465,319 @@ class Uplink:
             origin_ts=ev.get("origin_server_ts"),
         )
 
-    def forward_proposals(self, master_room_id, local_proposals_room, events):
+    # -- D2: the auto-send exception (direct-share-level plan) ---------------
+    # Every gate below is a REFUSAL point: failing any one of them does not drop
+    # the proposal, it routes it to the teammate's inbox as the ordinary
+    # actionable draft it has always been. The gates are applied in the plan's
+    # order (D2.1 .. D2.6, with D2.11's suspension first) so the cheapest and
+    # most fundamental identity check runs before any network read.
+    IDENTITY_META = "proposal_identity"          # meta: the bound master identity
+    SUSPENDED_META = "direct_send_suspended_ts"  # meta: set => auto-send suspended
+    # Gates whose failure is the ORDINARY case (a share-level room, a
+    # person-targeted proposal, a cold start, a suspended or disabled
+    # auto-send). They log at DEBUG; every other gate is a would-be auto-send
+    # actively refused and logs at WARNING + writes a durable audit row.
+    QUIET_GATES = ("suspended", "disabled", "cold_start", "target", "consent")
+
+    @staticmethod
+    def _room_hash(room_id):
+        """Pseudonymous room identifier for logs + the rate/audit tables.
+
+        The rate cap and the audit trail must be per-room, but a room id names
+        a conversation; state.db and the log therefore only ever hold this
+        hash. Never log or store the room id itself on this path.
+        """
+        return hashlib.sha256((room_id or "").encode("utf-8")).hexdigest()
+
+    def direct_send_identity(self):
+        """D2-11: the master identity the proposal state is bound to."""
+        return (self.cfg.master_hs or "", self.cfg.master_user or "",
+                self.cfg.manager_mxid or "")
+
+    def _write_suspension(self, identity, ts):
+        """Write com.jkali.direct_send_suspended into LOCAL user account-data.
+
+        This is the event apps/user's suspensionAffordance() renders and whose
+        four fields ackDirectSendSuspension() echoes back verbatim. A failed
+        write is logged, not raised: the suspension itself lives in state.db
+        (meta), so auto-send stays off whether or not the UI could be told.
+        """
+        content = {"master_hs": identity[0], "master_user": identity[1],
+                   "manager_mxid": identity[2], "ts": ts}
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + DIRECT_SEND_SUSPENDED_TYPE)
+        try:
+            self.local("PUT", path, content)
+        except Exception as e:                    # noqa: BLE001 — never blocks the suspension
+            log.warning("could not surface the auto-send suspension to the app: %s", e)
+
+    def _direct_send_ack_matches(self, identity, ts):
+        """True iff com.jkali.direct_send_ack matches the CURRENT identity+ts.
+
+        All four fields must match the suspension this daemon currently holds —
+        an ack for a previous (or attacker-chosen) identity must not resume
+        auto-send for a different one. Any read error, malformed content, or
+        mismatch => False (stay suspended).
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + DIRECT_SEND_ACK_TYPE)
+        try:
+            data = self.local("GET", path)
+        except Exception:                         # noqa: BLE001 — fail closed
+            return False
+        if not isinstance(data, dict):
+            return False
+        return (data.get("master_hs") == identity[0]
+                and data.get("master_user") == identity[1]
+                and data.get("manager_mxid") == identity[2]
+                and data.get("ts") == ts)
+
+    def refresh_direct_send_binding(self):
+        """D2-11: bind proposal state to the master identity; return "suspended?".
+
+        master_proposals_room / proposal_sync_since / proposal_map are only
+        meaningful for ONE (master_hs, master_user, manager_mxid) tuple: a
+        different master or a different manager mxid is a different authority,
+        and reusing the watermark/dedup state across a rebinding would let a
+        replacement identity inherit the old one's trust. So any change:
+          - invalidates that state (the room id, the watermark and the dedup
+            map are dropped, which puts the next pull under D2.3's cold-start
+            rule -> the whole first batch routes to the inbox), and
+          - SUSPENDS auto-send, writing com.jkali.direct_send_suspended for
+            apps/user to surface. Auto-send resumes only once the teammate's
+            com.jkali.direct_send_ack matches this exact tuple.
+        The FIRST bind on an already-running install (no stored identity) is
+        adoption, not a rebinding: nothing changed, so nothing is suspended.
+        """
+        identity = self.direct_send_identity()
+        key = "\n".join(identity)
+        stored = self.meta_get(self.IDENTITY_META)
+        if stored is None:
+            self.meta_set(self.IDENTITY_META, key)
+        elif stored != key:
+            self.db.execute("DELETE FROM meta WHERE k IN "
+                            "('master_proposals_room','proposal_sync_since')")
+            self.db.execute("DELETE FROM proposal_map")
+            self.db.commit()
+            ts = int(time.time() * 1000)
+            self.meta_set(self.IDENTITY_META, key)
+            self.meta_set(self.SUSPENDED_META, str(ts))
+            self._write_suspension(identity, ts)
+            log.warning("master identity rebinding: proposal state invalidated and "
+                        "auto-send SUSPENDED until the teammate re-confirms in the app")
+        raw = self.meta_get(self.SUSPENDED_META)
+        if not raw:
+            return False
+        try:
+            ts = int(raw)
+        except (TypeError, ValueError):
+            return True                            # unreadable marker => stay suspended
+        if self._direct_send_ack_matches(identity, ts):
+            self.db.execute("DELETE FROM meta WHERE k=?", (self.SUSPENDED_META,))
+            self.db.commit()
+            log.info("master identity re-confirmed by the teammate; auto-send resumed")
+            return False
+        return True
+
+    def read_room_level(self, local_room_id):
+        """D2-5: a FRESH point-read of one room's explicit share level.
+
+        The reconcile pass's cached view can be minutes old, and the whole
+        point of `direct` is that it authorizes a send with no human in the
+        loop — so the level is re-read from the teammate's own account-data at
+        the moment of sending, through the SAME resolver
+        (consent.effective_level) the rest of the system uses. ANY failure —
+        bad room id, HTTP error, transport error, junk content — resolves
+        'private', never 'direct'.
+        """
+        if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
+            return "private"
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/rooms/" + urllib.parse.quote(local_room_id, safe="")
+                + "/account_data/" + consent.SHARE_OVERRIDE_TYPE)
+        try:
+            return consent.effective_level(self.local("GET", path))
+        except Exception:                          # noqa: BLE001 — fail closed
+            return "private"
+
+    def direct_send_under_cap(self, room_hash, now=None):
+        """D2-6: is this room under the rolling per-hour auto-send cap?
+
+        The counter lives in state.db (direct_send_log, hash-only), so the cap
+        survives KeepAlive restarts — an attacker who can crash the daemon
+        cannot reset the budget. Expired ticks are pruned on read, so the table
+        stays bounded by the cap itself.
+        """
+        now = int(time.time() if now is None else now)
+        cutoff = now - DIRECT_SEND_WINDOW_S
+        self.db.execute("DELETE FROM direct_send_log WHERE ts < ?", (cutoff,))
+        self.db.commit()
+        used = self.db.execute(
+            "SELECT COUNT(*) FROM direct_send_log WHERE room_hash=? AND ts>=?",
+            (room_hash, cutoff)).fetchone()[0]
+        return used < self.cfg.direct_send_cap
+
+    def _audit_direct_send(self, master_event_id, room_hash, outcome):
+        """D2-10: durable, hash-only auto-send audit row (no body, no room id)."""
+        self.db.execute(
+            "INSERT INTO direct_send_audit (ts, master_event_id, room_hash, outcome) "
+            "VALUES (?,?,?,?)", (int(time.time()), master_event_id, room_hash, outcome))
+        self.db.commit()
+
+    def _direct_send_gate(self, ev, clean, cold_start, suspended):
+        """Every D2 gate, in order. Returns (body_to_send, failed_gate).
+
+        body_to_send is the SANITIZED text and is non-None only when ALL gates
+        passed; otherwise it is None and failed_gate names the first refusal
+        (used for the hash-only log line and the audit row). No gate here has a
+        side effect except D2-6's prune, so a refusal costs nothing.
+        """
+        # D2-11 first, before anything is read: a rebound (or never
+        # re-confirmed) master identity cannot send, whatever else is true.
+        if suspended:
+            return None, "suspended"
+        cfg = self.cfg
+        if cfg.direct_send_cap <= 0:
+            return None, "disabled"               # cap 0 = auto-send switched off
+        # D2-1: SERVER-STAMPED sender only. The manager mxid must be configured
+        # and must be exactly who the homeserver says authored the event.
+        # cfg.master_user — the teammate's OWN scoped master account, which
+        # holds PL 100 in that room and could therefore author a proposal — is
+        # explicitly refused: it is a mirroring credential, never a send oracle.
+        # content's created_by plays no part here (it is pinned cosmetic, F16).
+        sender = ev.get("sender")
+        if not isinstance(cfg.manager_mxid, str) or not cfg.manager_mxid:
+            return None, "sender"
+        if not isinstance(sender, str) or sender != cfg.manager_mxid:
+            return None, "sender"
+        # Reachable only if manager_mxid were ever configured AS the teammate's
+        # own master account — a misconfiguration that would otherwise turn the
+        # mirroring credential into a send oracle. Refuse it explicitly rather
+        # than relying on the check above to be the only thing standing there.
+        if cfg.master_user and sender == cfg.master_user:
+            return None, "sender"
+        # D2-2: send-grade sanitization on top of the field whitelist.
+        body = sanitize_send_body(clean.get("body"))
+        if body is None:
+            return None, "sanitize"
+        # D2-3: freshness / replay bound. A cold start (no watermark, or an
+        # empty dedup map — e.g. a restored or lost state.db) would otherwise
+        # replay up to 100 historical proposals as real sends, so the WHOLE
+        # first batch goes to the inbox.
+        if cold_start:
+            return None, "cold_start"
+        ots = ev.get("origin_server_ts")
+        if not isinstance(ots, int) or isinstance(ots, bool):
+            return None, "freshness"
+        now_ms = int(time.time() * 1000)
+        if ots > now_ms + 60000 or (now_ms - ots) > DIRECT_SEND_FRESH_MS:
+            return None, "freshness"              # stale, or implausibly future-dated
+        # D2-4: POSITIVE target check — the proposal must be room-targeted AND
+        # that room must be a member of the mirrored set. A person-targeted
+        # (start-new-chat) proposal has no target_room and is NEVER auto-sent;
+        # a room outside mirror_rooms (a bridge management room, a random room
+        # id from a hostile master) fails membership rather than a denylist.
+        target = clean.get("target_room")
+        if not isinstance(target, str) or not target:
+            return None, "target"
+        if not self.mirror_for(target):
+            return None, "target"
+        # D2-5: fresh consent point-read at send time.
+        if self.read_room_level(target) != "direct":
+            return None, "consent"
+        # D2-6: persisted rolling per-room cap.
+        if not self.direct_send_under_cap(self._room_hash(target)):
+            return None, "cap"
+        return body, None
+
+    def _auto_send(self, master_event_id, local_room_id, body):
+        """D2-7/9/10: send one proposal into the conversation. (outcome, event_id).
+
+        Ordering is the safety property: the 'attempted' outcome and the rate-cap
+        tick are COMMITTED BEFORE the PUT, so a crash anywhere after this point
+        is recoverable as "may already have been sent" instead of replayable as
+        a second send. The transaction id is deterministic
+        (autosend_<master_event_id>), so even a retry the homeserver did receive
+        is de-duplicated server-side.
+
+        Outcomes:
+          'sent'      — the homeserver confirmed; caller files the auto_sent record.
+          'ambiguous' — dispatched, result unknown (transport failure, or a 5xx
+                        that may have been applied): caller files the labelled
+                        "may already have been sent" record, never a plain draft.
+          'fallback'  — the homeserver answered 4xx: it refused, nothing was
+                        sent, so the caller files the ordinary actionable draft.
+        """
+        room_hash = self._room_hash(local_room_id)
+        self.db.execute("INSERT OR REPLACE INTO proposal_map "
+                        "(master_event_id, local_event_id, outcome) VALUES (?,?,?)",
+                        (master_event_id, None, "attempted"))
+        self.db.execute("INSERT INTO direct_send_log (ts, room_hash) VALUES (?,?)",
+                        (int(time.time()), room_hash))
+        self.db.commit()
+        txn = "autosend_" + urllib.parse.quote(master_event_id, safe="")
+        content = {"msgtype": "m.text", "body": body,
+                   # cosmetic provenance only (F14) — never read by trust logic
+                   AUTO_SENT_FROM_PROPOSAL_KEY: master_event_id}
+        try:
+            res = self.local("PUT", "/_matrix/client/v3/rooms/"
+                             + urllib.parse.quote(local_room_id, safe="")
+                             + "/send/m.room.message/" + txn, content)
+        except urllib.error.HTTPError as e:
+            if isinstance(e.code, int) and 400 <= e.code < 500:
+                self._audit_direct_send(master_event_id, room_hash, "failed")
+                log.warning("direct send refused by the local hs (HTTP %s) room=%s",
+                            e.code, room_hash)
+                return "fallback", None
+            self._audit_direct_send(master_event_id, room_hash, "ambiguous")
+            log.warning("direct send outcome UNKNOWN (HTTP %s) room=%s", e.code, room_hash)
+            return "ambiguous", None
+        except Exception as e:                     # noqa: BLE001 — dispatched, unknown
+            self._audit_direct_send(master_event_id, room_hash, "ambiguous")
+            log.warning("direct send outcome UNKNOWN (%s) room=%s", type(e).__name__, room_hash)
+            return "ambiguous", None
+        self._audit_direct_send(master_event_id, room_hash, "sent")
+        log.info("direct send: 1 proposal auto-sent room=%s", room_hash)
+        sent_id = res.get("event_id") if isinstance(res, dict) else None
+        return "sent", (sent_id if isinstance(sent_id, str) and sent_id else None)
+
+    def _file_proposal_record(self, local_proposals_room, master_event_id, content, outcome):
+        """Write THE one inbox artifact for a proposal and record its outcome.
+
+        Exactly one of these runs per proposal on every path (ordinary draft,
+        auto-sent record, ambiguous record), which is what makes "exactly one
+        inbox artifact per proposal" true. The event type is still the hardcoded
+        com.jkali.proposal literal and the target is still the recorded local
+        proposals room — an auto-sent MESSAGE goes to the conversation, never
+        here, and this record is never an m.room.message. The txn id is
+        unchanged (proposal_<master_event_id>) so a replay is HS-idempotent.
+        """
+        res = self.local("PUT", "/_matrix/client/v3/rooms/"
+                         + urllib.parse.quote(local_proposals_room, safe="")
+                         + "/send/" + PROPOSAL_TYPE + "/proposal_"
+                         + urllib.parse.quote(master_event_id, safe=""), content)
+        self.db.execute("INSERT OR REPLACE INTO proposal_map "
+                        "(master_event_id, local_event_id, outcome) VALUES (?,?,?)",
+                        (master_event_id, (res or {}).get("event_id"), outcome))
+        self.db.commit()
+
+    def forward_proposals(self, master_room_id, local_proposals_room, events,
+                          cold_start=True, suspended=True):
         """Write each NEW master proposal into the local proposals room, once.
 
         SAFETY: the write target is asserted to be exactly the recorded local
         proposals room (never a mirror/conversation room), and the event type is
         hardcoded com.jkali.proposal (never m.room.message). Idempotent via
-        proposal_map. Returns the count actually posted."""
+        proposal_map. Returns the count of inbox artifacts written.
+
+        D2: a proposal whose target conversation is at the 'direct' level and
+        that passes every gate is ALSO auto-sent into that conversation first
+        (_direct_send_gate + _auto_send); the artifact filed here is then the
+        non-actionable record of that send, not a draft. cold_start and
+        suspended default to True — fail closed, so any caller that has not
+        established D2.3's freshness precondition and D2.11's identity binding
+        gets the pre-D2 behavior (inbox only).
+        """
         recorded = self.meta_get("local_proposals_room")
         if not local_proposals_room or local_proposals_room != recorded:
             return 0
@@ -1203,32 +1785,73 @@ class Uplink:
         if self.db.execute("SELECT 1 FROM mirror_rooms WHERE master_room_id=?",
                             (local_proposals_room,)).fetchone():
             return 0
-        mapped = {r[0] for r in self.db.execute(
-            "SELECT master_event_id FROM proposal_map").fetchall()}
+        handled = {r[0]: r[1] for r in self.db.execute(
+            "SELECT master_event_id, outcome FROM proposal_map").fetchall()}
         posted = 0
         for ev in events:
             if not isinstance(ev, dict) or ev.get("type") != PROPOSAL_TYPE:
                 continue
             meid = ev.get("event_id")
-            if not meid or meid in mapped:
+            if not meid:
+                continue
+            if meid in handled:
+                if handled[meid] != "attempted":
+                    continue                       # already has its one artifact
+                # D2-9 crash recovery: intent was recorded, the dispatch result
+                # is unknown, and no artifact exists yet. Never re-send — file
+                # the labelled "may already have been sent" record instead.
+                clean = self._sanitize_proposal(ev)
+                if clean is None:
+                    self.db.execute("UPDATE proposal_map SET outcome='fallback' "
+                                    "WHERE master_event_id=?", (meid,))
+                    self.db.commit()
+                    handled[meid] = "fallback"
+                    continue
+                content = dict(clean)
+                content[SEND_AMBIGUOUS_KEY] = True
+                self._file_proposal_record(local_proposals_room, meid, content, "ambiguous")
+                self._audit_direct_send(meid, self._room_hash(clean.get("target_room")),
+                                        "ambiguous_recovered")
+                log.warning("recovered an interrupted direct send as AMBIGUOUS "
+                            "(no re-send): %s", meid)
+                handled[meid] = "ambiguous"
+                posted += 1
                 continue
             clean = self._sanitize_proposal(ev)
             if clean is None:
                 # Record as handled so a malformed proposal is not retried forever.
                 self.db.execute("INSERT OR REPLACE INTO proposal_map "
-                                "(master_event_id, local_event_id) VALUES (?,?)", (meid, None))
+                                "(master_event_id, local_event_id, outcome) VALUES (?,?,?)",
+                                (meid, None, "fallback"))
                 self.db.commit()
-                mapped.add(meid)
+                handled[meid] = "fallback"
                 continue
-            txn = urllib.parse.quote(meid, safe="")
-            res = self.local("PUT", "/_matrix/client/v3/rooms/"
-                             + urllib.parse.quote(local_proposals_room, safe="")
-                             + "/send/" + PROPOSAL_TYPE + "/proposal_" + txn, clean)
-            self.db.execute("INSERT OR REPLACE INTO proposal_map "
-                            "(master_event_id, local_event_id) VALUES (?,?)",
-                            (meid, res.get("event_id")))
-            self.db.commit()
-            mapped.add(meid)
+            body, gate = self._direct_send_gate(ev, clean, cold_start, suspended)
+            if body is None:
+                # Refused: the ordinary actionable draft the teammate sends
+                # themselves. Log/audit hash-only, naming the gate, never the
+                # body — loudly when a would-be auto-send was actively refused.
+                if gate in self.QUIET_GATES:
+                    log.debug("proposal not auto-sent (%s)", gate)
+                else:
+                    room_hash = self._room_hash(clean.get("target_room"))
+                    log.warning("direct send REFUSED at gate '%s' room=%s", gate, room_hash)
+                    self._audit_direct_send(meid, room_hash, "refused:" + gate)
+                self._file_proposal_record(local_proposals_room, meid, clean, "fallback")
+                handled[meid] = "fallback"
+                posted += 1
+                continue
+            outcome, sent_id = self._auto_send(meid, clean["target_room"], body)
+            content = dict(clean)
+            if outcome == "sent":
+                content[AUTO_SENT_KEY] = True
+                if sent_id:
+                    content[SENT_EVENT_ID_KEY] = sent_id
+            elif outcome == "ambiguous":
+                content[SEND_AMBIGUOUS_KEY] = True
+            # 'fallback' (the hs refused): the plain actionable draft, unflagged.
+            self._file_proposal_record(local_proposals_room, meid, content, outcome)
+            handled[meid] = outcome
             posted += 1
         return posted
 
@@ -1238,12 +1861,25 @@ class Uplink:
         Reads the MASTER as the teammate's own account (outbound-only preserved).
         The proposal watermark (proposal_sync_since) advances only after the batch
         is forwarded; a master transport failure raises MasterUnreachable and the
-        watermark is left untouched (buffer + retry, like the mirror-up path)."""
+        watermark is left untouched (buffer + retry, like the mirror-up path).
+
+        This is also where D2.3's two auto-send preconditions are established:
+        whether this batch arrived on an INCREMENTAL sync with a populated dedup
+        map (otherwise the whole batch is a cold start and goes to the inbox),
+        and whether auto-send is currently suspended by D2.11's identity
+        binding. Both default to the refusing value if anything is unclear."""
         mpr = self.meta_get("master_proposals_room")
         lpr = self.meta_get("local_proposals_room")
         if not mpr or not lpr:
             return
         since = self.meta_get("proposal_sync_since")
+        # D2-3 cold start: no watermark, or an empty dedup map (a fresh, lost or
+        # restored state.db). Either way this batch may be historical, so the
+        # WHOLE of it routes to the inbox — auto-send needs an INCREMENTAL sync.
+        cold_start = not since or not self.db.execute(
+            "SELECT 1 FROM proposal_map LIMIT 1").fetchone()
+        # Fail closed if ensure_proposal_rooms() has not resolved the binding.
+        suspended = getattr(self, "_direct_suspended", True)
         flt = json.dumps({
             "room": {"rooms": [mpr], "timeline": {"limit": 100},
                      "state": {"types": []}, "ephemeral": {"types": []},
@@ -1260,7 +1896,8 @@ class Uplink:
                            timeout=(self.cfg.sync_timeout // 1000) + 30)
         room = (((data.get("rooms") or {}).get("join")) or {}).get(mpr) or {}
         events = ((room.get("timeline") or {}).get("events")) or []
-        posted = self.forward_proposals(mpr, lpr, events)
+        posted = self.forward_proposals(mpr, lpr, events,
+                                        cold_start=bool(cold_start), suspended=suspended)
         # Advance the watermark only after forward_proposals returned (no local
         # write raised); proposal_map still guards against any replayed overlap.
         self.meta_set("proposal_sync_since", data.get("next_batch") or since or "")

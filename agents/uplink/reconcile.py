@@ -11,10 +11,34 @@ No I/O, no side effects at import — unit-tested in tests/unit/uplink_reconcile
 import consent
 
 
+# D2b (direct-share-level plan): a desired-map value is the per-room LEVEL, not
+# a bool — 'share' and 'direct' both mirror, 'private' does not. The mirroring
+# decision is still exactly "level != private"; what the level ADDS is the
+# com.jkali.share_level stamp the master app reads (D4), which must be re-PUT
+# when a kept mirror's level flips in either direction.
+SHARE_LEVELS = ("share", "direct")
+
+
+def level_is_shared(level):
+    """Whether a desired-map value means "mirror this room" (D2b).
+
+    Accepts the per-room level string ('share'|'direct'|'private') and the
+    pre-D2b boolean, so both call shapes resolve identically. A string is
+    matched against the two sharing levels EXACTLY: an unrecognized level is
+    NOT shared, the same fail-closed rule consent.effective_level() applies
+    (never `bool(level)`, under which 'private' — a non-empty string — would
+    read as shared).
+    """
+    if isinstance(level, str):
+        return level in SHARE_LEVELS
+    return bool(level)
+
+
 def reconcile_decisions(desired_shared, existing_mirrors):
     """Decide per local room what the reconciler must do.
 
-    desired_shared   : { local_room_id: bool }  effective shared-state (§4).
+    desired_shared   : { local_room_id: level|bool }  effective share level
+                       (§4 / D2b) — see level_is_shared().
     existing_mirrors : iterable of local_room_ids that already have a mirror.
 
     Returns { 'create': [...], 'delete': [...], 'keep': [...] } with room ids in
@@ -29,14 +53,15 @@ def reconcile_decisions(desired_shared, existing_mirrors):
     desired = desired_shared or {}
     create, delete, keep = [], [], []
 
-    for rid, shared in desired.items():
+    for rid, level in desired.items():
+        shared = level_is_shared(level)
         if shared and rid not in mirrors:
             create.append(rid)
         elif shared and rid in mirrors:
             keep.append(rid)
 
     for rid in mirrors:
-        if not desired.get(rid, False):
+        if not level_is_shared(desired.get(rid, False)):
             delete.append(rid)
 
     return {
@@ -44,6 +69,31 @@ def reconcile_decisions(desired_shared, existing_mirrors):
         "delete": sorted(delete),
         "keep": sorted(keep),
     }
+
+
+def plan_level_restamp(desired, stamped, keep):
+    """Which KEPT mirrors need their com.jkali.share_level state re-PUT (D2b).
+
+    desired : { local_room_id: level }   this pass's resolved levels.
+    stamped : { local_room_id: level }   the level last stamped on each mirror
+                                         (state.db mirror_rooms.stamped_level;
+                                         None/absent for a mirror created
+                                         before D2b shipped).
+    keep    : the kept-mirror ids from reconcile_decisions().
+
+    Returns a sorted list of (local_room_id, level) for rooms whose CURRENT
+    sharing level differs from the last stamped one — promotion (share ->
+    direct) and demotion (direct -> share) alike, plus the one-time backfill
+    of a pre-D2b mirror that carries no stamp yet. Pure, and a diff rather
+    than a per-pass write: once stamped, a room drops out until it changes.
+    """
+    stamped = stamped or {}
+    out = []
+    for rid in (keep or []):
+        level = (desired or {}).get(rid)
+        if level in SHARE_LEVELS and stamped.get(rid) != level:
+            out.append((rid, level))
+    return sorted(out)
 
 
 def select_new_events(event_ids, mapped_ids):

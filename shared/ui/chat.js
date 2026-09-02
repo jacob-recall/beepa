@@ -86,6 +86,8 @@ async function openConvo(roomId) {
   S.openRoomId = roomId;
   convoSeen.clear();
   convoSetStatus('');
+  const input = $('convo-input');
+  if (input) input.value = '';                      // never carry a draft into a different room
 
   const rec = feedModel.get(roomId);
   const titleEl = $('convo-title');
@@ -233,6 +235,9 @@ async function sendConvoMessage(targetRoom, bodyOverride) {
   try {
     await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
       '/send/m.room.message/' + encodeURIComponent(t), { msgtype: 'm.text', body });
+    if (fromComposer && afterSendHook) {
+      try { afterSendHook(roomId, body); } catch (e) { /* app hook must not break send */ }
+    }
     return true;
   } catch (e) {
     convoSetStatus('Message failed to send: ' + String(e.message || e));  // CV-R3: status, not a bubble
@@ -240,4 +245,17 @@ async function sendConvoMessage(targetRoom, bodyOverride) {
   }
 }
 
-export { convoSetStatus, openConvo, startConvoWatch, stopConvoWatch, sendConvoMessage };
+// Optional app hook after a successful *composer* send (not an explicit-target
+// send). apps/user uses this to mark a pending proposal handled once the
+// teammate hits the normal Send/Enter path. Shared code never imports apps/.
+let afterSendHook = null;
+function setAfterSendHook(fn) { afterSendHook = typeof fn === 'function' ? fn : null; }
+
+function prefillComposer(text) {
+  const input = $('convo-input');
+  if (!input) return;
+  input.value = typeof text === 'string' ? text : '';
+  input.focus();
+}
+
+export { convoSetStatus, openConvo, startConvoWatch, stopConvoWatch, sendConvoMessage, prefillComposer, setAfterSendHook };

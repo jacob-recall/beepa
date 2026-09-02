@@ -201,3 +201,12 @@
 /* Proposals tab: small numbered dot badge (not "(N)" text) */
 #list-mode-proposals { position: relative; overflow: visible; }
 .proposal-count-dot { position: absolute; top: -5px; right: -7px; min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: #e02424; color: #fff; font-size: 10px; line-height: 16px; font-weight: 600; text-align: center; pointer-events: none; }
+
+.proposal-quick { display: inline-flex; flex: 0 0 auto; gap: 0; align-items: center; }
+.proposal-quick-yes, .proposal-quick-no {
+  border: 0; background: transparent; cursor: pointer;
+  width: 28px; height: 28px; padding: 0; border-radius: 50%;
+  font-size: 15px; line-height: 28px; color: var(--color-muted);
+}
+.proposal-quick-yes:hover { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
+.proposal-quick-no:hover { color: #c0392b; background: rgba(192, 57, 43, 0.12); }

@@ -11,6 +11,7 @@ docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/contact_cons
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/contacts_profile_handles.test.js
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/proposal_identifier.test.js
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/proposal_parse.test.js
+docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/proposal_row.test.js
 docker run --rm -v "$(pwd)":/w -w /w node:20-alpine node tests/unit/auto_merge_number.test.js
 python3 tests/unit/contacts_store.test.py
 python3 tests/unit/import_macos.test.py

@@ -282,7 +282,7 @@ button.primary, .btn-primary, #btn-signin.primary, .bridge-actions .primary, #mo
 }
 button.primary:hover, .btn-primary:hover { background: var(--color-accent-600); }
 button.danger, #modal-ok.danger { background: #ea0038; color: #fff; border: none; }
-button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(.share-opt):not(.share-slider):not(.share-menu-link):not(.hide-btn), .btn-secondary {
+button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(.share-opt):not(.share-slider):not(.share-menu-link):not(.hide-btn):not(.proposal-quick-yes):not(.proposal-quick-no), .btn-secondary {
   background: var(--color-surface); color: var(--color-text);
   border: 1px solid var(--color-divider); border-radius: 8px;
 }

@@ -1,19 +1,17 @@
-// Teammate proposal inbox — a fast, threads-style list on the left; selecting a
-// draft opens it full on the right where you see the whole message, edit it
-// inline, and act with three buttons: Send · Open conversation · Reject. A count
-// shows how many are pending; a kebab in the list's top bar shows/hides dismissed
-// ones. Empty-by-default (never a blocking "Loading…"); the poll only verifies
-// the cached proposals room + reads its messages — no full /sync.
+// Teammate proposal inbox. A room-targeted draft opens the real conversation
+// with the text already in the composer; the row has ✓ / ✕ so you can send or
+// reject without the full-pane editor. Enter on a focused row sends. Identifier
+// (new-chat) drafts still use the detail pane + confirm modal.
 
 import { ROOMID_RE, api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
-import { openConvo, sendConvoMessage } from '../../shared/ui/chat.js';
-import { buildPlatBadge } from '../../shared/ui/rows.js';
+import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook } from '../../shared/ui/chat.js';
+import { addConvoRowDecorator, buildPlatBadge } from '../../shared/ui/rows.js';
 import { sendCmd, validHandle } from '../../shared/ui/sources.js';
 import { confirmModal } from '../../shared/ui/connections.js';
 import { setProposalsViewHook, setDetailMode } from '../../shared/ui/nav.js';
-import { feedRelTime } from '../../shared/ui/search.js';
-import { feedModel } from '../../shared/state.js';
+import { feedRelTime, renderHome } from '../../shared/ui/search.js';
+import { S, feedModel } from '../../shared/state.js';
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
 let allProposals = [];     // everything parsed (pending + dismissed)
@@ -57,6 +55,36 @@ function parseProposal(e) {
     return { kind: 'identifier', eventId: e.event_id, targetSource: source, targetIdentifier: identifier, targetDisplay: display, body, template, ts };
   }
   return null;
+}
+
+function pendingForRoom(proposals, handled, roomId) {
+  if (typeof roomId !== 'string' || !roomId) return null;
+  if (!Array.isArray(proposals) || !handled || typeof handled.has !== 'function') return null;
+  let best = null;
+  for (const p of proposals) {
+    if (!p || p.kind !== 'room' || p.targetRoom !== roomId) continue;
+    if (handled.has(p.eventId)) continue;
+    if (!best || p.ts > best.ts) best = p;
+  }
+  return best;
+}
+
+function rowGesture(p, gesture) {
+  if (!p) return { action: 'none' };
+  if (gesture === 'reject') return { action: 'reject' };
+  if (gesture === 'enter' || gesture === 'accept') return { action: 'send' };
+  if (gesture === 'click') {
+    if (p.kind === 'room') return { action: 'open', prefill: p.body };
+    return { action: 'detail' };
+  }
+  return { action: 'none' };
+}
+
+function openWithDraft(roomId, body) {
+  openConvo(roomId);
+  queueMicrotask(() => {
+    if (S.openRoomId === roomId) prefillComposer(body);
+  });
 }
 
 // ---- proposals room discovery (cached; full /sync only on a real cache miss) --
@@ -182,11 +210,29 @@ async function sendIdentifierProposal(p, text, err, btn) {
   afterHandled(p);
 }
 
-// After send/reject: if that draft was open, clear the right pane; repaint the
-// list so the count + rows advance. No network round-trip.
+// After send/reject: drop the draft from the list. Stay in the open chat if
+// we just sent into one; identifier detail is the only pane we close.
+let focusListAfterHandle = false;
+function chatsListShowing() {
+  const btn = $('list-mode-chats');
+  return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
+}
 function afterHandled(p) {
-  if (selectedId === p.eventId) { selectedId = null; setDetailMode('empty'); }
-  renderList();
+  if (selectedId === p.eventId) {
+    selectedId = null;
+    if (p.kind === 'identifier') setDetailMode('empty');
+  }
+  updateCount(pendingList().length);
+  if (proposalsListShowing()) renderList();
+  else if (chatsListShowing()) renderHome();
+  if (focusListAfterHandle) {
+    focusListAfterHandle = false;
+    queueMicrotask(() => {
+      const btn = document.querySelector('.proposal-quick-yes');
+      const row = btn && btn.closest('.convo');
+      if (row) row.focus();
+    });
+  }
 }
 
 // ---- list (left) -------------------------------------------------------------
@@ -215,6 +261,7 @@ function buildRow(p, dismissed) {
   const open = () => select(p, dismissed);
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  if (!dismissed) attachQuickActions(row, p, false);
   return row;
 }
 
@@ -268,8 +315,13 @@ function renderList() {
 // ---- detail (right, full) ----------------------------------------------------
 function select(p, dismissed) {
   selectedId = p.eventId;
-  setDetailMode('proposal');
-  renderDetail(p, dismissed);
+  const g = rowGesture(p, 'click');
+  if (!dismissed && g.action === 'open') {
+    openWithDraft(p.targetRoom, g.prefill);
+  } else {
+    setDetailMode('proposal');
+    renderDetail(p, dismissed);
+  }
   for (const r of document.querySelectorAll('.proposal-row')) {
     r.classList.toggle('active', r.dataset.proposalId === p.eventId);
   }
@@ -346,11 +398,14 @@ async function refresh() {
   const sig = (arr) => arr.map((p) => p.eventId).sort().join(',');
   if (sig(proposals) === sig(allProposals)) return;
   allProposals = proposals;
+  updateCount(pendingList().length);
   // If the open draft vanished (sent/removed elsewhere), clear the right pane.
   if (selectedId && !allProposals.some((p) => p.eventId === selectedId)) {
-    selectedId = null; setDetailMode('empty');
+    selectedId = null;
+    if (!S.openRoomId) setDetailMode('empty');
   }
-  renderList();
+  if (proposalsListShowing()) renderList();
+  else if (chatsListShowing()) renderHome();
 }
 
 let pollTimer = null;
@@ -358,11 +413,74 @@ function proposalsListShowing() {
   const btn = $('list-mode-proposals');
   return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
 }
-function initProposalsUI() {
-  setProposalsViewHook(renderProposalsView);
-  if (!pollTimer) {
-    pollTimer = setInterval(() => { if (proposalsListShowing()) refresh().catch(() => {}); }, 10000);
+function decorateFeedRow(row, convo) {
+  if (!convo || !convo.id) return;
+  const p = pendingForRoom(allProposals, loadHandled(), convo.id);
+  if (p) attachQuickActions(row, p, true);
+}
+
+function attachQuickActions(row, p, prefillOnClick) {
+  const wrap = el('span', 'proposal-quick');
+  const yes = el('button', 'proposal-quick-yes', '✓');
+  yes.type = 'button';
+  yes.title = 'Send';
+  yes.setAttribute('aria-label', 'Send suggestion');
+  const no = el('button', 'proposal-quick-no', '✕');
+  no.type = 'button';
+  no.title = 'Reject';
+  no.setAttribute('aria-label', 'Reject suggestion');
+  const stop = (e) => e.stopPropagation();
+  yes.addEventListener('click', (e) => {
+    stop(e);
+    focusListAfterHandle = true;
+    sendProposal(p, p.body, null, yes);
+  });
+  no.addEventListener('click', (e) => {
+    stop(e);
+    focusListAfterHandle = true;
+    markHandled(p);
+    afterHandled(p);
+  });
+  wrap.appendChild(yes);
+  wrap.appendChild(no);
+  wrap.addEventListener('click', stop);
+  const kebab = row.querySelector('.share-controls');
+  if (kebab) row.insertBefore(wrap, kebab);
+  else row.appendChild(wrap);
+
+  row.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.target !== row) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    focusListAfterHandle = true;
+    sendProposal(p, p.body, null, null);
+  }, true);
+
+  if (prefillOnClick) {
+    row.addEventListener('click', () => {
+      const g = rowGesture(p, 'click');
+      if (g.action === 'open' && g.prefill) {
+        queueMicrotask(() => {
+          if (S.openRoomId === p.targetRoom) prefillComposer(g.prefill);
+        });
+      }
+    });
   }
 }
 
-export { initProposalsUI, renderProposalsView, parseProposal };
+function initProposalsUI() {
+  setProposalsViewHook(renderProposalsView);
+  addConvoRowDecorator(decorateFeedRow);
+  setAfterSendHook((roomId) => {
+    const p = pendingForRoom(allProposals, loadHandled(), roomId);
+    if (!p) return;
+    markHandled(p);
+    afterHandled(p);
+  });
+  if (!pollTimer) {
+    pollTimer = setInterval(() => { refresh().catch(() => {}); }, 10000);
+  }
+  refresh().catch(() => {});
+}
+
+export { initProposalsUI, renderProposalsView, parseProposal, pendingForRoom, rowGesture };

@@ -12,7 +12,7 @@
 import {
   resolve, resolveAll, effectiveLevel,
   readSharePolicy, writeSharePolicy,
-  writeShareOverride, overridesFromSync,
+  writeShareOverride, overridesFromSync, SHARE_OVERRIDE_TYPE,
   readConsentModel, CONSENT_MODEL_EXPLICIT,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
 } from '../../shared/model/consent.js';
@@ -25,6 +25,7 @@ import { setSharingViewHook } from '../../shared/ui/nav.js';
 import { SOURCES } from '../../shared/ui/sources.js';
 import { S, convosBySource, feedModel } from '../../shared/state.js';
 import { feedHideRoom, feedUnhideRoom, feedIsHidden } from '../../shared/ui/account-data.js';
+import { confirmModal } from '../../shared/ui/connections.js';
 
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.
@@ -45,6 +46,18 @@ const overrides = new Map();
 // — it only groups a person's threads — so this map is passed to the resolver
 // for signature compatibility and is ignored by it.
 let profileMap = {};
+
+// roomIds whose current 'share' override was written by the D0 migration
+// (content carries migrated:true) — populated from the same sync snapshot
+// that builds `overrides`, so it needs no extra round trip. Drives the
+// one-time "review migrated shares" list (D0/F11).
+let migratedRoomIds = [];
+// The master-identity re-confirm affordance (D2.11/F12) — null unless the
+// local account-data event com.jkali.direct_send_suspended is present, in
+// which case this is its normalized identity tuple. Owned entirely by S2:
+// S3's uplink is what writes/clears the suspension and reads the ack this
+// module writes below; nothing here talks to the uplink directly.
+let directSendSuspension = null;
 
 // ---- consent-model guard (direct-share-level plan, D0/F7) -------------------
 // Conversation sharing is now EXPLICIT-ONLY in shared/model/consent.js: a
@@ -130,17 +143,98 @@ async function writeContactPolicy(p) {
   return body;
 }
 
+// ---- migrated-shares review (D0/F11) -----------------------------------------
+// PURE: which of the room ids that DO carry a currently-recognized override
+// (validIds — the same set overridesFromSync() just produced, so a stale/
+// unknown room id can never appear here) also carry migrated:true on their
+// com.jkali.share_override account-data, straight from the sync snapshot
+// already fetched for `overrides` — no extra round trip. A malformed/missing
+// shape yields no rooms rather than throwing.
+function migratedRoomIdsFromSync(syncData, validIds) {
+  const out = [];
+  try {
+    const join = (syncData && syncData.rooms && syncData.rooms.join) || {};
+    for (const rid of Object.keys(join)) {
+      if (validIds && !validIds.has(rid)) continue;
+      const events = (join[rid] && join[rid].account_data && join[rid].account_data.events) || [];
+      for (const e of events) {
+        if (e && e.type === SHARE_OVERRIDE_TYPE && e.content && e.content.migrated === true) { out.push(rid); break; }
+      }
+    }
+  } catch (e) { /* malformed sync -> no migrated rooms surfaced */ }
+  return out;
+}
+
+// Per-viewer dismissal for the migrated-shares list — convenience only, same
+// pattern as SEEN_KEY above. Never the authorization decision.
+const MIGRATED_DISMISSED_KEY = 'com.jkali.migrated_review_dismissed';
+function loadMigratedDismissed() {
+  try { return new Set(JSON.parse(localStorage.getItem(MIGRATED_DISMISSED_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function saveMigratedDismissed(set) {
+  try { localStorage.setItem(MIGRATED_DISMISSED_KEY, JSON.stringify([...set])); } catch (e) { /* ignore */ }
+}
+
+// ---- master-identity re-confirm surface (D2.11/F12) --------------------------
+const DIRECT_SEND_SUSPENDED_TYPE = 'com.jkali.direct_send_suspended';
+const DIRECT_SEND_ACK_TYPE = 'com.jkali.direct_send_ack';
+
+// PURE: normalize a com.jkali.direct_send_suspended account-data content into
+// the affordance's identity tuple, or null if any of the four fields is
+// missing/wrong-shaped. A partial/junk event must never render a broken
+// confirm — same "safe default on malformed input" discipline as the rest of
+// this model.
+function suspensionAffordance(content) {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return null;
+  const { master_hs, master_user, manager_mxid, ts } = content;
+  if (typeof master_hs !== 'string' || !master_hs) return null;
+  if (typeof master_user !== 'string' || !master_user) return null;
+  if (typeof manager_mxid !== 'string' || !manager_mxid) return null;
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return { master_hs, master_user, manager_mxid, ts };
+}
+
+// PURE: the exact content the teammate's confirm writes to
+// com.jkali.direct_send_ack — the SAME identity tuple, verbatim, so S3's
+// uplink can compare it byte-for-byte against the suspension it stored
+// before resuming auto-send. Takes either a raw suspended-event content or an
+// already-normalized affordance (both go through suspensionAffordance first).
+function directSendAckContent(affordance) {
+  const a = suspensionAffordance(affordance);
+  return a ? { master_hs: a.master_hs, master_user: a.master_user, manager_mxid: a.manager_mxid, ts: a.ts } : null;
+}
+
+function userAccountDataPath(type) {
+  return '/_matrix/client/v3/user/' + encodeURIComponent(S.userId) + '/account_data/' + type;
+}
+async function readDirectSendSuspension() {
+  try { return suspensionAffordance(await api('GET', userAccountDataPath(DIRECT_SEND_SUSPENDED_TYPE))); }
+  catch (e) { return null; }
+}
+// Writes the ack; returns the tuple written, or null if `affordance` didn't
+// normalize (never PUTs a malformed body).
+async function ackDirectSendSuspension(affordance) {
+  const body = directSendAckContent(affordance);
+  if (!body) return null;
+  await api('PUT', userAccountDataPath(DIRECT_SEND_ACK_TYPE), body);
+  return body;
+}
+
 async function loadConsentState() {
   // The model marker first: every render below branches on it.
   try { consentModel = await readConsentModel(); } catch (e) { consentModel = 1; }
   try { policy = await readSharePolicy(); } catch (e) { /* keep previous cache */ }
   try { contactPolicy = await readContactPolicy(); } catch (e) { /* keep previous cache */ }
   try {
-    const map = overridesFromSync(await fetchOverridesSnapshot());
+    const syncData = await fetchOverridesSnapshot();
+    const map = overridesFromSync(syncData);
     overrides.clear();
     for (const k of Object.keys(map)) overrides.set(k, map[k]);
+    migratedRoomIds = migratedRoomIdsFromSync(syncData, new Set(overrides.keys()));
   } catch (e) { /* keep previous cache */ }
   try { profileMap = roomProfileMap(await readProfiles()); } catch (e) { /* keep previous cache */ }
+  try { directSendSuspension = await readDirectSendSuspension(); } catch (e) { directSendSuspension = null; }
 }
 
 // All known conversations across sources, deduped by room id (same
@@ -163,9 +257,12 @@ function effectiveFor(convo) {
   return resolve(convo, policy, overrides.get(convo.id), profileMap[convo.id]);
 }
 
+// Three levels, no inherit (F13/consent-summary copy fix): the reason a
+// resolve()/resolveAll() result carries is always one of exactly these four
+// under the explicit model, and the wording never implies a standing policy.
 function reasonText(r) {
-  if (r.shared) return r.reason === 'explicit' ? 'shared (explicit)' : 'shared (' + r.reason + ')';
-  return r.reason === 'excluded' ? 'private (excluded)' : 'private';
+  if (r.shared) return r.reason === 'direct' ? 'Direct — sent automatically' : 'Shared';
+  return r.reason === 'excluded' ? 'Private' : 'Private (default)';
 }
 
 // ---- sliding tri-state control (kebab rows + per-source headers) ----
@@ -272,7 +369,11 @@ function shareCycleIndex(convo) {
   return idx >= 0 ? idx : 0;
 }
 
-function buildShareSlider(convo) {
+// `afterAdvance` (optional) fires once the write + local cache update above
+// have completed, so a caller composing this slider with the separate Direct
+// control (below) can re-derive whether Direct should still be offered —
+// e.g. sliding Share->Private must hide it, Private->Share may reveal it.
+function buildShareSlider(convo, afterAdvance) {
   return buildTriStateSlider(explicitModel() ? SHARE_CYCLE_V2 : SHARE_CYCLE, {
     ariaLabel: 'Sharing for ' + sanitizeLine(convo.title || convo.id),
     getIndex: () => shareCycleIndex(convo),
@@ -281,8 +382,80 @@ function buildShareSlider(convo) {
     onAdvance: async (opt) => {
       await writeShareOverride(convo.id, opt.override);
       if (opt.override) overrides.set(convo.id, opt.override); else overrides.delete(convo.id);
+      if (afterAdvance) afterAdvance();
     },
   });
+}
+
+// ---- Direct: a separate confirmed control, never a cycle position (F6) ------
+// The ONLY two places allowed to write override 'direct' are this confirm and
+// the identical confirm reused by the migrated-shares review below — both
+// call escalateToDirect(), so there is exactly one write site for the escalation
+// and it is always gated by confirmDirect(). Every other write path in this
+// file (the cycle, the bulk action) is restricted to 'share'/'private'.
+function directConfirmText(convoTitle) {
+  return 'Your manager’s messages will be sent as you, without your review.\n\n'
+    + 'A compromised manager session or master server could send messages as you '
+    + 'into “' + convoTitle + '”. Recipients will not be able to tell the '
+    + 'difference between a message you typed and one your manager sent automatically.\n\n'
+    + 'Turn on Direct for this conversation?';
+}
+function confirmDirect(convo) {
+  return confirmModal('Turn on Direct?', directConfirmText(sanitizeLine(convo.title || convo.id)), false);
+}
+async function escalateToDirect(convo) {
+  const ok = await confirmDirect(convo);
+  if (!ok) return false;
+  await writeShareOverride(convo.id, 'direct');
+  overrides.set(convo.id, 'direct');
+  return true;
+}
+
+// Revealed only once the conversation is already Share/Direct (never while
+// Private — Direct implies mirrored) and only under the explicit model.
+// Turning Direct OFF goes straight back to 'share' with NO confirm — F6/plan
+// text: de-escalation via the normal cycle/control is unconfirmed, only the
+// escalation into 'direct' requires one.
+function buildDirectRow(convo, onChange) {
+  const row = el('div', 'share-direct-row');
+  const isDirect = effectiveLevel(overrides.get(convo.id)) === 'direct';
+  const btn = el('button', 'share-direct-btn' + (isDirect ? ' active' : ''), isDirect ? 'Direct ✓' : 'Turn on Direct…');
+  btn.type = 'button';
+  btn.title = 'Auto-send: your manager’s messages go out without your review';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    btn.disabled = true;
+    try {
+      if (isDirect) {
+        await writeShareOverride(convo.id, 'share');
+        overrides.set(convo.id, 'share');
+      } else {
+        await escalateToDirect(convo);
+      }
+    } finally { btn.disabled = false; }
+    if (onChange) onChange();
+  });
+  row.appendChild(btn);
+  return row;
+}
+
+// Combines the Share/Private slider with the separate Direct control, keeping
+// both in sync with each other without re-deriving the slider's own internal
+// state (buildTriStateSlider owns that): a change on either side rebuilds
+// just the Direct row via `refreshDirect`.
+function buildShareMenuBody(convo) {
+  const wrap = el('div', 'share-menu-body');
+  const directHost = el('div', 'share-direct-host');
+  function refreshDirect() {
+    directHost.replaceChildren();
+    if (!explicitModel()) return;
+    if (effectiveLevel(overrides.get(convo.id)) === 'private') return;
+    directHost.appendChild(buildDirectRow(convo, refreshDirect));
+  }
+  wrap.appendChild(buildShareSlider(convo, refreshDirect));
+  wrap.appendChild(directHost);
+  refreshDirect();
+  return wrap;
 }
 
 function sourcePolicyIndex(sourceId) {
@@ -332,7 +505,7 @@ function decorateRow(row, convo) {
   kebab.title = 'Sharing';
   kebab.setAttribute('aria-label', 'Sharing controls');
   const menu = el('div', 'share-menu hidden');
-  menu.appendChild(buildShareSlider(convo));
+  menu.appendChild(buildShareMenuBody(convo));
   // Hide/Unhide — only for Home-feed rows (feedModel.has is true for every Home row).
   if (feedModel.has(convo.id)) {
     const hideBtn = el('button', 'share-menu-link', feedIsHidden(convo.id) ? 'Unhide conversation' : 'Hide conversation');
@@ -414,16 +587,79 @@ function buildSourceSwitches() {
   return wrap;
 }
 
+// ---- bulk action per source (F11): "set all conversations in this source" --
+// PURE: what a bulk Share/Private write on `convos` would do against the
+// current `overridesMap`. Refuses anything but 'share'/'private' (returns
+// null — 'direct' can NEVER be reached in bulk). `overwritesPrivate` lists
+// every convo id that is CURRENTLY an explicit 'private' override and would
+// be changed by this bulk write — the caller must list these in the confirm
+// before writing; this function only computes the plan, it never writes.
+const BULK_SHARE_LEVELS = new Set(['share', 'private']);
+function planBulkShareChange(convos, overridesMap, level) {
+  if (!BULK_SHARE_LEVELS.has(level)) return null;
+  const get = (id) => (overridesMap instanceof Map
+    ? overridesMap.get(id)
+    : (overridesMap && typeof overridesMap === 'object' ? overridesMap[id] : undefined));
+  const ids = [];
+  const overwritesPrivate = [];
+  for (const c of (Array.isArray(convos) ? convos : [])) {
+    if (!c || typeof c.id !== 'string' || !c.id) continue;
+    ids.push(c.id);
+    if (level === 'share' && get(c.id) === 'private') overwritesPrivate.push(c.id);
+  }
+  return { level, ids, overwritesPrivate };
+}
+
+async function bulkSetSourceLevel(source, level) {
+  const convos = convosBySource[source.id] || [];
+  const plan = planBulkShareChange(convos, overrides, level);
+  if (!plan) return;                                    // refuses anything but share/private
+  const levelLabel = level === 'share' ? 'Share' : 'Private';
+  let text = 'Set all ' + plan.ids.length + ' ' + source.label + ' conversation(s) to ' + levelLabel + '?';
+  // Never silently overwrite an explicit 'private' — list exactly what changes.
+  if (plan.overwritesPrivate.length) {
+    const names = plan.overwritesPrivate.map((rid) => {
+      const c = convos.find((x) => x.id === rid);
+      return sanitizeLine((c && c.title) || rid);
+    });
+    text += '\n\nThese are currently set to Private and will change to Share:\n' + names.join('\n');
+  }
+  const ok = await confirmModal('Set all to ' + levelLabel + '?', text, false);
+  if (!ok) return;
+  for (const rid of plan.ids) {
+    await writeShareOverride(rid, level);
+    overrides.set(rid, level);
+  }
+  renderSharingView();
+}
+
+function buildBulkShareRow(source) {
+  const wrap = el('div', 'share-bulk-row');
+  wrap.appendChild(el('span', 'muted', 'Set all ' + source.label + ' conversations:'));
+  const shareBtn = el('button', 'share-bulk-btn', 'Share');
+  shareBtn.type = 'button';
+  shareBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'share'));
+  const privateBtn = el('button', 'share-bulk-btn', 'Private');
+  privateBtn.type = 'button';
+  privateBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'private'));
+  wrap.appendChild(shareBtn);
+  wrap.appendChild(privateBtn);
+  return wrap;
+}
+
 // Mounted into the per-source view's header via setSourceViewHook (search.js).
 function mountSourceSwitch(sourceId) {
   const host = $('source-share-switch');
   if (!host) return;
   const source = SOURCES.find((s) => s.id === sourceId);
   host.replaceChildren();
-  // Dead under the explicit model: a per-source policy no longer shares any
-  // conversation, so showing the control here would misstate what is shared.
+  // The per-source STANDING POLICY is dead under the explicit model — a
+  // conversation no longer inherits from it. The bulk action below is a
+  // deliberate, one-shot, per-conversation WRITE (never an inherited state),
+  // offered here in its place.
   if (explicitModel()) {
-    host.appendChild(el('span', 'muted', 'Updating to explicit levels…'));
+    if (source) host.appendChild(buildBulkShareRow(source));
+    else host.appendChild(el('span', 'muted', 'Updating to explicit levels…'));
     return;
   }
   if (source) host.appendChild(buildSourcePolicySlider(source));
@@ -456,13 +692,20 @@ function renderConsentSummary() {
       if (!groups.has(r.reason)) groups.set(r.reason, []);
       groups.get(r.reason).push(r.convo);
     }
+    // Three levels, no inherit (F13): under the explicit model `reason` is
+    // always exactly 'explicit' (Share) or 'direct' — nothing else can make a
+    // conversation shared any more, so the copy states exactly that rather
+    // than a generic reason list left over from the standing-policy model.
     const parts = [];
-    for (const [reason, list] of groups) {
-      parts.push(reason === 'explicit'
-        ? list.length + ' individually shared'
-        : reason + ' (' + list.length + ')');
-    }
+    if (groups.has('explicit')) parts.push(groups.get('explicit').length + ' shared');
+    if (groups.has('direct')) parts.push(groups.get('direct').length + ' set to Direct');
     host.appendChild(el('p', '', 'The manager can currently see: ' + parts.join(', ') + '.'));
+    if (groups.has('direct')) {
+      host.appendChild(el('p', 'muted',
+        'Direct conversations are sent by your manager as you, without your review. A '
+        + 'compromised manager session or master server could send messages as you into '
+        + 'these conversations, and recipients cannot tell the difference.'));
+    }
 
     const list = el('div', 'share-summary-list');
     for (const r of shared) {
@@ -655,6 +898,94 @@ function renderContactShareView() {
   host.appendChild(list);
 }
 
+// ---- master-identity re-confirm affordance (D2.11/F12) -----------------------
+// Rendered only when readDirectSendSuspension() (loadConsentState) found a
+// com.jkali.direct_send_suspended event. The teammate's confirm writes
+// com.jkali.direct_send_ack with the SAME identity tuple (directSendAckContent);
+// S3's uplink resumes auto-send only when that ack matches its current binding.
+function directSendSuspensionBanner() {
+  const a = directSendSuspension;
+  if (!a) return null;
+  const box = el('div', 'share-model-banner share-reconfirm-banner');
+  box.appendChild(el('h3', '', 'Manager identity changed — Direct auto-send is paused'));
+  box.appendChild(el('p', 'muted',
+    'Auto-send was paused because the manager account or master server this app '
+    + 'talks to changed. New identity: manager ' + sanitizeLine(a.manager_mxid)
+    + ' on master server ' + sanitizeLine(a.master_hs)
+    + ' (master account ' + sanitizeLine(a.master_user) + '). Confirm you recognize '
+    + 'this change to resume Direct auto-send for any conversation set to Direct.'));
+  const btn = el('button', 'share-bulk-btn primary', 'Confirm and resume');
+  btn.type = 'button';
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      await ackDirectSendSuspension(a);
+      directSendSuspension = null;
+      renderSharingView();
+    } catch (e) { btn.disabled = false; }
+  });
+  box.appendChild(btn);
+  return box;
+}
+
+// ---- migrated-shares review (D0/F11) ------------------------------------------
+// One-time (per room, per browser profile — dismissal is convenience-only
+// localStorage) list of conversations D0's migration converted from a
+// standing policy into an explicit 'share' override, so that conversion is
+// surfaced rather than silent.
+function renderMigratedReview() {
+  const host = $('share-migrated');
+  if (!host) return;
+  host.replaceChildren();
+  if (!explicitModel()) return;
+  const dismissed = loadMigratedDismissed();
+  const pending = migratedRoomIds.filter((rid) => !dismissed.has(rid));
+  if (!pending.length) return;
+
+  const box = el('div', 'share-model-banner share-migrated-box');
+  box.appendChild(el('h3', '', 'Review migrated shares'));
+  box.appendChild(el('p', 'muted',
+    'These conversations were converted from a standing "share all" policy into '
+    + 'an explicit Share when this app moved to per-conversation sharing. Review '
+    + 'each one: keep it Shared, set it Private, or (with confirmation) Direct.'));
+  const dismissOne = (rid) => { dismissed.add(rid); saveMigratedDismissed(dismissed); renderSharingView(); };
+  for (const rid of pending) {
+    const convo = allConvos().find((c) => c.id === rid);
+    const row = el('div', 'share-summary-row');
+    row.appendChild(el('span', 'title', sanitizeLine((convo && convo.title) || rid)));
+    const keepBtn = el('button', 'share-bulk-btn', 'Keep Share');
+    keepBtn.type = 'button';
+    keepBtn.addEventListener('click', () => dismissOne(rid));
+    row.appendChild(keepBtn);
+    const privateBtn = el('button', 'share-bulk-btn', 'Set Private');
+    privateBtn.type = 'button';
+    privateBtn.addEventListener('click', async () => {
+      await writeShareOverride(rid, 'private');
+      overrides.set(rid, 'private');
+      dismissOne(rid);
+    });
+    row.appendChild(privateBtn);
+    if (convo) {
+      const directBtn = el('button', 'share-bulk-btn', 'Set Direct…');
+      directBtn.type = 'button';
+      directBtn.addEventListener('click', async () => {
+        if (await escalateToDirect(convo)) dismissOne(rid);
+      });
+      row.appendChild(directBtn);
+    }
+    box.appendChild(row);
+  }
+  const dismissAll = el('button', 'share-bulk-btn', 'Dismiss all');
+  dismissAll.type = 'button';
+  dismissAll.addEventListener('click', () => {
+    for (const rid of pending) dismissed.add(rid);
+    saveMigratedDismissed(dismissed);
+    renderSharingView();
+  });
+  box.appendChild(dismissAll);
+  host.appendChild(box);
+}
+
 // Rendered whenever the 'sharing' nav view opens, via setSharingViewHook (nav.js).
 // The two conversation standing-policy controls (global Share-All, per-source
 // cycle) are replaced by a banner once the daemon reports the explicit model —
@@ -662,6 +993,12 @@ function renderContactShareView() {
 // sharing state that is not real. The CONTACT-share controls below are a
 // different consent dimension and are unaffected.
 function renderSharingView() {
+  const reconfirmHost = $('share-reconfirm');
+  if (reconfirmHost) {
+    reconfirmHost.replaceChildren();
+    const banner = directSendSuspensionBanner();
+    if (banner) reconfirmHost.appendChild(banner);
+  }
   const globalHost = $('share-global');
   if (globalHost) {
     globalHost.replaceChildren();
@@ -687,6 +1024,7 @@ function renderSharingView() {
         + 'conversation.')
       : buildSourceSwitches());
   }
+  renderMigratedReview();
   renderConsentSummary();
   renderContactShareView();
 }
@@ -699,4 +1037,8 @@ async function initConsentUI() {
   await loadConsentState();
 }
 
-export { initConsentUI, renderSharingView, loadConsentState, countSharedNow };
+export {
+  initConsentUI, renderSharingView, loadConsentState, countSharedNow,
+  planBulkShareChange, migratedRoomIdsFromSync,
+  suspensionAffordance, directSendAckContent,
+};

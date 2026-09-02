@@ -1,6 +1,13 @@
 /* apps/user/style.css — layout only; visuals in shared/style/beepa.css */
 
 .hidden { display: none !important; }
+
+/* direct-share-level (S2): the "Direct" control revealed under the kebab
+   share slider (share-menu-body wraps the slider + this row). */
+.share-menu-body { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.share-direct-row { width: 100%; }
+.share-direct-btn { width: 100%; font-size: 11px; padding: 5px 6px; }
+.share-direct-btn.active { color: #c0392b; font-weight: 600; }
 .spacer { flex: 1; }
 .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 .row input { flex: 1; }
@@ -193,6 +200,10 @@
 .proposal-kebab-item:hover { background: rgba(127,127,127,0.12); }
 .proposals-divider { padding: 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .proposal-row.dismissed { opacity: .6; }
+.proposal-row.proposal-history { opacity: .75; cursor: default; }
+.proposal-row.proposal-ambiguous { background: rgba(234, 179, 8, 0.08); }
+.thread-badge.sent-directly { background: var(--color-neutral-200); color: var(--color-muted); }
+.thread-badge.ambiguous-badge { background: rgba(234, 179, 8, 0.25); color: #7a5b00; }
 #proposal-detail-body { display: flex; flex-direction: column; height: 100%; padding: 14px 16px; box-sizing: border-box; }
 .proposal-to { display: flex; align-items: center; gap: 6px; }
 .proposal-to-name { font-weight: 600; }

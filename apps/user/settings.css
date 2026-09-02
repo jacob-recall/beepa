@@ -164,6 +164,15 @@
 #detail-admin .share-newly-box h3 { font-size: 13px; margin: 0 0 6px; }
 #detail-admin .share-newly-box > p.muted { display: none; }
 
+/* direct-share-level (S2): bulk action row, per-source bulk-source-switch host */
+#detail-admin .share-bulk-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#detail-admin .share-bulk-btn { font-size: 12px; padding: 5px 10px; width: auto; margin: 0; }
+#detail-admin .share-migrated-box .share-summary-row { flex-wrap: wrap; gap: 6px; }
+#detail-admin .share-reconfirm-banner,
+#detail-admin .share-migrated-box { border: 1px solid var(--color-divider); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+#detail-admin .share-reconfirm-banner h3,
+#detail-admin .share-migrated-box h3 { font-size: 13px; margin: 0 0 6px; }
+
 #detail-admin #orglink-card {
   margin-bottom: 16px !important; padding: 14px 0 !important;
   border: none !important; border-bottom: 1px solid var(--color-divider) !important;

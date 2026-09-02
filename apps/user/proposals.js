@@ -14,9 +14,10 @@ import { feedRelTime } from '../../shared/ui/search.js';
 import { S, feedModel } from '../../shared/state.js';
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
-let allProposals = [];     // everything parsed (pending + dismissed)
+let allProposals = [];     // everything parsed (pending + dismissed + non-actionable)
 let selectedId = null;     // eventId shown in the right pane, or null
 let showDismissed = false;
+let showSent = false;
 let kebabOpen = false;
 
 function loadHandled() {
@@ -35,6 +36,18 @@ function unmarkHandled(p) { const s = loadHandled(); s.delete(p.eventId); saveHa
 // through the gated start-chat capability). target_room wins if present; an
 // identifier parse NEVER carries a targetRoom, so a person-targeted draft can
 // never be redirected into a room send. Neither valid → dropped.
+//
+// S3 auto-send classification (direct-share-level plan D2.8/D2.9, wire
+// contract pinned here for S3 to match): a normal draft's content can ALSO
+// carry `"com.jkali.auto_sent": true` + `"sent_event_id"` (the uplink's
+// non-actionable outcome record for a message it already sent directly) or
+// `"com.jkali.send_ambiguous": true` (a post-dispatch failure whose outcome
+// is unknown). Both flags come ONLY from event content — never from
+// localStorage/HANDLED_KEY — so classification is identical on a fresh
+// browser profile and an existing one. `autoSent`/`ambiguous` are mutually
+// exclusive (autoSent wins if a malformed event somehow carried both) and
+// mark the proposal non-actionable: never counted pending, never sendable
+// with one click.
 function parseProposal(e) {
   if (!e || e.type !== 'com.jkali.proposal' || !e.content) return null;
   const c = e.content;
@@ -43,18 +56,45 @@ function parseProposal(e) {
   const ts = typeof c.origin_ts === 'number' ? c.origin_ts
       : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
   const template = c.template === true;
+  const autoSent = c['com.jkali.auto_sent'] === true;
+  const sentEventId = (autoSent && typeof c.sent_event_id === 'string' && c.sent_event_id) ? c.sent_event_id : null;
+  const ambiguous = !autoSent && c['com.jkali.send_ambiguous'] === true;
 
   const room = c.target_room;
   if (typeof room === 'string' && room) {
-    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts };
+    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous };
   }
   const identifier = typeof c.target_identifier === 'string' ? c.target_identifier.trim() : '';
   if (identifier && validHandle(identifier)) {
     const source = typeof c.target_source === 'string' ? c.target_source : '';
     const display = (typeof c.target_display === 'string' && c.target_display) ? c.target_display : identifier;
-    return { kind: 'identifier', eventId: e.event_id, targetSource: source, targetIdentifier: identifier, targetDisplay: display, body, template, ts };
+    return { kind: 'identifier', eventId: e.event_id, targetSource: source, targetIdentifier: identifier, targetDisplay: display, body, template, ts, autoSent, sentEventId, ambiguous };
   }
   return null;
+}
+
+// PURE: split a proposal list into the four rendered buckets. `autoSent` and
+// `ambiguous` proposals are NEVER pending/dismissed — they classify the same
+// way regardless of what `handled` contains (localStorage-independent, F5).
+function partitionProposals(proposals, handled) {
+  const h = (handled && typeof handled.has === 'function') ? handled : new Set();
+  const pending = [];
+  const dismissed = [];
+  const ambiguous = [];
+  const sent = [];
+  for (const p of (Array.isArray(proposals) ? proposals : [])) {
+    if (!p) continue;
+    if (p.autoSent) { sent.push(p); continue; }
+    if (p.ambiguous) { ambiguous.push(p); continue; }
+    (h.has(p.eventId) ? dismissed : pending).push(p);
+  }
+  const byTsDesc = (a, b) => b.ts - a.ts;
+  return {
+    pending: pending.sort(byTsDesc),
+    dismissed: dismissed.sort(byTsDesc),
+    ambiguous: ambiguous.sort(byTsDesc),
+    sent: sent.sort(byTsDesc),
+  };
 }
 
 function pendingForRoom(proposals, handled, roomId) {
@@ -63,6 +103,7 @@ function pendingForRoom(proposals, handled, roomId) {
   let best = null;
   for (const p of proposals) {
     if (!p || p.kind !== 'room' || p.targetRoom !== roomId) continue;
+    if (p.autoSent || p.ambiguous) continue;        // non-actionable, never a pending draft
     if (handled.has(p.eventId)) continue;
     if (!best || p.ts > best.ts) best = p;
   }
@@ -165,14 +206,13 @@ function setDetailError(err, msg) {
   err.textContent = msg || '';
   err.classList.toggle('hidden', !msg);
 }
-function pendingList() {
-  const handled = loadHandled();
-  return allProposals.filter((p) => !handled.has(p.eventId)).sort((a, b) => b.ts - a.ts);
-}
-function dismissedList() {
-  const handled = loadHandled();
-  return allProposals.filter((p) => handled.has(p.eventId)).sort((a, b) => b.ts - a.ts);
-}
+function pendingList() { return partitionProposals(allProposals, loadHandled()).pending; }
+function dismissedList() { return partitionProposals(allProposals, loadHandled()).dismissed; }
+// Non-actionable history: sent directly by the uplink (F5), never a draft.
+function historyList() { return partitionProposals(allProposals, loadHandled()).sent; }
+// Non-actionable, but needs a manual look — a post-dispatch failure whose
+// outcome the uplink could not confirm (D2.9).
+function ambiguousList() { return partitionProposals(allProposals, loadHandled()).ambiguous; }
 
 // ---- send paths (UNCHANGED guards) -------------------------------------------
 async function sendProposal(p, body, err, btn) {
@@ -260,7 +300,48 @@ function buildRow(p, dismissed) {
   return row;
 }
 
-function buildTopBar(pendingN, dismissedN) {
+// Non-actionable: "sent directly" history from the uplink's auto-send outcome
+// record (F5). Never a quick-action row — clicking only opens the real
+// conversation, never re-sends.
+function buildHistoryRow(p) {
+  const row = el('div', 'convo proposal-row proposal-history');
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  row.appendChild(buildPlatBadge(sourceOf(p)));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', targetName(p)));
+  meta.appendChild(el('div', 'preview', sanitizeLine(p.body).replace(/\s+/g, ' ').slice(0, 90)));
+  row.appendChild(meta);
+  if (p.ts) row.appendChild(el('span', 'when', feedRelTime(p.ts)));
+  row.appendChild(el('span', 'thread-badge sent-directly', 'Sent directly'));
+  const open = () => { if (p.kind === 'room') openConvo(p.targetRoom); };
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  return row;
+}
+
+// Non-actionable as a one-click send (D2.9 post-dispatch ambiguous failure) —
+// distinct from both a pending draft and sent history: it may or may not
+// already be out. The only affordance is the manual path, opening the real
+// conversation so the teammate can check for themselves.
+function buildAmbiguousRow(p) {
+  const row = el('div', 'convo proposal-row proposal-ambiguous');
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+  row.appendChild(buildPlatBadge(sourceOf(p)));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', targetName(p)));
+  meta.appendChild(el('div', 'preview', 'May already have been sent — check the conversation'));
+  row.appendChild(meta);
+  if (p.ts) row.appendChild(el('span', 'when', feedRelTime(p.ts)));
+  row.appendChild(el('span', 'thread-badge ambiguous-badge', 'Check conversation'));
+  const open = () => { if (p.kind === 'room') openConvo(p.targetRoom); };
+  row.addEventListener('click', open);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  return row;
+}
+
+function buildTopBar(pendingN, dismissedN, sentN) {
   const bar = el('div', 'proposals-head');
   const left = el('div', 'proposals-head-left');
   left.appendChild(el('span', 'proposals-title', 'Proposals'));
@@ -282,6 +363,12 @@ function buildTopBar(pendingN, dismissedN) {
       + (dismissedN ? ' (' + dismissedN + ')' : '');
     toggle.addEventListener('click', (e) => { e.stopPropagation(); showDismissed = !showDismissed; kebabOpen = false; renderList(); });
     menu.appendChild(toggle);
+    const sentToggle = el('button', 'proposal-kebab-item');
+    sentToggle.type = 'button';
+    sentToggle.textContent = (showSent ? 'Hide sent' : 'Show sent')
+      + (sentN ? ' (' + sentN + ')' : '');
+    sentToggle.addEventListener('click', (e) => { e.stopPropagation(); showSent = !showSent; kebabOpen = false; renderList(); });
+    menu.appendChild(sentToggle);
     bar.appendChild(menu);
   }
   return bar;
@@ -292,11 +379,21 @@ function renderList() {
   if (!list) return;
   const pending = pendingList();
   const dismissed = dismissedList();
+  const ambiguous = ambiguousList();
+  const sent = historyList();
   list.replaceChildren();
-  list.appendChild(buildTopBar(pending.length, dismissed.length));
+  list.appendChild(buildTopBar(pending.length, dismissed.length, sent.length));
   updateCount(pending.length);
 
-  if (!pending.length && !(showDismissed && dismissed.length)) {
+  // Ambiguous rows need a manual look, so they always show, above pending —
+  // never folded away behind a toggle the way sent/dismissed are.
+  if (ambiguous.length) {
+    list.appendChild(el('div', 'proposals-divider muted', 'Needs a manual check'));
+    for (const p of ambiguous) list.appendChild(buildAmbiguousRow(p));
+  }
+
+  if (!pending.length && !ambiguous.length
+    && !(showDismissed && dismissed.length) && !(showSent && sent.length)) {
     list.appendChild(el('p', 'list-empty', 'No proposals right now.'));
     return;
   }
@@ -304,6 +401,10 @@ function renderList() {
   if (showDismissed && dismissed.length) {
     list.appendChild(el('div', 'proposals-divider muted', 'Dismissed'));
     for (const p of dismissed) list.appendChild(buildRow(p, true));
+  }
+  if (showSent && sent.length) {
+    list.appendChild(el('div', 'proposals-divider muted', 'Sent directly'));
+    for (const p of sent) list.appendChild(buildHistoryRow(p));
   }
 }
 
@@ -457,4 +558,4 @@ function initProposalsUI() {
   refresh().catch(() => {});
 }
 
-export { initProposalsUI, renderProposalsView, parseProposal, pendingForRoom, rowGesture };
+export { initProposalsUI, renderProposalsView, parseProposal, partitionProposals, pendingForRoom, rowGesture };

@@ -209,9 +209,17 @@ function markActiveContact(id) {
   }
 }
 
+// F13 copy fix (direct-share-level plan): since D1, a profile's share-state
+// has NO effect on whether its linked conversations mirror to the manager —
+// that is decided per-conversation only (see consent.js). This label is
+// purely a tag on the contact profile itself; it is not even consulted by
+// resolveContactShare() (the address-book/contact-info sharing dimension,
+// which is a separate global/per-source policy — see shared/model/consent.js).
+// The control is kept (its storage shape is retained for compatibility) but
+// the copy states plainly that it does not control what your manager can see.
 function buildShareToggle(profile) {
   const wrap = el('div', 'contact-share-row');
-  wrap.appendChild(el('span', 'muted', 'Sharing'));
+  wrap.appendChild(el('span', 'muted', 'Label (does not affect what your manager can see)'));
   const toggle = el('span', 'share-toggle');
   for (const [val, label] of [['share', 'Share'], ['inherit', 'Auto'], ['private', 'Private']]) {
     const b = el('button', 'share-opt' + (profile.share === val ? ' active' : ''), label);

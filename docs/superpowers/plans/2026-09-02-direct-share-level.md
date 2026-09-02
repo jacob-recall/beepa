@@ -326,3 +326,63 @@ Reviewer: pilotfish:security-reviewer, 2026-09-02 (read-only, pre-approval).
   defense ships regardless.
 - Impersonation residual risk accepted and disclosed in the teammate's
   consent copy (F14).
+
+## Wire contract (S2/S3)
+
+S2 (`apps/user/proposals.js`, `apps/user/consent.js`) shipped the rendering
+for records S3 (`agents/uplink/uplink.py`) has not written yet. These names
+are pinned so S3 produces exactly what S2 already classifies — do not rename
+or reshape any of these without updating both sides in the same change.
+
+- **Auto-sent history record** — a normal `com.jkali.proposal` event, content
+  = the usual proposal fields (`target_room`/`body`/etc.) **plus**:
+  - `"com.jkali.auto_sent": true`
+  - `"sent_event_id": "<local event id the uplink's send produced>"`
+
+  `apps/user/proposals.js`'s `parseProposal()` sets `autoSent: true` and
+  `sentEventId` from these two fields and nothing else; `partitionProposals()`
+  puts it in the `sent` bucket, rendered by `buildHistoryRow()` as a
+  non-actionable "Sent directly" row — never counted pending, never returned
+  by `pendingForRoom()`. `sent_event_id` is currently read but not yet
+  rendered anywhere; S3 must still write it verbatim (a future slice may use
+  it to deep-link the exact message).
+
+- **Ambiguous record** — a normal `com.jkali.proposal` event, content = the
+  usual proposal fields plus:
+  - `"com.jkali.send_ambiguous": true`
+
+  (Never set alongside `com.jkali.auto_sent: true` — if both are ever present
+  on one event, S2's parser treats `auto_sent` as authoritative and ignores
+  `send_ambiguous`; S3 must not rely on that and should only ever set one.)
+
+  `parseProposal()` sets `ambiguous: true`; `partitionProposals()` puts it in
+  the `ambiguous` bucket, rendered by `buildAmbiguousRow()` — always shown,
+  never folded behind a toggle — labelled "may already have been sent — check
+  the conversation", with only a manual "open the conversation" affordance
+  (click the row), never a one-click send.
+
+- **Classification is content-only.** Both flags are read only from the
+  `com.jkali.proposal` event content fetched from the teammate's proposals
+  room; `apps/user/proposals.js` never consults `localStorage`
+  (`HANDLED_KEY`) to decide `autoSent`/`ambiguous` — only to decide
+  pending-vs-dismissed among the remaining, actionable proposals. A fresh
+  browser profile (empty `localStorage`) and an existing one classify these
+  two kinds identically; pinned by `tests/unit/proposal_classification.test.js`.
+
+- **Master-identity re-confirm tuple** — two LOCAL account-data event types
+  on the teammate's own homeserver (not proposal-room events):
+  - `com.jkali.direct_send_suspended`, content
+    `{ master_hs, master_user, manager_mxid, ts }` — written by S3's uplink
+    when the master identity it is bound to changes, suspending auto-send.
+  - `com.jkali.direct_send_ack`, content = the **same four fields, same
+    values**, written by `apps/user/consent.js`'s
+    `ackDirectSendSuspension()` once the teammate confirms the new identity
+    shown in `directSendSuspensionBanner()`. S3 resumes auto-send only when
+    this ack's tuple matches the suspension's tuple it currently holds.
+
+  `suspensionAffordance(content)` (pure) normalizes the suspended-event
+  content into the four-field tuple the banner renders, or `null` on any
+  missing/malformed field (never a broken confirm on junk input).
+  `directSendAckContent(affordance)` (pure) is the exact ack body to write —
+  the same four fields, verbatim, nothing added. Both are pinned by
+  `tests/unit/direct_send_reconfirm.test.js`.

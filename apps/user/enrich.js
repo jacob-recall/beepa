@@ -111,4 +111,8 @@ async function autoMergeContacts() {
   }
 }
 
-export { autoMergeContacts };
+// The loopback base + guarded headers are shared with the per-contact override
+// UI (apps/user/consent.js), which POSTs /contacts/list through the SAME
+// origin-gated helper. Exported rather than copied so there is one definition
+// of the helper's discovery and its two non-simple headers.
+export { autoMergeContacts, sessionConnectBase, SESSION_CONNECT_HEADERS };

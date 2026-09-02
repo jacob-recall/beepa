@@ -206,7 +206,32 @@ what bounds the capability is the gate list under "Security invariants".
   only if it is live, its source is in the daemon's known-source allowlist
   (`SOURCE_ID_TO_LABEL` — adding a store source means adding it there), and
   `consent.resolve_contact_share` says shared; a not-shared row is in
-  neither leg and never reaches a network call. The tombstone leg diffs the
+  neither leg and never reaches a network call.
+  **Per-contact overrides (per-contact-share plan, C2)** add a more specific
+  level to that resolution — `com.jkali.contact_overrides`, keyed
+  `'<source>|<network_id>'`, values `share`/`private` — with these bounds:
+  `overrides` is a **required positional** parameter of
+  `plan_contact_mirror` (F4: an unconverted call site must be a `TypeError`,
+  never a silent widening back to source-only); it is consulted strictly
+  **after** the known-source and `deleted` checks, so it can never resurrect
+  an unknown source or a soft-deleted row; and it is a **boolean gate only** —
+  every field of pushed content comes from the store row, never from the
+  override key. `read_contact_overrides()` returns `{}` for 404 and **None**
+  for anything else, and a `None` **skips the push leg entirely** while
+  tombstones still run off the last successfully-read map cached in
+  `meta['contact_overrides_cache']` (P3) — a transient read failure must never
+  let a `'private'`-overridden contact fall back to a share-all source and push
+  its PII. `read_contact_policy()` has the same 404-vs-other split and a
+  non-404 error **aborts the whole pass** (collapsing it to global-private used
+  to storm a full tombstone sweep on a blip). The push leg re-reads the map
+  every `OVERRIDE_RECHECK` (50) pushes and drops rows flipped to `'private'`
+  mid-pass (F10); the residual sub-chunk window is accepted.
+  **F9: an override key IS a phone number / email — never log one.** Contact
+  logging stays counts-only, as it already was for handles and display names.
+  New contacts rooms are created with `history_visibility: joined` (F2) as a
+  partial mitigation for the fact that a tombstone does not retract what was
+  already mirrored; existing rooms are deliberately unchanged, and the UI copy
+  states the residual plainly. The tombstone leg diffs the
   **complete, unfiltered** `contact_mirror` table against live-shared, so
   a mirrored handle whose source was renamed/removed is tombstoned, never
   stranded. Tombstones are applied before pushes (revocation never waits
@@ -242,6 +267,7 @@ python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_reconcile.test.py
 python3 tests/unit/uplink_direct_send.test.py    # D2 auto-send gates + schema
 python3 tests/unit/uplink_share_level.test.py    # D2b share-level stamping
+python3 tests/unit/uplink_contact_overrides.test.py  # per-contact override gates
 
 # run the daemon against a real local + master pair (see master/CLAUDE.md
 # to bring the master stack up first):

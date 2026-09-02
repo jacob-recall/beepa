@@ -1,4 +1,4 @@
-# tests/ — 30 unit tests + the consent conformance harness, all wired into tests/run.sh + the 14-scenario integration harness
+# tests/ — 33 unit tests + the consent conformance harness, all wired into tests/run.sh + the 14-scenario integration harness
 
 PLAN-MASTER-SYNC.md §13; PLAN-MASTER-SYNC-IMPL.md's "Cross-cutting:
 documentation & tests". Every edge case named in the design doc has an
@@ -8,7 +8,7 @@ explicit, named test — see the scenario list below.
 
 ```
 tests/
-  run.sh                          runs all 30 unit tests (14 node + 16 python)
+  run.sh                          runs all 33 unit tests (15 node + 18 python)
                                   + the consent conformance harness — see below
   unit/
     consent.test.js               shared/model/consent.js — the explicit three-level model
@@ -16,7 +16,8 @@ tests/
     master_invites.test.js        apps/master/invites.js — the console's auto-join/render trust gate
     user_invites.test.js          apps/user/invites.js — the hub's bridge-invite auto-join trust gate
     csp_parity.test.js            CSP header parity across apps
-    contact_consent.test.js       contact-level consent precedence
+    contact_consent.test.js       contact-level consent precedence + per-contact overrides
+    contact_overrides.test.js     apps/user consent-write discipline (cap, recovery, fan-out)
     contacts_profile_handles.test.js  unified-contact profile/handle shaping
     proposal_identifier.test.js   proposal identifier derivation
     proposal_parse.test.js        proposal parsing
@@ -25,6 +26,8 @@ tests/
     import_macos.test.py          macOS address-book import
     contact_consent_py.test.py    contact-level consent — MUST mirror contact_consent.test.js
     uplink_reconcile.test.py      agents/uplink/reconcile.py — reconcile/idempotency/watermark
+    uplink_contact_overrides.test.py  per-contact override gates in the contact mirror
+    contacts_list_guard.test.py   session-connect POST /contacts/list gate (F1 + Host allowlist)
     uplink_proposal_sanitize.test.py  proposal sanitization on the way down
     number_resolver.test.py       phone-number resolution
     consent_py.test.py            agents/uplink/consent.py — MUST mirror consent.test.js
@@ -83,6 +86,15 @@ tests/
   another), the space name/creator bind, the per-pass caps, malformed and
   foreign room ids, and `localpart()` edge cases. A failure here means the hub
   would auto-join a room it must not.
+- `unit/contact_consent.test.js` / `unit/contact_consent_py.test.py` — the
+  contact dimension, including the per-contact override level. **These two
+  files must assert the same cases with the same expected results.** They pin
+  that an override beats both standing levels in both directions, that an
+  UNRECOGNIZED override VALUE *inherits* (the contact dimension keeps its
+  standing policies — the opposite of the conversation dimension's fail-closed
+  rule), the first-`|` key spec, and that `normalizeContactOverrides` returns a
+  READ FAILURE (not `{}`) for a non-object `overrides` field or an over-cap
+  stored map.
 - `unit/consent_py.test.py` — the same case list against
   `agents/uplink/consent.py`. **These two files must assert the same
   cases with the same expected results.** If you add a case to one, add
@@ -105,6 +117,23 @@ tests/
   inbox artifact per proposal in every path, hash-only logs and audit rows,
   the S3 schema migration against a pre-S3 state.db, and the one-time
   proposals-room topic re-PUT.
+- `unit/contact_overrides.test.js` — the per-contact-share plan's write
+  discipline, proven against an INJECTED transport so "zero PUTs" is
+  observable: a read that throws (or reports `error`) performs **zero** writes
+  for both `com.jkali.contact_overrides` and `com.jkali.contact_profiles` (F3
+  — the old fail-to-empty read + blind PUT could erase a stored `'private'`
+  deny or the whole profile store); a write that would cross the 1024-entry cap
+  is refused before any PUT, with the cap named (F5); an over-cap STORED map
+  still accepts single-key removal and clear-all, so recovery stays in-app; a
+  two-handle profile fan-out produces BOTH keys in one PUT while an unimported
+  or unknown-source handle is refused visibly rather than minted (F7).
+- `unit/uplink_contact_overrides.test.py` — the uplink half: a 404 overrides
+  read behaves exactly as before; `'private'`/`'share'` overrides withhold and
+  admit exactly one contact; **a non-404 overrides read yields pushed == 0 that
+  pass while tombstones still run** off the state.db-cached map (C2/P3); a
+  non-404 POLICY read aborts the pass entirely (no tombstone storm); a mid-pass
+  flip to `'private'` drops the remaining row (F10); and no log line carries a
+  network_id or an override key (F9).
 - `unit/uplink_share_level.test.py` — D2b: per-room LEVELS through
   `reconcile_decisions` (`level_is_shared`, so `'private'` can never read as
   shared through bare truthiness) and `plan_level_restamp`, plus a real
@@ -220,7 +249,7 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 cd /Users/jkali/work/pm_mng
 
 # --- unit tests ---
-# tests/run.sh runs all 30 (14 node + 16 python) + the consent conformance harness:
+# tests/run.sh runs all 33 (15 node + 18 python) + the consent conformance harness:
 tests/run.sh
 
 # --- integration (needs BOTH stacks up first) ---

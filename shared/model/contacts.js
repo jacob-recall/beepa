@@ -343,11 +343,19 @@ function profilesPath() {
     '/account_data/' + CONTACT_PROFILES_TYPE;
 }
 
+// F3 (per-contact-share plan): 404/absent is the ONLY failure that reads as an
+// empty store. Any other failure RE-THROWS, because the old catch-all made a
+// transient blip indistinguishable from "the user has no contacts" — and the
+// very next writeProfiles() would then blind-PUT that empty store over the real
+// one, destroying every grouping and every handle link. A caller that cannot
+// read the store must keep its last-known-good cache and DISABLE writing, not
+// write an emptiness it never read.
 async function readProfiles() {
   try {
     return normalizeProfiles(await api('GET', profilesPath()));
   } catch (e) {
-    return emptyProfiles();
+    if (e && e.status === 404) return emptyProfiles();
+    throw e;
   }
 }
 

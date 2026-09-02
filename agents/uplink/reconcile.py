@@ -121,7 +121,7 @@ def select_new_events(event_ids, mapped_ids):
 PUSH_CAP = 200  # per-pass push budget; tombstones are never capped
 
 
-def plan_contact_mirror(rows, mirrored, policy, sources, push_cap=PUSH_CAP):
+def plan_contact_mirror(rows, mirrored, policy, sources, overrides, push_cap=PUSH_CAP):
     """Plan one contact-mirror pass: a diff of desired-shared-and-live vs
     mirrored (§12 phase 5; pm_mng-q5u.2 backfill-on-enable).
 
@@ -141,6 +141,12 @@ def plan_contact_mirror(rows, mirrored, policy, sources, push_cap=PUSH_CAP):
                Filters ONLY the rows: a row outside it can never be a push
                candidate and never counts as live-shared. Adding a store
                source means adding it there.
+    overrides: the per-contact override map (consent.normalize_contact_overrides),
+               '<source>|<network_id>' -> 'share'|'private'. A REQUIRED
+               POSITIONAL parameter (F4): an unconverted call site must be a
+               TypeError, never a silent widening back to source-only
+               resolution. Pass None/{} explicitly for "no overrides".
+               It is a BOOLEAN GATE ONLY — see the invariant below.
     push_cap : at most this many pushes per pass; the remainder is re-planned
                next pass, so a first backfill of a large address book resumes
                naturally without blocking the daemon's loop for minutes.
@@ -151,16 +157,25 @@ def plan_contact_mirror(rows, mirrored, policy, sources, push_cap=PUSH_CAP):
              "pending":    shared pushes deferred by push_cap}.
 
     tombstone = mirrored handles minus live-shared handles (select_contacts_to_tombstone).
-    push      = live (deleted=0) rows in `sources` whose source resolves shared
+    push      = live (deleted=0) rows in `sources` that resolve shared under
+                per-contact override > per-source > global
                 AND (not mirrored OR mirrored_version != row version).
                 `!=`, not `<`: version is a per-store change token, not a
                 clock — a rebuilt contacts.db restarts at 1 and `<` would leave
                 stale PII on the master forever.
     A not-shared row appears in neither list, so it never reaches a PUT.
+
+    F4 INVARIANT — the override is a BOOLEAN GATE ONLY. It is consulted strictly
+    AFTER the known-source allowlist and the `deleted` check (so an override can
+    never resurrect an unknown source or a soft-deleted row), and NOTHING from
+    the override key ever becomes pushed content: every field of a pushed
+    contact comes from the store row (see uplink._put_contact). The key is only
+    ever used to LOOK UP a boolean.
     """
     mirrored = dict(mirrored or {})
     known = set(sources or ())
     policy = policy or {}
+    ovr = overrides if isinstance(overrides, dict) else {}
     live_shared = set()
     candidates = []
     not_shared = 0
@@ -170,7 +185,11 @@ def plan_contact_mirror(rows, mirrored, policy, sources, push_cap=PUSH_CAP):
             continue
         if row.get("deleted"):
             continue
-        if not consent.resolve_contact_share(source, policy).get("shared"):
+        # Override lookup AFTER the two gates above (F4). A key the spec rejects
+        # yields None -> inherit from source/global, never a widening.
+        key = consent.contact_override_key(source, row.get("network_id"))
+        override = ovr.get(key) if key is not None else None
+        if not consent.resolve_contact_share(source, policy, override).get("shared"):
             not_shared += 1
             continue
         key = (source, row.get("network_id"))

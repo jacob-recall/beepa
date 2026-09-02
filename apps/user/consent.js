@@ -15,17 +15,24 @@ import {
   writeShareOverride, overridesFromSync, SHARE_OVERRIDE_TYPE,
   readConsentModel, CONSENT_MODEL_EXPLICIT,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
+  CONTACT_OVERRIDES_CAP, CONTACT_OVERRIDE_STATES,
+  contactOverrideKey, splitContactOverrideKey,
+  readContactOverrides, writeContactOverrides,
 } from '../../shared/model/consent.js';
-import { readProfiles, roomProfileMap } from '../../shared/model/contacts.js';
+import { readProfiles, writeProfiles, roomProfileMap } from '../../shared/model/contacts.js';
 import { api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setConvoRowDecorator } from '../../shared/ui/rows.js';
 import { setSourceViewHook } from '../../shared/ui/search.js';
 import { setSharingViewHook } from '../../shared/ui/nav.js';
-import { SOURCES } from '../../shared/ui/sources.js';
+import { SOURCES, validHandle } from '../../shared/ui/sources.js';
 import { S, convosBySource, feedModel } from '../../shared/state.js';
 import { feedHideRoom, feedUnhideRoom, feedIsHidden } from '../../shared/ui/account-data.js';
 import { confirmModal } from '../../shared/ui/connections.js';
+// The SAME origin-gated loopback helper enrich.js already talks to (custom
+// X-Beepa-Connect header + application/json force a CORS preflight the helper
+// only echoes for this app's origin). Imported, never re-implemented.
+import { sessionConnectBase, SESSION_CONNECT_HEADERS } from './enrich.js';
 
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.
@@ -234,6 +241,17 @@ async function loadConsentState() {
     migratedRoomIds = migratedRoomIdsFromSync(syncData, new Set(overrides.keys()));
   } catch (e) { /* keep previous cache */ }
   try { profileMap = roomProfileMap(await readProfiles()); } catch (e) { /* keep previous cache */ }
+  // F3: the three states are distinct on purpose — an unreadable overrides map
+  // DISABLES the per-contact controls rather than rendering an empty one.
+  try {
+    const st = await readContactOverrides();
+    contactOverridesStatus = st.status;
+    contactOverrides = st.overrides || Object.create(null);
+  } catch (e) {
+    contactOverridesStatus = 'error';
+    contactOverrides = Object.create(null);
+  }
+  await loadImportedContacts();
   try { directSendSuspension = await readDirectSendSuspension(); } catch (e) { directSendSuspension = null; }
 }
 
@@ -315,6 +333,21 @@ function buildTriStateSlider(cycle, opts) {
 
   const hint = el('span', 'share-slider-hint');
   btn.appendChild(hint);
+  // F8 CONSENT-WRITE INVARIANT: no consent control may swallow a write error.
+  // A failed write is SURFACED here and the control keeps rendering
+  // last-known-good state (refresh() is skipped), never the requested one — a
+  // toggle that looks moved but never landed is a consent lie.
+  const err = el('span', 'share-slider-error hidden');
+  btn.appendChild(err);
+  function showWriteError(message) {
+    err.textContent = 'Not saved — ' + sanitizeLine(message || 'try again')
+      + '. Still showing your last saved setting.';
+    err.classList.remove('hidden');
+  }
+  function clearWriteError() {
+    err.textContent = '';
+    err.classList.add('hidden');
+  }
 
   function refresh() {
     const idx = getIndex();
@@ -340,14 +373,21 @@ function buildTriStateSlider(cycle, opts) {
     if (e.detail > 0 && rect.width > 0) {
       const frac = (e.clientX - rect.left) / rect.width;
       next = Math.max(0, Math.min(cycle.length - 1, Math.floor(frac * cycle.length)));
-      if (next === getIndex()) return;                 // clicked the current state
+      if (next === getIndex()) { clearWriteError(); return; }  // clicked the current state
     } else {
       next = (getIndex() + 1) % cycle.length;
     }
+    clearWriteError();
     try {
       const ok = await onAdvance(cycle[next]);
+      // A handler that returns false REFUSED deliberately (e.g. a declined
+      // confirm) and has already said so in its own surface; anything that
+      // THROWS is a failed write and must be visible here (F8).
       if (ok === false) return;
-    } catch (err) { return; }
+    } catch (e2) {
+      showWriteError(e2 && e2.message);
+      return;
+    }
     refresh();
   });
 
@@ -567,15 +607,23 @@ function buildGlobalSwitch() {
   btn.setAttribute('role', 'switch');
   btn.setAttribute('aria-checked', policy.global === 'share-all' ? 'true' : 'false');
   btn.appendChild(el('span', 'switch-knob'));
+  const err = el('p', 'error hidden');
   btn.addEventListener('click', async () => {
     const next = policy.global === 'share-all' ? 'private' : 'share-all';
+    err.classList.add('hidden');
     try { policy = await writeSharePolicy({ ...policy, global: next }); }
-    catch (e) { return; }
+    catch (e) {                                   // F8: never a silent swallow
+      err.textContent = 'Not saved — ' + sanitizeLine((e && e.message) || 'try again')
+        + '. Still showing your last saved setting.';
+      err.classList.remove('hidden');
+      return;
+    }
     btn.classList.toggle('on', policy.global === 'share-all');
     btn.setAttribute('aria-checked', policy.global === 'share-all' ? 'true' : 'false');
     renderConsentSummary();
   });
   wrap.appendChild(btn);
+  wrap.appendChild(err);
   return wrap;
 }
 
@@ -801,13 +849,21 @@ function renderConsentSummary() {
       row.appendChild(el('span', 'reason', 'no source'));
       const btn = el('button', 'danger', 'Clear');
       btn.type = 'button';
+      // F8: surfaced, never swallowed — row keeps last-known-good state.
+      const rowErr = el('span', 'share-slider-error hidden');
       btn.addEventListener('click', async () => {
         try {
           await writeShareOverride(rid, null);
           overrides.delete(rid);
-        } catch (e) { return; }
+        } catch (e) {
+          rowErr.textContent = 'Not saved — ' + sanitizeLine((e && e.message) || 'try again')
+            + '. Still showing your last saved setting.';
+          rowErr.classList.remove('hidden');
+          return;
+        }
         renderConsentSummary();
       });
+      row.appendChild(rowErr);
       row.appendChild(btn);
       box.appendChild(row);
     }
@@ -825,13 +881,22 @@ function renderConsentSummary() {
       row.appendChild(el('span', 'reason', reasonText(r)));
       const btn = el('button', 'danger', 'Exclude');
       btn.type = 'button';
+      // F8: surfaced, never swallowed — the load-bearing direction is exactly
+      // this one (a revocation the user believes landed but did not).
+      const rowErr = el('span', 'share-slider-error hidden');
       btn.addEventListener('click', async () => {
         try {
           await writeShareOverride(r.convo.id, 'private');
           overrides.set(r.convo.id, 'private');
-        } catch (e) { return; }
+        } catch (e) {
+          rowErr.textContent = 'Not saved — ' + sanitizeLine((e && e.message) || 'try again')
+            + '. Still showing your last saved setting.';
+          rowErr.classList.remove('hidden');
+          return;
+        }
         renderConsentSummary();
       });
+      row.appendChild(rowErr);
       row.appendChild(btn);
       box.appendChild(row);
     }
@@ -873,14 +938,22 @@ function buildContactGlobalSwitch() {
   btn.setAttribute('aria-label', 'Share my contacts with my manager');
   btn.setAttribute('aria-checked', contactPolicy.global === 'share-all' ? 'true' : 'false');
   btn.appendChild(el('span', 'switch-knob'));
+  const err = el('p', 'error hidden');
   btn.addEventListener('click', async () => {
     const next = contactPolicy.global === 'share-all' ? 'private' : 'share-all';
+    err.classList.add('hidden');
     try { contactPolicy = await writeContactPolicy({ ...contactPolicy, global: next }); }
-    catch (e) { return; }
+    catch (e) {                                   // F8: never a silent swallow
+      err.textContent = 'Not saved — ' + sanitizeLine((e && e.message) || 'try again')
+        + '. Still showing your last saved setting.';
+      err.classList.remove('hidden');
+      return;
+    }
     // Full re-render so the per-source "following global" hints update too.
     renderContactShareView();
   });
   wrap.appendChild(btn);
+  wrap.appendChild(err);
   return wrap;
 }
 
@@ -926,6 +999,354 @@ function buildContactSourceSwitchRow(source) {
   return row;
 }
 
+// ===========================================================================
+// PER-CONTACT OVERRIDES (per-contact-share plan, C3) — the most specific level
+// of the contact dimension. The control unit is a HANDLE, `<source>|<network_id>`.
+// Everything below is either PURE (unit-tested in plain node) or takes its I/O
+// as an injected `io` object, so the write discipline can be proven without a
+// browser: F3 (merge over a fresh read, never a blind PUT of a cached map),
+// F5 (entry cap refused BEFORE any PUT), F7 (a fan-out key that would never
+// apply is refused VISIBLY, never minted).
+// ===========================================================================
+
+// The source ids this app knows. A handle outside it can never become a valid
+// override key (the uplink would not mirror that source anyway).
+function knownSourceIds() {
+  const out = new Set();
+  for (const s of SOURCES) if (s.kind !== 'all') out.add(s.id);
+  return out;
+}
+
+// PURE. Validate a /contacts/list response into rows the UI may render and key
+// on — shape, known source, handle shape — mirroring enrich.js's discipline of
+// never trusting the loopback helper's output blindly. Returns [] for junk.
+function validImportedContacts(body, knownSources) {
+  const known = knownSources instanceof Set ? knownSources : new Set();
+  const rows = (body && Array.isArray(body.contacts)) ? body.contacts : [];
+  const out = [];
+  const seen = new Set();
+  for (const r of rows) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const source = typeof r.source === 'string' ? r.source : '';
+    const network_id = typeof r.network_id === 'string' ? r.network_id : '';
+    if (!known.has(source)) continue;
+    if (!validHandle(network_id)) continue;
+    const key = contactOverrideKey(source, network_id);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      source,
+      network_id,
+      key,
+      display_name: typeof r.display_name === 'string' ? r.display_name : '',
+    });
+  }
+  return out;
+}
+
+// PURE (F7). One override key per LINKED HANDLE of a profile — but only for
+// handles that pass the key spec + known-source gate AND reconcile against the
+// imported address book. Everything else is reported as `unmatched` so the
+// caller can refuse it VISIBLY: a 'private' that silently never applies is a
+// leak the teammate believes closed, and a 'share' on a not-yet-imported handle
+// is a dormant grant that would fire on the next import.
+function planHandleFanOut(handles, importedKeys, knownSources) {
+  const known = knownSources instanceof Set ? knownSources : new Set();
+  const imported = importedKeys instanceof Set ? importedKeys : new Set();
+  const keys = [];
+  const unmatched = [];
+  const seen = new Set();
+  for (const h of (Array.isArray(handles) ? handles : [])) {
+    const source = (h && typeof h.source === 'string') ? h.source : '';
+    const network_id = (h && typeof h.network_id === 'string') ? h.network_id : '';
+    const key = contactOverrideKey(source, network_id);
+    if (!key || !known.has(source)) {
+      unmatched.push({ source, network_id, reason: 'unknown source' });
+      continue;
+    }
+    if (!imported.has(key)) {
+      unmatched.push({ source, network_id, reason: 'not in your imported contacts' });
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  return { keys, unmatched };
+}
+
+// PURE (F3/F5). What a set of changes would make the stored map, or a refusal.
+//   current : the map from a FRESH read (never a cached one)
+//   changes : [[key, 'share'|'private'|null], ...]   null clears the key
+// Refuses BEFORE any write if the result would cross `cap` — a write that
+// strictly REDUCES the entry count is always allowed, which is what keeps the
+// over-cap recovery (remove one / clear all) in-app.
+function planContactOverrideWrite(current, changes, cap) {
+  const limit = typeof cap === 'number' ? cap : CONTACT_OVERRIDES_CAP;
+  const src = (current && typeof current === 'object' && !Array.isArray(current)) ? current : {};
+  const next = Object.create(null);
+  for (const k of Object.keys(src)) {
+    if (splitContactOverrideKey(k) && CONTACT_OVERRIDE_STATES.has(src[k])) next[k] = src[k];
+  }
+  const baseCount = Object.keys(next).length;
+  const refused = [];
+  for (const c of (Array.isArray(changes) ? changes : [])) {
+    const key = Array.isArray(c) ? c[0] : null;
+    const value = Array.isArray(c) ? c[1] : undefined;
+    if (!splitContactOverrideKey(key)) { refused.push(key); continue; }
+    if (value === null || value === undefined) { delete next[key]; continue; }
+    if (!CONTACT_OVERRIDE_STATES.has(value)) { refused.push(key); continue; }
+    next[key] = value;
+  }
+  const count = Object.keys(next).length;
+  if (count > limit && count >= baseCount) {
+    return { ok: false, reason: 'cap', cap: limit, count, baseCount, refused, next: null };
+  }
+  return { ok: true, reason: null, cap: limit, count, baseCount, refused, next };
+}
+
+// Are these changes destructive-only (removals)? The one thing still permitted
+// while the STORED map is over the cap, so recovery never needs a raw client.
+function isDestructiveOnly(changes) {
+  const list = Array.isArray(changes) ? changes : [];
+  if (!list.length) return false;
+  return list.every((c) => Array.isArray(c) && (c[1] === null || c[1] === undefined));
+}
+
+// The guarded write path. `io` is { read, write } so tests can prove "a read
+// that fails performs ZERO writes" without a homeserver. Never widens on a bad
+// read, never blind-PUTs a cached map, and refuses over-cap before writing.
+// Returns { ok, reason, wrote, overrides, plan } — `reason` is what the caller
+// must SHOW (F8: a failure is never silent).
+async function applyContactOverrides(io, changes) {
+  let state;
+  try {
+    state = await io.read();
+  } catch (e) {
+    return { ok: false, reason: 'read', wrote: false, message: (e && e.message) || 'read failed' };
+  }
+  if (!state || state.status === 'error') {
+    return { ok: false, reason: 'read', wrote: false, message: 'could not read your current settings' };
+  }
+  if (state.status === 'over-cap' && !isDestructiveOnly(changes)) {
+    return { ok: false, reason: 'over-cap', wrote: false, cap: CONTACT_OVERRIDES_CAP,
+      message: 'your saved per-contact list is over the ' + CONTACT_OVERRIDES_CAP
+        + '-entry limit; remove entries (or clear them all) before adding more' };
+  }
+  const plan = planContactOverrideWrite(state.overrides, changes);
+  if (!plan.ok) {
+    return { ok: false, reason: 'cap', wrote: false, cap: plan.cap, count: plan.count, plan,
+      message: 'that would store ' + plan.count + ' per-contact settings, over the '
+        + plan.cap + '-entry limit; nothing was saved' };
+  }
+  try {
+    await io.write(plan.next);
+  } catch (e) {
+    return { ok: false, reason: 'write', wrote: false, message: (e && e.message) || 'write failed' };
+  }
+  return { ok: true, reason: null, wrote: true, overrides: plan.next, plan };
+}
+
+// The same discipline for com.jkali.contact_profiles (F3): read fresh, mutate
+// the FRESH store, write. A read failure performs ZERO writes — the old
+// catch-all-to-empty + blind PUT could destroy the whole profile store on a blip.
+async function saveProfilesGuarded(io, mutate) {
+  let store;
+  try {
+    store = await io.read();
+  } catch (e) {
+    return { ok: false, reason: 'read', wrote: false, message: (e && e.message) || 'read failed' };
+  }
+  let next;
+  try {
+    next = mutate(store);
+  } catch (e) {
+    return { ok: false, reason: 'mutate', wrote: false, message: (e && e.message) || 'invalid change' };
+  }
+  try {
+    return { ok: true, reason: null, wrote: true, store: await io.write(next) };
+  } catch (e) {
+    return { ok: false, reason: 'write', wrote: false, message: (e && e.message) || 'write failed' };
+  }
+}
+
+// The real I/O bindings the app passes to the two helpers above.
+const OVERRIDES_IO = { read: readContactOverrides, write: writeContactOverrides };
+const PROFILES_IO = { read: readProfiles, write: writeProfiles };
+
+// ---- module cache + the imported address book --------------------------------
+// contactOverrides is a RENDER cache only. Every write re-reads first
+// (applyContactOverrides), so this can never become the basis of a blind PUT.
+let contactOverrides = Object.create(null);
+let contactOverridesStatus = 'ok';     // 'ok' | 'over-cap' | 'error'
+let importedContacts = [];
+let importedContactsError = null;
+
+// The teammate's own imported address book, via the loopback helper's
+// origin-gated POST /contacts/list. Fail-soft with a VISIBLE reason: an
+// unreachable helper must not look like "you have no contacts".
+async function loadImportedContacts() {
+  try {
+    const r = await fetch((await sessionConnectBase()) + '/contacts/list',
+      { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
+    if (!r.ok) {
+      importedContacts = [];
+      importedContactsError = 'the local contacts helper returned ' + r.status;
+      return;
+    }
+    const body = await r.json().catch(() => null);
+    importedContacts = validImportedContacts(body, knownSourceIds());
+    importedContactsError = null;
+  } catch (e) {
+    importedContacts = [];
+    importedContactsError = 'the local contacts helper is not running';
+  }
+}
+
+function overrideKeyCount() {
+  return Object.keys(contactOverrides).length;
+}
+
+// The imported address book as a key set — what a profile fan-out reconciles
+// its linked handles against (F7).
+function importedContactKeys() {
+  return new Set(importedContacts.map((c) => c.key));
+}
+
+// Run one override change set, refresh the cache from what actually landed, and
+// hand the caller a message to SHOW on refusal (F5/F7/F8 — never silent).
+async function commitOverrides(changes) {
+  const res = await applyContactOverrides(OVERRIDES_IO, changes);
+  if (res.ok) {
+    contactOverrides = res.overrides;
+    contactOverridesStatus = 'ok';
+  }
+  return res;
+}
+
+// The active-override count + clear-all, shown wherever overrides are edited.
+// The count deliberately includes keys that match no imported contact — those
+// are exactly the ones a teammate cannot otherwise find to remove (F7).
+function buildOverrideSummary(onChange) {
+  const box = el('div', 'contact-override-summary');
+  const total = overrideKeyCount();
+  const importedKeys = new Set(importedContacts.map((c) => c.key));
+  const orphan = Object.keys(contactOverrides).filter((k) => !importedKeys.has(k)).length;
+  if (contactOverridesStatus === 'error') {
+    box.appendChild(el('p', 'error',
+      'Your per-contact settings could not be read, so these controls are '
+      + 'disabled. Nothing was changed. Reload once your homeserver responds.'));
+    return box;
+  }
+  if (contactOverridesStatus === 'over-cap') {
+    box.appendChild(el('p', 'error',
+      'Your saved per-contact list is over the ' + CONTACT_OVERRIDES_CAP
+      + '-entry limit, so it is not being applied. Remove entries, or clear them '
+      + 'all below, to start applying it again.'));
+  }
+  box.appendChild(el('p', 'muted', total + ' contact(s) set individually'
+    + (orphan ? ' (' + orphan + ' not in your imported contacts)' : '') + '.'));
+  const err = el('p', 'error hidden');
+  if (total) {
+    const clear = el('button', 'danger', 'Clear all per-contact settings');
+    clear.type = 'button';
+    clear.addEventListener('click', async () => {
+      const ok = await confirmModal('Clear all per-contact settings?',
+        'This removes all ' + total + ' individual contact settings. Each contact '
+        + 'goes back to following its source setting — which may mean sharing it '
+        + 'again. Contacts already mirrored are not un-sent.', false);
+      if (!ok) return;
+      clear.disabled = true;
+      const res = await commitOverrides(Object.keys(contactOverrides).map((k) => [k, null]));
+      clear.disabled = false;
+      if (!res.ok) {
+        err.textContent = 'Not saved — ' + sanitizeLine(res.message || 'try again') + '.';
+        err.classList.remove('hidden');
+        return;
+      }
+      if (onChange) onChange();
+    });
+    box.appendChild(clear);
+  }
+  box.appendChild(err);
+  return box;
+}
+
+// One imported contact: display name AND network_id, always both (P3 — two
+// contacts can carry visually identical names, and the handle is what the
+// override actually keys on), plus the three-way control.
+function buildImportedContactRow(row, onChange) {
+  const wrap = el('div', 'contact-override-row');
+  const meta = el('span', 'contact-row-meta');
+  const src = SOURCES.find((s) => s.id === row.source);
+  meta.appendChild(el('span', 'title', sanitizeLine(row.display_name || 'Unnamed')));
+  meta.appendChild(el('span', 'muted',
+    ' ' + (src ? src.label : sanitizeLine(row.source)) + ' · ' + sanitizeLine(row.network_id)));
+  wrap.appendChild(meta);
+
+  const current = contactOverrides[row.key];
+  const inherited = resolveContactShare(row.source, contactPolicy);
+  const err = el('p', 'error hidden');
+  const toggle = el('span', 'share-toggle');
+  const disabled = contactOverridesStatus === 'error';
+  for (const [val, label] of [['share', 'Share'], [null, 'Auto'], ['private', 'Private']]) {
+    const active = (val === null) ? !current : current === val;
+    const b = el('button', 'share-opt' + (active ? ' active' : ''), label);
+    b.type = 'button';
+    b.disabled = disabled;
+    b.addEventListener('click', async () => {
+      err.classList.add('hidden');
+      b.disabled = true;
+      const res = await commitOverrides([[row.key, val]]);
+      b.disabled = disabled;
+      if (!res.ok) {                                  // F8: visible, never silent
+        err.textContent = 'Not saved — ' + sanitizeLine(res.message || 'try again')
+          + '. Still showing your last saved setting.';
+        err.classList.remove('hidden');
+        return;
+      }
+      if (onChange) onChange();
+    });
+    toggle.appendChild(b);
+  }
+  wrap.appendChild(toggle);
+  wrap.appendChild(el('span', 'share-slider-hint' + (
+    (current ? current === 'share' : inherited.shared) ? ' shared' : ''),
+  current
+    ? (current === 'share' ? 'Shared — overrides the ' + row.source + ' setting for this contact only'
+      : 'Private — overrides the ' + row.source + ' setting for this contact only')
+    : (inherited.shared ? 'Following ' + row.source + ' (shared)' : 'Following ' + row.source + ' (private)')));
+  wrap.appendChild(err);
+  return wrap;
+}
+
+// The imported-contacts panel: the surface that covers store-only contacts (a
+// contact with no conversation, e.g. an alerting bot) which no conversation row
+// could ever reach.
+function renderImportedContactsPanel(host) {
+  const box = el('div', 'contact-override-panel');
+  box.appendChild(el('h3', '', 'Individual contacts'));
+  box.appendChild(el('p', 'muted',
+    'Each contact below can override the source setting above for that contact '
+    + 'only. Turning a contact off stops sharing it and removes it from your '
+    + 'manager’s list; it cannot un-send what was already mirrored.'));
+  box.appendChild(buildOverrideSummary(() => renderContactShareView()));
+  if (importedContactsError) {
+    box.appendChild(el('p', 'error',
+      'Your imported contacts could not be listed — ' + sanitizeLine(importedContactsError)
+      + '. Per-contact settings you already saved are still in force.'));
+  } else if (!importedContacts.length) {
+    box.appendChild(el('p', 'muted', 'No imported contacts yet.'));
+  } else {
+    const list = el('div', 'contact-override-list');
+    for (const row of importedContacts) {
+      list.appendChild(buildImportedContactRow(row, () => renderContactShareView()));
+    }
+    box.appendChild(list);
+  }
+  host.appendChild(box);
+}
+
 // Rendered into #share-contacts (its own settings-block) whenever the sharing
 // view opens. Default/empty policy renders as PRIVATE (every switch off) —
 // resolveContactShare returns not-shared for an absent/default policy.
@@ -945,9 +1366,15 @@ function renderContactShareView() {
 
   host.appendChild(buildContactGlobalSwitch());
 
+  // F2 RETRACTION HONESTY. The old copy claimed turning this off "removes the
+  // contacts already shared" — it does not. The uplink tombstones the contact
+  // state events, but a tombstone is itself a state event: prior content stays
+  // retrievable from room history to anyone already joined. Say so.
   host.appendChild(el('p', 'muted',
-    'Turning this off stops sharing your contacts going forward, and removes the '
-    + 'contacts already shared on the next sync.'));
+    'Turning a contact off stops sharing it and removes it from your manager’s '
+    + 'list; it cannot un-send what was already mirrored. Anyone already in the '
+    + 'shared contacts room can still read the earlier copy from that room’s '
+    + 'history.'));
 
   // Optional per-source contact sharing (mirrors the per-source conversation
   // switches): each source can override the global with share-all / private-all
@@ -958,6 +1385,10 @@ function renderContactShareView() {
     list.appendChild(buildContactSourceSwitchRow(s));
   }
   host.appendChild(list);
+
+  // The most specific level, last: per-contact overrides over the per-source
+  // switches above.
+  renderImportedContactsPanel(host);
 }
 
 // ---- master-identity re-confirm affordance (D2.11/F12) -----------------------
@@ -1103,4 +1534,9 @@ export {
   initConsentUI, renderSharingView, loadConsentState, countSharedNow,
   planBulkShareChange, migratedRoomIdsFromSync,
   suspensionAffordance, directSendAckContent,
+  knownSourceIds, validImportedContacts, planHandleFanOut,
+  planContactOverrideWrite, isDestructiveOnly,
+  applyContactOverrides, saveProfilesGuarded,
+  OVERRIDES_IO, PROFILES_IO,
+  commitOverrides, buildOverrideSummary, importedContactKeys,
 };

@@ -1958,15 +1958,71 @@ class Uplink:
     def read_contact_policy(self):
         """Normalized contact-share policy from com.jkali.contact_share_policy.
 
-        Absent/error -> the safe default (global 'private', no sources), matching
-        the conversation policy read's fail-safe: nothing shared unless a level
-        explicitly says so."""
+        404/ABSENT -> the safe default (global 'private', no sources): nothing
+        shared unless a level explicitly says so.
+        ANY OTHER ERROR -> None, and the caller SKIPS the whole pass (P3
+        alignment with read_contact_profiles). Collapsing a 500 into
+        global-private used to look identical to "the teammate revoked
+        everything" and stormed a full tombstone sweep on a transient local
+        blip; a read we could not perform is not a revocation."""
         path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
                 + "/account_data/" + consent.CONTACT_SHARE_POLICY_TYPE)
         try:
-            return consent.normalize_contact_policy(self.local("GET", path))
-        except urllib.error.HTTPError:
-            return {"global": "private", "sources": {}}
+            data = self.local("GET", path)
+        except urllib.error.HTTPError as e:
+            return {"global": "private", "sources": {}} if e.code == 404 else None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return None
+        return consent.normalize_contact_policy(data)
+
+    # The last successfully-read overrides map, cached in state.db's generic
+    # meta table (no schema change). P3: used FOR THE TOMBSTONE LEG ONLY while a
+    # read is failing, so a transient error neither leaks (pushes stay skipped)
+    # nor flaps tombstone/re-push churn against the master.
+    CONTACT_OVERRIDES_CACHE = "contact_overrides_cache"
+    # F10: how many pushes may go out between two samples of the overrides map.
+    OVERRIDE_RECHECK = 50
+
+    def read_contact_overrides(self):
+        """Per-contact overrides from com.jkali.contact_overrides.
+
+        404/ABSENT -> {} (no overrides; per-source/global decide alone).
+        ANY OTHER ERROR (HTTP non-404, URLError/timeout, malformed body, a
+        stored map the model reads as a failure) -> None. The caller then SKIPS
+        the push leg entirely and runs tombstones off the cached map: a
+        transient read failure must never let a 'private'-overridden contact
+        fall back to a share-all source and push its PII (F5/C2).
+
+        F9: override keys ARE phone numbers/emails. Never log one — counts only.
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + consent.CONTACT_OVERRIDES_TYPE)
+        try:
+            data = self.local("GET", path)
+        except urllib.error.HTTPError as e:
+            return {} if e.code == 404 else None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            return None
+        return consent.normalize_contact_overrides(data)
+
+    def _cached_contact_overrides(self):
+        """The last successfully-read overrides map, or {} if none/corrupt."""
+        raw = self.meta_get(self.CONTACT_OVERRIDES_CACHE)
+        if not raw:
+            return {}
+        try:
+            cached = consent.normalize_contact_overrides({"overrides": json.loads(raw)})
+        except ValueError:
+            return {}
+        return cached or {}
+
+    def _store_contact_overrides(self, overrides):
+        """Persist the freshly-read map for the tombstone-leg cache (P3)."""
+        try:
+            self.meta_set(self.CONTACT_OVERRIDES_CACHE,
+                          json.dumps(overrides, sort_keys=True))
+        except (TypeError, ValueError):
+            pass  # never let a cache write break a mirror pass
 
     def ensure_contacts_room(self):
         """Idempotently ensure the per-teammate master contacts room; cache its id.
@@ -1990,6 +2046,16 @@ class Uplink:
             "invite": [cfg.manager_mxid],
             "initial_state": [
                 {"type": CONTACTS_MARKER, "state_key": "", "content": {}},
+                # F2 (per-contact-share plan): a tombstone does NOT retract what
+                # was already mirrored — state history stays readable to joined
+                # members. Pinning history_visibility to `joined` on NEWLY
+                # created contacts rooms is the partial mitigation: a manager
+                # who has not joined yet cannot read the pre-join history.
+                # Existing rooms are deliberately left as they are (changing it
+                # later would not retract anything either); the residual is
+                # documented in the UI copy the teammate actually reads.
+                {"type": "m.room.history_visibility", "state_key": "",
+                 "content": {"history_visibility": "joined"}},
                 {"type": "m.space.parent", "state_key": cfg.master_space,
                  "content": {"via": [self._server_name(cfg.master_user)], "canonical": True}},
             ],
@@ -2065,9 +2131,17 @@ class Uplink:
               other than "absent", this step AND the push leg are skipped this
               pass (a push without profiles would stamp person_display null and
               never be corrected); tombstones still run.
+          (a2) Read the per-contact overrides (com.jkali.contact_overrides) and
+              the contact-share policy. A non-404 POLICY read aborts the whole
+              pass (a policy we could not read is not a revocation). A non-404
+              OVERRIDES read skips the PUSH leg and runs tombstones off the
+              last successfully-read map cached in state.db, so a transient
+              blip neither leaks an overridden-private contact nor flaps
+              tombstone/re-push churn.
           (b) Plan: reconcile.plan_contact_mirror over every row of every known
               source (SOURCE_ID_TO_LABEL) against the COMPLETE contact_mirror
-              table. A row whose source resolves NOT shared is in neither leg
+              table, resolving per-contact override > per-source > global.
+              A row that resolves NOT shared is in neither leg
               and never leaves the machine. A mirrored handle that is no longer
               live-and-shared (source flipped private, row soft-deleted, source
               renamed/removed) is tombstoned. A live-and-shared row that is not
@@ -2094,6 +2168,19 @@ class Uplink:
             profiles = []
         id_to_dn = {p["id"]: p["displayName"] for p in _normalize_profiles_handles(profiles)}
         policy = self.read_contact_policy()
+        if policy is None:
+            log.warning("contacts: policy read failed (not 404) — skipping this pass "
+                        "entirely; a policy we could not read is not a revocation")
+            return
+        # (a2) Overrides. F9: counts only — an override key is a phone/email.
+        overrides = self.read_contact_overrides()
+        overrides_ok = overrides is not None
+        if overrides_ok:
+            self._store_contact_overrides(overrides)
+        else:
+            log.warning("contacts: overrides read failed (not 404) — skipping pushes "
+                        "this pass; tombstones run off the cached map")
+            overrides = self._cached_contact_overrides()
         conn = contacts_store.open_store(self.cfg.contacts_db)
         try:
             # (a) Recompute the derived person_id cache for every known-source row.
@@ -2114,7 +2201,8 @@ class Uplink:
                 rows.extend(contacts_store.shared_since(conn, source, 0))
             mirrored = {(r[0], r[1]): r[2] for r in self.db.execute(
                 "SELECT source, network_id, mirrored_version FROM contact_mirror").fetchall()}
-            plan = reconcile.plan_contact_mirror(rows, mirrored, policy, SOURCE_ID_TO_LABEL.keys())
+            plan = reconcile.plan_contact_mirror(rows, mirrored, policy,
+                                                 SOURCE_ID_TO_LABEL.keys(), overrides)
             # (c) Tombstones first. _put_contact's deleted branch raises before
             # returning on an outage, so the mirror row is dropped ONLY after
             # the master's 2xx; a dropped row leaves `mirrored` and is never
@@ -2129,8 +2217,26 @@ class Uplink:
                 self.db.commit()
                 tombstoned += 1
             pending = plan["pending"]
-            if profiles_ok:
-                for row in plan["push"]:
+            dropped = 0
+            if profiles_ok and overrides_ok:
+                # F10: the push leg samples consent once per plan, and a first
+                # backfill can run for minutes. Re-read the overrides map every
+                # OVERRIDE_RECHECK pushes and drop any remaining row the
+                # teammate has flipped to 'private' mid-pass. A failed re-read
+                # keeps the map we already have (never widens); the residual
+                # sub-chunk window — up to OVERRIDE_RECHECK pushes between
+                # samples — is ACCEPTED and documented.
+                for i, row in enumerate(plan["push"]):
+                    if i and i % self.OVERRIDE_RECHECK == 0:
+                        fresh = self.read_contact_overrides()
+                        if fresh is not None:
+                            overrides = fresh
+                            self._store_contact_overrides(overrides)
+                    key = consent.contact_override_key(row.get("source"),
+                                                       row.get("network_id"))
+                    if key is not None and overrides.get(key) == "private":
+                        dropped += 1
+                        continue
                     sk = self._put_contact(room, row, id_to_dn)
                     self.db.execute(
                         "INSERT OR REPLACE INTO contact_mirror "
@@ -2141,10 +2247,12 @@ class Uplink:
                     pushed += 1
             else:
                 pending += len(plan["push"])
-            if relinked or pushed or tombstoned or plan["not_shared"] or pending:
+            if relinked or pushed or tombstoned or plan["not_shared"] or pending or dropped:
+                # F9: counts only — never a network_id, display name, or an
+                # override KEY (which is itself a phone number / email).
                 log.info("contacts: relinked=%d pushed=%d tombstoned=%d not_shared=%d "
-                         "pending=%d", relinked, pushed, tombstoned, plan["not_shared"],
-                         pending)
+                         "pending=%d dropped=%d", relinked, pushed, tombstoned,
+                         plan["not_shared"], pending, dropped)
         finally:
             conn.close()
 

@@ -128,8 +128,17 @@ not_shared = normalize_contact_policy({"global": "private"})
 K = lambda v, s="imessage": (s, "h%d" % v)  # noqa: E731
 
 
-def _plan(rows, mirrored, policy, sources=SOURCES, **kw):
-    return plan_contact_mirror(rows, mirrored, policy, sources, **kw)
+def _plan(rows, mirrored, policy, sources=SOURCES, overrides=None, **kw):
+    return plan_contact_mirror(rows, mirrored, policy, sources, overrides, **kw)
+
+
+# F4: `overrides` is a REQUIRED POSITIONAL parameter, so an unconverted call
+# site is a TypeError, never a silent widening back to source-only resolution.
+try:
+    plan_contact_mirror([], {}, share_imsg, SOURCES)
+    eq(True, False, "F4: overrides must be a required positional parameter")
+except TypeError:
+    eq(True, True, "F4: overrides must be a required positional parameter")
 
 
 # BACKFILL: rows at 1..3 imported before the flip, nothing mirrored, source
@@ -190,6 +199,43 @@ eq(_plan([], {}, share_imsg), {"tombstone": [], "push": [], "not_shared": 0, "pe
    "plan: empty")
 eq(_plan(None, None, share_imsg, sources=None),
    {"tombstone": [], "push": [], "not_shared": 0, "pending": 0}, "plan: None inputs")
+
+# ---- per-contact overrides through the planner (per-contact-share, C2) ----
+# The override is the MOST SPECIFIC level and a BOOLEAN GATE ONLY: it decides
+# membership of the two legs, and never contributes a field to pushed content.
+OV_SHARE = {"imessage|h3": "share"}
+OV_PRIVATE = {"imessage|h3": "private"}
+
+# absent overrides behave exactly as before (regression pin for every case above)
+eq(_plan(_crows(1, 2), {}, share_imsg, overrides=None),
+   _plan(_crows(1, 2), {}, share_imsg, overrides={}), "override: None == {} == today")
+
+# 'share' on ONE contact inside a private-all source pushes exactly that row
+p = _plan(_crows(1, 3), {}, priv_imsg, overrides=OV_SHARE)
+eq([r["version"] for r in p["push"]], [3], "override: share in a private source pushes just that row")
+eq(p["not_shared"], 1, "override: the un-overridden sibling is still not shared")
+# and every pushed FIELD comes from the store row, never the override key (F4)
+eq((p["push"][0]["source"], p["push"][0]["network_id"]), ("imessage", "h3"),
+   "override: pushed content comes from the row, not the key")
+
+# 'private' on ONE contact inside a share-all source tombstones its mirror
+p = _plan(_crows(1, 3), {K(1): 1, K(3): 3}, share_imsg, overrides=OV_PRIVATE)
+eq(p["tombstone"], [K(3)], "override: private in a share-all source tombstones that row")
+eq(p["push"], [], "override: nothing else re-pushed")
+
+# ORDERING (F4): an override can never resurrect an unknown source...
+p = _plan(_crows(3, source="mystery"), {}, share_all,
+          overrides={"mystery|h3": "share"})
+eq((p["push"], p["not_shared"]), ([], 0), "override: cannot resurrect an unknown source")
+# ...nor a soft-deleted row
+p = _plan(_crows(3, deleted=1), {}, not_shared, overrides=OV_SHARE)
+eq((p["push"], p["tombstone"]), ([], []), "override: cannot resurrect a deleted row")
+
+# a malformed override key never applies (inherit), and never crashes the pass
+for junk in ({"nopipe": "share"}, {"|h3": "share"}, {"imessage|": "share"},
+             {"__proto__|h3": "share"}, {"imessage|h3": "junk"}, "notadict", None, []):
+    p = _plan(_crows(3), {}, not_shared, overrides=junk)
+    eq((p["push"], p["not_shared"]), ([], 1), "override: junk map inherits, never widens")
 
 
 # ---- contact revocation: select_contacts_to_tombstone (pm_mng-q5u.1) ------

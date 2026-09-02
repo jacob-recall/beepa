@@ -20,7 +20,9 @@
 // arguments (call-site and conformance-vector compatibility) and deliberately
 // ignores them. The layered, most-specific-wins model survives only in the
 // SEPARATE contact-sharing dimension at the bottom of this file
-// (resolveContactShare / normalizeContactPolicy), which is untouched.
+// (resolveContactShare / normalizeContactPolicy / normalizeContactOverrides),
+// which keeps its standing policies on purpose — and, as of the per-contact-
+// share plan, gains a per-CONTACT override that is more specific than both.
 //
 // The one-time migration that materializes previously-inherited shares into
 // explicit 'share' overrides lives in agents/uplink/uplink.py (D0); it keeps
@@ -306,6 +308,76 @@ const CONTACT_SHARE_POLICY_TYPE = 'com.jkali.contact_share_policy'; // global us
 const CONTACT_GLOBAL_STATES = new Set(['share-all', 'private']);
 const CONTACT_SOURCE_STATES = new Set(['share-all', 'private-all', 'inherit']);
 
+// ---- per-contact overrides (per-contact-share plan, C1) ---------------------
+// A SECOND, more specific level in the contact dimension: one HANDLE
+// ('<source>|<network_id>') may be pinned 'share' or 'private', winning over the
+// per-source and global standing policies. Unlike the conversation dimension,
+// the contact dimension deliberately KEEPS its standing policies — absent means
+// inherit, not private.
+const CONTACT_OVERRIDES_TYPE = 'com.jkali.contact_overrides'; // global user account-data
+// F5: every WRITE path must refuse before crossing this, and a STORED map above
+// it reads as a read-failure (normalizeContactOverrides -> null) so a bloated
+// event can never be silently half-honored. Only the destructive recovery
+// writes (single-key removal, clear-all) are permitted in that state.
+const CONTACT_OVERRIDES_CAP = 1024;
+const CONTACT_OVERRIDE_STATES = new Set(['share', 'private']);
+
+// F5/F6 KEY SPEC — the override key is '<source>|<network_id>'. The segment
+// before the FIRST '|' must be a valid source id; the remainder is taken
+// VERBATIM and may itself contain '|' (the importer's email charset admits it),
+// which is why nothing here ever uses split('|'). The SOURCE_KEY_RE prefix is
+// what makes the composite injective.
+function contactOverrideKey(source, network_id) {
+  if (typeof source !== 'string' || !SOURCE_KEY_RE.test(source)) return null;
+  if (typeof network_id !== 'string' || !network_id) return null;
+  return source + '|' + network_id;
+}
+
+// The inverse: { source, network_id } or null. Splits ONCE, on the first '|'.
+function splitContactOverrideKey(key) {
+  if (typeof key !== 'string') return null;
+  const i = key.indexOf('|');
+  if (i <= 0) return null;
+  const source = key.slice(0, i);
+  const network_id = key.slice(i + 1);
+  if (!SOURCE_KEY_RE.test(source) || !network_id) return null;
+  return { source, network_id };
+}
+
+// The stored-map reader, split out from normalizeContactOverrides so the UI's
+// over-cap recovery path can still see the (validated) entries it must delete.
+// Returns { count, map } — count is the number of STORED entries (cap check) —
+// or null for a READ FAILURE. Own-property discipline throughout, output built
+// on a null-prototype object so no surviving key can reach Object.prototype.
+function contactOverrideEntries(raw) {
+  const content = plainObject(raw);
+  const out = Object.create(null);
+  if (!content) return { count: 0, map: out };
+  // An absent `overrides` field is an empty map; a PRESENT but non-plain-object
+  // one is a READ FAILURE, never {} (F5) — a partially corrupt event must not
+  // silently drop a 'private' deny and re-widen the contact to its source.
+  if (!Object.prototype.hasOwnProperty.call(content, 'overrides')) return { count: 0, map: out };
+  const src = plainObject(content.overrides);
+  if (!src) return null;
+  const keys = Object.keys(src);
+  for (const k of keys) {
+    if (!splitContactOverrideKey(k)) continue;      // malformed KEY -> dropped (inherit)
+    const v = src[k];
+    if (v === 'share' || v === 'private') out[k] = v; // unknown VALUE -> dropped (inherit)
+  }
+  return { count: keys.length, map: out };
+}
+
+// { '<source>|<network_id>': 'share'|'private' } — or null on a READ FAILURE
+// (non-plain-object `overrides` field, or a stored map over CONTACT_OVERRIDES_CAP).
+// MUST stay byte-parity with agents/uplink/consent.py's normalize_contact_overrides.
+function normalizeContactOverrides(raw) {
+  const e = contactOverrideEntries(raw);
+  if (e === null) return null;
+  if (e.count > CONTACT_OVERRIDES_CAP) return null;
+  return e.map;
+}
+
 // Coerce a stored/incoming contact-share policy into the known-safe shape
 // { global: 'share-all'|'private', sources: { <source>: 'share-all'|'private-all' } }.
 // Unknown global -> 'private' (safe default). Only recognized source states are
@@ -323,14 +395,25 @@ function normalizeContactPolicy(raw) {
 }
 
 // Resolve whether a given source's contacts are shared AND the reason.
-//   source : the source id (e.g. 'imessage')
-//   policy : a normalized contact policy (from normalizeContactPolicy)
+//   source   : the source id (e.g. 'imessage')
+//   policy   : a normalized contact policy (from normalizeContactPolicy)
+//   override : this ONE contact's stored override, 'share'|'private'|absent
+//              (from normalizeContactOverrides, keyed by contactOverrideKey)
 // Precedence (most-specific-wins), mirroring resolve() above:
+//   0. per-contact 'share'      -> shared,     reason 'this contact'
+//   0. per-contact 'private'    -> not shared, reason 'this contact private'
 //   1. per-source 'share-all'   -> shared,     reason 'all <source> contacts'
 //   2. per-source 'private-all' -> not shared, reason 'private'
 //   3. global 'share-all'       -> shared,     reason 'all contacts'
 //   4. safe default             -> not shared, reason 'private'
-function resolveContactShare(source, policy) {
+// An unrecognized override VALUE falls through to the source/global levels —
+// the contact dimension keeps its standing policies (F5's fall-through is safe
+// here only because normalizeContactOverrides drops unknown values on the way
+// IN, and a non-dict stored map is a read failure rather than an empty one).
+function resolveContactShare(source, policy, override) {
+  if (override === 'share') return { shared: true, reason: 'this contact' };
+  if (override === 'private') return { shared: false, reason: 'this contact private' };
+
   const pol = plainObject(policy) || {};
 
   // same gated lookup as the conversation dimension: valid source id, own
@@ -352,6 +435,53 @@ function contactSharePolicyPath(userId) {
     '/account_data/' + CONTACT_SHARE_POLICY_TYPE;
 }
 
+// Account-data path for the per-contact overrides map.
+function contactOverridesPath(userId) {
+  return '/_matrix/client/v3/user/' + encodeURIComponent(userId) +
+    '/account_data/' + CONTACT_OVERRIDES_TYPE;
+}
+
+// F3 WRITE DISCIPLINE — read the overrides map, distinguishing the three states
+// a caller must treat differently. NEVER collapses an error into {}: a
+// fail-to-empty read followed by a blind PUT is exactly how a stored 'private'
+// deny gets erased and a withheld contact re-widens to its source policy.
+//   { status: 'ok',       overrides }  — 404/absent (empty) or a valid map
+//   { status: 'over-cap', overrides }  — stored map above the cap; `overrides`
+//                                        holds the validated entries so the UI
+//                                        can offer the destructive-only
+//                                        recovery (remove one / clear all)
+//   { status: 'error',    overrides: null } — anything else; controls DISABLE
+async function readContactOverrides() {
+  let data;
+  try {
+    data = await api('GET', contactOverridesPath(S.userId));
+  } catch (e) {
+    if (e && e.status === 404) return { status: 'ok', overrides: Object.create(null) };
+    return { status: 'error', overrides: null };
+  }
+  const entries = contactOverrideEntries(data);
+  if (entries === null) return { status: 'error', overrides: null };
+  if (entries.count > CONTACT_OVERRIDES_CAP) {
+    return { status: 'over-cap', overrides: entries.map };
+  }
+  return { status: 'ok', overrides: entries.map };
+}
+
+// Write the whole overrides map. The caller is responsible for having built it
+// as a MERGE over a fresh read (see apps/user/consent.js's applyContactOverrides)
+// — this helper deliberately does no merging of its own, so there is exactly one
+// place where the merge discipline lives.
+async function writeContactOverrides(overrides) {
+  const body = { overrides: {} };
+  const src = plainObject(overrides) || {};
+  for (const k of Object.keys(src)) {
+    if (!splitContactOverrideKey(k)) continue;
+    if (CONTACT_OVERRIDE_STATES.has(src[k])) body.overrides[k] = src[k];
+  }
+  await api('PUT', contactOverridesPath(S.userId), body);
+  return normalizeContactOverrides(body);
+}
+
 export {
   SHARE_POLICY_TYPE, SHARE_OVERRIDE_TYPE, PROFILE_STATES,
   CONSENT_MODEL_TYPE, CONSENT_MODEL_EXPLICIT,
@@ -362,4 +492,8 @@ export {
   overridesFromSync,
   CONTACT_SHARE_POLICY_TYPE,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
+  CONTACT_OVERRIDES_TYPE, CONTACT_OVERRIDES_CAP, CONTACT_OVERRIDE_STATES,
+  contactOverrideKey, splitContactOverrideKey,
+  contactOverrideEntries, normalizeContactOverrides,
+  contactOverridesPath, readContactOverrides, writeContactOverrides,
 };

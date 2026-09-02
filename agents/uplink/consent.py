@@ -16,7 +16,9 @@ share-state, the per-source policy and the global standing policy do NOT affect
 whether a conversation mirrors. resolve() still ACCEPTS those arguments (call
 sites + conformance vectors) and deliberately ignores them. The layered,
 most-specific-wins model survives only in the SEPARATE contact-sharing
-dimension at the bottom of this file, which is untouched.
+dimension at the bottom of this file, which keeps its standing policies on
+purpose — and, as of the per-contact-share plan, gains a per-CONTACT override
+that is more specific than both.
 
 The one-time migration that materializes previously-inherited shares into
 explicit 'share' overrides lives in uplink.py (D0) and keeps its own copy of
@@ -203,6 +205,86 @@ CONTACT_SHARE_POLICY_TYPE = "com.jkali.contact_share_policy"  # global user acco
 CONTACT_GLOBAL_STATES = {"share-all", "private"}
 CONTACT_SOURCE_STATES = {"share-all", "private-all", "inherit"}
 
+# ---- per-contact overrides (per-contact-share plan, C1) --------------------
+# A SECOND, more specific level in the contact dimension: one HANDLE
+# ('<source>|<network_id>') may be pinned 'share' or 'private', winning over the
+# per-source and global standing policies. Unlike the conversation dimension,
+# the contact dimension deliberately KEEPS its standing policies — absent means
+# inherit, not private.
+CONTACT_OVERRIDES_TYPE = "com.jkali.contact_overrides"  # global user account-data
+# F5: every WRITE path must refuse before crossing this, and a STORED map above
+# it reads as a read-failure (normalize_contact_overrides -> None) so a bloated
+# event can never be silently half-honored.
+CONTACT_OVERRIDES_CAP = 1024
+CONTACT_OVERRIDE_STATES = {"share", "private"}
+
+
+def contact_override_key(source, network_id):
+    """'<source>|<network_id>' for a valid pair, else None (F5/F6 key spec).
+
+    The segment before the FIRST '|' must be a valid source id; the remainder is
+    taken VERBATIM and may itself contain '|' (the importer's email charset
+    admits it), which is why nothing here ever uses split('|'). The
+    _SOURCE_KEY_RE prefix is what makes the composite injective. Mirrors
+    contactOverrideKey() in consent.js."""
+    if not isinstance(source, str) or not _SOURCE_KEY_RE.fullmatch(source):
+        return None
+    if not isinstance(network_id, str) or not network_id:
+        return None
+    return source + "|" + network_id
+
+
+def split_contact_override_key(key):
+    """The inverse: {'source', 'network_id'} or None. Splits ONCE, first '|'."""
+    if not isinstance(key, str):
+        return None
+    i = key.find("|")
+    if i <= 0:
+        return None
+    source, network_id = key[:i], key[i + 1:]
+    if not _SOURCE_KEY_RE.fullmatch(source) or not network_id:
+        return None
+    return {"source": source, "network_id": network_id}
+
+
+def _contact_override_entries(raw):
+    """(stored_entry_count, {key: value}) for a stored overrides event, or None
+    for a READ FAILURE. Mirrors contactOverrideEntries() in consent.js."""
+    content = _plain(raw)
+    if content is None:
+        return (0, {})
+    # An absent `overrides` field is an empty map; a PRESENT but non-dict one is
+    # a READ FAILURE, never {} (F5) — a partially corrupt event must not
+    # silently drop a 'private' deny and re-widen the contact to its source.
+    if "overrides" not in content:
+        return (0, {})
+    src = _plain(content.get("overrides"))
+    if src is None:
+        return None
+    out = {}
+    keys = list(src.keys())
+    for k in keys:
+        if split_contact_override_key(k) is None:
+            continue  # malformed KEY -> dropped (inherit)
+        v = src[k]
+        if v == "share" or v == "private":  # unknown VALUE -> dropped (inherit)
+            out[k] = v
+    return (len(keys), out)
+
+
+def normalize_contact_overrides(raw):
+    """{'<source>|<network_id>': 'share'|'private'} — or None on a READ FAILURE
+    (non-dict `overrides` field, or a stored map over CONTACT_OVERRIDES_CAP).
+
+    MUST stay byte-parity with normalizeContactOverrides() in consent.js."""
+    e = _contact_override_entries(raw)
+    if e is None:
+        return None
+    count, out = e
+    if count > CONTACT_OVERRIDES_CAP:
+        return None
+    return out
+
 
 def normalize_contact_policy(raw):
     """Coerce a contact-share policy into { 'global', 'sources' }.
@@ -225,15 +307,30 @@ def normalize_contact_policy(raw):
     return {"global": global_, "sources": sources}
 
 
-def resolve_contact_share(source, policy):
+def resolve_contact_share(source, policy, override=None):
     """Resolve whether a source's contacts are shared AND the reason.
 
+    override is THIS ONE contact's stored value ('share'|'private'|absent), from
+    normalize_contact_overrides keyed by contact_override_key.
+
     Precedence (most-specific-wins), mirroring resolveContactShare() in JS:
+      0. per-contact 'share'      -> shared,     'this contact'
+      0. per-contact 'private'    -> not shared, 'this contact private'
       1. per-source 'share-all'   -> shared,     'all <source> contacts'
       2. per-source 'private-all' -> not shared, 'private'
       3. global 'share-all'       -> shared,     'all contacts'
       4. safe default             -> not shared, 'private'
+    An unrecognized override VALUE falls through to the source/global levels —
+    the contact dimension keeps its standing policies (F5's fall-through is safe
+    here only because normalize_contact_overrides drops unknown values on the
+    way IN, and a non-dict stored map is a read failure rather than an empty
+    one). `==` never raises on an unhashable override; `in <set>` would.
     """
+    if override == "share":
+        return {"shared": True, "reason": "this contact"}
+    if override == "private":
+        return {"shared": False, "reason": "this contact private"}
+
     pol = _plain(policy) or {}
 
     # same gated lookup as the conversation dimension: valid source id, own

@@ -31,7 +31,8 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   actual authorization decision always comes from `resolve()`/`resolveAll()`,
   never from what has or hasn't been flagged.
 - `contacts.js` — PLAN §12 phase 5. The *only* place that renders
-  `com.jkali.contact_profiles`: create/rename/delete a profile, attach/detach
+  `com.jkali.contact_profiles`, and the home of the profile-level per-contact
+  share fan-out (one `com.jkali.contact_overrides` key per linked handle): create/rename/delete a profile, attach/detach
   conversations to it (client-side filter over already-loaded
   `convosBySource`, no new endpoint), a per-profile Share/Auto/Private
   toggle, and non-auto merge suggestions (`suggestions()` from
@@ -135,6 +136,38 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   from account-data / the live consent resolver / the live proposals room.
 - **Consent is always read from `shared/model/consent.js`.** Never
   hand-roll the precedence logic in this app; call `resolve()`/`resolveAll()`.
+- **The consent-write invariant (per-contact-share plan, F8): no consent
+  control may swallow a write error.** A failed write is SURFACED next to the
+  control, and the control keeps rendering **last-known-good** state — never
+  the requested state. A toggle that looks moved but never landed is a consent
+  lie, and it was the reported bug in the contact-share affordance. This
+  applies to `buildTriStateSlider`'s handler, both global switches, the
+  per-contact controls, and the profile fan-out. A handler may still return
+  `false` to mean "refused deliberately" (a declined confirm) — that is not a
+  swallowed error, and the refusing surface says so itself.
+- **Every consent write is a MERGE over a FRESH read, and a failed read writes
+  NOTHING (F3).** `applyContactOverrides` (per-contact overrides) and
+  `saveProfilesGuarded` (`com.jkali.contact_profiles`) are the only two write
+  paths; both re-read first, both distinguish 404 (empty) from any other
+  failure (controls disabled, zero PUTs), and neither ever blind-PUTs this
+  module's cache. `contacts.js`'s `persist()` therefore takes a MUTATOR that
+  receives the freshly-read store, not a pre-computed one.
+- **The per-contact override entry cap (1024) is refused BEFORE any PUT (F5),
+  with a visible message naming the cap.** A stored map already over the cap
+  reads as a read failure, but the destructive-only writes — single-key
+  removal and clear-all — stay permitted in that state, so recovery never
+  needs a raw Matrix client.
+- **A profile fan-out never mints a key that would not apply (F7).** It writes
+  one override key per LINKED handle, but only for handles that pass the key
+  spec + known-source gate AND reconcile against `POST /contacts/list`;
+  anything else is reported visibly ("2 of 3 handles applied; …"). A `'private'`
+  that silently never applies is a leak the teammate believes closed, and a
+  `'share'` on a not-yet-imported handle is a dormant grant.
+- **Retraction copy must stay honest (F2).** Turning a contact off stops
+  sharing it and removes it from the manager's list; it does NOT un-send what
+  was already mirrored — tombstones are state events, so prior content stays
+  readable from room history to anyone already joined. Never restore copy that
+  claims removal deletes what was shared.
 - **A profile links a room; it never shares one.** Conversation sharing is
   EXPLICIT-ONLY since the direct-share-level plan's D1: the per-conversation
   level (`share`/`direct`/`private`, absent-or-unrecognized = private) is the

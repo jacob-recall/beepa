@@ -1,12 +1,16 @@
 // Contact profiles — list (left) + detail (right).
 
 import {
-  readProfiles, writeProfiles,
+  readProfiles,
   upsertProfile, removeProfile, linkRoom, unlinkRoom, setProfileShare, newProfileId,
   linkHandle, unlinkHandle,
   suggestions,
 } from '../../shared/model/contacts.js';
-import { loadConsentState } from './consent.js';
+import {
+  loadConsentState, saveProfilesGuarded, PROFILES_IO,
+  planHandleFanOut, knownSourceIds, importedContactKeys,
+  commitOverrides, buildOverrideSummary,
+} from './consent.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setContactsViewHook, setDetailMode } from '../../shared/ui/nav.js';
 import { appendDirectoryRows } from '../../shared/ui/search.js';
@@ -47,8 +51,27 @@ function roomToProfileId() {
   return map;
 }
 
-async function persist(next) {
-  store = await writeProfiles(next);
+// F3/F8 WRITE DISCIPLINE. `mutate` receives the store read FRESH from
+// account-data, never this module's cache, so a write can only ever be a merge
+// over what is actually stored — the old blind PUT of a cached (and, after a
+// failed read, EMPTY) store could destroy every grouping and handle link. A
+// failed read performs ZERO writes and is SURFACED; a failed write is surfaced
+// too, and the view keeps rendering last-known-good state.
+let contactsError = null;
+
+async function persist(mutate) {
+  contactsError = null;
+  const res = await saveProfilesGuarded(PROFILES_IO, mutate);
+  if (!res.ok) {
+    contactsError = res.reason === 'read'
+      ? 'Your contacts could not be read, so nothing was saved. Try again once '
+        + 'your homeserver responds.'
+      : 'Not saved — ' + ((res.message || 'try again')) + '. Nothing was changed.';
+    renderPeopleList();
+    if (activeProfileId) renderContactDetail(activeProfileId);
+    return false;
+  }
+  store = res.store;
   try { await loadConsentState(); } catch (e) { /* ok */ }
   renderPeopleList();
   if (activeProfileId && store.profiles.some(p => p.id === activeProfileId)) {
@@ -57,6 +80,7 @@ async function persist(next) {
     activeProfileId = null;
     setDetailMode('empty');
   }
+  return true;
 }
 
 function profilePreview(p) {
@@ -185,10 +209,13 @@ function buildSuggestionRow(group, ignored) {
   btn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const id = newProfileId();
-    let next = upsertProfile(store, { id, displayName: group.convos[0].title || group.key, share: 'inherit' });
-    for (const c of group.convos) next = linkRoom(next, id, c.id);
-    await persist(next);
-    selectContact(id);
+    const ok = await persist((fresh) => {
+      let next = upsertProfile(fresh, {
+        id, displayName: group.convos[0].title || group.key, share: 'inherit' });
+      for (const c of group.convos) next = linkRoom(next, id, c.id);
+      return next;
+    });
+    if (ok) selectContact(id);
   });
   row.appendChild(btn);
   const skip = el('button', 'contact-ignore', '×');
@@ -224,11 +251,71 @@ function buildShareToggle(profile) {
   for (const [val, label] of [['share', 'Share'], ['inherit', 'Auto'], ['private', 'Private']]) {
     const b = el('button', 'share-opt' + (profile.share === val ? ' active' : ''), label);
     b.type = 'button';
-    b.addEventListener('click', async () => { await persist(setProfileShare(store, profile.id, val)); });
+    b.addEventListener('click', async () => {
+      await persist((fresh) => setProfileShare(fresh, profile.id, val));
+    });
     toggle.appendChild(b);
   }
   wrap.appendChild(toggle);
   return wrap;
+}
+
+// ---- profile-level fan-out over the contact-share OVERRIDES (C3.2/F7) -------
+// The override unit is a HANDLE, so a profile-level control writes ONE key per
+// LINKED handle. A handle that fails the key spec / known-source gate, or that
+// does not reconcile against the imported address book, is REFUSED VISIBLY and
+// no key is minted for it: a 'private' that silently never applies is a leak
+// the teammate believes closed, and a 'share' on a not-yet-imported handle
+// would sit dormant and fire on the next import.
+function describeUnmatched(unmatched) {
+  return unmatched
+    .map((u) => sanitizeLine(u.network_id || '(no handle)') + ' — ' + u.reason)
+    .join('; ');
+}
+
+function buildHandleFanOut(handleIds) {
+  const box = el('div', 'contact-fanout');
+  box.appendChild(el('div', 'list-section', 'Share these contacts with your manager'));
+  box.appendChild(el('p', 'muted',
+    'Applies to each linked handle above, and overrides the source setting for '
+    + 'that contact only. Turning a contact off stops sharing it and removes it '
+    + 'from your manager’s list; it cannot un-send what was already mirrored.'));
+  const report = el('p', 'muted');
+  const row = el('div', 'contact-fanout-row');
+  const run = async (value, btn) => {
+    const plan = planHandleFanOut(handleIds, importedContactKeys(), knownSourceIds());
+    if (!plan.keys.length) {
+      report.className = 'error';
+      report.textContent = plan.unmatched.length
+        ? 'Nothing applied — ' + describeUnmatched(plan.unmatched) + '.'
+        : 'Nothing applied — this contact has no linked handles.';
+      return;
+    }
+    btn.disabled = true;
+    const res = await commitOverrides(plan.keys.map((k) => [k, value]));
+    btn.disabled = false;
+    if (!res.ok) {                                   // F5/F8: refusal is visible
+      report.className = 'error';
+      report.textContent = 'Not saved — ' + (res.message || 'try again') + '.';
+      return;
+    }
+    const total = plan.keys.length + plan.unmatched.length;
+    report.className = plan.unmatched.length ? 'error' : 'muted';
+    report.textContent = plan.keys.length + ' of ' + total + ' handle(s) applied'
+      + (plan.unmatched.length ? '; ' + describeUnmatched(plan.unmatched) : '') + '.';
+  };
+  for (const [val, label] of [['share', 'Share'], [null, 'Auto'], ['private', 'Private']]) {
+    const b = el('button', 'share-opt', label);
+    b.type = 'button';
+    b.addEventListener('click', () => run(val, b));
+    row.appendChild(b);
+  }
+  box.appendChild(row);
+  box.appendChild(report);
+  box.appendChild(buildOverrideSummary(() => {
+    if (activeProfileId) renderContactDetail(activeProfileId);
+  }));
+  return box;
 }
 
 function renderContactDetail(profileId) {
@@ -244,12 +331,13 @@ function renderContactDetail(profileId) {
       nameInput.addEventListener('blur', async () => {
         const v = nameInput.value.trim();
         if (!v || v === profile.displayName) return;
-        await persist(upsertProfile(store, { id: profile.id, displayName: v }));
+        await persist((fresh) => upsertProfile(fresh, { id: profile.id, displayName: v }));
       });
     }
   }
 
   host.replaceChildren();
+  if (contactsError) host.appendChild(el('p', 'error', contactsError));
   host.appendChild(buildShareToggle(profile));
 
   const linked = el('div', 'contact-linked-list');
@@ -270,7 +358,7 @@ function renderContactDetail(profileId) {
       unlink.type = 'button';
       unlink.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await persist(unlinkRoom(store, c.id));
+        await persist((fresh) => unlinkRoom(fresh, c.id));
       });
       row.appendChild(unlink);
       row.addEventListener('click', () => openConvo(c.id));
@@ -298,7 +386,7 @@ function renderContactDetail(profileId) {
       btn.type = 'button';
       btn.disabled = linkedByRoom[c.id] === profile.id;
       btn.addEventListener('click', async () => {
-        await persist(linkRoom(store, profile.id, c.id));
+        await persist((fresh) => linkRoom(fresh, profile.id, c.id));
         attachInput.value = '';
         attachResults.replaceChildren();
       });
@@ -332,7 +420,7 @@ function renderContactDetail(profileId) {
       unlink.type = 'button';
       unlink.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await persist(unlinkHandle(store.profiles, h.source, h.network_id));
+        await persist((fresh) => unlinkHandle(fresh.profiles, h.source, h.network_id));
       });
       row.appendChild(unlink);
       handles.appendChild(row);
@@ -366,7 +454,7 @@ function renderContactDetail(profileId) {
       return;
     }
     // persist() re-renders this detail view, which rebuilds the form fresh.
-    await persist(linkHandle(store.profiles, profile.id, source, identifier));
+    await persist((fresh) => linkHandle(fresh.profiles, profile.id, source, identifier));
   };
   addBtn.addEventListener('click', addHandleNow);
   handleInput.addEventListener('keydown', (e) => {
@@ -377,12 +465,13 @@ function renderContactDetail(profileId) {
   addHandle.appendChild(addBtn);
   addHandle.appendChild(handleWarn);
   handles.appendChild(addHandle);
+  handles.appendChild(buildHandleFanOut(existing));
   host.appendChild(handles);
 
   const del = el('button', 'danger contact-delete-block', 'Delete contact');
   del.type = 'button';
   del.addEventListener('click', async () => {
-    await persist(removeProfile(store, profile.id));
+    await persist((fresh) => removeProfile(fresh, profile.id));
   });
   host.appendChild(del);
 }
@@ -406,6 +495,9 @@ function renderPeopleList() {
   if (!list) return;
   const q = (($('people-search') && $('people-search').value) || '').trim().toLowerCase();
   list.replaceChildren();
+  // F8: a failed contacts read/write is never silent — it is stated here and in
+  // the detail panel, and the views keep rendering last-known-good state.
+  if (contactsError) list.appendChild(el('p', 'error', contactsError));
 
   const withName = allConvos().map((c) => Object.assign({}, c, { name: c.title }));
   const groups = suggestions(withName, store);
@@ -451,7 +543,9 @@ function wireContactsNav() {
       btn.disabled = true;
       try {
         const id = newProfileId();
-        await persist(upsertProfile(store, { id, displayName: name, share: 'inherit' }));
+        const ok = await persist((fresh) =>
+          upsertProfile(fresh, { id, displayName: name, share: 'inherit' }));
+        if (!ok) return;
         selectContact(id);
         input.value = '';
       } finally { btn.disabled = false; }
@@ -463,7 +557,16 @@ function wireContactsNav() {
 
 async function renderPeopleView() {
   wireContactsNav();
-  try { store = await readProfiles(); } catch (e) { /* keep cache */ }
+  // F3: readProfiles now re-throws anything that is not a 404, so a transient
+  // failure keeps the last-known-good cache AND says so — it never renders an
+  // empty address book that the next write would then make real.
+  contactsError = null;
+  try {
+    store = await readProfiles();
+  } catch (e) {
+    contactsError = 'Your contacts could not be read — showing the last copy '
+      + 'this tab loaded. Changes are not saved until the read succeeds.';
+  }
   renderPeopleViewBody();
 }
 
@@ -509,7 +612,8 @@ async function openAddToContact(roomId) {
   if (!addContactBackdrop) return;
   const { backdrop, card } = addContactBackdrop;
 
-  try { store = await readProfiles(); } catch (e) { /* keep cache */ }
+  let readFailed = false;
+  try { store = await readProfiles(); } catch (e) { readFailed = true; }
 
   const convo = convoById(roomId);
   const convoTitle = sanitizeLine((convo && convo.title) || roomId);
@@ -537,7 +641,11 @@ async function openAddToContact(roomId) {
   results.style.cssText = 'max-height:320px;overflow-y:auto;margin:6px 0;';
   card.appendChild(results);
 
-  const feedback = el('p', 'muted');
+  const feedback = el('p', readFailed ? 'error' : 'muted');
+  if (readFailed) {
+    feedback.textContent = 'Your contacts could not be read — this list may be '
+      + 'incomplete, and saving will be refused until the read succeeds.';
+  }
   card.appendChild(feedback);
 
   // Save WITHOUT persist()'s People-view re-renders: this modal is opened from a
@@ -549,18 +657,23 @@ async function openAddToContact(roomId) {
   // only path that does, so without it a room linked/created here would not be
   // reflected in row Share/Private badges until the next natural refresh — but
   // we deliberately do NOT re-render the People view from here.
-  const saveFromModal = async (next) => {
-    store = await writeProfiles(next);
+  // F3: same merge-over-a-fresh-read discipline as persist(); the only
+  // difference is that this modal deliberately skips the People-view re-render.
+  const saveFromModal = async (mutate) => {
+    const res = await saveProfilesGuarded(PROFILES_IO, mutate);
+    if (!res.ok) return res;
+    store = res.store;
     try { await loadConsentState(); } catch (e) { /* consent-cache refresh is best-effort */ }
+    return res;
   };
   const finishLink = async (profileId) => {
-    try {
-      await saveFromModal(linkRoom(store, profileId, roomId));
-      feedback.textContent = 'Added.';
-      setTimeout(closeAddToContact, 700);
-    } catch (e) {
-      feedback.textContent = 'Could not save — try again.';
+    const res = await saveFromModal((fresh) => linkRoom(fresh, profileId, roomId));
+    if (!res.ok) {
+      feedback.textContent = 'Could not save — ' + (res.message || 'try again') + '.';
+      return;
     }
+    feedback.textContent = 'Added.';
+    setTimeout(closeAddToContact, 700);
   };
 
   const renderResults = () => {
@@ -584,16 +697,15 @@ async function openAddToContact(roomId) {
   const newBtn = el('button', 'primary', 'New contact from this conversation');
   newBtn.type = 'button';
   newBtn.addEventListener('click', async () => {
-    try {
-      const id = newProfileId();
-      let next = upsertProfile(store, { id, displayName: convoTitle, share: 'inherit' });
-      next = linkRoom(next, id, roomId);
-      await saveFromModal(next);
-      feedback.textContent = 'Created “' + convoTitle + '”.';
-      setTimeout(closeAddToContact, 900);
-    } catch (e) {
-      feedback.textContent = 'Could not create — try again.';
+    const id = newProfileId();
+    const res = await saveFromModal((fresh) =>
+      linkRoom(upsertProfile(fresh, { id, displayName: convoTitle, share: 'inherit' }), id, roomId));
+    if (!res.ok) {
+      feedback.textContent = 'Could not create — ' + (res.message || 'try again') + '.';
+      return;
     }
+    feedback.textContent = 'Created “' + convoTitle + '”.';
+    setTimeout(closeAddToContact, 900);
   });
   newRow.appendChild(newBtn);
   card.appendChild(newRow);

@@ -30,6 +30,18 @@ numbers / emails: like the cookie return, they go ONLY to the authorized
 loopback origin and are NEVER logged (F6). The resolver is SELECT-only — no
 write happens anywhere on this path.
 
+POST /contacts/list (F1-gated) returns the teammate's OWN imported address book
+(agents/contacts/contacts.db, read-only) so the app can offer a per-contact
+share override for rows that have no conversation — e.g. "Datadog Alerting".
+It is deliberately a POST, not a GET: this helper's GETs are ungated
+liveness-only by design (F5), and adding a GET would also widen the shared CORS
+methods header (F1). Parameterless (the path is fixed and carries no query —
+_diag logs self.path), rows filtered to the known source ids, response capped
+at CONTACTS_MAX rows, deleted rows excluded. The values are real phone
+numbers/emails: like the cookie and /enrich/numbers returns they go ONLY to the
+authorized loopback origin and are NEVER logged (F6). See session-connect's
+CLAUDE.md for the ACCEPTED local-process residual.
+
 POST /enroll/exchange (F1-gated) is the server-side leg of the app's "Connect
 to organization" flow. The browser cannot fetch a REMOTE master origin (the
 app's CSP connect-src is loopback-only), so it hands us {master_url, code} and
@@ -52,6 +64,9 @@ Security invariants (do not weaken) — identical to gmessages-connect:
     bodies are NEVER returned or logged; failures map to fixed generic messages.
   * F2 — bridge-returned login_id/step_id are validated (connect.ID_RE) before
     being interpolated into a provisioning-API path — on both /start and /input.
+  * F1b (per-contact-share plan) — /contacts/list additionally requires a Host
+    header naming this loopback listener (HOST_ALLOWED), as defence-in-depth
+    against DNS rebinding: a rebound name reaches us with the attacker's Host.
 
 Run:  python3 connect_server.py --host 127.0.0.1 --port 8021
 (usually via run-connect.sh under launchd — com.jkali.session-connect).
@@ -60,6 +75,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import urllib.parse
 import urllib.request
@@ -79,6 +95,20 @@ APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
 SERVER_NETWORKS = ("twitter", "linkedin", "instagram")
 ENRICH_NUMBERS_PATH = "/enrich/numbers"
 ENROLL_EXCHANGE_PATH = "/enroll/exchange"
+CONTACTS_LIST_PATH = "/contacts/list"
+
+# The teammate's own imported address book (agents/contacts/, mode 600). Opened
+# READ-ONLY (sqlite `mode=ro`) so this helper can never create, migrate, or
+# write it — the importer and the uplink are its only writers.
+CONTACTS_DB = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "agents", "contacts", "contacts.db")
+# Must stay in step with agents/uplink/uplink.py's SOURCE_ID_TO_LABEL: a row
+# whose source is not here is not a source this system mirrors, so it can never
+# become a valid override key and is filtered out before the response is built.
+CONTACTS_SOURCES = ("whatsapp", "imessage", "gmessages",
+                    "instagram", "linkedin", "twitter")
+CONTACTS_MAX = 2000   # P3: this server is single-threaded; bound the response.
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8021
@@ -100,6 +130,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 _PATH_RE = re.compile(r"^/connect/([a-z]+)/(start|input)$")
+
+# The port actually bound by serve() (the default may be held by a foreign
+# process, see serve()'s fallback range). Used ONLY to build the Host allowlist
+# for /contacts/list — the security boundary is still the loopback bind.
+_BOUND_PORT = DEFAULT_PORT
+
+
+def _host_allowed(host):
+    """F1b: the Host header must name this loopback listener.
+
+    Anti-rebinding defence-in-depth — a DNS-rebound name resolves to 127.0.0.1
+    but arrives carrying the ATTACKER's Host, so pinning it costs nothing and
+    removes the rebinding path. Not a replacement for _authorized(): both run."""
+    if not isinstance(host, str):
+        return False
+    return host in ("127.0.0.1:%d" % _BOUND_PORT, "localhost:%d" % _BOUND_PORT)
 
 
 def _make_handler():
@@ -198,7 +244,8 @@ def _make_handler():
             if self._origin() is not None and (
                     self._route()[0] is not None
                     or self.path == ENRICH_NUMBERS_PATH
-                    or self.path == ENROLL_EXCHANGE_PATH):
+                    or self.path == ENROLL_EXCHANGE_PATH
+                    or self.path == CONTACTS_LIST_PATH):
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -227,6 +274,15 @@ def _make_handler():
                     return
                 self._discard_body()
                 self._enrich_numbers()
+                return
+            if self.path == CONTACTS_LIST_PATH:
+                if not self._authorized():   # F1: gate BEFORE any DB read
+                    return
+                if not _host_allowed(self.headers.get("Host")):  # F1b
+                    self._json(403, {"error": "forbidden"}, cors=True); self._diag(403)
+                    return
+                self._discard_body()         # parameterless by design
+                self._contacts_list()
                 return
             if self.path == ENROLL_EXCHANGE_PATH:
                 if not self._authorized():   # F1: gate BEFORE any outbound call
@@ -260,6 +316,39 @@ def _make_handler():
                 self._json(500, {"error": "Could not resolve numbers."}, cors=True)
                 return
             self._json(200, {"numbers": numbers}, cors=True)
+
+        # ---- the teammate's OWN imported address book, LOCAL-only ----
+        def _contacts_list(self):
+            # F6 posture, identical to /enrich/numbers: this returns PII (real
+            # E.164 numbers / emails / display names) but ONLY to the authorized
+            # loopback origin, and NEVER to a log — the sole log line (_diag)
+            # carries method/path/origin/status, and the path here is a fixed
+            # parameterless literal. Read-only: `mode=ro` means this process
+            # cannot create or migrate contacts.db even if it is absent.
+            rows = []
+            try:
+                con = sqlite3.connect("file:%s?mode=ro" % CONTACTS_DB, uri=True, timeout=15)
+            except sqlite3.Error:
+                # No store yet (the hourly importer has not run) — an empty list
+                # is the truthful answer, not an error the UI must special-case.
+                self._json(200, {"contacts": []}, cors=True)
+                return
+            try:
+                cur = con.execute(
+                    "SELECT source, network_id, kind, display_name FROM contacts "
+                    "WHERE deleted = 0 ORDER BY source, network_id LIMIT ?",
+                    (CONTACTS_MAX,))
+                for source, network_id, kind, display_name in cur:
+                    if source not in CONTACTS_SOURCES:
+                        continue  # not a source this system mirrors -> not offerable
+                    rows.append({"source": source, "network_id": network_id,
+                                 "kind": kind, "display_name": display_name})
+            except sqlite3.Error:
+                self._json(500, {"error": "Could not read contacts."}, cors=True)
+                return
+            finally:
+                con.close()
+            self._json(200, {"contacts": rows}, cors=True)
 
         # ---- server-side leg of the GUI "Connect to organization" flow ----
         def _enroll_exchange(self, body):
@@ -409,6 +498,7 @@ def serve(host, port):
     # process; try a small fallback range so the helper doesn't crash-loop on
     # EADDRINUSE. The security boundary is the loopback HOST (127.0.0.1) — never
     # 0.0.0.0 — not the specific port.
+    global _BOUND_PORT
     httpd, chosen = None, port
     for p in range(port, port + 5):
         try:
@@ -420,6 +510,7 @@ def serve(host, port):
     if httpd is None:
         sys.stderr.write("[connect] no free port in %d-%d; exiting\n" % (port, port + 4))
         return 1
+    _BOUND_PORT = chosen   # F1b: pins /contacts/list's Host allowlist
     # Publish the chosen loopback base where the app (served same-origin from
     # :8011) can read it, so the browser knows which port to fetch — the CSP
     # whitelists the whole range. Best-effort; the app falls back to the default.

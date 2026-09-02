@@ -99,6 +99,38 @@ ever returned (F6) — the credential never touches a Matrix room.
   and returns each 1:1 conversation's real phone number/email. Like the
   cookie returns, the values go only to the authorized loopback origin and
   are never logged.
+- `POST /contacts/list` → `{contacts: [{source, network_id, kind,
+  display_name}]}` — the teammate's OWN imported address book
+  (`agents/contacts/contacts.db`), opened **read-only** (`sqlite mode=ro`, so
+  this process can never create or migrate it), soft-deleted rows excluded,
+  rows filtered to the known source ids (`CONTACTS_SOURCES`, kept in step with
+  the uplink's `SOURCE_ID_TO_LABEL`), and capped at `CONTACTS_MAX` (2000)
+  because this server is single-threaded. `apps/user` uses it to offer a
+  per-contact share override for contacts that have no conversation (e.g. an
+  alerting bot), which no conversation row could otherwise reach.
+  - **Deliberately a POST, not a GET (F1).** This helper's GETs are ungated
+    liveness-only by design; a GET here would be unauthenticated, and adding
+    one would also widen the shared `Access-Control-Allow-Methods` header for
+    every other endpoint.
+  - **Parameterless.** The path is a fixed literal with no query string, so the
+    one diagnostic line (`_diag`, which logs `self.path`) cannot leak a handle.
+  - **Host allowlist (F1b).** In addition to `_authorized()`, the `Host` header
+    must be `127.0.0.1:<bound port>` or `localhost:<bound port>` — DNS-rebinding
+    defence-in-depth, since a rebound name resolves to loopback but arrives
+    carrying the attacker's `Host`.
+  - **F6 posture**, identical to `/enrich/numbers`: the values are real phone
+    numbers / emails / display names; they go only to the authorized loopback
+    origin and are **never logged**.
+  - **ACCEPTED RESIDUAL (local process, documented per the per-contact-share
+    plan's F1 disposition).** Any process running as this user that can speak
+    the loopback protocol — correct `Origin`, `Content-Type`,
+    `X-Beepa-Connect`, and now `Host` — can read the imported address book.
+    That is a *broader* read than `/enrich/numbers` (which returns only the
+    handles of conversations that already exist). It is accepted for the same
+    reason as the residuals below: a local process running as this user can
+    already read `contacts.db` (mode 600) directly, so the endpoint grants no
+    capability the attacker does not already have. Do **not** widen it into a
+    GET, a query-parameterized search, or an unfiltered dump of other stores.
 - `POST /enroll/exchange` → `{master_url, code}` in; the server-side leg of
   the app's **Connect to organization** flow. The browser cannot fetch a
   remote master origin (`apps/user`'s CSP `connect-src` is loopback-only), so
@@ -153,6 +185,9 @@ ever returned (F6) — the credential never touches a Matrix room.
 - **F2 — bridge-returned `login_id`/`step_id` are validated** with
   `connect.ID_RE` before being interpolated into a provisioning-API path,
   on both `/start` and `/input`.
+- **F1b — `/contacts/list` additionally pins the `Host` header** to this
+  listener's own loopback name:port (`_host_allowed`, using the port `serve()`
+  actually bound). It runs *after* `_authorized()`, never instead of it.
 
 ## How to run / test
 

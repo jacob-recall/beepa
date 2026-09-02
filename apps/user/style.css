@@ -221,3 +221,23 @@
 }
 .proposal-quick-yes:hover { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
 .proposal-quick-no:hover { color: #c0392b; background: rgba(192, 57, 43, 0.12); }
+
+/* ── per-contact share overrides (per-contact-share plan, C3) ───────────────
+   F8: a failed consent write is SURFACED, never swallowed — .share-slider-error
+   is the in-control line the tri-state slider shows when a write did not land,
+   while the control itself keeps rendering last-known-good state. */
+.share-slider-error { font-size: 10px; line-height: 1.3; color: #ea0038; }
+.contact-override-panel { margin-top: 14px; }
+.contact-override-summary { margin: 6px 0; }
+.contact-override-summary p { margin: 2px 0; }
+.contact-override-list { display: flex; flex-direction: column; }
+.contact-override-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 0; border-bottom: 1px solid var(--color-divider);
+}
+.contact-override-row:last-child { border-bottom: none; }
+.contact-override-row .contact-row-meta { flex: 1; min-width: 160px; }
+.contact-override-row .share-slider-hint { flex-basis: 100%; }
+.contact-override-row p.error { flex-basis: 100%; margin: 2px 0 0; font-size: 11px; }
+.contact-fanout { margin-top: 14px; }
+.contact-fanout-row { display: flex; gap: 6px; margin: 6px 0; }

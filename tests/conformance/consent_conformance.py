@@ -77,6 +77,21 @@ SOURCE_IDS = ["imessage", "whatsapp", "gmessages", "linkedin", "twitter",
               "imessage\n"]
 ROOM_IDS = ["!a:local", "!b:local", "!c:local", "", "constructor", "__proto__", "5",
             "!a:local\n"]
+# Per-contact override keys (per-contact-share plan, F5/F6). Valid ones, plus
+# every malformation the key spec must drop: no pipe, empty source segment,
+# empty network_id, a prototype-named or non-matching source, an embedded '|'
+# in the network_id (legal — the importer's email charset admits it), and the
+# trailing-newline canary for end-of-STRING anchoring. Deliberately NO
+# integer-like key: JS hoists those in an object's key order, Python does not,
+# which would be a false ordering difference in any echoed map.
+OVERRIDE_KEYS = [
+    "imessage|+15551234567", "whatsapp|+15550000000", "imessage|a@b.example",
+    "imessage|a|b@example.com", "imessage||x", "imessage|", "|+1555", "nopipe",
+    "__proto__|x", "constructor|x", "toString|x", "5|x", "iMessage|+1",
+    "imessage|+1\n", "imessage\n|+1", "",
+]
+OVERRIDE_VALUES = ["share", "private", "inherit", "junk", "Share", "share-all",
+                   "", None, 5, True, False, {}, [], {"state": "share"}]
 
 
 def _key_pool():
@@ -216,6 +231,51 @@ def unknown_override_vectors():
     return out
 
 
+# ------------------------------------------- the per-contact override class
+# The contact dimension KEEPS its standing policies, so its fall-through rule is
+# the opposite of the conversation dimension's: an unrecognized override VALUE
+# inherits from per-source/global rather than resolving private. That makes the
+# cross-product of (override value x policy x source) the thing both sides must
+# agree on exactly, so it gets a deterministic class of its own rather than
+# relying on the fuzzer to reach it.
+CONTACT_POLICIES = [
+    {"global": "share-all", "sources": {"imessage": "share-all"}},
+    {"global": "share-all", "sources": {"imessage": "private-all"}},
+    {"global": "private", "sources": {"imessage": "share-all"}},
+    {"global": "private", "sources": {}},
+    {},
+    {"global": "share-all", "sources": ["share-all"]},
+]
+
+
+def contact_override_vectors():
+    """Every override value x every contact policy x a few source shapes, plus a
+    normalize_contact_overrides vector for every key/value pairing."""
+    out = []
+    for override in OVERRIDE_VALUES + ["share", "private"]:
+        for policy in CONTACT_POLICIES:
+            for source in ("imessage", "whatsapp", "", "5", "__proto__", 5, None):
+                out.append({"kind": "resolve_contact_share", "source": source,
+                            "policy": policy, "override": override})
+    for key in OVERRIDE_KEYS:
+        for value in OVERRIDE_VALUES:
+            out.append({"kind": "normalize_contact_overrides",
+                        "raw": {"overrides": {key: value}}})
+    for raw in (None, {}, [], "x", 5, {"overrides": None}, {"overrides": []},
+                {"overrides": "share"}, {"overrides": 5}, {"overrides": {}},
+                {"nope": {"imessage|+1": "share"}},
+                {"overrides": {k: "share" for k in OVERRIDE_KEYS}}):
+        out.append({"kind": "normalize_contact_overrides", "raw": raw})
+    # The entry cap: exactly at it reads, one over it is a READ FAILURE on both
+    # sides (never a silently half-honored map).
+    at_cap = {"imessage|+1%d" % i: "private" for i in range(consent.CONTACT_OVERRIDES_CAP)}
+    over_cap = dict(at_cap)
+    over_cap["imessage|+1over"] = "private"
+    out.append({"kind": "normalize_contact_overrides", "raw": {"overrides": at_cap}})
+    out.append({"kind": "normalize_contact_overrides", "raw": {"overrides": over_cap}})
+    return out
+
+
 # ------------------------------------------------------------------- fuzzing
 class Gen:
     def __init__(self, seed):
@@ -283,6 +343,27 @@ class Gen:
             p["displayName"] = self.pick(["Ann", "Bob", "", "5"] + SCALARS + [[], {}])
         return p
 
+    def contact_override(self):
+        """One per-contact override VALUE (the third resolve_contact_share arg)."""
+        return self.pick(OVERRIDE_VALUES + ["share", "private"] * 3 + JUNK_STR)
+
+    def contact_overrides_event(self):
+        """A whole stored com.jkali.contact_overrides CONTENT."""
+        c = self.r.random()
+        if c < 0.08:
+            return self.junk()                       # not even a dict
+        if c < 0.16:
+            return {"overrides": self.junk()}        # non-dict field = read failure
+        m = {}
+        for _ in range(self.r.randint(0, 5)):
+            m[self.pick(OVERRIDE_KEYS)] = self.pick(OVERRIDE_VALUES + ["share", "private"] * 2)
+        body = {"overrides": m}
+        if self.r.random() < 0.1:
+            body[self.pick(JUNK_STR)] = self.junk()
+        if self.r.random() < 0.08:
+            body.pop("overrides")                    # absent field = empty map
+        return body
+
     def sync(self):
         rooms = {}
         for _ in range(self.r.randint(0, 4)):
@@ -322,7 +403,9 @@ def fuzz_vectors(n, seed):
         out.append({"kind": "normalize_contact_policy", "raw": g.policy()})
         out.append({"kind": "resolve_contact_share",
                     "source": g.pick(SOURCE_IDS + SCALARS + [["x"], {}]),
-                    "policy": g.policy()})
+                    "policy": g.policy(),
+                    "override": g.contact_override()})
+        out.append({"kind": "normalize_contact_overrides", "raw": g.contact_overrides_event()})
         out.append({"kind": "overrides_from_sync", "sync": g.sync()})
         convos = [g.convo() for _ in range(g.r.randint(0, 4))]
         ids = [c.get("id") for c in convos
@@ -357,7 +440,12 @@ def eval_py(v):
         if k == "normalize_contact_policy":
             return consent.normalize_contact_policy(v["raw"])
         if k == "resolve_contact_share":
-            return consent.resolve_contact_share(v["source"], v["policy"])
+            # .get(): pre-per-contact-share vectors carry no override field, and
+            # None must fall through exactly as JS's `undefined` does.
+            return consent.resolve_contact_share(v["source"], v["policy"],
+                                                 v.get("override"))
+        if k == "normalize_contact_overrides":
+            return consent.normalize_contact_overrides(v["raw"])
         raise ValueError("unknown kind " + k)
     except Exception as e:  # a crash is a comparable outcome, not a skip
         return {"__error__": type(e).__name__}
@@ -414,7 +502,9 @@ def check_invariants(vectors, py, js):
 
 def main():
     unknown = unknown_override_vectors()
-    vectors = exhaustive_resolve_vectors() + unknown + fuzz_vectors(FUZZ_N, SEED)
+    contact = contact_override_vectors()
+    vectors = (exhaustive_resolve_vectors() + unknown + contact
+               + fuzz_vectors(FUZZ_N, SEED))
     py = [eval_py(v) for v in vectors]
     js = eval_js(vectors)
     assert len(js) == len(vectors), "node returned %d results for %d vectors" % (len(js), len(vectors))
@@ -438,10 +528,24 @@ def main():
         if a != b or pe or je:
             mismatches.append((i, v, py[i], js[i]))
 
-    n_fuzz = FUZZ_N * 9  # entry points per fuzz iteration (see fuzz_vectors)
+    n_fuzz = FUZZ_N * 10  # entry points per fuzz iteration (see fuzz_vectors)
+    # ACCEPTANCE (per-contact-share C4): the run must actually EXERCISE the new
+    # override argument, not merely keep passing without it.
+    n_override_bearing = sum(1 for v in vectors
+                             if v["kind"] == "resolve_contact_share"
+                             and v.get("override") is not None)
+    n_override_maps = sum(1 for v in vectors if v["kind"] == "normalize_contact_overrides")
     print("consent conformance: %d vectors (%d exhaustive resolve + %d unknown-value "
-          "+ %d fuzz), seed=%d"
-          % (len(vectors), len(vectors) - n_fuzz - len(unknown), len(unknown), n_fuzz, SEED))
+          "+ %d per-contact-override + %d fuzz), seed=%d"
+          % (len(vectors), len(vectors) - n_fuzz - len(unknown) - len(contact),
+             len(unknown), len(contact), n_fuzz, SEED))
+    print("  override-bearing resolve_contact_share vectors=%d  "
+          "normalize_contact_overrides vectors=%d"
+          % (n_override_bearing, n_override_maps))
+    if not n_override_bearing or not n_override_maps:
+        print("NO OVERRIDE-BEARING VECTORS: the per-contact override argument was "
+              "never exercised, so this run proves nothing about it")
+        sys.exit(1)
     print("  python errors=%d  js errors=%d  differing/erroring vectors=%d"
           % (py_err, js_err, len(mismatches)))
     if mismatches:

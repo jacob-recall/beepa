@@ -28,9 +28,24 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   contact-profile share-state, the per-source policy and the global standing
   policy are still accepted as arguments and deliberately ignored. The
   layered, most-specific-wins model survives only in the SEPARATE
-  contact-sharing dimension (`resolveContactShare`). Plus normalization
+  contact-sharing dimension (`resolveContactShare`), which as of the
+  per-contact-share plan gains a third, most-specific level: a per-CONTACT
+  override (`com.jkali.contact_overrides`, keyed `'<source>|<network_id>'`,
+  value `share`/`private`). Its key spec is load-bearing — the segment before
+  the FIRST `|` must match `SOURCE_KEY_RE`, the remainder is verbatim and may
+  itself contain `|`, so nothing ever calls `split('|')` (use
+  `contactOverrideKey` / `splitContactOverrideKey`). `normalizeContactOverrides`
+  returns **null for a READ FAILURE** — a present-but-non-object `overrides`
+  field, or a stored map over `CONTACT_OVERRIDES_CAP` (1024) — never `{}`, so a
+  partially corrupt event cannot silently drop a `'private'` deny. Unlike the
+  conversation dimension, an unrecognized override VALUE inherits from
+  source/global rather than resolving private: the contact dimension keeps its
+  standing policies. Plus normalization
   helpers and account-data storage helpers for `com.jkali.share_policy` /
-  `com.jkali.share_override`. **Must stay byte-parity with
+  `com.jkali.share_override` / `com.jkali.contact_overrides`
+  (`readContactOverrides` reports `ok` / `over-cap` / `error` distinctly; a
+  caller must DISABLE its controls on `error` rather than write an emptiness it
+  never read). **Must stay byte-parity with
   `agents/uplink/consent.py`** — same precedence, same reason strings, same
   normalization. `tests/unit/consent.test.js` and
   `tests/unit/consent_py.test.py` assert the two independently; if you change
@@ -41,7 +56,10 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   profile" and "share ∈ {share,private,inherit}" in `normalizeProfiles()` —
   never trust stored data past that function. Linking/unlinking/sharing is
   manual only; `suggestions()` is pure and advisory (never mutates, never
-  auto-merges).
+  auto-merges). `readProfiles()` treats **only 404** as an empty store and
+  re-throws every other failure: the old catch-all made a transient blip look
+  identical to "no contacts", and the next `writeProfiles()` blind-PUT that
+  emptiness over the real store, destroying every grouping and handle link.
 
   **Approved exception — `autoMergeByNumber()`.** This is the ONE sanctioned
   auto-merge path: it groups conversations that a trusted local helper has

@@ -10,6 +10,7 @@
 import {
   resolve, effectiveShared, effectiveLevel, resolveAll, normalizePolicy, normalizeOverride,
   overridesFromSync, normalizeContactPolicy, resolveContactShare,
+  normalizeContactOverrides,
 } from '../../shared/model/consent.js';
 
 function evalOne(v) {
@@ -31,7 +32,12 @@ function evalOne(v) {
     case 'normalize_contact_policy':
       return normalizeContactPolicy(v.raw);
     case 'resolve_contact_share':
-      return resolveContactShare(v.source, v.policy);
+      // v.override is absent on pre-per-contact-share vectors; `undefined`
+      // must fall through to the source/global levels exactly as Python's
+      // `.get("override")` -> None does.
+      return resolveContactShare(v.source, v.policy, v.override);
+    case 'normalize_contact_overrides':
+      return normalizeContactOverrides(v.raw);
     default:
       throw new Error('unknown vector kind: ' + v.kind);
   }

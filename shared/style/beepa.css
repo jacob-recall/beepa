@@ -347,6 +347,7 @@ button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(
   user-select: none; pointer-events: none;
 }
 .share-slider-seg.active { color: var(--color-text); font-weight: 600; }
+.share-slider-track.mixed .share-slider-thumb { opacity: 0; }
 .share-slider-hint {
   font-size: 10px; line-height: 1.3; color: var(--color-muted);
 }

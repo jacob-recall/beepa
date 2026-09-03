@@ -91,6 +91,7 @@
 #list-head .list-search { width: 100%; }
 #source-share-switch { width: 100%; }
 #source-share-switch .share-slider { width: 100%; }
+#source-share-switch .share-bulk-row { width: 100%; }
 #list-head-actions { display: flex; gap: 8px; }
 #list-head-actions input { flex: 1; }
 /* Bridge invites the auto-join gate refused or deferred (apps/user/main.js). */

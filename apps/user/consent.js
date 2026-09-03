@@ -350,16 +350,20 @@ function buildTriStateSlider(cycle, opts) {
   }
 
   function refresh() {
-    const idx = getIndex();
-    track.style.setProperty('--idx', String(idx));
+    const raw = getIndex();
+    const idx = (typeof raw === 'number' && raw >= 0 && raw < cycle.length) ? raw : -1;
+    track.classList.toggle('mixed', idx < 0);
+    track.style.setProperty('--idx', String(idx < 0 ? 0 : idx));
     for (let i = 0; i < segs.children.length; i++) {
       segs.children[i].classList.toggle('active', i === idx);
     }
     const hintText = getHint();
     hint.textContent = hintText;
     hint.classList.toggle('shared', hintShared ? hintShared() : false);
-    btn.setAttribute('aria-valuenow', String(idx));
-    btn.setAttribute('aria-valuetext', cycle[idx].label + (hintText ? ' — ' + hintText : ''));
+    if (idx < 0) btn.removeAttribute('aria-valuenow');
+    else btn.setAttribute('aria-valuenow', String(idx));
+    const label = idx < 0 ? 'Mixed' : cycle[idx].label;
+    btn.setAttribute('aria-valuetext', label + (hintText ? ' — ' + hintText : ''));
   }
 
   btn.addEventListener('click', async (e) => {
@@ -370,12 +374,13 @@ function buildTriStateSlider(cycle, opts) {
     // the track. Keyboard activation (detail === 0) keeps advance-by-one.
     let next;
     const rect = track.getBoundingClientRect();
+    const cur = getIndex();
     if (e.detail > 0 && rect.width > 0) {
       const frac = (e.clientX - rect.left) / rect.width;
       next = Math.max(0, Math.min(cycle.length - 1, Math.floor(frac * cycle.length)));
-      if (next === getIndex()) { clearWriteError(); return; }  // clicked the current state
+      if (next === cur) { clearWriteError(); return; }  // clicked the current state
     } else {
-      next = (getIndex() + 1) % cycle.length;
+      next = ((cur >= 0 ? cur : -1) + 1) % cycle.length;
     }
     clearWriteError();
     try {
@@ -680,7 +685,7 @@ function planBulkShareChange(convos, overridesMap, level) {
 async function bulkSetSourceLevel(source, level) {
   const convos = convosBySource[source.id] || [];
   const plan = planBulkShareChange(convos, overrides, level);
-  if (!plan) return;                                    // refuses anything but share/private/direct
+  if (!plan) return false;                              // refuses anything but share/private/direct
   const levelLabel = level === 'share' ? 'Share' : (level === 'direct' ? 'Direct' : 'Private');
 
   if (plan.requiresRiskConfirm) {
@@ -710,14 +715,14 @@ async function bulkSetSourceLevel(source, level) {
       + 'you set it explicitly.'
       + '\n\nTurn on Direct for all of these conversations?';
     const ok = await confirmModal('Turn on Direct for all ' + source.label + '?', text, false);
-    if (!ok) return;
+    if (!ok) return false;
     for (const rid of plan.ids) {
       const convo = convos.find((x) => x.id === rid) || { id: rid };
       await writeShareOverride(convo.id, 'direct');
       overrides.set(convo.id, 'direct');
     }
     renderSharingView();
-    return;
+    return true;
   }
 
   let text = 'Set all ' + plan.ids.length + ' ' + source.label + ' conversation(s) to ' + levelLabel + '?';
@@ -730,30 +735,64 @@ async function bulkSetSourceLevel(source, level) {
     text += '\n\nThese are currently set to Private and will change to ' + levelLabel + ':\n' + names.join('\n');
   }
   const ok = await confirmModal('Set all to ' + levelLabel + '?', text, false);
-  if (!ok) return;
+  if (!ok) return false;
   for (const rid of plan.ids) {
     await writeShareOverride(rid, level);
     overrides.set(rid, level);
   }
   renderSharingView();
+  return true;
+}
+
+const BULK_CYCLE = [
+  { val: 'share', label: 'Share' },
+  { val: 'direct', label: 'Direct' },
+  { val: 'private', label: 'Private' },
+];
+
+// Common explicit level across every convo in this source, or null if mixed /
+// empty. Drives the bulk slider thumb; a mixed source shows no thumb so we
+// never claim a level that isn't actually set on every conversation.
+function bulkCommonLevel(source) {
+  const convos = convosBySource[source.id] || [];
+  if (!convos.length) return null;
+  let common = null;
+  for (const c of convos) {
+    const lv = effectiveLevel(overrides.get(c.id));
+    if (common === null) common = lv;
+    else if (common !== lv) return null;
+  }
+  return common;
 }
 
 function buildBulkShareRow(source) {
   const wrap = el('div', 'share-bulk-row');
-  wrap.appendChild(el('span', 'muted', 'Set all ' + source.label + ' conversations:'));
-  const shareBtn = el('button', 'share-bulk-btn', 'Share');
-  shareBtn.type = 'button';
-  shareBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'share'));
-  const directBtn = el('button', 'share-bulk-btn', 'Direct');
-  directBtn.type = 'button';
-  directBtn.title = 'Auto-send: your manager’s messages go out without your review';
-  directBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'direct'));
-  const privateBtn = el('button', 'share-bulk-btn', 'Private');
-  privateBtn.type = 'button';
-  privateBtn.addEventListener('click', () => bulkSetSourceLevel(source, 'private'));
-  wrap.appendChild(shareBtn);
-  wrap.appendChild(directBtn);
-  wrap.appendChild(privateBtn);
+  wrap.appendChild(buildTriStateSlider(BULK_CYCLE, {
+    ariaLabel: 'Set all ' + source.label + ' conversations',
+    getIndex: () => {
+      const common = bulkCommonLevel(source);
+      if (!common) return -1;
+      const idx = BULK_CYCLE.findIndex((o) => o.val === common);
+      return idx >= 0 ? idx : -1;
+    },
+    getHint: () => {
+      const n = (convosBySource[source.id] || []).length;
+      const common = bulkCommonLevel(source);
+      if (!n) return 'No ' + source.label + ' conversations yet';
+      if (!common) return 'Set all ' + source.label + ' conversations';
+      if (common === 'direct') return 'All Direct — sent automatically';
+      if (common === 'share') return 'All shared';
+      return 'All private';
+    },
+    hintShared: () => {
+      const common = bulkCommonLevel(source);
+      return common === 'share' || common === 'direct';
+    },
+    onAdvance: async (opt) => {
+      const ok = await bulkSetSourceLevel(source, opt.val);
+      if (ok === false) return false;
+    },
+  }));
   return wrap;
 }
 

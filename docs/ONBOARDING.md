@@ -93,8 +93,10 @@ It will, in order:
 4. **Provision your local account** (`@jkali:localhost`) automatically.
 5. **Load the one-click Connect helpers** (Instagram / LinkedIn / X / Google
    Messages) and the contacts importer.
-6. **Build the iMessage CLI** from Beeper's public repo (~4 min; needs Xcode
-   Command Line Tools — it triggers the installer if they're missing).
+6. **Download the iMessage CLI** — Beeper's prebuilt, Developer-ID-signed
+   binary (pinned version, checksum + signature verified; no Xcode or Swift
+   needed, takes seconds). Its stable signature means the macOS permission
+   grants you make later stick permanently.
 7. **Enroll to the master.** At the prompt:
    - **Master enrollment URL:** `https://jacobs-macbook-pro.jaguar-pirate.ts.net:8443`
    - **Enrollment code:** the one from Step 1.
@@ -117,18 +119,29 @@ Then, using the **Connect** buttons in the app (no terminal):
 - **Instagram / LinkedIn / X** — one click each; sign in on the tab that opens.
 - **Google Messages** — one click, then tap the matching emoji on your phone.
 
-Everything starts **private**. To share, flip a conversation (or a whole source,
-or global Share-All) to **Shared** — the uplink mirrors those up within ~30s.
+Everything starts **private**. Each conversation has an explicit level —
+**Share** (mirrors up; manager suggestions land in your Proposals inbox for
+review), **Direct** (mirrors up AND the manager's drafts send as you without
+review — enable only via its confirm dialog, per conversation or per source
+via the bulk action), or **Private**. There is no inherit/Share-All standing
+policy; use the per-source bulk action to set many at once. Shared
+conversations mirror up within ~10s. Contact sharing is separate: per-source
+switches plus per-contact overrides in Sharing settings.
 
 ---
 
 ## 6. iMessage (optional, Mac only)
 
-The CLI is already built. To turn iMessage on:
+The CLI is already installed. To turn iMessage on:
 1. Set your `self_handle` (your iMessage phone/email) in `imessage/daemon.json`.
-2. Grant `imessage/bin/imessage-cli` **Full Disk Access** in
-   System Settings → Privacy & Security.
-3. Re-run `./setup.sh` to load the daemon.
+2. Re-run `./setup.sh` to load the daemon.
+3. Grants (one-time each; the daemon opens the right Settings pane for you
+   when one is missing):
+   - **Receiving:** add `imessage/bin/imessage-cli` to **Full Disk Access**.
+   - **Sending:** add `imessage/bin/imessage-cli` to **Accessibility**, and
+     click **Allow** on the "control Messages" Automation prompt at first send.
+   If you ever replace the CLI binary, remove (−) and re-add (+) its rows —
+   toggling a stale row does not re-key it.
 
 ---
 

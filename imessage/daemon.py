@@ -424,23 +424,21 @@ def _ax_trusted(prompt=False):
         return True
 
 def _engine_mut(args, timeout):
-    """Run a MUTATING engine command (send/react/edit/create-chat). All mutating
-    ops need macOS Accessibility, which macOS attributes to the daemon's python3
-    (the launchd-launched host — same pattern as Beeper granting Beeper Desktop).
-    Pre-check it here and fail FAST when missing: register python3 in the
-    Accessibility list + show the system dialog (once per daemon run), and open
-    System Settings directly on that pane via the allowlisted, rate-capped
-    cmd_open (B-1/B-7) — granting becomes one toggle, not a hunt. The engine's
-    own error output is still checked as a fallback. list-argv, shell=False —
-    M-20 preserved."""
-    if not _ax_trusted():
-        log.info("accessibility missing (grant the daemon's python3) — opening pane")
-        if not _AX_PROMPTED["done"]:
-            _AX_PROMPTED["done"] = True
-            threading.Thread(target=_ax_trusted, kwargs={"prompt": True},
-                             daemon=True).start()
-        cmd_open("accessibility")
-        return False
+    """Run a MUTATING engine command (send/react/edit/create-chat).
+
+    No Accessibility PRE-check: the Developer-ID-signed CLI holds its OWN TCC
+    identity and runs its own authorization preflight — an AXIsProcessTrusted()
+    probe of THIS interpreter gates on the wrong binary and false-negatives on
+    machines where sending demonstrably works (TCC keys on the real executable;
+    the daemon's framework Python is not the granted row, and a grant to an
+    unsigned interpreter is not a stable identity anyway). The old pre-check
+    refused every send on a fresh install before the CLI was ever invoked.
+    Instead: attempt the op, then react only to a failure the ENGINE ITSELF
+    attributes to Accessibility — register the interpreter + system dialog once
+    per run (harmless, helps macOS variants that attribute to the parent) and
+    open the Settings pane via the allowlisted, rate-capped cmd_open (B-1/B-7).
+    Tradeoff: a genuinely missing grant costs one bounded subprocess timeout
+    instead of an instant refusal. list-argv, shell=False — M-20 preserved."""
     try:
         p = subprocess.run([CLI, *args], capture_output=True,
                            timeout=timeout, shell=False)
@@ -449,7 +447,12 @@ def _engine_mut(args, timeout):
         ok, out = False, (e.stdout or b"") + (e.stderr or b"")
         log.info("engine timeout (mutating op)")
     if not ok and b"Accessibility" in out:
-        log.info("engine blocked on missing Accessibility grant")
+        log.info("engine blocked on missing Accessibility grant — grant "
+                 "imessage/bin/imessage-cli in the opened pane")
+        if not _AX_PROMPTED["done"]:
+            _AX_PROMPTED["done"] = True
+            threading.Thread(target=_ax_trusted, kwargs={"prompt": True},
+                             daemon=True).start()
         cmd_open("accessibility")
     return ok
 

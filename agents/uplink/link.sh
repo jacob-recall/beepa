@@ -117,7 +117,11 @@ LA_DIR="${HOME}/Library/LaunchAgents"
 PLIST_DEST="${LA_DIR}/com.jkali.uplink.plist"
 if [ -f "${PLIST_SRC}" ] && command -v launchctl >/dev/null 2>&1; then
   mkdir -p "${LA_DIR}"
-  cp "${PLIST_SRC}" "${PLIST_DEST}"
+  # Rewrite the repo plist's placeholder paths to THIS checkout (same rule as
+  # setup.sh install_agent) — a raw cp shipped /Users/jkali/... paths onto
+  # other machines and the uplink never started.
+  REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
+  sed "s#/Users/jkali/work/pm_mng#${REPO_ROOT}#g" "${PLIST_SRC}" > "${PLIST_DEST}"
   launchctl unload "${PLIST_DEST}" 2>/dev/null || true
   if launchctl load "${PLIST_DEST}" 2>/dev/null; then
     log "loaded launchd daemon com.jkali.uplink"

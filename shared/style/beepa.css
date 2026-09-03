@@ -61,6 +61,7 @@ input:focus-visible, .input:focus-visible { border-color: var(--color-accent); o
 .nav-icon { font-size: 0; }
 .nav-icon .ic { font-size: 20px; line-height: 1; }
 .rail-brand { color: var(--color-accent); }
+.msg .body a { color: inherit; text-decoration: underline; overflow-wrap: anywhere; }
 .rail-brand .brand-img { width: 30px; height: 30px; display: block; margin: 0 auto; border-radius: 7px; }
 .settings-popover {
   background: var(--color-panel-header); color: #e9edef;

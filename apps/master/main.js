@@ -24,7 +24,7 @@
 // NO composer, NO send call, anywhere in this file.
 
 import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE, MXC_RE } from '../../shared/matrix/client.js';
-import { $, el, sanitize, sanitizeLine } from '../../shared/ui/el.js';
+import { $, el, sanitize, sanitizeLine, appendLinkified } from '../../shared/ui/el.js';
 import { S } from '../../shared/state.js';
 import {
   localpart, spaceLabelFor, invitesToJoin, acceptedSpaces, verifiedChildIds, ROOM_SHAPE_RE,
@@ -976,7 +976,12 @@ function renderBubble(ev) {
   if (resolved.kind === 'media') cls += ' media';
   else if (resolved.kind === 'notice') cls += ' notice';
   const bubble = el('div', cls);
-  const bodyNode = el('div', 'body', resolved.text);
+  // Text/notice bodies get conservative linkification (explicit http(s) only,
+  // link text == href — shared/ui/el.js appendLinkified); media labels stay
+  // plain (loadMediaInto may replace them anyway).
+  const bodyNode = el('div', 'body');
+  if (resolved.kind === 'text' || resolved.kind === 'notice') appendLinkified(bodyNode, resolved.text);
+  else bodyNode.textContent = resolved.text;
   bubble.appendChild(bodyNode);
   row.appendChild(bubble);
   box.appendChild(row);

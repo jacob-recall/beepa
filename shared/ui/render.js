@@ -3,7 +3,7 @@
 
 import { feedPreviewFromEvent } from './account-data.js';
 import { api } from '../matrix/client.js';
-import { $, el, sanitize, sanitizeLine, txn } from './el.js';
+import { $, el, sanitize, sanitizeLine, txn, appendLinkified } from './el.js';
 import { IMSG_BOT_MXID } from './sources.js';
 import { S, convoNamePending, convoNames, convoSeen } from '../state.js';
 
@@ -128,7 +128,13 @@ function renderMessageEvent(ev) {
   if (sent) { who.textContent = 'You'; }
   else { bubble.dataset.sender = ev.sender; who.textContent = convoDisplayName(ev.sender); }
   bubble.appendChild(who);
-  bubble.appendChild(el('div', 'body', resolved.text));   // sanitized text/label, own node
+  // Sanitized text/label in its own node (CV-R2). Text/notice bodies get
+  // conservative linkification (explicit http(s) only, link text == href —
+  // see el.js appendLinkified); media labels and other kinds stay plain.
+  const bodyNode = el('div', 'body');
+  if (resolved.kind === 'text' || resolved.kind === 'notice') appendLinkified(bodyNode, resolved.text);
+  else bodyNode.textContent = resolved.text;
+  bubble.appendChild(bodyNode);
   bubble.appendChild(el('div', 'when', convoTime(ev.origin_server_ts)));
   box.appendChild(bubble);
 

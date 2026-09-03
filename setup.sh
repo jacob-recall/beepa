@@ -179,9 +179,22 @@ install_agent() {
   sleep 1
   if command -v curl >/dev/null 2>&1 && curl -fsS "${health}" >/dev/null 2>&1; then
     log "  ${label} is up (${health})"
-  else
-    log "  ${label} not answering yet at ${health} — it may still be starting."
+    return
   fi
+  # The helpers auto-fall back to the next port when theirs is taken (e.g.
+  # 8021 held by another process -> 8022; CSP already allows the range, and
+  # the app auto-discovers via connect.local.json). Probe the fallbacks
+  # before declaring it down — "not answering at 8021" used to read as a
+  # failure when the service was healthy on 8022.
+  port="${health##*:}"; port="${port%%/*}"
+  for off in 1 2 3 4; do
+    alt="${health/:${port}\//:$((port + off))/}"
+    if command -v curl >/dev/null 2>&1 && curl -fsS "${alt}" >/dev/null 2>&1; then
+      log "  ${label} is up on fallback port $((port + off)) (${alt}) — its usual port ${port} was busy; this is fine."
+      return
+    fi
+  done
+  log "  ${label} not answering yet at ${health} — it may still be starting."
 }
 
 install_agent "${HERE}/gmessages-connect/com.jkali.gmessages-connect.plist" \

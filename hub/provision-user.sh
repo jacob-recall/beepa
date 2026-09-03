@@ -50,9 +50,15 @@ else
   fail "docker not available — cannot register the local account"
 fi
 
-# login -> access token (JSON built + parsed in python; no shell/JSON injection)
+# login -> access token (JSON built + parsed in python; no shell/JSON injection).
+# Exit codes: 0 = token on stdout, or empty for 401/403 (genuinely wrong
+# password — the only case that may mean "someone else's account"); 7 = the
+# homeserver is unhealthy (5xx / unreachable). A 500 during first-time setup
+# used to be misreported as "account exists with a foreign password", sending
+# the operator to exactly the wrong place.
+login_rc=0
 TOKEN="$(python3 - "${HS}" "${LP}" "${LOCAL_PASSWORD}" <<'PY'
-import sys, json, urllib.request
+import sys, json, urllib.request, urllib.error
 hs, lp, pw = sys.argv[1], sys.argv[2], sys.argv[3]
 body = json.dumps({"type":"m.login.password",
                    "identifier":{"type":"m.id.user","user":lp},
@@ -61,10 +67,18 @@ req = urllib.request.Request(hs+"/_matrix/client/v3/login", data=body,
                              headers={"Content-Type":"application/json"})
 try:
     print(json.load(urllib.request.urlopen(req)).get("access_token",""))
+except urllib.error.HTTPError as e:
+    sys.stderr.write("login error: %s\n" % e)
+    if e.code not in (401, 403):
+        sys.exit(7)          # server broken, not a credentials problem
 except Exception as e:
     sys.stderr.write("login error: %s\n" % e)
+    sys.exit(7)              # unreachable/timeout: same
 PY
-)"
+)" || login_rc=$?
+if [ "${login_rc}" = 7 ]; then
+  fail "homeserver unhealthy during login (see the error above) — fix the hub before provisioning; this is NOT a password problem."
+fi
 if [ -z "${TOKEN}" ]; then
   if [ "${created}" = 1 ]; then
     fail "created @${LP}:localhost but login failed — that is a real bug, not a re-run."

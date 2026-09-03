@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NOTE: the /Users/jkali/work/pm_mng paths below are PLACEHOLDERS,
+     rewritten to this checkout's real path by setup.sh install_agent when the
+     agent is installed into ~/Library/LaunchAgents. Do not debug against this
+     repo copy's paths - read the installed copy instead. -->
 <plist version="1.0">
 <dict>
     <key>Label</key><string>com.jkali.contacts-import</string>

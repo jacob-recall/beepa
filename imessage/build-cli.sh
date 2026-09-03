@@ -58,9 +58,14 @@ BIN="$(find "${TMP}" -type f -name imessage-cli -perm -u+x | head -1)"
 if ! codesign --verify --strict "${BIN}" 2>/dev/null; then
   log "signature verification FAILED — refusing to install"; exit 1
 fi
-if ! codesign -dvv "${BIN}" 2>&1 | grep -q "TeamIdentifier=${TEAM_ID}"; then
-  log "unexpected code-signing team (want ${TEAM_ID}) — refusing to install"; exit 1
-fi
+# No pipe here: `codesign | grep -q` under set -o pipefail is a latent race —
+# grep -q exits on first match and closes the pipe, codesign takes SIGPIPE,
+# and a SUCCESSFUL match reports as a failed check on some machines.
+sig="$(codesign -dvv "${BIN}" 2>&1 || true)"
+case "${sig}" in
+  *"TeamIdentifier=${TEAM_ID}"*) ;;
+  *) log "unexpected code-signing team (want ${TEAM_ID}) — refusing to install"; exit 1 ;;
+esac
 
 mkdir -p "${HERE}/imessage/bin"
 cp "${BIN}" "${OUT}"; chmod 755 "${OUT}"

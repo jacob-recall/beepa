@@ -171,7 +171,7 @@ if [ -f "${IMSG_TMPL}" ] && [ ! -f "${IMSG_DEST}" ]; then
   mkdir -p "$(dirname "${IMSG_DEST}")"
   CLI_PATH="${OUT_ROOT}/imessage/bin/imessage-cli"; export CLI_PATH
   python3 "${HERE}/hub/_render_subst.py" "${IMSG_TMPL}" "${IMSG_DEST}" \
-    AS_TOKEN_IMESSAGE HS_TOKEN_IMESSAGE CLI_PATH
+    AS_TOKEN_IMESSAGE HS_TOKEN_IMESSAGE CLI_PATH LOCAL_MXID
   chmod 600 "${IMSG_DEST}"
   log "wrote imessage/daemon.json (tokens match imessage-registration.yaml; still fill self_handle + provide bin/imessage-cli)"
 fi

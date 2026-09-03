@@ -804,10 +804,20 @@ class Uplink:
 
     @staticmethod
     def room_name_from_sync(room):
-        for e in (((room or {}).get("state") or {}).get("events")) or []:
+        """Latest m.room.name from state AND timeline. /sync delivers state only
+        up to the start of the timeline window, so a recent rename (e.g. the
+        iMessage daemon's contact-name sync) rides in `timeline` — reading only
+        `state` returned None and every mirror was created as "conversation".
+        Timeline is chronological, so the last hit wins."""
+        name = None
+        events = ((((room or {}).get("state") or {}).get("events")) or []) \
+            + ((((room or {}).get("timeline") or {}).get("events")) or [])
+        for e in events:
             if isinstance(e, dict) and e.get("type") == "m.room.name":
-                return (e.get("content") or {}).get("name")
-        return None
+                n = (e.get("content") or {}).get("name")
+                if isinstance(n, str) and n:
+                    name = n
+        return name
 
     # -- reconcile ----------------------------------------------------------
     def full_sync(self):
@@ -1015,6 +1025,15 @@ class Uplink:
                 raise
             except urllib.error.HTTPError as e:
                 log.warning("share_level re-stamp %s failed: %s", rid, e)
+        # Keep kept mirrors' names in step with the local rooms (contact names
+        # arrive late; mirrors created before them said "conversation" forever).
+        for rid in plan["keep"]:
+            try:
+                self.sync_mirror_name(rid, self.room_name_from_sync(join.get(rid)))
+            except MasterUnreachable:
+                raise
+            except urllib.error.HTTPError as e:
+                log.warning("mirror rename %s failed: %s", rid, e)
         # Backfill/tail every kept + freshly-created room.
         for rid in sorted(set(plan["create"]) | set(plan["keep"])):
             self.sync_room(rid)
@@ -1048,6 +1067,29 @@ class Uplink:
                         (level, local_room_id))
         self.db.commit()
         log.info("share_level stamp %s -> %s", local_room_id, level)
+
+    def sync_mirror_name(self, local_room_id, name):
+        """Keep a kept mirror's m.room.name in step with the local room's.
+
+        Same diff pattern as stamp_share_level: last-pushed name tracked in
+        state.db meta ('mname:<local_room_id>'), a master PUT only on change,
+        recorded only after the 2xx. Without this, a mirror created before the
+        local room got its contact name (or created as "conversation" by the
+        old state-only name read) kept the stale name forever. Names are never
+        logged (hash-only discipline)."""
+        if not isinstance(name, str) or not name:
+            return
+        if self.meta_get("mname:" + local_room_id) == name:
+            return
+        row = self.mirror_for(local_room_id)
+        if not row:
+            return
+        master_room_id = row[0]
+        self.master("PUT", "/_matrix/client/v3/rooms/"
+                    + urllib.parse.quote(master_room_id, safe="")
+                    + "/state/m.room.name", {"name": name})
+        self.meta_set("mname:" + local_room_id, name)
+        log.info("mirror renamed %s", local_room_id)
 
     def create_mirror(self, local_room_id, source, name, profile=None, level=None):
         """Create a mirror room on MASTER, add to space, tag source, invite mgr.

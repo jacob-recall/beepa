@@ -121,6 +121,7 @@ def make_uplink(mirrors=(), policy=None, profiles=None, sync=None, migrated=Fals
     u.create_mirror = lambda rid, *a, **kw: u.created.append(rid)
     u.delete_mirror = lambda rid: u.deleted.append(rid)
     u.stamp_share_level = lambda rid, level: u.stamped.append((rid, level))
+    u.sync_mirror_name = lambda rid, name: None
     u.sync_room = lambda rid: u.synced.append(rid)
     return u
 

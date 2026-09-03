@@ -183,7 +183,17 @@ chmod 600 "${STATE_FILE}"
   echo "MASTER_TEAMMATE_USER='@${TEAMMATES[0]}:${SERVER}'"
   echo "MASTER_TEAMMATE_TOKEN='${ftok}'"
   echo "MASTER_SPACE_TEAMMATE='${fsp}'"
-} > "${TOKENS_FILE}"
+  # PRESERVE keys other scripts record into tokens.local: this rewrite used to
+  # silently drop MASTER_PUBLIC_URL/ENROLL_PUBLIC_URL (written by
+  # tailscale-serve.sh), so any later provisioning run — e.g. adding a
+  # teammate — broke enrollment handout back to the master's loopback URL.
+  # enroll.py's _advertised_hs_url() now refuses that state loudly; this keeps
+  # it from arising at all.
+  if [ -f "${TOKENS_FILE}" ]; then
+    grep -E "^(MASTER_PUBLIC_URL|ENROLL_PUBLIC_URL)='" "${TOKENS_FILE}" || true
+  fi
+} > "${TOKENS_FILE}.new"
+mv "${TOKENS_FILE}.new" "${TOKENS_FILE}"
 chmod 600 "${TOKENS_FILE}"
 log "wrote ${TOKENS_FILE} (mode 600)"
 log "done. teammates: ${TEAMMATES[*]}"

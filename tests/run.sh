@@ -24,6 +24,7 @@ python3 tests/unit/contact_consent_py.test.py
 python3 tests/unit/uplink_reconcile.test.py
 python3 tests/unit/uplink_contact_overrides.test.py
 python3 tests/unit/enroll_require_manager.test.py
+python3 tests/unit/enroll_public_url.test.py
 python3 tests/unit/enroll_delete_teammate.test.py
 python3 tests/unit/enroll_password_derivation.test.py
 python3 tests/conformance/consent_conformance.py

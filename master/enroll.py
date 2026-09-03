@@ -170,6 +170,29 @@ def _public_hs_url():
             or _cs_base()).rstrip("/")
 
 
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _advertised_hs_url():
+    """The CS-API base exchange() hands a REMOTE teammate — refuses a silent
+    loopback fallback. A teammate's uplink can never use the master's own
+    127.0.0.1, so advertising it is never a valid outcome of a remote
+    exchange: it produced a successful-LOOKING enrollment that was guaranteed
+    broken and cost a full debugging session to trace. An EXPLICIT loopback
+    (MASTER_PUBLIC_URL set in env or tokens.local) stays allowed so
+    single-host/local test setups keep working — the gate is on provenance
+    (silent fallback), not on the string."""
+    pub = _public_hs_url()
+    explicit = bool(os.environ.get("MASTER_PUBLIC_URL")
+                    or _tokens().get("MASTER_PUBLIC_URL"))
+    if not explicit and urllib.parse.urlparse(pub).hostname in _LOOPBACK_HOSTS:
+        raise EnrollError(
+            "MASTER_PUBLIC_URL is unset, so enrollment would hand out %s — "
+            "unusable from any other machine. Run ./master/tailscale-serve.sh "
+            "on the master to record the tailnet URL, then retry." % pub)
+    return pub
+
+
 def known_teammates():
     """Teammate localparts that provision.sh issued a scoped account for."""
     toks = _tokens()
@@ -459,6 +482,9 @@ def exchange(code):
         raise EnrollError("enrollment code expired")
 
     teammate = rec["teammate"]
+    # Resolve the advertised URL BEFORE minting/burning: a doomed exchange
+    # (silent loopback fallback) must not consume the single-use code.
+    advertised = _advertised_hs_url()
     mxid, space = _teammate_facts(teammate)
     cs_base = _cs_base()
     manager = _tokens().get("MASTER_MANAGER_USER", "")
@@ -470,7 +496,7 @@ def exchange(code):
     _save_store(store)
 
     return {
-        "master_hs_url": _public_hs_url(),   # tailnet URL for the teammate's uplink
+        "master_hs_url": advertised,         # tailnet URL for the teammate's uplink
         "master_user": mxid,
         "master_token": token,
         "manager_mxid": manager,
@@ -879,6 +905,12 @@ def _make_handler():
             env = os.environ.get("ENROLL_PUBLIC_URL")
             if env:
                 return env.rstrip("/")
+            # tokens.local is recorded by master/tailscale-serve.sh — prefer it
+            # over the Host header: a manager console calling over loopback
+            # would otherwise mint an enroll URL no teammate can reach.
+            tok = _tokens().get("ENROLL_PUBLIC_URL")
+            if tok:
+                return tok.rstrip("/")
             host = self.headers.get("Host")
             if host:
                 return "http://" + host

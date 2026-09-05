@@ -1,10 +1,11 @@
+import { feedRelTime } from '../model/message_preview.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
 import { feedIsHidden, refreshConvos } from './account-data.js';
 import { $, el, sanitizeLine } from './el.js';
 import { buildConvoRow, buildFeedRow, elEmpty } from './rows.js';
-import { SOURCES } from './sources.js';
+import { SOURCES } from '../model/source_catalog.js';
 import { S, convosBySource, feedModel } from '../state.js';
 
 // Optional app-injected hook: called with the sourceId whenever the per-source
@@ -22,17 +23,6 @@ function scheduleFeedRender() {
   if (S.feedRenderScheduled) return;
   S.feedRenderScheduled = true;
   setTimeout(() => { S.feedRenderScheduled = false; renderHome(); }, 0);
-}
-
-function feedRelTime(ts) {
-  const d = Date.now() - ts;
-  if (d < 0) return '';
-  if (d < 60000) return 'now';
-  if (d < 3600000) return Math.floor(d / 60000) + 'm';
-  if (d < 86400000) return Math.floor(d / 3600000) + 'h';
-  if (d < 604800000) return Math.floor(d / 86400000) + 'd';
-  const dt = new Date(ts);
-  return (dt.getMonth() + 1) + '/' + dt.getDate();
 }
 
 // HF-8: render the merged feed sorted by recency, capped at ~200 rows. The

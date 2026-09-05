@@ -1,3 +1,4 @@
+import { feedPreviewFromEvent } from '../model/message_preview.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -113,26 +114,6 @@ async function refreshConvos() {
 // never `formatted_body`. Media msgtypes yield a STATIC label, never the
 // bridged filename/body. Reactions/redactions/receipts/typing/state are not
 // messages and return null (they never update lastBody/lastTs).
-function feedPreviewFromEvent(ev) {
-  if (!ev || ev.type !== 'm.room.message' || !ev.content) return null;
-  let content = ev.content;
-  const rel = content['m.relates_to'];
-  if (rel && rel.rel_type === 'm.replace') {        // edit: read m.new_content.body only
-    content = content['m.new_content'];
-    if (!content) return null;
-  }
-  const mt = content.msgtype;
-  let body;
-  if ((mt === 'm.text' || mt === 'm.notice') && typeof content.body === 'string') {
-    body = content.body;                            // text/notice: the real (sanitized-on-render) body
-  } else if (mt === 'm.image') { body = 'Photo'; }  // media: static label ONLY (never the filename)
-  else if (mt === 'm.video') { body = 'Video'; }
-  else if (mt === 'm.audio') { body = 'Audio'; }
-  else if (mt === 'm.file')  { body = 'File'; }
-  else { return null; }                             // anything else is not a previewable message
-  return { body, ts: typeof ev.origin_server_ts === 'number' ? ev.origin_server_ts : 0 };
-}
-
 // HF-5: keep only the LAST qualifying message in a room's timeline slice.
 function feedLastPreview(room) {
   const tl = (room && room.timeline && room.timeline.events) || [];

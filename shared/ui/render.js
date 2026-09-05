@@ -1,7 +1,7 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { feedPreviewFromEvent } from './account-data.js';
+import { feedPreviewFromEvent } from '../model/message_preview.js';
 import { api } from '../matrix/client.js';
 import { $, el, sanitize, sanitizeLine, txn, appendLinkified } from './el.js';
 import { IMSG_BOT_MXID } from './sources.js';

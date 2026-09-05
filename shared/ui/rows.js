@@ -3,8 +3,8 @@
 
 import { openConvo } from './chat.js';
 import { $, el, sanitizeLine } from './el.js';
-import { feedRelTime } from './search.js';
-import { SOURCES } from './sources.js';
+import { feedRelTime } from '../model/message_preview.js';
+import { SOURCES } from '../model/source_catalog.js';
 import { feedModel, runtime } from '../state.js';
 
 // Optional app-injected per-row decorator (e.g. apps/user's share controls,

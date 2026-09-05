@@ -20,6 +20,9 @@ import { S, convoSeen, feedModel, runtime } from '../state.js';
 const convoCache = new Map();
 const CACHE_MAX_ROOMS = 20;
 const CACHE_MAX_EVENTS = 60;
+let cacheSession = null;
+let convoEpoch = 0;
+let activeWatch = null;
 
 // Only cache events that actually resolve to a renderable message (mirrors
 // what renderMessageEvent would keep) — no point spending cache slots on
@@ -83,6 +86,10 @@ function convoSetStatus(text) {
 async function openConvo(roomId) {
   if (!ROOMID_RE.test(roomId) || !S.joinedSet.has(roomId)) return;  // reject unvalidated ids
   stopConvoWatch();                                 // stop any prior room's watch first
+  const epoch = convoEpoch;
+  const session = S.token;
+  if (cacheSession !== session) { convoCache.clear(); cacheSession = session; }
+  const current = () => epoch === convoEpoch && S.token === session && S.openRoomId === roomId;
   S.openRoomId = roomId;
   convoSeen.clear();
   convoSetStatus('');
@@ -125,6 +132,7 @@ async function openConvo(roomId) {
   try {
     const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50';
     const data = await api('GET', q);
+    if (!current()) return;
     const chunk = Array.isArray(data.chunk) ? data.chunk.slice().reverse() : [];  // b -> chronological
     cacheAppend(roomId, chunk.filter(isCacheable));   // keep the cache warm regardless of the guard below
     if (S.openRoomId === roomId) {                    // guard: user may have switched rooms mid-fetch
@@ -134,9 +142,9 @@ async function openConvo(roomId) {
       if (box) box.scrollTop = box.scrollHeight;
     }
   } catch (e) {
-    convoSetStatus('Could not load messages: ' + String(e.message || e));  // CV-R3: status, not a bubble
+    if (current()) convoSetStatus('Could not load messages: ' + String(e.message || e));
   }
-  startConvoWatch(roomId);
+  if (current()) startConvoWatch(roomId);
 }
 
 // CV-I1 / CV-4: a THIRD independent long-poll, server-filtered to the open room
@@ -144,20 +152,27 @@ async function openConvo(roomId) {
 // appends ONLY to #convo-messages (via renderMessageEvent) and references none
 // of the command/console symbols. 25s long-poll timeout + 3s error backoff.
 async function startConvoWatch(roomId) {
-  if (S.convoRunning) return;
+  if (!S.token || S.openRoomId !== roomId || activeWatch) return;
+  const owner = { room: roomId, token: S.token, epoch: convoEpoch, since: null };
+  activeWatch = owner;
+  const current = () => activeWatch === owner && convoEpoch === owner.epoch &&
+    S.token === owner.token && S.openRoomId === owner.room;
   S.convoRunning = true;
   S.convoSince = null;
   const watchRoom = roomId;
-  while (S.convoRunning && S.token && S.openRoomId === watchRoom) {
+  try {
+  while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
         room: { rooms: [watchRoom], timeline: { limit: 20 }, state: { types: [] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
-        (S.convoSince ? '&since=' + encodeURIComponent(S.convoSince) : '');
+        (owner.since ? '&since=' + encodeURIComponent(owner.since) : '');
       const data = await api('GET', q);
-      S.convoSince = data.next_batch;
+      if (!current()) return;
+      owner.since = data.next_batch;
+      S.convoSince = owner.since;
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[watchRoom];                 // read ONLY the open room's timeline
       if (room && room.timeline && Array.isArray(room.timeline.events) && S.openRoomId === watchRoom) {
@@ -172,13 +187,19 @@ async function startConvoWatch(roomId) {
         if (box) box.scrollTop = box.scrollHeight;
       }
     } catch (e) {
-      if (!S.token) { S.convoRunning = false; return; }
+      if (!current()) return;
       await new Promise(r => setTimeout(r, 3000));
     }
   }
+  } finally {
+    if (activeWatch === owner) { activeWatch = null; S.convoRunning = false; }
+  }
 }
 function stopConvoWatch() {
+  convoEpoch += 1;
+  activeWatch = null;
   S.convoRunning = false;
+  S.convoSince = null;
   S.openRoomId = null;
 }
 

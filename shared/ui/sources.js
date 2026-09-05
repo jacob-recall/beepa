@@ -10,28 +10,7 @@ import { S, runtime } from '../state.js';
 // No remote/bridged data selects what the sidebar renders or which space it
 // reads. `all` is the embedded Element pane; the others name a Matrix space
 // and a management bot. `canStartChat` is the Directory capability gate (D-1).
-const SOURCES = [
-  { id: 'all', label: 'All chats', kind: 'all', icon: '💬' },
-  { id: 'whatsapp', label: 'WhatsApp', kind: 'source', botMxid: '@whatsappbot:localhost',
-    spaceName: 'WhatsApp', canStartChat: true, icon: '🟢',
-    blurb: 'Link your personal WhatsApp; chats appear as rooms in Element.' },
-  { id: 'imessage', label: 'iMessage', kind: 'source', botMxid: '@imessagebot:localhost',
-    spaceName: 'iMessage', mgmtMarker: 'com.jkali.bridge.mgmt', canStartChat: true,
-    icon: '🔵',
-    blurb: 'Bridge iMessage from this Mac; grant the permissions once and chats appear in Element.' },
-  { id: 'gmessages', label: 'Google Messages', kind: 'source', botMxid: '@gmessagesbot:localhost',
-    spaceName: 'Google Messages', canStartChat: true, icon: '📱',
-    blurb: 'Link your Google account with a quick sign-in; your chats appear as rooms in Element.' },
-  { id: 'instagram', label: 'Instagram', kind: 'source', botMxid: '@instagrambot:localhost',
-    spaceName: 'Instagram', canStartChat: true, icon: '📷',
-    blurb: 'Bridge your Instagram DMs: sign into instagram.com, then run the connect helper (it copies your session for one paste); chats appear as rooms in Element.' },
-  { id: 'linkedin', label: 'LinkedIn', kind: 'source', botMxid: '@linkedinbot:localhost',
-    spaceName: 'LinkedIn', canStartChat: false, icon: '💼',
-    blurb: 'Bridge your LinkedIn messages: sign into linkedin.com, then run the connect helper — it links automatically; chats appear as rooms in Element.' },
-  { id: 'twitter', label: 'X', kind: 'source', botMxid: '@twitterbot:localhost',
-    spaceName: 'Twitter', canStartChat: true, icon: '✖️',
-    blurb: 'Bridge your X (Twitter) DMs: sign into x.com, then run the connect helper — it links automatically; chats appear as rooms in Element.' },
-];
+import { SOURCES } from '../model/source_catalog.js';
 const WA = SOURCES.find(s => s.id === 'whatsapp');
 const IMSG = SOURCES.find(s => s.id === 'imessage');
 const GMSG = SOURCES.find(s => s.id === 'gmessages');

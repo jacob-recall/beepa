@@ -30,6 +30,8 @@ import {
   localpart, spaceLabelFor, invitesToJoin, acceptedSpaces, verifiedChildIds, ROOM_SHAPE_RE,
 } from './invites.js';
 import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers } from './hidden.js';
+import { masterTransport } from './transport.js';
+import { PLATFORM_ICON, PLATFORM_LABEL } from '../../shared/model/source_catalog.js';
 
 // Per-browser hidden-teammate labels (localStorage). Convenience only.
 const HIDDEN_KEY = 'beepa_hidden_teammates';
@@ -38,13 +40,16 @@ const HIDDEN_KEY = 'beepa_hidden_teammates';
 // Authenticated media (Synapse default) cannot be fetched by a bare <img src>
 // — the token must ride in an Authorization header — so real media is fetched
 // as bytes with S.token and shown via an object URL (CSP allows img/media blob:).
-const MASTER_BASE = 'http://127.0.0.1:8018';
+const MASTER_TRANSPORT = masterTransport(globalThis.location || {
+  hostname: '127.0.0.1', port: '8011', origin: 'http://127.0.0.1:8011',
+}, globalThis.BEEPA_MASTER_CONFIG);
+const MASTER_BASE = MASTER_TRANSPORT.csBase;
 
 // The master enroll/admin service (master/enroll.py serve). Manager-authenticated
 // POSTs: /admin/add-teammate and /admin/delete-teammate. Neither is a Matrix
 // send path nor a proposal. The service verifies the caller is @manager:master
 // before doing anything. CSP connect-src is extended by exactly this origin.
-const ENROLL_BASE = 'http://127.0.0.1:8019';
+const ENROLL_BASE = MASTER_TRANSPORT.enrollBase;
 
 // The two custom room-state types the uplink stamps on a teammate's dedicated
 // "Contacts" room (agents/uplink/uplink.py): CONTACTS_MARKER on the room itself
@@ -74,7 +79,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // server_name ("master") — see master/docker-compose.master.yml + provision.sh.
 // This call only affects THIS page's module instance of shared/matrix/client.js
 // (each document gets its own ES module graph), so apps/user is unaffected.
-configureMatrixBase({ csBase: 'http://127.0.0.1:8018', serverName: 'master' });
+configureMatrixBase({ csBase: MASTER_BASE, serverName: MASTER_TRANSPORT.serverName });
 
 // ---- master-local state (deliberately separate from shared/state.js's S,
 // whose other fields — qr, activeSettingsSource, feedLowPriority, ... — are
@@ -521,14 +526,7 @@ function relTime(ts) {
 
 // Badge derived ONLY from the room's own com.jkali.source state (read in
 // parseSnapshot above) — never a bridged message field.
-const PLATFORM_ICON = {
-  whatsapp: '🟢', imessage: '🔵', gmessages: '📱',
-  instagram: '📷', linkedin: '💼', twitter: '✖️',
-};
-const PLATFORM_LABEL = {
-  whatsapp: 'WhatsApp', imessage: 'iMessage', gmessages: 'Google Messages',
-  instagram: 'Instagram', linkedin: 'LinkedIn', twitter: 'X (Twitter)',
-};
+
 function buildPlatBadge(sourceId) {
   const safe = typeof sourceId === 'string' ? sourceId.replace(/[^a-z]/g, '') : '';
   const cls = 'plat-badge' + (safe ? ' ' + safe : '');
@@ -1967,7 +1965,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     // apps/master/session.local.json with the manager token. Loopback-only,
     // same-origin fetch (CSP connect-src 'self'). GET only — no non-GET call is
     // added here, so harness scenario 7's write-surface scan is unaffected.
-    try {
+    if (MASTER_TRANSPORT.allowLocalBootstrap) try {
       const r = await fetch('session.local.json', { cache: 'no-store' });
       if (r.ok) {
         const s = await r.json();

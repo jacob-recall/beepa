@@ -19,10 +19,21 @@ log()  { printf '[master-setup] %s\n' "$*" >&2; }
 step() { printf '\n[master-setup] === %s ===\n' "$*" >&2; }
 fail() { printf '[master-setup] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Real teammate roster (space-separated). Defaults to the local user so a
-# single-machine dogfood works; add more names or set TEAMMATES=... to include
-# others up front (provision.sh is idempotent and also grows via the console).
-TEAMMATES="${TEAMMATES:-jkali}"
+# provision.sh adopts the complete existing roster; an explicit TEAMMATES
+# value may add accounts, but a routine setup must not replace the roster.
+python3 "${HERE}/install_config.py" --root "${HERE}" ensure --role master >/dev/null
+BEEPA_INSTALL_ROOT="$(python3 "${HERE}/install_config.py" --root "${HERE}" initialize-state)"
+export BEEPA_INSTALL_ROOT
+BEEPA_MASTER_STATE_DIR="$(python3 - "${HERE}/.beepa-install.json" <<'PYCODE'
+import json, sys
+from pathlib import Path
+data = json.load(open(sys.argv[1]))
+print(data.get('master_state_root', str(Path(data['state_root']) / 'master')))
+PYCODE
+)"
+export BEEPA_MASTER_STATE_DIR
+BEEPA_PYTHON="$(python3 "${HERE}/install_config.py" --root "${HERE}" runtime)"
+export BEEPA_PYTHON
 
 # --------------------------------------------------------------------------
 step "Preflight"
@@ -38,7 +49,7 @@ if ! command -v docker >/dev/null 2>&1; then
     fail "Docker Desktop is installed but its CLI isn't available. Launch it, wait for it to start, then re-run master-setup.sh."
   elif command -v brew >/dev/null 2>&1; then
     log "Docker not found — installing Docker Desktop via Homebrew…"
-    brew install --cask docker || fail "brew install failed — install Docker Desktop manually: https://www.docker.com/products/docker-desktop/"
+    HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask docker || fail "brew install failed — install Docker Desktop manually: https://www.docker.com/products/docker-desktop/"
   else
     fail "Docker not found and Homebrew unavailable. Install Docker Desktop, then re-run: https://www.docker.com/products/docker-desktop/"
   fi
@@ -70,7 +81,7 @@ done
 
 # --------------------------------------------------------------------------
 step "Step 1/6 — mint master/.env if absent"
-ENV_FILE="${HERE}/master/.env"
+ENV_FILE="${BEEPA_MASTER_STATE_DIR:-${BEEPA_INSTALL_ROOT}/master}/.env"
 if [ ! -f "${ENV_FILE}" ]; then
   if command -v openssl >/dev/null 2>&1; then PW="$(openssl rand -hex 32)"
   else PW="$(head -c 48 /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | head -c 64)"; fi
@@ -93,8 +104,16 @@ step "Step 2/6 — render master Synapse config + mint secrets"
 
 # --------------------------------------------------------------------------
 step "Step 3/6 — bring the matrix-master stack up"
-docker compose -p matrix-master --env-file "${ENV_FILE}" \
-  -f "${HERE}/master/docker-compose.master.yml" up -d
+python3 "${HERE}/install_config.py" --root "${HERE}" compose --role master -- up -d
+if python3 - "${BEEPA_MASTER_STATE_DIR:-${BEEPA_INSTALL_ROOT}/master}/.beepa-config/last-render.json" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+sys.exit(0 if p.exists() and "synapse/homeserver.yaml" in json.loads(p.read_text()).get("changed", []) else 1)
+PY
+then
+  python3 "${HERE}/install_config.py" --root "${HERE}" compose --role master -- restart synapse
+fi
 
 step "Step 4/6 — wait for the master Synapse to be healthy"
 up=0
@@ -107,7 +126,7 @@ log "master Synapse is up (127.0.0.1:8018)"
 
 # --------------------------------------------------------------------------
 step "Step 5/6 — provision manager + teammate accounts and spaces"
-TEAMMATES="${TEAMMATES}" "${HERE}/master/provision.sh"
+"${HERE}/master/provision.sh"
 
 # Passwordless auto-login for the manager console: mint a console-session token
 # and write it where apps/master fetches it (apps/master/session.local.json,
@@ -127,8 +146,8 @@ except Exception:
 PY
 )"
   if [ -n "${MTOK}" ]; then
-    ( umask 077; printf '{"user_id":"@manager:master","access_token":"%s"}\n' "${MTOK}" > "${HERE}/apps/master/session.local.json" )
-    chmod 600 "${HERE}/apps/master/session.local.json"
+    ( umask 077; printf '{"user_id":"@manager:master","access_token":"%s"}\n' "${MTOK}" > "${BEEPA_INSTALL_ROOT}/apps/master/session.local.json" )
+    chmod 600 "${BEEPA_INSTALL_ROOT}/apps/master/session.local.json"
     log "passwordless login enabled for apps/master (no password screen)"
   fi
 fi
@@ -139,14 +158,8 @@ LA_DIR="${HOME}/Library/LaunchAgents"; mkdir -p "${LA_DIR}" "${HERE}/master/logs
 PLIST_SRC="${HERE}/master/com.jkali.master-enroll.plist"
 PLIST_DST="${LA_DIR}/com.jkali.master-enroll.plist"
 if [ -f "${PLIST_SRC}" ] && command -v launchctl >/dev/null 2>&1; then
-  cp "${PLIST_SRC}" "${PLIST_DST}"
-  # Rewrite the author's baked-in absolute path to THIS clone's path so the
-  # launchd service starts wherever the master was cloned.
-  sed -i '' "s#/Users/jkali/work/pm_mng#${HERE}#g" "${PLIST_DST}" 2>/dev/null \
-    || sed -i "s#/Users/jkali/work/pm_mng#${HERE}#g" "${PLIST_DST}"
-  launchctl unload "${PLIST_DST}" 2>/dev/null || true
-  if launchctl load "${PLIST_DST}" 2>/dev/null; then log "loaded com.jkali.master-enroll"
-  else log "could not launchctl load; run: launchctl load '${PLIST_DST}'"; fi
+  python3 "${HERE}/install_config.py" --root "${HERE}" install-agent master-enroll
+  log "loaded org.beepa.master-enroll"
   sleep 1
   curl -fsS http://127.0.0.1:8019/enroll/health >/dev/null 2>&1 \
     && log "enroll service answering on 127.0.0.1:8019" \
@@ -155,10 +168,23 @@ else
   log "skip enroll service: plist or launchctl unavailable — run 'python3 master/enroll.py serve' manually"
 fi
 
+if command -v launchctl >/dev/null 2>&1; then
+  python3 "${HERE}/install_config.py" --root "${HERE}" install-agent master-gateway
+fi
+
 if [ -x "${HERE}/master/tailscale-serve.sh" ]; then
   "${HERE}/master/tailscale-serve.sh" || log "Tailscale exposure skipped/failed (non-fatal) — see above"
 else
   log "master/tailscale-serve.sh missing — master reachable on 127.0.0.1 only"
+fi
+
+# The web interface is shared with the teammate install, but can start without
+# its database/config. Same Compose project/service avoids a second :8011 bind.
+# Never remove orphans here: the teammate services may be running alongside it.
+step "Install the master app and start its web interface"
+python3 "${HERE}/install_config.py" --root "${HERE}" compose --role local-ui -- up -d views
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  python3 "${HERE}/desktop/install_apps.py" --role master
 fi
 
 # --------------------------------------------------------------------------
@@ -166,7 +192,8 @@ cat >&2 <<DONE
 
 [master-setup] ============================================================
 [master-setup] Master is set up.
-  Manager console:  open apps/master/index.html against 127.0.0.1:8018
+  Manager app:      open Beepa Master.app in ~/Applications (macOS).
+  Browser address:  http://127.0.0.1:8011/apps/master/index.html
   Manager login:    username 'manager', password from:
                       python3 master/enroll.py password manager --manager
   Onboard a teammate (them, or you on the hub side of this machine):

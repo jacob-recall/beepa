@@ -99,11 +99,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    from .recovery import Registry, RecoveryError
+except ImportError:
+    from recovery import Registry, RecoveryError
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(HERE, ".provision-state.local")
-TOKENS_FILE = os.path.join(HERE, "tokens.local")
-SECRETS_FILE = os.path.join(HERE, "synapse", ".secrets.local")
-DEFAULT_STORE = os.path.join(HERE, "enrollments.local")
+sys.path.insert(0, os.path.dirname(HERE))
+from http_limits import read_body
+INSTALL_ROOT = os.environ.get("BEEPA_INSTALL_ROOT", os.path.dirname(HERE))
+DATA_DIR = os.path.abspath(os.environ.get("BEEPA_MASTER_STATE_DIR") or os.path.join(INSTALL_ROOT, "master"))
+STATE_FILE = os.path.join(DATA_DIR, ".provision-state.local")
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.local")
+SECRETS_FILE = os.path.join(DATA_DIR, "synapse", ".secrets.local")
+DEFAULT_STORE = os.path.join(DATA_DIR, "enrollments.local")
 DEFAULT_CS_BASE = "http://127.0.0.1:8018"
 DEFAULT_SERVE_PORT = 8019
 DEFAULT_TTL = int(os.environ.get("ENROLL_TTL", "600"))  # 10 minutes
@@ -199,7 +208,7 @@ def known_teammates():
     out = []
     for k in toks:
         m = re.match(r"^MASTER_([A-Z0-9]+)_USER$", k)
-        if m and m.group(1) != "MANAGER":
+        if m and m.group(1) not in ("MANAGER", "TEAMMATE"):
             out.append(m.group(1).lower())
     return sorted(out)
 
@@ -496,12 +505,55 @@ def exchange(code):
     _save_store(store)
 
     return {
+        **_recovery_registry().manifest(),
         "master_hs_url": advertised,         # tailnet URL for the teammate's uplink
         "master_user": mxid,
         "master_token": token,
         "manager_mxid": manager,
         "master_space": space,
     }
+
+
+def _recovery_registry():
+    return Registry(os.path.join(os.path.dirname(STATE_FILE), "recovery.local.json"))
+
+
+def issue_recovery(token, install_id, recovery_token):
+    if not token:
+        raise HttpError(401, "missing bearer token")
+    who = _whoami(_cs_base(), token)
+    if not who:
+        raise HttpError(401, "invalid or expired token")
+    user = next((name for name in known_teammates()
+                 if _tokens().get("MASTER_%s_USER" % _key(name)) == who), None)
+    if not user or who == _manager_mxid():
+        raise HttpError(403, "recovery is scoped to an enrolled teammate")
+    return _recovery_registry().issue(user, install_id, recovery_token)
+
+
+def recover_pairing(install_id, recovery_token, authority):
+    with _recovery_registry().authorized(install_id, recovery_token, authority) as (user, manifest):
+        if user not in known_teammates():
+            raise RecoveryError("Pairing is no longer enrolled")
+        advertised = _advertised_hs_url()
+        account = provision_account(user)
+        token, mxid = account["token"], account["mxid"]
+        U = _key(user)
+        space = _tokens().get("MASTER_SPACE_%s" % U, "")
+        status = 404
+        if space:
+            status, _ = _request("GET", _cs_base() + "/_matrix/client/v3/rooms/"
+                + urllib.parse.quote(space, safe="") + "/state/m.room.create/",
+                headers={"Authorization": "Bearer " + token})
+        if status in (403, 404):
+            space = _create_space(_cs_base(), token, user)
+        elif status != 200:
+            raise EnrollError("Cannot verify recovery destination")
+        _upsert_shell_vars(STATE_FILE, {"SPACE_%s" % U: space}, "# Master provisioning state")
+        _upsert_shell_vars(TOKENS_FILE, {"MASTER_%s_USER" % U: mxid,
+            "MASTER_%s_TOKEN" % U: token, "MASTER_SPACE_%s" % U: space}, "# Master scoped tokens")
+        return dict(manifest, master_hs_url=advertised, master_user=mxid, master_token=token,
+                    master_space=space, manager_mxid=_manager_mxid())
 
 
 # ------------------------------------------------------------------ admin: add-teammate
@@ -839,6 +891,7 @@ def delete_teammate(token, username):
     if user not in known_teammates():
         raise EnrollError("unknown or unprovisioned teammate: %s" % user)
 
+    _recovery_registry().revoke_user(user)
     cs_base = _cs_base()
     mxid = "@%s:%s" % (user, _server_name())
     password = derive_password("teammate", user)
@@ -869,6 +922,10 @@ def _make_handler():
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(5)
+
         def log_message(self, *a):  # quiet; avoid noisy stderr access logs
             pass
 
@@ -892,8 +949,11 @@ def _make_handler():
             self.wfile.write(payload)
 
         def _read_json_body(self):
-            n = int(self.headers.get("Content-Length") or "0")
-            return json.loads(self.rfile.read(n) or b"{}")
+            raw = read_body(self, 65536)
+            data = json.loads(raw or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("request must be an object")
+            return data
 
         def _bearer(self):
             auth = self.headers.get("Authorization", "") or ""
@@ -931,10 +991,29 @@ def _make_handler():
         def do_GET(self):
             if self.path == "/enroll/health":
                 self._json(200, {"status": "ok"})
+            elif self.path == "/enroll/manifest":
+                self._json(200, _recovery_registry().manifest())
             else:
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path in ("/enroll/recovery/issue", "/enroll/recovery"):
+                try:
+                    data = self._read_json_body()
+                    if self.path.endswith("/issue"):
+                        result = issue_recovery(self._bearer(), data.get("install_id"), data.get("recovery_token"))
+                    else:
+                        result = recover_pairing(data.get("install_id"), data.get("recovery_token"), data.get("master_authority_id"))
+                    self._json(200, result)
+                except HttpError as error:
+                    self._json(error.status, {"error": str(error)})
+                except RecoveryError as error:
+                    self._json(403, {"error": str(error)})
+                except (ValueError, TypeError, TimeoutError):
+                    self._json(400, {"error": "malformed recovery request"})
+                except Exception:
+                    self._json(502, {"error": "recovery currently unavailable"})
+                return
             if self.path == "/admin/add-teammate":
                 self._admin_add_teammate()
                 return
@@ -947,7 +1026,7 @@ def _make_handler():
             try:
                 data = self._read_json_body()
                 code = data.get("code")
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, TimeoutError):
                 self._json(400, {"error": "malformed request"}, cors=True)
                 return
             if not code or not isinstance(code, str):
@@ -964,8 +1043,18 @@ def _make_handler():
         def _admin_add_teammate(self):
             token = self._bearer()
             try:
+                _require_manager(token)
+            except HttpError as e:
+                self.close_connection = True
+                self._json(e.status, {"error": str(e)}, cors=True)
+                return
+            except Exception:
+                self.close_connection = True
+                self._json(502, {"error": "manager authentication unavailable"}, cors=True)
+                return
+            try:
                 data = self._read_json_body()
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, TimeoutError):
                 self._json(400, {"error": "malformed request"}, cors=True)
                 return
             username = data.get("username") if isinstance(data, dict) else None
@@ -982,8 +1071,18 @@ def _make_handler():
         def _admin_delete_teammate(self):
             token = self._bearer()
             try:
+                _require_manager(token)
+            except HttpError as e:
+                self.close_connection = True
+                self._json(e.status, {"error": str(e)}, cors=True)
+                return
+            except Exception:
+                self.close_connection = True
+                self._json(502, {"error": "manager authentication unavailable"}, cors=True)
+                return
+            try:
                 data = self._read_json_body()
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, TimeoutError):
                 self._json(400, {"error": "malformed request"}, cors=True)
                 return
             username = data.get("username") if isinstance(data, dict) else None

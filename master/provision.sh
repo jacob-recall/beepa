@@ -8,9 +8,8 @@
 # power level (events_default 50, teammate PL 100, manager PL 0).
 #
 # The teammate roster is the real people who sync to this master — set via the
-# TEAMMATES env var (space-separated usernames), default "jkali". The
-# integration harness, which needs two isolated teammates for the cross-user
-# isolation scenario, runs this with TEAMMATES="alice bob".
+# TEAMMATES env var (space-separated additions). Existing roster entries are
+# always retained. A new master may have only the manager until teammates join.
 #
 # Re-running is safe: existing accounts are skipped, tokens refreshed, and a
 # space already recorded (and still joined) is not recreated.
@@ -26,8 +25,9 @@ export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 CS_BASE="${MASTER_CS_BASE:-http://127.0.0.1:8018}"
 COMPOSE=(docker compose -p matrix-master -f "${HERE}/docker-compose.master.yml")
 HS_YAML="/data/homeserver.yaml"          # path inside the synapse container
-TOKENS_FILE="${HERE}/tokens.local"
-STATE_FILE="${HERE}/.provision-state.local"
+DATA_DIR="${BEEPA_MASTER_STATE_DIR:-${BEEPA_INSTALL_ROOT:-$(dirname "${HERE}")}/master}"
+TOKENS_FILE="${DATA_DIR}/tokens.local"
+STATE_FILE="${DATA_DIR}/.provision-state.local"
 SERVER="master"
 
 MANAGER_LP="manager"
@@ -49,11 +49,15 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'; }
 # --- passwords + persisted roster: read persisted values (if any) ---
 # shellcheck disable=SC1090
 [ -s "${STATE_FILE}" ] && source "${STATE_FILE}" || true
+PERSISTED_TEAMMATES="${TEAMMATES:-}"
+[ -s "${TOKENS_FILE}" ] && source "${TOKENS_FILE}" || true
 
 # Roster resolution: explicit env override wins; else the persisted roster the
 # last provision / console-add wrote (sourced just above as a scalar TEAMMATES);
 # else the single real user "jkali".
-read -r -a TEAMMATES <<< "${ENV_TEAMMATES:-${TEAMMATES:-jkali}}"
+ROSTER="$(python3 "${HERE}/roster.py" "${PERSISTED_TEAMMATES}" "${MASTER_TEAMMATES:-}" "${ENV_TEAMMATES}")" \
+  || fail "invalid teammate roster"
+read -r -a TEAMMATES <<< "${ROSTER}"
 
 # Passwords are DERIVED, never stored: master/enroll.py provision-account
 # registers/logs-in each account from TEAMMATE_PASSWORD_KEY (synapse/
@@ -72,6 +76,16 @@ provision_account() {
   /usr/bin/python3 "${ENROLL_PY}" provision-account "$1" ${2:+"$2"}
 }
 json_field() { python3 -c 'import sys,json;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+
+# Keep saved scoped tokens stable when they still authenticate as the expected
+# account. provision-account still validates/migrates the derived password.
+token_valid() {
+  local token="$1" expected="$2"
+  [ -n "${token}" ] || return 1
+  curl -fsS --max-time 15 -H "Authorization: Bearer ${token}" \
+    "${CS_BASE}/_matrix/client/v3/account/whoami" \
+    | python3 -c 'import json,sys;sys.exit(json.load(sys.stdin).get("user_id") != sys.argv[1])' "${expected}" 2>/dev/null
+}
 
 # --- wait for Synapse health ---
 log "waiting for Synapse CS API at ${CS_BASE} ..."
@@ -123,6 +137,9 @@ JSON
 log "provisioning @${MANAGER_LP}:${SERVER} (derived password; migrating any legacy one)"
 acct=$(provision_account "${MANAGER_LP}" --manager) || fail "manager provisioning failed — see enroll.py stderr above"
 MANAGER_TOKEN=$(printf '%s' "${acct}" | json_field token) || fail "manager: no token in provision-account output"
+if token_valid "${MASTER_MANAGER_TOKEN:-}" "@${MANAGER_LP}:${SERVER}"; then
+  MANAGER_TOKEN="${MASTER_MANAGER_TOKEN}"
+fi
 [ -n "${MANAGER_TOKEN}" ] || fail "manager: empty token"
 [ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${MANAGER_LP}: migrated to derived password (existing sessions kept)"
 
@@ -139,6 +156,8 @@ for t in "${TEAMMATES[@]}"; do
   log "provisioning @${t}:${SERVER}"
   acct=$(provision_account "$t") || fail "provisioning @${t} failed — see enroll.py stderr above"
   tok=$(printf '%s' "${acct}" | json_field token) || fail "@${t}: no token in provision-account output"
+  eval "oldtok=\${MASTER_${U}_TOKEN:-}"
+  if token_valid "${oldtok}" "@${t}:${SERVER}"; then tok="${oldtok}"; fi
   [ -n "${tok}" ] || fail "@${t}: empty token"
   [ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${t}: migrated to derived password (existing sessions kept)"
   eval "TOKEN_${U}=\${tok}"
@@ -179,10 +198,12 @@ chmod 600 "${STATE_FILE}"
   done
   # Convenience aliases for the FIRST teammate (the default single-user slot),
   # so callers can source stable MASTER_TEAMMATE_* without knowing the name.
-  FT=$(upper "${TEAMMATES[0]}"); eval "ftok=\${TOKEN_${FT}}"; eval "fsp=\${SPACE_${FT}:-}"
-  echo "MASTER_TEAMMATE_USER='@${TEAMMATES[0]}:${SERVER}'"
-  echo "MASTER_TEAMMATE_TOKEN='${ftok}'"
-  echo "MASTER_SPACE_TEAMMATE='${fsp}'"
+  if [ -n "${TEAMMATES[*]:-}" ]; then
+    FT=$(upper "${TEAMMATES[0]}"); eval "ftok=\${TOKEN_${FT}}"; eval "fsp=\${SPACE_${FT}:-}"
+    echo "MASTER_TEAMMATE_USER='@${TEAMMATES[0]}:${SERVER}'"
+    echo "MASTER_TEAMMATE_TOKEN='${ftok}'"
+    echo "MASTER_SPACE_TEAMMATE='${fsp}'"
+  fi
   # PRESERVE keys other scripts record into tokens.local: this rewrite used to
   # silently drop MASTER_PUBLIC_URL/ENROLL_PUBLIC_URL (written by
   # tailscale-serve.sh), so any later provisioning run — e.g. adding a
@@ -193,7 +214,7 @@ chmod 600 "${STATE_FILE}"
     grep -E "^(MASTER_PUBLIC_URL|ENROLL_PUBLIC_URL)='" "${TOKENS_FILE}" || true
   fi
 } > "${TOKENS_FILE}.new"
-mv "${TOKENS_FILE}.new" "${TOKENS_FILE}"
+mv -f "${TOKENS_FILE}.new" "${TOKENS_FILE}"
 chmod 600 "${TOKENS_FILE}"
 log "wrote ${TOKENS_FILE} (mode 600)"
 log "done. teammates: ${TEAMMATES[*]}"

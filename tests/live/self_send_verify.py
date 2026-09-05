@@ -54,6 +54,20 @@ BOT_MXID = {
     "gmessages": "@gmessagesbot:localhost",
 }
 
+
+def bot_mxid(client, platform):
+    domain = client.user.split(":", 1)[1]
+    configured = os.environ.get(platform.upper() + "_BOT_ID")
+    return configured or BOT_MXID[platform].split(":", 1)[0] + ":" + domain
+
+
+def imessage_self_mxid(client, handle):
+    # Same injective UTF-8 encoding as daemon.ghost_localpart; no engine call.
+    localpart = "".join(ch if ch.isascii() and (ch.islower() or ch.isdigit())
+                        else "".join("=%02x" % byte for byte in ch.encode("utf-8"))
+                        for ch in handle)
+    return "@imessage_" + localpart + ":" + client.user.split(":", 1)[1]
+
 # Guardrail caps. These are NOT identity verification (nothing here can prove
 # a handle is really the operator's own) — they only bound blast radius and
 # force a deliberate, explicit opt-in per run. See tests/live/README.md.
@@ -199,7 +213,9 @@ def verify_imsg_mgmt(client, room_id):
     st = client.room_state(room_id)
     if not isinstance(st, list):
         return False
-    has_marker = any(e.get("type") == "com.jkali.bridge.mgmt" and e.get("state_key") == "imessage" for e in st)
+    expected = bot_mxid(client, "imessage")
+    has_marker = any(e.get("type") == "com.jkali.bridge.mgmt" and e.get("state_key") == "imessage"
+                     and e.get("sender") == expected for e in st)
     is_portal = any(e.get("type") == "uk.half-shot.bridge" for e in st)
     return has_marker and not is_portal
 
@@ -214,13 +230,13 @@ def resolve_imsg_mgmt(client):
 def resolve_mgmt(client, platform):
     if platform == "imessage":
         return resolve_imsg_mgmt(client)
-    return find_bot_dm_mgmt(client, BOT_MXID[platform])
+    return find_bot_dm_mgmt(client, bot_mxid(client, platform))
 
 
 def verify_mgmt(client, platform, room_id):
     if platform == "imessage":
         return verify_imsg_mgmt(client, room_id)
-    return is_bot_dm_mgmt(client, BOT_MXID[platform], room_id)
+    return is_bot_dm_mgmt(client, bot_mxid(client, platform), room_id)
 
 
 # ---- portal discovery + polling -------------------------------------------
@@ -247,12 +263,20 @@ def find_portal_for_handle(client, platform, handle, before):
     return None
 
 
-def poll_for_nonce(client, room_id, nonce, timeout_s, poll_interval_s, local_user):
+def poll_for_nonce(client, room_id, nonce, timeout_s, poll_interval_s, local_user, inbound_sender=None):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         for ev in client.recent_messages(room_id):
-            body = (ev.get("content") or {}).get("body", "")
-            if nonce in body and ev.get("sender") != local_user:
+            content = ev.get("content") or {}
+            body = content.get("body", "")
+            sender = ev.get("sender")
+            # The iMessage bot posts outgoing echoes too. Those are not proof
+            # that the self-directed message returned inbound from the service.
+            if content.get("com.jkali.from_me") is True:
+                continue
+            if inbound_sender is not None and sender != inbound_sender:
+                continue
+            if isinstance(body, str) and nonce in body and sender != local_user:
                 return True, ev.get("sender")
         time.sleep(poll_interval_s)
     return False, None
@@ -276,7 +300,8 @@ def run_imessage(client, handle, nonce, timeout_s, poll_interval_s):
             time.sleep(poll_interval_s)
     if not portal:
         return False, "no iMessage portal appeared for %s within %ss" % (handle, timeout_s)
-    ok, sender = poll_for_nonce(client, portal, text, timeout_s, poll_interval_s, client.user)
+    ok, sender = poll_for_nonce(client, portal, text, timeout_s, poll_interval_s, client.user,
+                               inbound_sender=imessage_self_mxid(client, handle))
     if ok:
         return True, "nonce round-tripped in portal %s (sender=%s)" % (portal, sender)
     return False, "nonce never round-tripped in portal %s within %ss" % (portal, timeout_s)

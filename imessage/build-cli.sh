@@ -27,7 +27,7 @@ SHA256="7629c828593faef7e324cd86a94df2e8fdbe7ae48c7b6f8d22167589627a77e6"
 ASSET="imessage-cli-${VERSION}-macos-universal.tar.gz"
 URL="https://github.com/beeper/platform-imessage/releases/download/v${VERSION}/${ASSET}"
 TEAM_ID="PZYM8XX95Q"           # expected Developer ID team (Automattic, Inc.)
-OUT="${HERE}/imessage/bin/imessage-cli"
+OUT="${BEEPA_INSTALL_ROOT:-${HERE}}/imessage/bin/imessage-cli"
 log() { printf '[imessage-build] %s\n' "$*" >&2; }
 
 [ "${SKIP_IMESSAGE:-0}" = "1" ] && { log "SKIP_IMESSAGE=1 — skipping iMessage CLI download"; exit 0; }
@@ -67,8 +67,8 @@ case "${sig}" in
   *) log "unexpected code-signing team (want ${TEAM_ID}) — refusing to install"; exit 1 ;;
 esac
 
-mkdir -p "${HERE}/imessage/bin"
-cp "${BIN}" "${OUT}"; chmod 755 "${OUT}"
+mkdir -p "$(dirname "${OUT}")"
+cp -f "${BIN}" "${OUT}"; chmod 755 "${OUT}"
 # Do NOT re-sign: that would strip the Developer ID signature (and its stable,
 # grant-preserving identity) and replace it with a throwaway ad-hoc one.
 log "installed ${OUT} (prebuilt v${VERSION}, Developer ID ${TEAM_ID})"

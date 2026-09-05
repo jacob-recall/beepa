@@ -28,28 +28,27 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(BASE, "daemon.json")))
-PORT = int(CFG["port"])
-HS = CFG["hs_url"]
-DOMAIN = CFG["domain"]
-USER_ID = CFG["user_id"]          # the ONLY allowed command sender (M-1)
-BOT_ID = CFG["bot_id"]
-AS_TOKEN = CFG["as_token"]
-HS_TOKEN = CFG["hs_token"]
-CLI = CFG["cli_path"]
+# Importing the module is inert: tests and diagnostics never open the installed
+# database/configuration or invoke the native executable. main() initializes it.
+CFG = {}
+PORT = 29350
+HS = DOMAIN = USER_ID = BOT_ID = AS_TOKEN = HS_TOKEN = CLI = ""
+STATE_DIR = BASE
+_transport = None
+_runner = subprocess.run
 MAX_BODY = 8 * 1024 * 1024        # 8 MiB transaction cap (M-6)
 MAX_TEXT = CFG.get("max_body_kb", 64) * 1024
-HOST_ALLOW = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"host.docker.internal:{PORT}"}
-ATTACH_PREFIXES = [os.path.realpath(p) for p in CFG["attachment_allow_prefixes"]]
-MXC_RE = re.compile(r"^mxc://localhost/([A-Za-z0-9_-]{1,255})$")
+HOST_ALLOW = set()
+ATTACH_PREFIXES = []
+MXC_RE = re.compile(r"(?!)")
 # SC-P2: start-chat handle validation. PHONE_RE uses literal ASCII [0-9] (+
 # re.ASCII) to match the hub's JS \d exactly; EMAIL_RE mirrors the hub regex.
 # EMAIL_RE may admit bidi/zero-width (SC-P6 clean_text()s the echoed reply).
 PHONE_RE = re.compile(r"^\+[1-9][0-9]{6,14}$", re.ASCII)
 EMAIL_RE = re.compile(r"^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,24}$")
 RATE_PER_MIN = int(CFG.get("rate_per_chat_per_min", 30))
-BACKFILL_COUNT = max(0, min(int(CFG.get("backfill_count", 25)), 50))  # R-4 hard cap 50
-BACKFILL_GLOBAL_CAP = 500          # R-4: per-daemon-start total backfilled posts
+BACKFILL_COUNT = 25  # configured during initialize()
+BACKFILL_GLOBAL_CAP = 500          # per-poll throughput budget; unfinished work remains pending
 MGMT_MARKER_TYPE = "com.jkali.bridge.mgmt"
 MGMT_MARKER_KEY = "imessage"
 
@@ -88,10 +87,10 @@ logging.basicConfig(
 # ---------------------------------------------------------------- sanitizing
 _CTRL = re.compile("[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069\u200B-\u200F\uFEFF]")
 
-def clean_text(s, limit=MAX_TEXT):
+def clean_text(s, limit=None):
     if not isinstance(s, str):
         return ""
-    return _CTRL.sub("", s)[:limit]
+    return _CTRL.sub("", s)[:MAX_TEXT if limit is None else limit]
 
 def clean_name(s):
     return clean_text(s, 96) or "Unknown"
@@ -112,32 +111,86 @@ def sha(t):
     return hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()
 
 # ---------------------------------------------------------------- state (M-10)
-DB = sqlite3.connect(os.path.join(BASE, "state.db"), check_same_thread=False)
-DB.execute("CREATE TABLE IF NOT EXISTS map (chat_id TEXT PRIMARY KEY, room_id TEXT UNIQUE)")
-DB.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
-DB.execute("CREATE TABLE IF NOT EXISTS ledger (h TEXT PRIMARY KEY, ts REAL)")  # hashes only (M-13)
-DB.execute("CREATE TABLE IF NOT EXISTS seen_msg (chat_id TEXT, msg_id TEXT, PRIMARY KEY (chat_id, msg_id))")
-DB.execute("CREATE TABLE IF NOT EXISTS txns (txn_id TEXT PRIMARY KEY, ts REAL)")
-# SC-P5: persistent start-chat caps (survives launchd restart, unlike in-memory).
-# Append-only attempt log; global counts bound fan-out, handle_hash gives 60s dedup.
-DB.execute("CREATE TABLE IF NOT EXISTS startchat_log (ts REAL, handle_hash TEXT)")
-# (chat_id,msg_id) -> mapped Matrix event id (R-1 prereq). Ids only, no bodies
-# (M-13); body_hash is a sha256 hex used solely for inbound-edit detection.
-DB.execute("CREATE TABLE IF NOT EXISTS event_map "
-           "(chat_id TEXT, msg_id TEXT, event_id TEXT, sender TEXT, body_hash TEXT, "
-           "PRIMARY KEY (chat_id, msg_id))")
-DB.execute("CREATE INDEX IF NOT EXISTS event_map_ev ON event_map(event_id)")
-# Inbound reactions already relayed -> Matrix (dedupe + inbound-unreact redaction).
-DB.execute("CREATE TABLE IF NOT EXISTS rxn_in "
-           "(chat_id TEXT, target_msg TEXT, rxn_id TEXT, event_id TEXT, "
-           "PRIMARY KEY (chat_id, target_msg, rxn_id))")
-# Outbound m.reaction events the daemon itself mapped to an engine react (R-6:
-# only these events, redacted in the same room, ever reach engine unreact).
-DB.execute("CREATE TABLE IF NOT EXISTS rxn_out "
-           "(event_id TEXT PRIMARY KEY, chat_id TEXT, target_msg TEXT, rkey TEXT)")
-DB.commit()
-os.chmod(os.path.join(BASE, "state.db"), 0o600)  # M-10, regardless of creator umask
-DBLOCK = threading.Lock()
+DB = None
+DBLOCK = threading.RLock()
+EVENT_LOCK = threading.Lock()
+_EVENT_CONTEXT = threading.local()
+_tail_scan_success = {}
+_tail_scan_attempt = {}
+
+
+def initialize(config=None, state_dir=None, transport=None, runner=None):
+    """Initialize one daemon before starting threads; injectable without live I/O."""
+    global CFG, PORT, HS, DOMAIN, USER_ID, BOT_ID, AS_TOKEN, HS_TOKEN, CLI
+    global MAX_TEXT, HOST_ALLOW, ATTACH_PREFIXES, MXC_RE, RATE_PER_MIN
+    global BACKFILL_COUNT, STATE_DIR, DB, _transport, _runner
+    install_root = os.environ.get("BEEPA_INSTALL_ROOT")
+    default_state = os.path.join(install_root, "imessage") if install_root else BASE
+    if config is None:
+        path = os.environ.get("IMESSAGE_CONFIG", os.path.join(default_state, "daemon.json"))
+        with open(path) as f:
+            config = json.load(f)
+    CFG = dict(config)
+    PORT = int(CFG["port"])
+    HS, DOMAIN = CFG["hs_url"].rstrip("/"), CFG["domain"]
+    USER_ID, BOT_ID = CFG["user_id"], CFG["bot_id"]
+    AS_TOKEN, HS_TOKEN, CLI = CFG["as_token"], CFG["hs_token"], CFG["cli_path"]
+    MAX_TEXT = int(CFG.get("max_body_kb", 64)) * 1024
+    HOST_ALLOW = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"host.docker.internal:{PORT}"}
+    ATTACH_PREFIXES = [os.path.realpath(p) for p in CFG["attachment_allow_prefixes"]]
+    MXC_RE = re.compile(r"^mxc://" + re.escape(DOMAIN) + r"/([A-Za-z0-9_-]{1,255})$")
+    RATE_PER_MIN = int(CFG.get("rate_per_chat_per_min", 30))
+    BACKFILL_COUNT = max(0, int(CFG.get("backfill_count", 25)))
+    STATE_DIR = os.path.abspath(state_dir or os.environ.get("IMESSAGE_STATE_DIR", default_state))
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(os.path.join(STATE_DIR, "tmp"), mode=0o700, exist_ok=True)
+    _transport, _runner = transport, runner or subprocess.run
+    if DB is not None:
+        DB.close()
+    db_path = os.path.join(STATE_DIR, "state.db")
+    DB = sqlite3.connect(db_path, check_same_thread=False)
+    DB.execute("CREATE TABLE IF NOT EXISTS map (chat_id TEXT PRIMARY KEY, room_id TEXT UNIQUE)")
+    DB.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    DB.execute("CREATE TABLE IF NOT EXISTS ledger (h TEXT PRIMARY KEY, ts REAL)")  # hashes only (M-13)
+    DB.execute("CREATE TABLE IF NOT EXISTS seen_msg (chat_id TEXT, msg_id TEXT, PRIMARY KEY (chat_id, msg_id))")
+    DB.execute("CREATE TABLE IF NOT EXISTS txns (txn_id TEXT PRIMARY KEY, ts REAL)")
+    # SC-P5: persistent start-chat caps (survives launchd restart, unlike in-memory).
+    # Append-only attempt log; global counts bound fan-out, handle_hash gives 60s dedup.
+    DB.execute("CREATE TABLE IF NOT EXISTS startchat_log (ts REAL, handle_hash TEXT)")
+    # (chat_id,msg_id) -> mapped Matrix event id (R-1 prereq). Ids only, no bodies
+    # (M-13); body_hash is a sha256 hex used solely for inbound-edit detection.
+    DB.execute("CREATE TABLE IF NOT EXISTS event_map "
+               "(chat_id TEXT, msg_id TEXT, event_id TEXT, sender TEXT, body_hash TEXT, "
+               "PRIMARY KEY (chat_id, msg_id))")
+    DB.execute("CREATE INDEX IF NOT EXISTS event_map_ev ON event_map(event_id)")
+    # Inbound reactions already relayed -> Matrix (dedupe + inbound-unreact redaction).
+    DB.execute("CREATE TABLE IF NOT EXISTS rxn_in "
+               "(chat_id TEXT, target_msg TEXT, rxn_id TEXT, event_id TEXT, "
+               "PRIMARY KEY (chat_id, target_msg, rxn_id))")
+    # Outbound m.reaction events the daemon itself mapped to an engine react (R-6:
+    # only these events, redacted in the same room, ever reach engine unreact).
+    DB.execute("CREATE TABLE IF NOT EXISTS rxn_out "
+               "(event_id TEXT PRIMARY KEY, chat_id TEXT, target_msg TEXT, rkey TEXT)")
+    DB.execute("CREATE TABLE IF NOT EXISTS inbound_pending (chat_id TEXT, msg_id TEXT, "
+               "status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(chat_id,msg_id))")
+    DB.execute("CREATE TABLE IF NOT EXISTS inbound_component (room_id TEXT, msg_id TEXT, "
+               "component TEXT, event_id TEXT, status TEXT, PRIMARY KEY(room_id,msg_id,component))")
+    DB.execute("CREATE TABLE IF NOT EXISTS outbound_event (event_id TEXT PRIMARY KEY, room_id TEXT, "
+               "state TEXT NOT NULL, updated REAL NOT NULL, reason TEXT, engine_id TEXT)")
+    DB.execute("CREATE TABLE IF NOT EXISTS dispatch_rate (chat_hash TEXT, ts REAL)")
+    # The only safe recovery after an interrupted native invocation is ambiguity.
+    # A queued/preflight failure is replayable; a dispatch may already have sent.
+    DB.execute("UPDATE outbound_event SET state='ambiguous', reason='restart_during_dispatch' "
+               "WHERE state='dispatching'")
+    DB.execute("UPDATE outbound_event SET state='retryable' WHERE state='processing'")
+    DB.commit()
+    os.chmod(db_path, 0o600)
+    _rate.clear()
+    _backfill_posted[0] = 0
+    _portal_create_hist.clear()
+    _tail_scan_success.clear()
+    _tail_scan_attempt.clear()
+
 
 def meta_get(k, default=None):
     with DBLOCK:
@@ -163,6 +216,42 @@ def map_add(chat_id, room_id):
     with DBLOCK:
         DB.execute("INSERT OR REPLACE INTO map (chat_id, room_id) VALUES (?,?)", (chat_id, room_id))
         DB.commit()
+
+
+def component_txn(room_id, msg_id, component):
+    return "imsgd_" + sha(json.dumps([room_id, msg_id, component], separators=(",", ":")))
+
+
+def component_get(room_id, msg_id, component):
+    with DBLOCK:
+        return DB.execute("SELECT event_id,status FROM inbound_component "
+                          "WHERE room_id=? AND msg_id=? AND component=?",
+                          (room_id, msg_id, component)).fetchone()
+
+
+def component_put(room_id, msg_id, component, event_id, status="confirmed"):
+    with DBLOCK:
+        DB.execute("INSERT OR REPLACE INTO inbound_component VALUES (?,?,?,?,?)",
+                   (room_id, msg_id, component, event_id, status))
+        DB.commit()
+
+
+def inbound_complete(chat_id, msg_id):
+    with DBLOCK:
+        DB.execute("INSERT OR IGNORE INTO seen_msg VALUES (?,?)", (chat_id, msg_id))
+        DB.execute("DELETE FROM inbound_pending WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+        DB.commit()
+
+
+def inbound_pending(chat_id, msg_id, status="pending"):
+    with DBLOCK:
+        DB.execute("INSERT OR REPLACE INTO inbound_pending VALUES (?,?,?)", (chat_id, msg_id, status))
+        DB.commit()
+
+
+def chat_pending(chat_id):
+    with DBLOCK:
+        return DB.execute("SELECT 1 FROM inbound_pending WHERE chat_id=? LIMIT 1", (chat_id,)).fetchone() is not None
 
 def event_map_put(chat_id, msg_id, event_id, sender, body_hash):
     with DBLOCK:
@@ -246,7 +335,7 @@ def txn_seen(txn_id):
 def txn_mark(txn_id):
     with DBLOCK:
         DB.execute("INSERT OR IGNORE INTO txns (txn_id, ts) VALUES (?,?)", (txn_id, time.time()))
-        DB.execute("DELETE FROM txns WHERE ts < ?", (time.time() - 3600,))
+        # Keep receipt IDs across late homeserver replays. They contain no bodies.
         DB.commit()
 
 def ledger_add(text):
@@ -288,20 +377,23 @@ _rate_lock = threading.Lock()
 
 def rate_ok(chat_id):
     now = time.time()
-    with _rate_lock:
-        hist = [t for t in _rate.get(chat_id, []) if now - t < 60]
+    with _rate_lock, DBLOCK:
+        DB.execute("DELETE FROM dispatch_rate WHERE ts < ?", (now - 60,))
+        hist = [r[0] for r in DB.execute("SELECT ts FROM dispatch_rate WHERE chat_hash=? ORDER BY ts", (sha(chat_id),))]
         if hist and now - hist[-1] < 1.0:
-            _rate[chat_id] = hist
+            DB.commit()
             return False
         if len(hist) >= RATE_PER_MIN:
-            _rate[chat_id] = hist
+            DB.commit()
             return False
-        hist.append(now)
-        _rate[chat_id] = hist
+        DB.execute("INSERT INTO dispatch_rate VALUES (?,?)", (sha(chat_id), now))
+        DB.commit()
         return True
 
 # ---------------------------------------------------------------- matrix api
 def mx(method, path, body=None, user=None, raw=False, content_type=None):
+    if _transport is not None:
+        return _transport(method, path, body, user=user, raw=raw, content_type=content_type)
     q = {"user_id": user} if user else {}
     url = HS + path + (("?" + urllib.parse.urlencode(q)) if q else "")
     data = body if raw else (None if body is None else json.dumps(body).encode())
@@ -327,30 +419,31 @@ def set_displayname(user_id, name):
     except Exception:
         log.info("displayname set failed user=%s", sha(user_id)[:8])
 
-def send_text(room_id, sender, text, extra=None):
+def send_text(room_id, sender, text, extra=None, txn=None):
     rid = urllib.parse.quote(room_id, safe="")
-    txn = "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    txn = txn or "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
     content = {"msgtype": "m.text", "body": text}
     if extra:
         content.update(extra)
     return mx("PUT", f"/_matrix/client/v3/rooms/{rid}/send/m.room.message/{txn}",
               content, user=sender)
 
-def send_reaction(room_id, sender, target_event, key):
+def send_reaction(room_id, sender, target_event, key, txn=None):
     rid = urllib.parse.quote(room_id, safe="")
-    txn = "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    txn = txn or "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
     return mx("PUT", f"/_matrix/client/v3/rooms/{rid}/send/m.reaction/{txn}",
               {"m.relates_to": {"rel_type": "m.annotation", "event_id": target_event, "key": key}},
               user=sender)
 
-def send_replace(room_id, sender, target_event, text, extra=None):
+def send_replace(room_id, sender, target_event, text, extra=None, txn=None):
     rid = urllib.parse.quote(room_id, safe="")
-    txn = "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    txn = txn or "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
     content = {"msgtype": "m.text", "body": "* " + text,
                "m.new_content": {"msgtype": "m.text", "body": text},
                "m.relates_to": {"rel_type": "m.replace", "event_id": target_event}}
     if extra:
         content.update(extra)
+        content["m.new_content"].update(extra)
     return mx("PUT", f"/_matrix/client/v3/rooms/{rid}/send/m.room.message/{txn}",
               content, user=sender)
 
@@ -378,83 +471,54 @@ def _extract_json(raw):
 
 def cli_json(*args, timeout=60):
     argv = [CLI, "--no-events", "--json", *args]
-    p = subprocess.run(argv, capture_output=True, timeout=timeout, shell=False)
+    p = _runner(argv, capture_output=True, timeout=timeout, shell=False)
     if p.returncode != 0:
         raise RuntimeError("engine rc=%d" % p.returncode)
     if len(p.stdout) > 32 * 1024 * 1024:
         raise RuntimeError("engine output too large")
     return _extract_json(p.stdout.decode("utf-8", "replace"))
 
-_AX_PROMPTED = {"done": False}
+class EngineOutcome:
+    """Confirmed means CLI acceptance; only delivered=True is delivery evidence."""
+    def __init__(self, state, reason, engine_id=None, delivered=False):
+        self.state, self.reason = state, reason
+        self.engine_id, self.delivered = engine_id, delivered
 
-def _ax_trusted(prompt=False):
-    """This process's macOS Accessibility trust, via AXIsProcessTrusted. macOS
-    attributes the CLI's Accessibility to its launchd-launched ancestor — this
-    very python3 — so the daemon's OWN status is exactly what the engine's
-    mutating preflight will see. prompt=True calls AXIsProcessTrustedWithOptions
-    with the prompt option, which REGISTERS python3 as a row in System Settings
-    > Privacy & Security > Accessibility and shows the system grant dialog (the
-    only way to make the row appear without the user clicking '+'). Fail-open:
-    if this introspection breaks, sends proceed and the engine's own error path
-    still catches a real missing grant."""
-    try:
-        import ctypes
-        AS = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-        AS.AXIsProcessTrusted.restype = ctypes.c_bool
-        if not prompt:
-            return bool(AS.AXIsProcessTrusted())
-        CF = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-        CF.CFDictionaryCreate.restype = ctypes.c_void_p
-        CF.CFDictionaryCreate.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
-            ctypes.c_void_p, ctypes.c_void_p]
-        key = ctypes.c_void_p.in_dll(AS, "kAXTrustedCheckOptionPrompt")
-        yes = ctypes.c_void_p.in_dll(CF, "kCFBooleanTrue")
-        keys = (ctypes.c_void_p * 1)(key)
-        vals = (ctypes.c_void_p * 1)(yes)
-        opts = CF.CFDictionaryCreate(None, keys, vals, 1, None, None)
-        AS.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
-        AS.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
-        return bool(AS.AXIsProcessTrustedWithOptions(opts))
-    except Exception as e:
-        log.info("ax introspection failed (%s) — assuming trusted", type(e).__name__)
-        return True
+    def __bool__(self):
+        return self.state == "confirmed"
+
 
 def _engine_mut(args, timeout):
-    """Run a MUTATING engine command (send/react/edit/create-chat).
-
-    No Accessibility PRE-check: the Developer-ID-signed CLI holds its OWN TCC
-    identity and runs its own authorization preflight — an AXIsProcessTrusted()
-    probe of THIS interpreter gates on the wrong binary and false-negatives on
-    machines where sending demonstrably works (TCC keys on the real executable;
-    the daemon's framework Python is not the granted row, and a grant to an
-    unsigned interpreter is not a stable identity anyway). The old pre-check
-    refused every send on a fresh install before the CLI was ever invoked.
-    Instead: attempt the op, then react only to a failure the ENGINE ITSELF
-    attributes to Accessibility — register the interpreter + system dialog once
-    per run (harmless, helps macOS variants that attribute to the parent) and
-    open the Settings pane via the allowlisted, rate-capped cmd_open (B-1/B-7).
-    Tradeoff: a genuinely missing grant costs one bounded subprocess timeout
-    instead of an instant refusal. list-argv, shell=False — M-20 preserved."""
+    """Keep the signed CLI's own authorization preflight; no Python TCC gate."""
     try:
-        p = subprocess.run([CLI, *args], capture_output=True,
-                           timeout=timeout, shell=False)
-        ok, out = p.returncode == 0, (p.stdout or b"") + (p.stderr or b"")
-    except subprocess.TimeoutExpired as e:
-        ok, out = False, (e.stdout or b"") + (e.stderr or b"")
-        log.info("engine timeout (mutating op)")
-    if not ok and b"Accessibility" in out:
-        log.info("engine blocked on missing Accessibility grant — grant "
-                 "imessage/bin/imessage-cli in the opened pane")
-        if not _AX_PROMPTED["done"]:
-            _AX_PROMPTED["done"] = True
-            threading.Thread(target=_ax_trusted, kwargs={"prompt": True},
-                             daemon=True).start()
-        cmd_open("accessibility")
-    return ok
+        p = _runner([CLI, *args], capture_output=True, timeout=timeout, shell=False)
+    except subprocess.TimeoutExpired:
+        return EngineOutcome("ambiguous", "engine_timeout")
+    except OSError:
+        # subprocess failed to start, so no native send could have happened.
+        return EngineOutcome("retryable", "engine_unavailable")
+    out = (p.stdout or b"") + (p.stderr or b"")
+    if p.returncode != 0:
+        if b"Accessibility" in out:
+            log.info("engine blocked on missing Accessibility grant; grant the configured CLI")
+            cmd_open("accessibility")
+            return EngineOutcome("refused", "accessibility_required")
+        # An arbitrary native failure can occur after dispatch. No blind resend.
+        return EngineOutcome("ambiguous", "engine_failed")
+    result = {}
+    try:
+        result = _extract_json((p.stdout or b"").decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        pass
+    if not isinstance(result, dict):
+        result = {}
+    if result.get("error") or result.get("success") is False:
+        return EngineOutcome("ambiguous", "engine_reported_error")
+    mid = result.get("id")
+    delivered = result.get("delivered") is True
+    return EngineOutcome("confirmed", "engine_delivered" if delivered else "engine_accepted",
+                         mid if isinstance(mid, str) else None, delivered)
+
 
 def engine_send(chat_id, text):
     return _engine_mut(["--no-events", "send", chat_id, text], 60)
@@ -493,6 +557,10 @@ def safe_engine_path(path):
     rp = os.path.realpath(str(path))
     return any(rp == p or rp.startswith(p + os.sep) for p in ATTACH_PREFIXES) and os.path.isfile(rp)
 
+
+class AttachmentRefused(Exception):
+    pass
+
 def download_mxc_to_tmp(mxc, filename_hint):
     m = MXC_RE.match(str(mxc or ""))
     if not m:
@@ -501,9 +569,9 @@ def download_mxc_to_tmp(mxc, filename_hint):
     hint = os.path.splitext(str(filename_hint or ""))[1]
     if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", hint or ""):
         ext = hint.lower()
-    fd, tmp = tempfile.mkstemp(dir=os.path.join(BASE, "tmp"), suffix=ext)
+    fd, tmp = tempfile.mkstemp(dir=os.path.join(STATE_DIR, "tmp"), suffix=ext)
     try:
-        url = f"{HS}/_matrix/client/v1/media/download/localhost/{urllib.parse.quote(m.group(1))}"
+        url = f"{HS}/_matrix/client/v1/media/download/{urllib.parse.quote(DOMAIN, safe='')}/{urllib.parse.quote(m.group(1))}"
         req = urllib.request.Request(url)
         req.add_header("Authorization", "Bearer " + AS_TOKEN)
         with urllib.request.urlopen(req, timeout=120) as r:
@@ -514,14 +582,16 @@ def download_mxc_to_tmp(mxc, filename_hint):
                     break
                 size += len(chunk)
                 if size > 200 * 1024 * 1024:
-                    raise RuntimeError("attachment too large")
+                    raise AttachmentRefused("attachment too large")
                 os.write(fd, chunk)
         return tmp
-    except Exception:
+    except Exception as exc:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        if isinstance(exc, AttachmentRefused):
+            raise
         return None
     finally:
         os.close(fd)
@@ -529,25 +599,49 @@ def download_mxc_to_tmp(mxc, filename_hint):
 # ---------------------------------------------------------------- portals
 SPACE_KEY = "space_id"
 
+
+def create_or_recover_room(payload, key):
+    """A deterministic alias resolves a lost createRoom response before retry."""
+    alias_localpart = "imessage_" + sha(BOT_ID + "\0" + key)
+    payload = dict(payload, room_alias_name=alias_localpart)
+    try:
+        return mx("POST", "/_matrix/client/v3/createRoom", payload, user=BOT_ID)["room_id"]
+    except Exception:
+        alias = urllib.parse.quote("#" + alias_localpart + ":" + DOMAIN, safe="")
+        room = mx("GET", "/_matrix/client/v3/directory/room/" + alias, user=BOT_ID)["room_id"]
+        state = mx("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(room, safe="") + "/state", user=BOT_ID)
+        expected_type = (payload.get("creation_content") or {}).get("type")
+        if not isinstance(state, list) or not any(
+                e.get("type") == "m.room.create" and e.get("sender") == BOT_ID
+                and (e.get("content") or {}).get("type") == expected_type for e in state):
+            raise ValueError("room alias ownership mismatch")
+        for expected in payload.get("initial_state", []):
+            if expected["type"] == "uk.half-shot.bridge" and not any(
+                    e.get("type") == expected["type"] and e.get("state_key") == expected["state_key"]
+                    and e.get("sender") == BOT_ID and e.get("content") == expected["content"] for e in state):
+                raise ValueError("room alias source mismatch")
+        return room
+
 def ensure_space():
     sid = meta_get(SPACE_KEY)
     if sid:
         return sid
-    r = mx("POST", "/_matrix/client/v3/createRoom", {
+    sid = create_or_recover_room({
         "name": "iMessage", "preset": "private_chat", "visibility": "private",
         "creation_content": {"type": "m.space"},
         "invite": [USER_ID],
-    }, user=BOT_ID)
-    meta_set(SPACE_KEY, r["room_id"])
+    }, "space")
+    meta_set(SPACE_KEY, sid)
     log.info("space created")
-    return r["room_id"]
+    return sid
 
 def ensure_portal(chat_id, chat_name, is_group):
     room = room_for_chat(chat_id)
     if room:
+        ensure_portal_link(chat_id, room)
         return room
     space = ensure_space()
-    r = mx("POST", "/_matrix/client/v3/createRoom", {
+    room = create_or_recover_room({
         "name": clean_name(chat_name or chat_id),
         "preset": "private_chat", "visibility": "private", "is_direct": not is_group,
         "invite": [USER_ID],
@@ -558,12 +652,10 @@ def ensure_portal(chat_id, chat_name, is_group):
             {"type": "m.space.parent", "state_key": space,
              "content": {"via": [DOMAIN], "canonical": True}},
         ],
-    }, user=BOT_ID)
-    room = r["room_id"]
-    sp = urllib.parse.quote(space, safe="")
-    mx("PUT", f"/_matrix/client/v3/rooms/{sp}/state/m.space.child/{urllib.parse.quote(room, safe='')}",
-       {"via": [DOMAIN]}, user=BOT_ID)
+    }, "portal:" + chat_id)
+    # Allocation is durable before the independent space-link operation.
     map_add(chat_id, room)
+    ensure_portal_link(chat_id, room)
     log.info("portal created chat=%s", sha(chat_id)[:8])
     try:
         maybe_backfill(chat_id, room, chat_name, is_group)
@@ -571,8 +663,18 @@ def ensure_portal(chat_id, chat_name, is_group):
         log.info("backfill error chat=%s", sha(chat_id)[:8])
     return room
 
+
+def ensure_portal_link(chat_id, room):
+    flag = "portal_linked:" + room
+    if meta_get(flag) == "1":
+        return
+    sp = urllib.parse.quote(ensure_space(), safe="")
+    mx("PUT", f"/_matrix/client/v3/rooms/{sp}/state/m.space.child/{urllib.parse.quote(room, safe='')}",
+       {"via": [DOMAIN]}, user=BOT_ID)
+    meta_set(flag, "1")
+
 # ---------------------------------------------------------------- backfill (R-4)
-_backfill_posted = [0]              # per-daemon-start global post counter
+_backfill_posted = [0]              # reset each poll; completion is durable per message
 _portal_create_hist = []           # portal-creation rate cap (backfill trigger)
 _backfill_lock = threading.Lock()
 
@@ -586,43 +688,41 @@ def _portal_backfill_ok():
 
 def maybe_backfill(chat_id, room, chat_name, is_group):
     if BACKFILL_COUNT <= 0:
-        return
+        return True
     flag = "backfill:%s:%s" % (chat_id, room)
     if meta_get(flag) == "1":
-        return
-    meta_set(flag, "1")                 # written BEFORE posting (R-4), idempotent
+        return True
     if not _portal_backfill_ok():
-        log.info("backfill rate-capped chat=%s", sha(chat_id)[:8])
-        return
-    try:
-        msgs = cli_json("messages", chat_id).get("items", [])
-    except Exception:
-        return
+        return False
+    msgs = cli_json("messages", chat_id).get("items", [])
     if not isinstance(msgs, list):
-        return
-    for m in msgs[-BACKFILL_COUNT:]:   # oldest-first within the window
+        raise ValueError("invalid source history")
+    complete = True
+    for m in msgs[-BACKFILL_COUNT:]:
         mid = str(m.get("id") or "")
         if not mid:
             continue
         with DBLOCK:
-            dup = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?",
-                             (chat_id, mid)).fetchone()
-        if dup:
-            continue                    # never double-post (R-4 idempotency)
+            seen = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
+        if seen:
+            continue
+        inbound_pending(chat_id, mid)
         with _backfill_lock:
             if _backfill_posted[0] >= BACKFILL_GLOBAL_CAP:
-                log.info("backfill global cap reached")
-                return
+                complete = False
+                continue
             _backfill_posted[0] += 1
-        with DBLOCK:
-            DB.execute("INSERT OR IGNORE INTO seen_msg (chat_id, msg_id) VALUES (?,?)", (chat_id, mid))
-            DB.commit()
         try:
             _relay_message(chat_id, room, chat_name, is_group, m)
             reconcile_reactions(chat_id, m)
+            inbound_complete(chat_id, mid)
         except Exception:
-            log.info("backfill post failed chat=%s", sha(chat_id)[:8])
-    log.info("backfill done chat=%s", sha(chat_id)[:8])
+            complete = False
+            log.info("backfill post pending chat=%s", sha(chat_id)[:8])
+    if complete:
+        meta_set(flag, "1")
+    return complete
+
 
 def ensure_ghost(handle, name):
     lp = ghost_localpart(handle)
@@ -672,20 +772,47 @@ def sync_portal_name(chat, chat_id):
         log.info("portal rename failed chat=%s", sha(chat_id)[:8])
 
 def poll_once():
+    _backfill_posted[0] = 0  # throughput budget per pass, never a lifetime ceiling
     data = cli_json("chats")
     items = data.get("items", []) if isinstance(data, dict) else []
+    now = time.monotonic()
+    interval = max(1.0, float(CFG.get("tail_rescan_seconds", 30)))
+    budget = max(1, int(CFG.get("tail_rescan_chats_per_poll", 8)))
+    unchanged = []
+
+    def scan(chat, chat_id, marker):
+        _tail_scan_attempt[chat_id] = time.monotonic()
+        try:
+            if handle_chat_delta(chat, chat_id):
+                if marker:
+                    meta_set("cursor:" + chat_id, marker)
+                # Advance only after the complete returned tail was handled.
+                # A restart intentionally makes each unchanged tail due again.
+                _tail_scan_success[chat_id] = time.monotonic()
+        except Exception as e:
+            log.info("chat pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
+
     for c in items if isinstance(items, list) else []:
+        if not isinstance(c, dict):
+            continue
         chat_id = str(c.get("id") or "")
         if not chat_id:
             continue
         sync_portal_name(c, chat_id)
         marker = str(c.get("timestamp") or "")
-        key = "cursor:" + chat_id
-        if marker and meta_get(key) == marker:
+        if marker and meta_get("cursor:" + chat_id) == marker and not chat_pending(chat_id):
+            # Chat timestamps are hints, not complete change tokens: an inbound
+            # self-chat row (or an edit/reaction) may arrive behind that marker.
+            last = _tail_scan_success.get(chat_id)
+            if last is None or now - last >= interval:
+                unchanged.append((c, chat_id, marker))
             continue
-        handle_chat_delta(c, chat_id)
-        if marker:
-            meta_set(key, marker)
+        scan(c, chat_id, marker)
+    # Bound extra native reads and give failed tails their turn without letting
+    # the first failing source starve later unchanged chats.
+    unchanged.sort(key=lambda item: _tail_scan_attempt.get(item[1], float("-inf")))
+    for chat, chat_id, marker in unchanged[:budget]:
+        scan(chat, chat_id, marker)
 
 CONTACTS_DB = os.path.realpath(os.path.join(BASE, "..", "agents", "contacts", "contacts.db"))
 
@@ -724,35 +851,48 @@ def chat_display_name(chat):
     return ", ".join(x for x in others if x) or "Note to self"
 
 def handle_chat_delta(chat, chat_id):
-    # `chats` embeds only the latest message; fetch the full recent list so
-    # bursts between polls are not dropped.
-    try:
-        msgs = cli_json("messages", chat_id).get("items", [])
-    except Exception:
-        msgs = (chat.get("messages") or {}).get("items", [])
+    # Never fall back to the embedded last-message snapshot on a failed history
+    # read: advancing the chat marker from that snapshot loses the missing gap.
+    msgs = cli_json("messages", chat_id).get("items", [])
     if not isinstance(msgs, list):
-        return
+        raise ValueError("invalid source history")
     name = chat_display_name(chat)
     is_group = (chat.get("type") or "single") != "single"
-    for m in msgs[-25:]:
+    available = {str(m.get("id")) for m in msgs if isinstance(m, dict) and m.get("id")}
+    with DBLOCK:
+        for mid, in DB.execute("SELECT msg_id FROM inbound_pending WHERE chat_id=?", (chat_id,)).fetchall():
+            if mid not in available:
+                DB.execute("UPDATE inbound_pending SET status='source_unavailable' WHERE chat_id=? AND msg_id=?", (chat_id, mid))
+        DB.commit()
+    budget = max(1, int(CFG.get("poll_message_budget", 200)))
+    processed = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
         mid = str(m.get("id") or "")
         if not mid:
             continue
         with DBLOCK:
-            dup = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?",
-                             (chat_id, mid)).fetchone()
-        if not dup:
-            with DBLOCK:
-                DB.execute("INSERT OR IGNORE INTO seen_msg (chat_id, msg_id) VALUES (?,?)", (chat_id, mid))
-                DB.commit()
-            deliver_inbound(chat_id, name, is_group, m)
-        # Reactions/edits can land on already-seen messages, so reconcile every
-        # windowed message regardless of the seen-set (dedup is internal).
+            seen = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
+        inbound_pending(chat_id, mid)
+        if not seen and processed >= budget:
+            continue
+        if not seen:
+            processed += 1
         try:
+            if not seen:
+                deliver_inbound(chat_id, name, is_group, m)
+                # Component receipts make retries safe even if this commit fails.
+                with DBLOCK:
+                    DB.execute("INSERT OR IGNORE INTO seen_msg VALUES (?,?)", (chat_id, mid))
+                    DB.commit()
             reconcile_edit(chat_id, m)
             reconcile_reactions(chat_id, m)
-        except Exception:
-            log.info("reconcile error chat=%s", sha(chat_id)[:8])
+            inbound_complete(chat_id, mid)
+        except Exception as e:
+            log.info("inbound pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
+    return not chat_pending(chat_id)
+
 
 def deliver_inbound(chat_id, chat_name, is_group, m):
     text = clean_text(m.get("text") or "")
@@ -765,59 +905,81 @@ def deliver_inbound(chat_id, chat_name, is_group, m):
     _relay_message(chat_id, room, chat_name, is_group, m)
 
 def _relay_message(chat_id, room, chat_name, is_group, m):
-    """Post one inbound message's attachments + text into `room`, recording the
-    (chat,msg)->event_id map (R-1 prereq) for the primary event."""
+    """Deliver each source component once; persist no message bodies or paths."""
     text = clean_text(m.get("text") or "")
-    from_me = bool(m.get("isSender"))
+    from_me = m.get("isSender") is True
     sender_handle = str(m.get("senderID") or chat_id.rsplit(";", 1)[-1])
     mid = str(m.get("id") or "")
-    # from_me is the daemon's trustworthy own-message signal: derived from the
-    # ENGINE's isSender (a remote contact cannot make the engine report their
-    # message as from-me) and posted ONLY as @imessagebot (BOT_ID). The hub UI
-    # renders it right-aligned as "You" via the com.jkali.from_me content field.
-    # NEVER stamp this field on a ghost-authored (received) message.
-    from_me_extra = {"com.jkali.from_me": True} if from_me else None
-    if from_me:
-        sender = BOT_ID
-        disp = text
-    else:
-        sender = ensure_ghost(sender_handle, m.get("senderName") or sender_handle)
+    if not mid:
+        raise ValueError("source message ID required")
+    extra = {"com.jkali.from_me": True} if from_me else None
+    sender = BOT_ID if from_me else ensure_ghost(sender_handle, m.get("senderName") or sender_handle)
+    if not from_me:
         ghost_join(sender, room)
-        disp = text
     primary_event = None
-    for att in (m.get("attachments") or []):
+    relayed_text_hash = sha(text)
+    failures = []
+    attachments = m.get("attachments") or []
+    for index, att in enumerate(attachments):
+        # Engine IDs when available; the source array index is the stable
+        # fallback, never an on-disk path that may change after redownload.
+        key = "attachment:" + str(att.get("id") or index)
+        previous = component_get(room, mid, key)
+        if previous:
+            primary_event = previous[0] or primary_event
+            continue
         path = decode_asset_url(att.get("srcURL") or "")
-        if not path or not safe_engine_path(path):
-            log.info("attachment path rejected chat=%s", sha(chat_id)[:8])
+        if not path:
+            component_put(room, mid, key, "", "refused_invalid_path")
             continue
         rp = os.path.realpath(path)
-        mime = mimetypes.guess_type(rp)[0] or "application/octet-stream"
+        allowed = any(rp == p or rp.startswith(p + os.sep) for p in ATTACH_PREFIXES)
+        if not allowed:
+            component_put(room, mid, key, "", "refused_path")
+            continue
+        if not safe_engine_path(rp):
+            failures.append("attachment_unavailable")
+            continue
         try:
+            mime = mimetypes.guess_type(rp)[0] or "application/octet-stream"
             mxc = upload_media(rp, mime)
-            msgtype = "m.image" if mime.startswith("image/") else "m.file"
-            rid = urllib.parse.quote(room, safe="")
-            txn = "imsgd" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
-            content = {"msgtype": msgtype, "body": clean_name(os.path.basename(rp)), "url": mxc,
+            content = {"msgtype": "m.image" if mime.startswith("image/") else "m.file",
+                       "body": clean_name(os.path.basename(rp)), "url": mxc,
                        "info": {"mimetype": mime, "size": os.path.getsize(rp)}}
-            if from_me:
-                content["com.jkali.from_me"] = True
-            r = mx("PUT", f"/_matrix/client/v3/rooms/{rid}/send/m.room.message/{txn}",
-                   content, user=sender)
-            primary_event = (r or {}).get("event_id") or primary_event
-        except Exception:
-            log.info("attachment relay failed chat=%s", sha(chat_id)[:8])
-    if disp:
-        try:
-            r = send_text(room, sender, disp, from_me_extra)
-            primary_event = (r or {}).get("event_id") or primary_event
-            log.info("inbound relayed chat=%s bytes=%d", sha(chat_id)[:8], len(disp))
-        except Exception:
-            log.info("inbound relay failed chat=%s", sha(chat_id)[:8])
-    if mid and primary_event:
-        # body_hash tracks the engine text (== disp; the body is no longer
-        # mutated) so inbound-edit detection compares like with like.
-        event_map_put(chat_id, mid, primary_event, sender, sha(text))
+            if extra:
+                content.update(extra)
+            rid = urllib.parse.quote(room, safe="")
+            txn = component_txn(room, mid, key)
+            result = mx("PUT", f"/_matrix/client/v3/rooms/{rid}/send/m.room.message/{txn}", content, user=sender)
+            event_id = result["event_id"]
+            if not event_id:
+                raise ValueError("missing event receipt")
+            component_put(room, mid, key, event_id)
+            primary_event = event_id
+        except Exception as e:
+            failures.append(type(e).__name__)
+    if text:
+        previous = component_get(room, mid, "text")
+        if previous:
+            primary_event = previous[0] or primary_event
+            if previous[1].startswith("confirmed:"):
+                relayed_text_hash = previous[1].split(":", 1)[1]
+        else:
+            try:
+                result = send_text(room, sender, text, extra, txn=component_txn(room, mid, "text"))
+                event_id = result["event_id"]
+                if not event_id:
+                    raise ValueError("missing event receipt")
+                component_put(room, mid, "text", event_id, "confirmed:" + sha(text))
+                primary_event = event_id
+            except Exception as e:
+                failures.append(type(e).__name__)
+    if primary_event:
+        event_map_put(chat_id, mid, primary_event, sender, relayed_text_hash)
+    if failures:
+        raise OSError("source components still pending")
     return primary_event
+
 
 def reconcile_reactions(chat_id, m):
     """Relay engine reactions on message `m` to Matrix m.reaction, once each
@@ -853,11 +1015,15 @@ def reconcile_reactions(chat_id, m):
         ghost = ensure_ghost(pid, pid) if pid else BOT_ID
         ghost_join(ghost, room)
         try:
-            r = send_reaction(room, ghost, target_event, key)
-            rxn_in_add(chat_id, target_msg, rxn_id, (r or {}).get("event_id") or "")
+            r = send_reaction(room, ghost, target_event, key,
+                              txn=component_txn(room, target_msg, "reaction:" + rxn_id))
+            if not (r or {}).get("event_id"):
+                raise ValueError("missing reaction receipt")
+            rxn_in_add(chat_id, target_msg, rxn_id, r["event_id"])
             log.info("inbound reaction chat=%s", sha(chat_id)[:8])
         except Exception:
             log.info("inbound reaction failed chat=%s", sha(chat_id)[:8])
+            raise
 
 def reconcile_edit(chat_id, m):
     """Relay an inbound edit to Matrix m.replace on the original event (R-1)."""
@@ -890,11 +1056,15 @@ def reconcile_edit(chat_id, m):
     # the marker is never emitted on a ghost-authored edit (M-22 intact).
     from_me_extra = {"com.jkali.from_me": True} if from_me else None
     try:
-        send_replace(room, sender, target_event, text, from_me_extra)
+        result = send_replace(room, sender, target_event, text, from_me_extra,
+                              txn=component_txn(room, target_msg, "edit:" + sha(text)))
+        if not (result or {}).get("event_id"):
+            raise ValueError("missing edit receipt")
         event_map_put(chat_id, target_msg, target_event, sender, sha(text))
         log.info("inbound edit chat=%s", sha(chat_id)[:8])
     except Exception:
         log.info("inbound edit failed chat=%s", sha(chat_id)[:8])
+        raise
 
 def poll_loop():
     while True:
@@ -1009,7 +1179,9 @@ def _status_text(grants):
 
 def cmd_status(room_id):
     try:
-        send_text(room_id, BOT_ID, _status_text(probe_grants()))
+        status = delivery_status()
+        summary = "\nDelivery journal: " + json.dumps(status, sort_keys=True)
+        send_text(room_id, BOT_ID, _status_text(probe_grants()) + summary)
     except Exception:
         log.info("status reply failed")
 
@@ -1068,6 +1240,7 @@ def cmd_start_chat(room_id, rest):
     # SC-P5: persistent global + per-handle caps (bounds a forged-event fan-out).
     ok, hour_ct, day_ct = startchat_gate(handle)
     if not ok:
+        outbound_set("retryable", "startchat_rate_limited")
         try:
             send_text(room_id, BOT_ID, "rate limited, try later.")
         except Exception:
@@ -1076,7 +1249,7 @@ def cmd_start_chat(room_id, rest):
                  sha(handle)[:8], hour_ct, day_ct)
         return
     # SC-4: handle is a separate positional; message is one "--message=" token.
-    result = engine_create_chat(handle, message)
+    result = dispatch_native(engine_create_chat, handle, message)
     try:
         # SC-P6: clean_text the WHOLE reply (handle may carry admitted bidi).
         # Report success/failure per engine result; never leak engine stderr.
@@ -1133,6 +1306,94 @@ def handle_command(ev, room_id, content):
     # else: unknown word, or an argless start-chat, or "status foo" -> ignore
     # (zero engine call, nothing logged from the body).
 
+# ---------------------------------------------------------------- durable outbound receipts
+TERMINAL_OUTCOMES = {"confirmed", "refused", "ambiguous"}
+
+
+def delivery_status():
+    with DBLOCK:
+        pending = dict(DB.execute("SELECT status,COUNT(*) FROM inbound_pending GROUP BY status"))
+        outbound = dict(DB.execute("SELECT state,COUNT(*) FROM outbound_event GROUP BY state"))
+        refused = DB.execute("SELECT COUNT(*) FROM inbound_component WHERE status LIKE 'refused%' ").fetchone()[0]
+    return {"inbound": pending, "inbound_refused_components": refused, "outbound": outbound,
+            "confirmed_means": "engine acceptance; not recipient delivery"}
+
+
+def outbound_get(event_id):
+    with DBLOCK:
+        return DB.execute("SELECT state,reason FROM outbound_event WHERE event_id=?", (event_id,)).fetchone()
+
+
+def outbound_set(state, reason, engine_id=None):
+    event_id = getattr(_EVENT_CONTEXT, "event_id", None)
+    if event_id is None:
+        return
+    with DBLOCK:
+        DB.execute("UPDATE outbound_event SET state=?,reason=?,engine_id=?,updated=? WHERE event_id=?",
+                   (state, reason, engine_id, time.time(), event_id))
+        DB.commit()
+
+
+def dispatch_native(function, *args):
+    # This commit is the boundary after which recovery must assume a send may
+    # have happened. No body is stored; Synapse retains retryable payloads.
+    outbound_set("dispatching", "native_dispatch")
+    try:
+        result = function(*args)
+    except Exception:
+        outbound_set("ambiguous", "dispatch_exception")
+        raise
+    if isinstance(result, EngineOutcome):
+        outcome = result
+    else:
+        # Compatibility for explicit injected transports returning booleans.
+        outcome = EngineOutcome("confirmed" if result else "retryable",
+                                "engine_accepted" if result else "pre_dispatch_failure")
+    outbound_set(outcome.state, outcome.reason, outcome.engine_id)
+    return bool(outcome)
+
+
+def process_outbound_event(ev):
+    """True permits txn ACK; retryable events stay with the homeserver for replay."""
+    if not isinstance(ev, dict):
+        return True
+    event_id = ev.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return True  # malformed events must never invoke the CLI
+    if not EVENT_LOCK.acquire(blocking=False):
+        return False  # serialize native dispatch, including concurrent txn POSTs
+    try:
+        previous = outbound_get(event_id)
+        if previous and previous[0] in TERMINAL_OUTCOMES:
+            return True
+        if previous and previous[0] == "dispatching":
+            # Normally only possible after a persistence error in this process.
+            with DBLOCK:
+                DB.execute("UPDATE outbound_event SET state='ambiguous',reason='unresolved_dispatch' WHERE event_id=?", (event_id,))
+                DB.commit()
+            return True
+        with DBLOCK:
+            DB.execute("INSERT OR REPLACE INTO outbound_event VALUES (?,?,?,?,?,?)",
+                       (event_id, str(ev.get("room_id") or ""), "processing", time.time(), "received", None))
+            DB.commit()
+        _EVENT_CONTEXT.event_id = event_id
+        try:
+            handle_event(ev)
+            state = outbound_get(event_id)[0]
+            if state == "processing":
+                outbound_set("refused", "ignored_or_invalid")
+        except Exception as e:
+            previous = outbound_get(event_id)
+            if previous[0] not in TERMINAL_OUTCOMES:
+                outbound_set("ambiguous" if previous[0] == "dispatching" else "retryable",
+                             "handler_" + type(e).__name__)
+            log.info("event pending id=%s error=%s", sha(event_id)[:8], type(e).__name__)
+        return outbound_get(event_id)[0] in TERMINAL_OUTCOMES
+    finally:
+        _EVENT_CONTEXT.event_id = None
+        EVENT_LOCK.release()
+
+
 # ---------------------------------------------------------------- transactions
 def handle_event(ev):
     if ev.get("sender") != USER_ID:           # M-1: exact allowlist, ALL types
@@ -1158,15 +1419,21 @@ def handle_event(ev):
     body = body[:MAX_TEXT]
     if not rate_ok(chat_id):                  # M-8 cap
         log.info("rate-capped chat=%s", sha(chat_id)[:8])
+        outbound_set("retryable", "rate_limited")
         return
     msgtype = content.get("msgtype")
     if msgtype in ("m.image", "m.file", "m.video", "m.audio"):
-        tmp = download_mxc_to_tmp(content.get("url"), body)
+        try:
+            tmp = download_mxc_to_tmp(content.get("url"), body)
+        except AttachmentRefused:
+            outbound_set("refused", "attachment_too_large")
+            return
         if not tmp:
             log.info("outbound attachment rejected chat=%s", sha(chat_id)[:8])
+            outbound_set("refused" if not MXC_RE.match(str(content.get("url") or "")) else "retryable", "attachment_unavailable")
             return
         try:
-            ok = engine_send_file(chat_id, tmp)
+            ok = dispatch_native(engine_send_file, chat_id, tmp)
             log.info("outbound file chat=%s ok=%s", sha(chat_id)[:8], ok)
         finally:
             try:
@@ -1174,8 +1441,9 @@ def handle_event(ev):
             except OSError:
                 pass
     elif msgtype == "m.text":
-        ledger_add(chat_id + "\0" + body)     # R-5: chat-scoped; M-13 hash only
-        ok = engine_send(chat_id, body)
+        ok = dispatch_native(engine_send, chat_id, body)
+        if ok:
+            ledger_add(chat_id + "\0" + body)
         log.info("outbound text chat=%s ok=%s bytes=%d", sha(chat_id)[:8], ok, len(body))
 
 def _resolve_target(room_id, chat_id, target_event):
@@ -1210,11 +1478,12 @@ def handle_out_reaction(ev):
         return
     if not rate_ok(chat_id):                  # R-3
         log.info("rate-capped chat=%s", sha(chat_id)[:8])
+        outbound_set("retryable", "rate_limited")
         return
     display = RXN_KEY_EMOJI.get(engine_key, engine_key)
-    ledger_add(chat_id + "\0" + msg_id + "\0" + display)   # R-5 echo suppress
-    ok = engine_react(msg_id, engine_key)
+    ok = dispatch_native(engine_react, msg_id, engine_key)
     if ok:
+        ledger_add(chat_id + "\0" + msg_id + "\0" + display)
         ev_id = ev.get("event_id")
         if ev_id:                             # R-6: remember mapped reaction event
             rxn_out_add(ev_id, chat_id, msg_id, engine_key)
@@ -1232,9 +1501,11 @@ def handle_out_edit(ev, room_id, chat_id, content, relates):
     text = text[:MAX_TEXT]
     if not rate_ok(chat_id):                  # R-3
         log.info("rate-capped chat=%s", sha(chat_id)[:8])
+        outbound_set("retryable", "rate_limited")
         return
-    ledger_add(chat_id + "\0" + text)         # R-5 echo suppress
-    ok = engine_edit(msg_id, text)
+    ok = dispatch_native(engine_edit, msg_id, text)
+    if ok:
+        ledger_add(chat_id + "\0" + text)
     log.info("outbound edit chat=%s ok=%s bytes=%d", sha(chat_id)[:8], ok, len(text))
 
 def handle_out_redaction(ev):
@@ -1253,14 +1524,19 @@ def handle_out_redaction(ev):
         return
     if not rate_ok(chat_id):                  # R-3
         log.info("rate-capped chat=%s", sha(chat_id)[:8])
+        outbound_set("retryable", "rate_limited")
         return
-    ok = engine_unreact(msg_id, engine_key)
+    ok = dispatch_native(engine_unreact, msg_id, engine_key)
     log.info("outbound unreact chat=%s ok=%s", sha(chat_id)[:8], ok)
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "imsgd"
     sys_version = ""
     protocol_version = "HTTP/1.1"   # Twisted needs Content-Length'd responses
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
 
     def _reply(self, code, payload):
         self.send_response(code)
@@ -1286,7 +1562,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urllib.parse.urlparse(self.path).path == "/health" and self._host_ok():
-            self._reply(200, b"OK")
+            self._reply(200, json.dumps(delivery_status()).encode())
         else:
             self._deny(404)
 
@@ -1311,14 +1587,18 @@ class Handler(BaseHTTPRequestHandler):
                 while True:
                     size_line = self.rfile.readline(32).strip()
                     size = int(size_line.split(b";")[0], 16)
+                    if size < 0:
+                        return self._deny(400)
                     if size == 0:
                         self.rfile.readline(4)
                         break
                     total += size
                     if total > MAX_BODY:
                         return self._deny(413)
-                    chunks.append(self.rfile.read(size))
-                    self.rfile.readline(4)  # trailing CRLF
+                    chunk = self.rfile.read(size)
+                    if len(chunk) != size or self.rfile.readline(4) != b"\r\n":
+                        return self._deny(400)
+                    chunks.append(chunk)
             except (ValueError, OSError):
                 return self._deny(400)
             body = b"".join(chunks)
@@ -1327,21 +1607,33 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 return self._deny(400)
+            if length < 0:
+                return self._deny(400)
             if length > MAX_BODY:
                 return self._deny(413)
             body = self.rfile.read(length)
+            if len(body) != length:
+                return self._deny(400)
         if txn_seen(txn_id):                   # M-8 idempotency (set-based)
             self._reply(200, b"{}")
             return
         try:
             events = json.loads(body.decode("utf-8", "replace")).get("events", [])
+            if not isinstance(events, list):
+                return self._deny(400)
         except Exception:
             return self._deny(400)
-        for ev in events if isinstance(events, list) else []:
+        complete = True
+        for ev in events:
             try:
-                handle_event(ev)
+                if not process_outbound_event(ev):
+                    complete = False
             except Exception as e:
+                complete = False
                 log.info("event error: %s", type(e).__name__)
+        if not complete:
+            self._reply(503, b'{"errcode":"M_UNAVAILABLE","error":"Retryable events remain"}')
+            return
         txn_mark(txn_id)
         self._reply(200, b"{}")
 
@@ -1350,6 +1642,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.umask(0o077)
+    initialize()
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)  # M-3 fixed port
     except OSError as e:
@@ -1357,7 +1650,7 @@ def main():
         sys.exit(1)
     srv.daemon_threads = True
     srv.timeout = 30
-    ensure_user("imessagebot")
+    ensure_user(BOT_ID.split(":", 1)[0].lstrip("@"))
     set_displayname(BOT_ID, "iMessage bridge bot")
     try:
         ensure_mgmt_room()                    # B-2: pinned mgmt room + marker

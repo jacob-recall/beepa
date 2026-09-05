@@ -11,6 +11,9 @@ services:
     # X-Frame-Options, method filter) come from views/nginx.conf; each app's
     # index.html <meta> CSP remains as defense in depth.
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    # Bootstrap credentials stay mode 600 and belong to the installing OS user.
+    # Run workers as that user instead of nginx's unrelated uid 101.
+    user: "${HOST_UID:?HOST_UID must be set by setup}:${HOST_GID:?HOST_GID must be set by setup}"
     restart: unless-stopped
     volumes:
       - ./apps:/usr/share/nginx/html/apps:ro
@@ -21,7 +24,7 @@ services:
       - "127.0.0.1:8011:80"
     read_only: true
     tmpfs:
-      - /var/cache/nginx
-      - /var/run
+      - "/var/cache/nginx:uid=${HOST_UID},gid=${HOST_GID},mode=0700"
+      - "/var/run:uid=${HOST_UID},gid=${HOST_GID},mode=0700"
     security_opt:
       - no-new-privileges:true

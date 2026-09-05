@@ -199,7 +199,7 @@ class Updater:
         if 'master' in manifest['roles']:
             result.append(('master', manifest['master_compose_project'], 'master/docker-compose.master.yml', 'master/.env'))
             if 'teammate' not in manifest['roles']:
-                result.append(('local-ui', manifest['compose_project'], 'docker-compose.apps.yml', None))
+                result.append(('local-ui', manifest['compose_project'], 'docker-compose.apps.yml', 'master/.env'))
         rows = []
         state = Path(manifest['state_root']).resolve() if manifest.get('state_initialized') else self.root
         for role, project, filename, envfile in result:
@@ -207,7 +207,8 @@ class Updater:
             project_dir = Path(os.environ.get('BEEPA_MASTER_STATE_DIR', manifest.get('master_state_root', state / 'master'))).resolve() if role == 'master' else release
             cmd = ['docker', 'compose', '-p', project, '--project-directory', str(project_dir)]
             if envfile:
-                cmd += ['--env-file', str(project_dir / '.env' if role == 'master' else state / envfile)]
+                env_path = runtime_path(self.root, 'master/.env') if role in ('master', 'local-ui') else state / envfile
+                cmd += ['--env-file', str(env_path)]
             cmd += ['-f', str(release / filename)]
             if role in ('teammate', 'local-ui'):
                 overlay = self.meta / ('views-' + release.name + '.json')

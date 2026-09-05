@@ -12,4 +12,4 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
-exec /usr/bin/python3 "${HERE}/connect_server.py" --host 127.0.0.1 --port 8021
+exec "${BEEPA_PYTHON:-/usr/bin/python3}" "${HERE}/connect_server.py" --host 127.0.0.1 --port 8021

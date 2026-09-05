@@ -84,18 +84,11 @@ order = sorted(secrets.items(), key=lambda kv: len(kv[1]), reverse=True)
 # (${LOCAL_MXID}) so a teammate's install isn't hardcoded to the author's
 # account. It is NOT a secret — scrub it by exact string, and ONLY in the files
 # that grant it (bridge configs + the gmessages appservice user-regex), so an
-# unrelated mention could never be caught. LIVE_MXID comes from .env's
-# LOCAL_LOCALPART (default 'jkali'), matching what hub/render-hub.sh renders.
-def _env_localpart():
-    try:
-        with open(os.path.join(ROOT, ".env")) as f:
-            for line in f:
-                if line.startswith("LOCAL_LOCALPART="):
-                    return line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return "jkali"
-LIVE_MXID = "@%s:localhost" % _env_localpart()
+# unrelated mention could never be caught. Use the same read-only identity
+# resolver as rendering; missing/conflicting configuration fails explicitly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from install_config import configured_identity
+LIVE_MXID = configured_identity(ROOT)
 MXID_FILES = {
     "meta/config.yaml", "twitter/config.yaml", "gmessages/config.yaml",
     "linkedin/config.yaml", "whatsapp/config.yaml",

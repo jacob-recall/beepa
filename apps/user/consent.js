@@ -20,6 +20,7 @@ import {
   readContactOverrides, writeContactOverrides,
 } from '../../shared/model/consent.js';
 import { readProfiles, writeProfiles, roomProfileMap } from '../../shared/model/contacts.js';
+import { loadContactPages } from './contact-pages.js';
 import { api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setConvoRowDecorator } from '../../shared/ui/rows.js';
@@ -1224,21 +1225,23 @@ let importedContactsError = null;
 // The teammate's own imported address book, via the loopback helper's
 // origin-gated POST /contacts/list. Fail-soft with a VISIBLE reason: an
 // unreachable helper must not look like "you have no contacts".
+let importedContactsLoad = 0;
 async function loadImportedContacts() {
+  const generation = ++importedContactsLoad;
+  const user = S.userId;
   try {
-    const r = await fetch((await sessionConnectBase()) + '/contacts/list',
-      { method: 'POST', headers: SESSION_CONNECT_HEADERS, body: '{}' });
-    if (!r.ok) {
-      importedContacts = [];
-      importedContactsError = 'the local contacts helper returned ' + r.status;
-      return;
-    }
-    const body = await r.json().catch(() => null);
-    importedContacts = validImportedContacts(body, knownSourceIds());
+    const base = await sessionConnectBase();
+    const rows = await loadContactPages(cursor => fetch(base + '/contacts/list',
+      { method: 'POST', headers: SESSION_CONNECT_HEADERS,
+        body: JSON.stringify(cursor ? { cursor } : {}) }),
+      body => validImportedContacts(body, knownSourceIds()));
+    if (generation !== importedContactsLoad || user !== S.userId) return;
+    importedContacts = rows;
     importedContactsError = null;
   } catch (e) {
+    if (generation !== importedContactsLoad || user !== S.userId) return;
     importedContacts = [];
-    importedContactsError = 'the local contacts helper is not running';
+    importedContactsError = e instanceof Error ? e.message : 'the local contacts helper is not running';
   }
 }
 

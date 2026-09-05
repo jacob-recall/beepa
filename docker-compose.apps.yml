@@ -1,0 +1,27 @@
+# Shared local web interface for teammate and master installations.
+# Same matrix-wa/views service as docker-compose.yml; start only views.
+# Never use --remove-orphans or down with this file.
+name: matrix-wa
+
+services:
+  views:
+    # Serves the single-source-of-truth apps: apps/user (points at the live
+    # hub 8008) and apps/master (points at the master 8018). shared/ is mounted
+    # so the ES-module imports (../../shared) resolve. Security headers (CSP,
+    # X-Frame-Options, method filter) come from views/nginx.conf; each app's
+    # index.html <meta> CSP remains as defense in depth.
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    volumes:
+      - ./apps:/usr/share/nginx/html/apps:ro
+      - ./apps:/usr/share/nginx/runtime/apps:ro
+      - ./shared:/usr/share/nginx/html/shared:ro
+      - ./views/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8011:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true

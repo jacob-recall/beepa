@@ -33,11 +33,14 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import quote
 
 import chrome_cookies as ck
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USER_ID = "@jkali:localhost"
+CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.environ.get('BEEPA_INSTALL_ROOT', CODE_ROOT)
+sys.path.insert(0, CODE_ROOT)
+from install_config import configured_identity, compose_prefix
 # Bridge-supplied ids get interpolated into a `sh -c` string; allow only the
 # characters real login_id/step_id values use (alnum, dot, dash, underscore),
 # so a hostile/garbled bridge response can never break out with a quote.
@@ -84,13 +87,13 @@ def shared_secret(config):
 
 def api(net, path, secret, body=None, timeout=15):
     """Call the bridge provisioning API inside its container via docker compose exec."""
-    url = "http://localhost:%d/_matrix/provision/v3%s?user_id=%s" % (net["port"], path, USER_ID)
+    url = "http://localhost:%d/_matrix/provision/v3%s?user_id=%s" % (net["port"], path, quote(configured_identity(REPO), safe=''))
     wget = ("wget -qO- -T %d --header='Authorization: Bearer %s' "
             "--header='Content-Type: application/json' --post-file=/dev/stdin '%s'"
             % (timeout, secret, url))
     inp = (json.dumps(body) if body is not None else "{}").encode()
     p = subprocess.run(
-        ["docker", "compose", "exec", "-T", net["service"], "sh", "-c", wget],
+        compose_prefix(REPO, CODE_ROOT) + ["exec", "-T", net["service"], "sh", "-c", wget],
         input=inp, capture_output=True, cwd=REPO, timeout=timeout + 20)
     return p.stdout.decode("utf-8", "replace").strip()
 

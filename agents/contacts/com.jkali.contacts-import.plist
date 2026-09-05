@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- NOTE: the /Users/jkali/work/pm_mng paths below are PLACEHOLDERS,
-     rewritten to this checkout's real path by setup.sh install_agent when the
+<!-- NOTE: the ${BEEPA_CODE_ROOT} paths below are PLACEHOLDERS,
+     legacy template only; install_config.py generates a neutral org.beepa agent when the
      agent is installed into ~/Library/LaunchAgents. Do not debug against this
      repo copy's paths - read the installed copy instead. -->
 <plist version="1.0">
@@ -10,13 +10,13 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/jkali/work/pm_mng/agents/contacts/run-import.sh</string>
+        <string>${BEEPA_CODE_ROOT}/agents/contacts/run-import.sh</string>
     </array>
-    <key>WorkingDirectory</key><string>/Users/jkali/work/pm_mng</string>
+    <key>WorkingDirectory</key><string>${BEEPA_CODE_ROOT}</string>
     <key>RunAtLoad</key><true/>
     <key>StartInterval</key><integer>3600</integer>
     <key>Umask</key><integer>63</integer>
-    <key>StandardOutPath</key><string>/Users/jkali/work/pm_mng/agents/contacts/logs/import.log</string>
-    <key>StandardErrorPath</key><string>/Users/jkali/work/pm_mng/agents/contacts/logs/import.err</string>
+    <key>StandardOutPath</key><string>${BEEPA_CODE_ROOT}/agents/contacts/logs/import.log</string>
+    <key>StandardErrorPath</key><string>${BEEPA_CODE_ROOT}/agents/contacts/logs/import.err</string>
 </dict>
 </plist>

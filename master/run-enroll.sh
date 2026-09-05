@@ -14,4 +14,4 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
-exec /usr/bin/python3 "${HERE}/enroll.py" serve --host 127.0.0.1 --port 8019
+exec "${BEEPA_PYTHON:-/usr/bin/python3}" "${HERE}/enroll.py" serve --host 127.0.0.1 --port 8019

@@ -15,10 +15,13 @@ What it does:
 Run from the repo root:  python3 gmessages-connect/connect.py
 """
 import sqlite3, subprocess, hashlib, json, os, sys, shutil, string, re, time, tempfile
+from urllib.parse import quote
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.environ.get('BEEPA_INSTALL_ROOT', CODE_ROOT)
 CONFIG = os.path.join(REPO, "gmessages", "config.yaml")
-USER_ID = "@jkali:localhost"
+sys.path.insert(0, CODE_ROOT)
+from install_config import configured_identity, compose_prefix
 SERVICE = "mautrix-gmessages"
 BASE = "http://localhost:29336/_matrix/provision/v3"
 STEP_ID = "fi.mau.gmessages.google_account"
@@ -45,7 +48,7 @@ def shared_secret():
 
 def api(path, secret, body=None, method="POST", timeout=15):
     """Call the provisioning API inside the bridge container via docker compose exec."""
-    url = f"{BASE}{path}?user_id={USER_ID}"
+    url = f"{BASE}{path}?user_id={quote(configured_identity(REPO), safe='')}"
     wget = ("wget -qO- -T %d --header='Authorization: Bearer %s' "
             "--header='Content-Type: application/json' " % (timeout, secret))
     if body is None and method == "GET":
@@ -55,7 +58,7 @@ def api(path, secret, body=None, method="POST", timeout=15):
         wget += f"--post-file=/dev/stdin '{url}'"
         inp = (json.dumps(body) if body is not None else "{}").encode()
     p = subprocess.run(
-        ["docker", "compose", "exec", "-T", SERVICE, "sh", "-c", wget],
+        compose_prefix(REPO, CODE_ROOT) + ["exec", "-T", SERVICE, "sh", "-c", wget],
         input=inp, capture_output=True, cwd=REPO, timeout=timeout + 20,
     )
     out = p.stdout.decode("utf-8", "replace").strip()

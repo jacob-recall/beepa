@@ -97,9 +97,13 @@ else
   fail "setup.sh not found or not executable at ${HERE}/setup.sh"
 fi
 
+BEEPA_INSTALL_ROOT="$(python3 "${HERE}/install_config.py" --root "${HERE}" initialize-state)"
+export BEEPA_INSTALL_ROOT
+
 log ""
 log "Connect your accounts now (one click each, no terminal):"
-log "  Open:  http://127.0.0.1:8011/apps/user/index.html"
+log "  Open Beepa.app in ~/Applications (macOS), or:"
+log "    http://127.0.0.1:8011/apps/user/index.html"
 log "  Use the Connect buttons for WhatsApp / Google Messages / Instagram /"
 log "  LinkedIn / X. WhatsApp is QR-based (see README.md); the rest are"
 log "  one-click via the helpers setup.sh just loaded."
@@ -116,13 +120,13 @@ step "Step 3/3 — enroll the uplink to the master"
 
 # Use the LOCAL_* creds setup.sh's provisioning step wrote, so link.sh does not
 # prompt for a hub token the teammate would have to find by hand.
-LOCAL_ENV="${HERE}/agents/uplink/local.env.local"
+LOCAL_ENV="${BEEPA_INSTALL_ROOT}/agents/uplink/local.env.local"
 if [ -f "${LOCAL_ENV}" ]; then
   set -a; . "${LOCAL_ENV}"; set +a
-  log "local hub creds ready (${LOCAL_USER:-@jkali:localhost}) — link.sh will use them"
+  log "local hub creds ready (${LOCAL_USER:-configured local account}) — link.sh will use them"
 fi
 
-UPLINK_ENV="${HERE}/agents/uplink/uplink.env.local"
+UPLINK_ENV="${BEEPA_INSTALL_ROOT}/agents/uplink/uplink.env.local"
 if [ -f "${UPLINK_ENV}" ]; then
   log "already enrolled: ${UPLINK_ENV} exists."
   log "  To re-enroll (e.g. against a different master), remove that file and"
@@ -168,7 +172,8 @@ cat >&2 <<DONE
 
 [install] ============================================================
 [install] Done.
-  Teammate app:    http://127.0.0.1:8011/apps/user/index.html
+  Teammate app:    Beepa.app in ~/Applications (macOS).
+  Browser address: http://127.0.0.1:8011/apps/user/index.html
   Connect status:  check the Connections card in the app for each network.
 DONE
 if [ -f "${UPLINK_ENV}" ]; then

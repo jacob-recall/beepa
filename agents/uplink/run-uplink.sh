@@ -18,8 +18,11 @@
 # See agents/uplink/CLAUDE.md.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_ENV="${HERE}/local.env.local"
-ENVFILE="${HERE}/uplink.env.local"
+STATE_DIR="${BEEPA_INSTALL_ROOT:-$(cd "${HERE}/../.." && pwd)}/agents/uplink"
+LOCAL_ENV="${STATE_DIR}/local.env.local"
+ENVFILE="${STATE_DIR}/uplink.env.local"
+export UPLINK_DB="${UPLINK_DB:-${STATE_DIR}/state.db}"
+export UPLINK_CONTACTS_DB="${UPLINK_CONTACTS_DB:-${STATE_DIR}/../contacts/contacts.db}"
 if [ ! -f "${LOCAL_ENV}" ] && [ ! -f "${ENVFILE}" ]; then
   echo "run-uplink: no local.env.local or uplink.env.local (no hub creds); not starting" >&2
   exit 78
@@ -30,4 +33,4 @@ set -a
 # shellcheck disable=SC1090
 [ -f "${ENVFILE}" ] && source "${ENVFILE}"       # full creds if already enrolled (overrides)
 set +a
-exec /usr/bin/python3 "${HERE}/uplink.py"
+exec "${BEEPA_PYTHON:-/usr/bin/python3}" "${HERE}/uplink.py"

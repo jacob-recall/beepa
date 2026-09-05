@@ -1,0 +1,2 @@
+# Core phone parsing metadata; no geocoder/carrier package, no native extension.
+phonenumberslite==9.0.38 --hash=sha256:a089149e963c6373fc0db41b2b103e7d12a6788ef186c4d5c205837ff5f1e32a

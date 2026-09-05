@@ -48,16 +48,19 @@ import subprocess
 
 log = logging.getLogger("number_resolver")
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-WHATSAPP_CONTAINER = "matrix-wa-postgres-1"
-WHATSAPP_DB = "mautrix_whatsapp"
-GMESSAGES_CONTAINER = "matrix-wa-postgres-1"
-GMESSAGES_DB = "mautrix_gmessages"
-PG_USER = "matrix"
-
-IMESSAGE_STATE_DB = os.path.join(REPO, "imessage", "state.db")
-
+from pathlib import Path
+import sys
+CODE_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(CODE_ROOT))
+from phone_numbers import normalize_phone
+from install_config import compose_prefix
+REPO = os.environ.get('BEEPA_INSTALL_ROOT', str(CODE_ROOT))
+WHATSAPP_CONTAINER = 'postgres'  # Compose service, not a generated container name
+WHATSAPP_DB = 'mautrix_whatsapp'
+GMESSAGES_CONTAINER = 'postgres'
+GMESSAGES_DB = 'mautrix_gmessages'
+PG_USER = 'matrix'
+IMESSAGE_STATE_DB = os.path.join(REPO, 'imessage', 'state.db')
 _PHONE_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 _EMAIL_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
@@ -66,57 +69,13 @@ _EMAIL_RE = re.compile(
 
 
 def _norm_phone(raw):
-    """Normalize `raw` to strict E.164, or return None.
-
-    Never invents a country code. A value that already starts with '+'
-    (or '00', treated as an international dial prefix) is validated as
-    given. A bare all-digit value with NO leading '+' is only accepted if
-    it's long enough (>=11 digits) to already be carrying a country code
-    itself (this is exactly the shape WhatsApp's `whatsmeow_lid_map.pn`
-    comes back in) — a shorter bare digit string is indistinguishable
-    from a national number missing its country code, so it's dropped
-    rather than guessed.
-    """
-    if not isinstance(raw, str):
-        return None
-    s = raw.strip()
-    if not s:
-        return None
-    digits = re.sub(r"[^0-9+]", "", s)
-    if not digits:
-        return None
-    if digits.startswith("00"):
-        digits = "+" + digits[2:]
-    if digits.startswith("+"):
-        candidate = "+" + digits[1:].replace("+", "")
-        return candidate if _PHONE_RE.match(candidate) else None
-    if len(digits) >= 11:
-        candidate = "+" + digits
-        if _PHONE_RE.match(candidate):
-            return candidate
-    return None
+    """Freeform values require an explicit international prefix here."""
+    return normalize_phone(raw)
 
 
 def _norm_wa_pn(raw):
-    """Normalize a WhatsApp `whatsmeow_lid_map.pn` value to E.164.
-
-    Unlike a freeform contact string, `pn` is not ambiguous: by
-    WhatsApp/whatsmeow's own construction it is always digits that
-    already include the country code (that's what `pn` means), just
-    without the leading '+'. So this only adds the '+' and strict-
-    validates the result — it does not run `_norm_phone`'s
-    "long-enough-to-be-international" length gate, which exists to guard
-    a genuinely ambiguous freeform bare number and would otherwise
-    wrongly drop legitimate short-country-code numbers (e.g. a 10-digit
-    total pn from a country with a 1-2 digit calling code).
-    """
-    if not isinstance(raw, str):
-        return None
-    digits = re.sub(r"[^0-9]", "", raw)
-    if not digits:
-        return None
-    candidate = "+" + digits
-    return candidate if _PHONE_RE.match(candidate) else None
+    """WhatsApp pn is a provider-defined country-code-bearing digit ID."""
+    return normalize_phone(raw, provider=True)
 
 
 def _parse_imessage_handle(chat_id):
@@ -146,7 +105,7 @@ def _psql(container, db, query, timeout=15):
     stdout lines (tab-separated fields), or None on any failure. Never
     writes; the query string is caller-controlled (module constants
     only, no external input is interpolated into SQL here)."""
-    argv = ["docker", "exec", container, "psql", "-U", PG_USER, "-d", db, "-tAc", query]
+    argv = compose_prefix(REPO, CODE_ROOT) + ["exec", "-T", container, "psql", "-U", PG_USER, "-d", db, "-tAc", query]
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -209,8 +168,9 @@ def resolve_gmessages():
         # bare digit string is a phone; an SMS short code or an
         # `<slug>@rbm.goog` RCS id could otherwise survive non-digit
         # stripping and be misread as one.
-        if room_id and phone and _PHONE_RE.match(phone):
-            out[room_id] = {"value": phone, "kind": "phone", "source": "gmessages"}
+        normalized = _norm_phone(phone) if phone.startswith("+") else None
+        if room_id and normalized:
+            out[room_id] = {"value": normalized, "kind": "phone", "source": "gmessages"}
     return out
 
 

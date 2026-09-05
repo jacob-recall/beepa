@@ -52,6 +52,8 @@ import time
 
 import connect  # gmessages-connect/connect.py — same dir; imported side-effect-free
 
+from http_limits import BoundedBodyMixin
+
 # The teammate app's browser origin (apps/user, served by the `views` nginx).
 # 127.0.0.1 and localhost are the same loopback app — a viewer may open either,
 # so BOTH are allowed; nothing else is (never "*"). An off-machine or foreign
@@ -70,7 +72,7 @@ _login_id = None
 def _make_handler():
     from http.server import BaseHTTPRequestHandler
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(BoundedBodyMixin, BaseHTTPRequestHandler):
         def log_message(self, *a):  # F6: no access log (never risk logging a header/body)
             pass
 
@@ -111,18 +113,8 @@ def _make_handler():
             self.wfile.write(payload)
 
         def _discard_body(self):
-            """Consume the request body (if any) so the connection is clean.
-            The bytes are dropped: /start ignores its body, /wait takes NO
-            params (F2)."""
-            try:
-                n = int(self.headers.get("Content-Length") or "0")
-            except (TypeError, ValueError):
-                n = 0
-            if n > 0:
-                try:
-                    self.rfile.read(n)
-                except Exception:
-                    pass
+            return self._bounded_body(65536) is not None
+
 
         # ---- F1: the authorization gate, run at the TOP of every do_POST,
         # BEFORE any cookie read or bridge call. Fails closed on all three.
@@ -171,12 +163,14 @@ def _make_handler():
             if self.path == "/connect/gmessages/start":
                 if not self._authorized():   # F1: gate BEFORE any side effect
                     return
-                self._discard_body()
+                if not self._discard_body():
+                    return
                 self._start()
             elif self.path == "/connect/gmessages/wait":
                 if not self._authorized():   # F1: gate BEFORE any side effect
                     return
-                self._discard_body()
+                if not self._discard_body():
+                    return
                 self._wait()
             else:
                 self._json(404, {"error": "not found"})

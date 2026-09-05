@@ -38,7 +38,7 @@ ensure_docker() {
       exit 1
     elif command -v brew >/dev/null 2>&1; then
       log "Docker not found — installing Docker Desktop via Homebrew…"
-      brew install --cask docker || { log "brew install failed — install Docker Desktop manually then re-run: https://www.docker.com/products/docker-desktop/"; exit 1; }
+      HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask docker || { log "brew install failed — install Docker Desktop manually then re-run: https://www.docker.com/products/docker-desktop/"; exit 1; }
     else
       log "Docker not found and Homebrew unavailable. Install Docker Desktop, then re-run:"
       log "  https://www.docker.com/products/docker-desktop/"
@@ -64,35 +64,25 @@ ensure_docker
 # from under an existing Postgres volume.
 ENV_FILE="${HERE}/.env"
 
-# Resolve the LOCAL identity (localpart + display name) ONCE, at first install.
-# The localpart is what the six bridges grant permissions to (rendered into their
-# configs by hub/render-hub.sh), so it is fixed for the life of an install —
-# changing it later means re-logging-in every bridge. Default from the Mac
-# (`id -un` / `id -F`); override by pre-setting LOCAL_LOCALPART/LOCAL_DISPLAYNAME
-# or by answering the prompt on a TTY. An existing .env's identity is
-# authoritative and is NEVER rotated.
-slugify_localpart() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/[^a-z0-9._=/-]+/-/g; s/^[-_]+//; s/-+$//'
-}
-if [ -f "${ENV_FILE}" ] && grep -q '^LOCAL_LOCALPART=' "${ENV_FILE}"; then
-  LOCAL_LOCALPART="$(grep -E '^LOCAL_LOCALPART=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
-  LOCAL_DISPLAYNAME="$(grep -E '^LOCAL_DISPLAYNAME=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
-  log "identity: @${LOCAL_LOCALPART}:localhost (from existing .env — unchanged)"
-else
-  LOCAL_LOCALPART="${LOCAL_LOCALPART:-$(slugify_localpart "$(id -un 2>/dev/null || echo user)")}"
-  [ -n "${LOCAL_LOCALPART}" ] || LOCAL_LOCALPART="user"
-  LOCAL_DISPLAYNAME="${LOCAL_DISPLAYNAME:-$(id -F 2>/dev/null || echo "${LOCAL_LOCALPART}")}"
-  [ -n "${LOCAL_DISPLAYNAME}" ] || LOCAL_DISPLAYNAME="${LOCAL_LOCALPART}"
-  if [ -t 0 ]; then
-    printf '[setup] Local account name (localpart) [%s]: ' "${LOCAL_LOCALPART}" >&2
-    read -r _lp || true; [ -n "${_lp:-}" ] && LOCAL_LOCALPART="$(slugify_localpart "${_lp}")"
-    printf '[setup] Your display name [%s]: ' "${LOCAL_DISPLAYNAME}" >&2
-    read -r _dn || true; [ -n "${_dn:-}" ] && LOCAL_DISPLAYNAME="${_dn}"
-  fi
-  log "identity: @${LOCAL_LOCALPART}:localhost  (display: ${LOCAL_DISPLAYNAME})"
-fi
+# Adopt the existing identity or persist the first-install OS/supplied value.
+# Output is shell-quoted by our own parser; no existing env file is executed.
+identity_env="$(python3 "${HERE}/install_config.py" --root "${HERE}" ensure --role teammate --shell)"
+eval "${identity_env}"
+log "identity: @${LOCAL_LOCALPART}:localhost (persisted installation identity)"
 export LOCAL_LOCALPART LOCAL_DISPLAYNAME
+BEEPA_INSTALL_ROOT="$(python3 "${HERE}/install_config.py" --root "${HERE}" initialize-state)"
+export BEEPA_INSTALL_ROOT
+BEEPA_MASTER_STATE_DIR="$(python3 - "${HERE}/.beepa-install.json" <<'PYCODE'
+import json, sys
+from pathlib import Path
+data = json.load(open(sys.argv[1]))
+print(data.get('master_state_root', str(Path(data['state_root']) / 'master')))
+PYCODE
+)"
+export BEEPA_MASTER_STATE_DIR
+ENV_FILE="${BEEPA_INSTALL_ROOT}/.env"
+BEEPA_PYTHON="$(python3 "${HERE}/install_config.py" --root "${HERE}" runtime)"
+export BEEPA_PYTHON
 
 if [ ! -f "${ENV_FILE}" ]; then
   if command -v openssl >/dev/null 2>&1; then
@@ -133,7 +123,23 @@ fi
 # --- 1. bring up the local stack (idempotent) ---
 if command -v docker >/dev/null 2>&1; then
   log "starting the local hub (docker compose: bridge + client)…"
-  ( cd "${HERE}" && docker compose --profile bridge --profile client up -d )
+  python3 "${HERE}/install_config.py" --root "${HERE}" compose -- up -d
+  # Bind-mounted YAML changes are not a Compose service-definition change.
+  # Explicitly restart only services whose effective configuration changed.
+  changed_services="$(python3 - "${HERE}" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from beepa_update import changed_config_services
+path = Path(sys.argv[1]) / '.beepa-config/last-render.json'
+if path.exists():
+    print(' '.join(changed_config_services(json.loads(path.read_text()).get('changed', []))))
+PY
+)"
+  if [ -n "${changed_services}" ]; then
+    # Values are the fixed service allowlist from changed_config_services.
+    python3 "${HERE}/install_config.py" --root "${HERE}" compose -- restart ${changed_services}
+  fi
 else
   log "docker not found — install Docker Desktop and re-run to start the stack."
 fi
@@ -161,18 +167,12 @@ install_agent() {
     log "skip ${label}: plist or launchctl unavailable"
     return
   fi
-  cp "${src}" "${dest}"
-  # The tracked plists ship with the author's absolute path baked in; rewrite it
-  # to THIS clone's path so the launchd service works wherever the teammate
-  # cloned (otherwise every native daemon points at a nonexistent path and dies).
-  sed -i '' "s#/Users/jkali/work/pm_mng#${HERE}#g" "${dest}" 2>/dev/null \
-    || sed -i "s#/Users/jkali/work/pm_mng#${HERE}#g" "${dest}"
-  launchctl unload "${dest}" 2>/dev/null || true
-  if launchctl load "${dest}" 2>/dev/null; then
-    log "loaded ${label}"
+  name="${label##*.}"
+  if python3 "${HERE}/install_config.py" --root "${HERE}" install-agent "${name}"; then
+    log "loaded org.beepa.${name}"
   else
-    log "could not launchctl load ${label}; run: launchctl load '${dest}'"
-    return
+    log "could not install org.beepa.${name}; rerun setup after resolving launchctl error"
+    return 1
   fi
   # Best-effort liveness (health is side-effect-free — reads no cookies).
   [ -n "${health}" ] || return 0
@@ -229,21 +229,21 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
 
   # iMessage appservice daemon (imessage/daemon.py): a KeepAlive launchd agent,
   # macOS only. daemon.json is rendered by hub/render-hub.sh (tokens match the
-  # registration; self_handle left as a placeholder). The CLI is built on demand
-  # from Beeper's public repo. It loads only when the binary exists AND the
+  # registration; self_handle left as a placeholder). The signed CLI is downloaded on demand
+  # from Beeper's pinned public release. It loads only when the binary exists AND the
   # teammate has filled in self_handle — otherwise say what's missing and carry
   # on (every other network is unaffected). Set SKIP_IMESSAGE=1 to opt out.
-  # Xcode Command Line Tools (Swift) are needed to build the iMessage CLI. Trigger
-  # the installer if Swift is missing — it opens a GUI dialog and installs in the
-  # background, so the build below simply skips this run and picks up on the next.
-  if ! command -v swift >/dev/null 2>&1; then
-    log "Swift not found — triggering Xcode Command Line Tools install (click Install in the dialog)…"
-    xcode-select --install 2>/dev/null || true
-    log "  when it finishes, re-run setup.sh to build iMessage (other networks work meanwhile)."
+  # The pinned Developer-ID-signed CLI is downloaded, not compiled. Preserve
+  # the existing executable and its macOS permission identity on every rerun.
+  IMSG_CFG="${BEEPA_INSTALL_ROOT}/imessage/daemon.json"
+  IMSG_CLI="$(python3 - "${BEEPA_INSTALL_ROOT}/.beepa-install.json" <<'PYCODE'
+import json, sys
+print(json.load(open(sys.argv[1]))['imessage_cli_path'])
+PYCODE
+)"
+  if [ ! -x "${IMSG_CLI}" ]; then
+    [ -x "${HERE}/imessage/build-cli.sh" ] && "${HERE}/imessage/build-cli.sh" || true
   fi
-  [ -x "${HERE}/imessage/build-cli.sh" ] && "${HERE}/imessage/build-cli.sh" || true
-  IMSG_CFG="${HERE}/imessage/daemon.json"
-  IMSG_CLI="${HERE}/imessage/bin/imessage-cli"
   IMSG_HANDLE_UNSET=0
   grep -q 'REPLACE_WITH_YOUR_IMESSAGE_HANDLE' "${IMSG_CFG}" 2>/dev/null && IMSG_HANDLE_UNSET=1
   if [ -f "${IMSG_CFG}" ] && [ -x "${IMSG_CLI}" ] && [ "${IMSG_HANDLE_UNSET}" = 0 ]; then
@@ -252,22 +252,27 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   else
     log "skip com.jkali.imessage-daemon — not ready yet:"
     [ -f "${IMSG_CFG}" ] || log "  - ${IMSG_CFG} missing (hub/render-hub.sh renders it)"
-    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI} missing — imessage/build-cli.sh should have built it; see ITS output above for the real reason (Swift toolchain missing, a polluted CPATH breaking the Darwin module, a clone/network failure, …). Do NOT assume it's Xcode CLT."
+    [ -x "${IMSG_CLI}" ] || log "  - ${IMSG_CLI} missing — the pinned signed download did not install; inspect build-cli.sh output above for download, checksum, or Developer ID signature failures, then retry. No Swift compilation is required."
     [ "${IMSG_HANDLE_UNSET}" = 1 ] && log "  - set self_handle (your iMessage phone/email) in ${IMSG_CFG}, and grant the CLI Full Disk Access"
     log "  then re-run setup.sh to load it."
   fi
 fi
 
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  python3 "${HERE}/desktop/install_apps.py" --role user
+fi
+
 cat >&2 <<DONE
 
 [setup] Done. One-click connect is on.
-  - Open the app:  http://127.0.0.1:8011
+  - Open Beepa.app in ~/Applications (macOS); drag it to the Dock if wanted.
+  - Browser address: http://127.0.0.1:8011/apps/user/index.html
   - Use the Connect buttons for WhatsApp / Google Messages / Instagram /
     LinkedIn / X — sign in once per network, no terminal, no paste.
   - Join the manager's org (optional): agents/uplink/link.sh <enroll-url> <code>
   - Contacts (macOS): imported hourly into agents/contacts/contacts.db; share
     them from the app's contact-share panel (default: private).
-  - iMessage (macOS): com.jkali.imessage-daemon is loaded when
+  - iMessage (macOS): org.beepa.imessage-daemon is loaded when
     imessage/daemon.json + imessage/bin/imessage-cli exist (see above).
-  - Stop a helper:  launchctl unload '${LA_DIR}/com.jkali.session-connect.plist'
+  - Stop a helper:  launchctl unload '${LA_DIR}/org.beepa.session-connect.plist'
 DONE

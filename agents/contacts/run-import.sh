@@ -5,4 +5,4 @@
 # No venv, no pip dependencies — stdlib only.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec /usr/bin/python3 "${HERE}/import_macos.py"
+exec "${BEEPA_PYTHON:-/usr/bin/python3}" "${HERE}/import_macos.py"

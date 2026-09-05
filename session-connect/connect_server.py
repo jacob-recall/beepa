@@ -81,6 +81,9 @@ import urllib.parse
 import urllib.request
 
 import connect  # session-connect/connect.py — same dir; imported side-effect-free
+import base64
+
+from http_limits import BoundedBodyMixin
 
 # Read-only number resolver lives in the sibling agents/enrich package. Add
 # that dir to sys.path so we import the module across the boundary rather than
@@ -100,9 +103,7 @@ CONTACTS_LIST_PATH = "/contacts/list"
 # The teammate's own imported address book (agents/contacts/, mode 600). Opened
 # READ-ONLY (sqlite `mode=ro`) so this helper can never create, migrate, or
 # write it — the importer and the uplink are its only writers.
-CONTACTS_DB = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "agents", "contacts", "contacts.db")
+CONTACTS_DB = os.environ.get('CONTACTS_DB', os.path.join(connect.REPO, "agents", "contacts", "contacts.db"))
 # Must stay in step with agents/uplink/uplink.py's SOURCE_ID_TO_LABEL: a row
 # whose source is not here is not a source this system mirrors, so it can never
 # become a valid override key and is filtered out before the response is built.
@@ -121,6 +122,7 @@ ENROLL_MAX_RESP = 16 * 1024  # the exchange returns 5 tiny fields; cap tightly s
 # raw upstream body (F6). Must match master/enroll.py's exchange() response.
 ENROLL_FIELDS = ("master_hs_url", "master_user", "master_token",
                  "manager_mxid", "master_space")
+ENROLL_OPTIONAL_FIELDS = ("master_authority_id", "master_data_epoch")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -148,10 +150,46 @@ def _host_allowed(host):
     return host in ("127.0.0.1:%d" % _BOUND_PORT, "localhost:%d" % _BOUND_PORT)
 
 
+def contact_page(path, cursor=None, limit=None):
+    """Read a keyset page. Cursor travels only in the authorized JSON body."""
+    limit = CONTACTS_MAX if limit is None else limit
+    if not isinstance(limit, int) or not 1 <= limit <= CONTACTS_MAX:
+        raise ValueError('Invalid contact page size')
+    after = ('', '')
+    if cursor is not None:
+        if not isinstance(cursor, str) or len(cursor) > 4096:
+            raise ValueError('Invalid contact cursor')
+        try:
+            value = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+        except (ValueError, UnicodeError):
+            raise ValueError('Invalid contact cursor') from None
+        if not isinstance(value, list) or len(value) != 2 or not all(isinstance(v, str) for v in value):
+            raise ValueError('Invalid contact cursor')
+        after = tuple(value)
+    if not os.path.exists(path):
+        return {'contacts': [], 'next_cursor': None}
+    con = sqlite3.connect('file:%s?mode=ro' % urllib.parse.quote(str(path), safe='/'), uri=True, timeout=2)
+    try:
+        placeholders = ','.join('?' for _ in CONTACTS_SOURCES)
+        rows = con.execute(
+            'SELECT source, network_id, kind, display_name FROM contacts '
+            'WHERE deleted=0 AND source IN (' + placeholders + ') '
+            'AND (source > ? OR (source = ? AND network_id > ?)) '
+            'ORDER BY source, network_id LIMIT ?',
+            tuple(CONTACTS_SOURCES) + (after[0], after[0], after[1], limit + 1)).fetchall()
+    finally:
+        con.close()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = base64.urlsafe_b64encode(json.dumps(list(rows[-1][:2])).encode()).decode() if more else None
+    return {'contacts': [dict(zip(('source', 'network_id', 'kind', 'display_name'), row)) for row in rows],
+            'next_cursor': next_cursor}
+
+
 def _make_handler():
     from http.server import BaseHTTPRequestHandler
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(BoundedBodyMixin, BaseHTTPRequestHandler):
         def log_message(self, *a):  # F6: no access log
             pass
 
@@ -191,32 +229,17 @@ def _make_handler():
                 return 0
 
         def _discard_body(self):
-            # Drain in bounded chunks (never allocate a caller-declared size) so
-            # an oversized Content-Length can't balloon this single-threaded
-            # server's memory before the connection is closed.
-            n = self._body_len()
-            while n > 0:
-                try:
-                    chunk = self.rfile.read(min(n, 65536))
-                except Exception:
-                    break
-                if not chunk:
-                    break
-                n -= len(chunk)
+            return self._bounded_body(65536) is not None
 
         def _read_json_body(self):
-            """Read and parse a small JSON body; drain and return None on any
-            problem (oversized, malformed, not an object). Never logged."""
-            n = self._body_len()
-            if n <= 0 or n > MAX_BODY:
-                self._discard_body()
+            raw = self._bounded_body(MAX_BODY)
+            if raw is None:
                 return None
             try:
-                raw = self.rfile.read(n)
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception:
+                value = json.loads(raw.decode('utf-8'))
+            except (ValueError, UnicodeError):
                 return None
-            return obj if isinstance(obj, dict) else None
+            return value if isinstance(value, dict) else None
 
         # ---- F1: authorization gate, run at the TOP of every do_POST ----
         def _authorized(self):
@@ -272,7 +295,8 @@ def _make_handler():
             if self.path == ENRICH_NUMBERS_PATH:
                 if not self._authorized():   # F1: gate BEFORE any DB read
                     return
-                self._discard_body()
+                if not self._discard_body():
+                    return
                 self._enrich_numbers()
                 return
             if self.path == CONTACTS_LIST_PATH:
@@ -281,13 +305,20 @@ def _make_handler():
                 if not _host_allowed(self.headers.get("Host")):  # F1b
                     self._json(403, {"error": "forbidden"}, cors=True); self._diag(403)
                     return
-                self._discard_body()         # parameterless by design
-                self._contacts_list()
+                body = self._read_json_body()
+                if getattr(self, '_body_rejected', False):
+                    return
+                if body is None:
+                    self._json(400, {'error': 'Invalid contacts request.'}, cors=True)
+                    return
+                self._contacts_list(body.get('cursor'))
                 return
             if self.path == ENROLL_EXCHANGE_PATH:
                 if not self._authorized():   # F1: gate BEFORE any outbound call
                     return
-                body = self._read_json_body()   # reads + drains the body itself
+                body = self._read_json_body()
+                if getattr(self, "_body_rejected", False):
+                    return
                 self._enroll_exchange(body)
                 return
             name, verb = self._route()
@@ -297,10 +328,13 @@ def _make_handler():
             if not self._authorized():   # F1: gate BEFORE any side effect
                 return
             if verb == "input":
-                body = self._read_json_body()   # reads + drains the body itself
+                body = self._read_json_body()
+                if getattr(self, "_body_rejected", False):
+                    return
                 self._submit_input(name, body)
             else:
-                self._discard_body()
+                if not self._discard_body():
+                    return
                 self._start_provisioning(name)
 
         # ---- read each 1:1 conversation's real phone/email, LOCAL-only ----
@@ -318,37 +352,22 @@ def _make_handler():
             self._json(200, {"numbers": numbers}, cors=True)
 
         # ---- the teammate's OWN imported address book, LOCAL-only ----
-        def _contacts_list(self):
+        def _contacts_list(self, cursor=None):
             # F6 posture, identical to /enrich/numbers: this returns PII (real
             # E.164 numbers / emails / display names) but ONLY to the authorized
             # loopback origin, and NEVER to a log — the sole log line (_diag)
             # carries method/path/origin/status, and the path here is a fixed
             # parameterless literal. Read-only: `mode=ro` means this process
             # cannot create or migrate contacts.db even if it is absent.
-            rows = []
             try:
-                con = sqlite3.connect("file:%s?mode=ro" % CONTACTS_DB, uri=True, timeout=15)
-            except sqlite3.Error:
-                # No store yet (the hourly importer has not run) — an empty list
-                # is the truthful answer, not an error the UI must special-case.
-                self._json(200, {"contacts": []}, cors=True)
+                page = contact_page(CONTACTS_DB, cursor)
+            except ValueError:
+                self._json(400, {'error': 'Invalid contact cursor.'}, cors=True)
                 return
-            try:
-                cur = con.execute(
-                    "SELECT source, network_id, kind, display_name FROM contacts "
-                    "WHERE deleted = 0 ORDER BY source, network_id LIMIT ?",
-                    (CONTACTS_MAX,))
-                for source, network_id, kind, display_name in cur:
-                    if source not in CONTACTS_SOURCES:
-                        continue  # not a source this system mirrors -> not offerable
-                    rows.append({"source": source, "network_id": network_id,
-                                 "kind": kind, "display_name": display_name})
             except sqlite3.Error:
                 self._json(500, {"error": "Could not read contacts."}, cors=True)
                 return
-            finally:
-                con.close()
-            self._json(200, {"contacts": rows}, cors=True)
+            self._json(200, page, cors=True)
 
         # ---- server-side leg of the GUI "Connect to organization" flow ----
         def _enroll_exchange(self, body):
@@ -389,6 +408,9 @@ def _make_handler():
             if not isinstance(data, dict):
                 self._json(502, {"status": "failed"}, cors=True); return
             out = {k: data.get(k) for k in ENROLL_FIELDS}
+            for key in ENROLL_OPTIONAL_FIELDS:
+                if isinstance(data.get(key), str) and 0 < len(data[key]) <= 256:
+                    out[key] = data[key]
             if not out.get("master_token") or not out.get("master_hs_url"):
                 self._json(502, {"status": "failed"}, cors=True); return
             self._json(200, out, cors=True)
@@ -515,8 +537,7 @@ def serve(host, port):
     # :8011) can read it, so the browser knows which port to fetch — the CSP
     # whitelists the whole range. Best-effort; the app falls back to the default.
     try:
-        pf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "..", "apps", "user", "connect.local.json")
+        pf = os.path.join(connect.REPO, "apps", "user", "connect.local.json")
         with open(pf, "w") as f:
             f.write('{"base": "http://127.0.0.1:%d"}\n' % chosen)
         os.chmod(pf, 0o600)

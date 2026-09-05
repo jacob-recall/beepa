@@ -4,20 +4,18 @@
 # registration_shared_secret present, which hub/render-hub.sh added). Idempotent:
 # reuses the stored password + existing account; safe to re-run.
 #
-# The localpart stays a fixed local label (default 'jkali') because the bridge
-# configs grant permissions to exactly that mxid; it is never seen off-machine
-# (the teammate's visible identity is their separate @<name>:master). Override
-# with LOCAL_LOCALPART only alongside the template change that reparameterizes
-# the bridge permissions (see pm_mng-9qg follow-up).
+# Identity is shared with rendering and helpers through install_config.py.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log()  { printf '[provision-user] %s\n' "$*" >&2; }
 fail() { printf '[provision-user] ERROR: %s\n' "$*" >&2; exit 1; }
 
+STATE_ROOT="${BEEPA_INSTALL_ROOT:-${HERE}}"
 HS="${LOCAL_HS_URL:-http://127.0.0.1:8008}"
-LP="${LOCAL_LOCALPART:-jkali}"
-CREDS="${HUB_USER_CREDS:-${HERE}/hub/.local-user.local}"       # stored password (600)
-OUT="${HUB_UPLINK_LOCAL_ENV:-${HERE}/agents/uplink/local.env.local}"  # LOCAL_* for link.sh (600)
+LOCAL_MXID="$(python3 "${HERE}/install_config.py" --root "${STATE_ROOT}" identity)"
+LP="${LOCAL_MXID#@}"; LP="${LP%%:*}"
+CREDS="${HUB_USER_CREDS:-${STATE_ROOT}/hub/.local-user.local}"       # stored password (600)
+OUT="${HUB_UPLINK_LOCAL_ENV:-${STATE_ROOT}/agents/uplink/local.env.local}"  # LOCAL_* for link.sh (600)
 
 # reuse a previously-stored password, else mint and persist one
 [ -f "${CREDS}" ] && { set -a; . "${CREDS}"; set +a; }
@@ -35,7 +33,7 @@ for _ in $(seq 1 30); do curl -fsS "${HS}/health" >/dev/null 2>&1 && { up=1; bre
 # register (idempotent — 'User ID already taken' is fine)
 created=0
 if command -v docker >/dev/null 2>&1; then
-  reg="$( ( cd "${HERE}" && docker compose exec -T synapse \
+  reg="$( ( python3 "${HERE}/install_config.py" --root "${HERE}" compose -- exec -T synapse \
       register_new_matrix_user -c /data/homeserver.yaml --no-admin \
       -u "${LP}" -p "${LOCAL_PASSWORD}" http://localhost:8008 ) 2>&1 || true )"
   case "${reg}" in
@@ -135,7 +133,7 @@ except Exception:
 PY
 )"
 if [ -n "${APP_TOKEN}" ]; then
-  APP_SESSION="${HERE}/apps/user/session.local.json"
+  APP_SESSION="${STATE_ROOT}/apps/user/session.local.json"
   ( umask 077; printf '{"user_id":"@%s:localhost","access_token":"%s"}\n' "${LP}" "${APP_TOKEN}" > "${APP_SESSION}" )
   chmod 600 "${APP_SESSION}"
   log "passwordless login enabled for apps/user (no password screen)"

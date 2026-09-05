@@ -6,20 +6,12 @@ store. `import_once` reads everything first, validates the whole batch, and
 only calls `contacts_store.upsert_contacts` once it has a complete `seen`
 list; any error along the way returns `{"error": ...}` and touches nothing.
 
-Normalization:
-  - phones -> E.164 (`+` + digits only), validated against
-    `^\\+[1-9]\\d{6,14}$`. A number that already carries a country code
-    (leading `+`, or a `00` international prefix) is normalized as-is. A
-    BARE national number (no country code in the source data) gets the
-    Mac's system-region calling code prepended (see `_get_system_region` /
-    `_REGION_CALLING_CODES`) — never minted from thin air. If no calling
-    code can be resolved (unknown/unmapped region) or the number still
-    doesn't validate afterward, the handle is dropped and counted as
-    "ambiguous" rather than fabricated.
-  - emails -> lowercased, strict-validated against a conservative regex;
-    invalid ones are dropped.
-  - a contact left with zero usable handles after normalization is dropped
-    entirely (it can never be a `start-chat` target).
+Normalization uses the pinned libphonenumber core metadata in phone_numbers.py.
+International numbers preserve their calling code; national numbers require the
+configured PHONE_REGION or Mac region. Trunk prefixes are parsed by that region's
+metadata. Extensions/post-dial targets are refused for automatic matching, not
+collapsed into a potentially different person's base number. Missing metadata
+fails the entire import before any store mutation.
 
 No handle values or display names are ever logged.
 """
@@ -30,20 +22,11 @@ import re
 import subprocess
 import sys
 
-_PHONE_RE = re.compile(r"^\+[1-9]\d{6,14}$")
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from phone_numbers import normalize_phone, metadata
 
-# Compact region -> calling-code map for the common case. This is
-# deliberately not libphonenumber-grade: it covers a bare national number
-# from the Mac's OWN region only. A bare number from a different region
-# (e.g. a UK contact's local-format number on a US-region Mac) has no
-# signal to disambiguate it and is dropped, never guessed. See
-# agents/contacts/CLAUDE.md and bd issue for the multi-region follow-up.
-_REGION_CALLING_CODES = {
-    "US": "1", "CA": "1", "GB": "44", "AU": "61", "DE": "49", "FR": "33",
-    "IN": "91", "JP": "81", "CN": "86", "BR": "55", "MX": "52", "ES": "34",
-    "IT": "39", "NL": "31", "IE": "353", "NZ": "64",
-}
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
 
 # Test seam: set to a list of raw contact dicts
 # ({"name": str, "phones": [str], "emails": [str]}) to bypass the OS call
@@ -127,46 +110,16 @@ def _get_system_region():
 
 
 def _get_calling_code():
-    """Resolves the system region's calling code, or None if the region
-    can't be determined or isn't in `_REGION_CALLING_CODES`."""
-    region = _get_system_region()
-    if region is None:
-        return None
-    return _REGION_CALLING_CODES.get(region)
+    """Compatibility helper; region metadata now owns calling-code selection."""
+    region = os.environ.get('PHONE_REGION') or _get_system_region()
+    code = metadata().country_code_for_region(region or '')
+    return str(code) if code else None
 
 
-def _normalize_phone(raw, calling_code):
-    """Returns (normalized_e164_or_None, ambiguous_bool).
-
-    `ambiguous` is True only for the "bare national number, no country
-    code resolvable" case — the one place this function would otherwise
-    have to guess. Every other invalid input (garbage text, a number that
-    already has a country code but still doesn't validate) is just
-    silently dropped, same as before.
-    """
-    if not isinstance(raw, str):
-        return None, False
-    digits = re.sub(r"[^0-9+]", "", raw)
-    if not digits:
-        return None, False
-    if digits.startswith("00"):
-        digits = "+" + digits[2:]
-    if digits.startswith("+"):
-        # already carries a country code -> normalize, never fabricate one.
-        candidate = "+" + digits[1:].replace("+", "")
-        if _PHONE_RE.match(candidate):
-            return candidate, False
-        return None, False
-
-    # Bare national number: no country code in the source data itself.
-    bare = digits.replace("+", "")
-    if calling_code:
-        candidate = "+" + calling_code + bare
-        if _PHONE_RE.match(candidate):
-            return candidate, False
-    # No calling code resolvable (unknown/unmapped region), or the result
-    # still doesn't validate -> ambiguous. Drop it, never mint it.
-    return None, True
+def _normalize_phone(raw, region):
+    value = normalize_phone(raw, region)
+    ambiguous = value is None and isinstance(raw, str) and any(c.isdigit() for c in raw)
+    return value, ambiguous
 
 
 def _normalize_email(raw):
@@ -243,7 +196,8 @@ def _normalize_raw_contacts(raw_contacts):
     RuntimeError if an element isn't a dict (a garbled-but-list payload),
     so a caller relying on the {"error": ...} fail-closed contract never
     sees a bare traceback instead."""
-    calling_code = _get_calling_code()  # resolved once per run, not per number
+    metadata()  # fail closed before an unavailable library could erase old rows
+    region = os.environ.get('PHONE_REGION') or _get_system_region()
     out = []
     dropped_ambiguous = 0
     for raw in raw_contacts:
@@ -252,7 +206,7 @@ def _normalize_raw_contacts(raw_contacts):
         name = raw.get("name") or ""
         handles = []
         for phone in raw.get("phones") or []:
-            norm, ambiguous = _normalize_phone(phone, calling_code)
+            norm, ambiguous = _normalize_phone(phone, region)
             if norm is not None:
                 handles.append({"kind": "phone", "value": norm})
             elif ambiguous:
@@ -291,6 +245,7 @@ def import_once(db_path):
     import contacts_store as cs
 
     try:
+        metadata()
         raw_contacts = _load_raw_contacts()
         contacts, dropped_ambiguous = _normalize_raw_contacts(raw_contacts)
     except RuntimeError as e:
@@ -313,7 +268,7 @@ def import_once(db_path):
 
 
 if __name__ == "__main__":
-    default_db = os.path.join(os.path.dirname(__file__), "contacts.db")
+    default_db = os.environ.get('CONTACTS_DB', os.path.join(os.path.dirname(__file__), "contacts.db"))
     result = import_once(default_db)
     if "error" in result:
         print("import_macos: %s" % result["error"], file=sys.stderr)

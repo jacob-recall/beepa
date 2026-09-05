@@ -2,6 +2,11 @@
 # Anchored to the repo root so the tracked templates under hub/templates/
 # (hub/templates/synapse, hub/templates/whatsapp, …) are NOT swept up by these.
 /.env
+/.beepa-install.json
+/.beepa-update/
+/.beepa-config/
+/master/.beepa-config/
+/.beepa-venvs/
 /synapse/
 /whatsapp/
 /meta/
@@ -44,6 +49,14 @@ master/tokens.local
 master/.env
 master/.provision-state.local
 master/enrollments.local
+master/recovery.local.json
+master/recovery.local.json.lock
+master/runtime/
+
+# SQLite WAL/SHM sidecars contain runtime data too.
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Master enroll/admin service logs (launchd) — never commit
 master/logs/*.log

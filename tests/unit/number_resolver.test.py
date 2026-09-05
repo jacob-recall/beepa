@@ -15,8 +15,8 @@ import number_resolver as nr
 
 
 class NormPhoneTests(unittest.TestCase):
-    def test_bare_international_gets_plus(self):
-        self.assertEqual(nr._norm_phone("16307461684"), "+16307461684")
+    def test_unattested_bare_digits_are_ambiguous(self):
+        self.assertIsNone(nr._norm_phone("16307461684"))
 
     def test_already_e164_unchanged(self):
         self.assertEqual(nr._norm_phone("+16307461684"), "+16307461684")
@@ -47,8 +47,8 @@ class ParseImessageHandleTests(unittest.TestCase):
 
     def test_email_handle(self):
         self.assertEqual(
-            nr._parse_imessage_handle("any;-;Jkalinovskiy@Gmail.com"),
-            ("jkalinovskiy@gmail.com", "email"),
+            nr._parse_imessage_handle("any;-;Casey@Example.com"),
+            ("casey@example.com", "email"),
         )
 
     def test_group_chat_shape_is_none(self):

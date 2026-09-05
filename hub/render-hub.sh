@@ -13,10 +13,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TPL="${HERE}/hub/templates"
-SECRETS="${HERE}/synapse/.hub-secrets.local"
-ENV_FILE="${HERE}/.env"
+STATE_ROOT="${BEEPA_INSTALL_ROOT:-${HERE}}"
+SECRETS="${STATE_ROOT}/synapse/.hub-secrets.local"
+ENV_FILE="${STATE_ROOT}/.env"
 SYN_IMAGE='ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb'
-OUT_ROOT="${OUT_ROOT:-${HERE}}"          # overridable for --verify into a scratch dir
+OUT_ROOT="${OUT_ROOT:-${STATE_ROOT}}"    # overridable for --verify into a scratch dir
 VERIFY=0; [ "${1:-}" = "--verify" ] && VERIFY=1
 log() { printf '[render-hub] %s\n' "$*" >&2; }
 
@@ -39,12 +40,8 @@ DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -
 [ -n "${DB_PASSWORD}" ] || { log "FATAL: POSTGRES_PASSWORD not set in .env"; exit 1; }
 export DB_PASSWORD
 
-# --- LOCAL_MXID: the mxid the six bridges grant permissions to. A plain value
-#     from .env's LOCAL_LOCALPART (like DB_PASSWORD), NOT a minted secret — so it
-#     is passed explicitly below and never written to .hub-secrets.local. Default
-#     'jkali' preserves the historical identity for an unconfigured .env. ---
-LOCAL_LOCALPART="$(grep -E '^LOCAL_LOCALPART=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
-LOCAL_MXID="@${LOCAL_LOCALPART:-jkali}:localhost"
+# Resolve the same installed identity used by provisioning and login helpers.
+LOCAL_MXID="$(python3 "${HERE}/install_config.py" --root "${STATE_ROOT}" identity)"
 export LOCAL_MXID
 
 # --- load existing secrets, mint any missing (never in --verify) ----------
@@ -74,18 +71,32 @@ fi
 # --- render every template with an explicit var allowlist -----------------
 # A tiny python substituter (portable; macOS has no envsubst) replaces only our
 # named placeholders, leaving mautrix's own ${...} config refs untouched.
+RENDER_ROOT="${OUT_ROOT}"
+if [ "${VERIFY}" != 1 ]; then
+  RENDER_ROOT="$(mktemp -d)"
+  trap 'rm -rf "${RENDER_ROOT}"' EXIT
+fi
 count=0
 while IFS= read -r tmpl; do
-  rel="${tmpl#"${TPL}/"}"; dest="${OUT_ROOT}/${rel%.tmpl}"
+  rel="${tmpl#"${TPL}/"}"; dest="${RENDER_ROOT}/${rel%.tmpl}"
   mkdir -p "$(dirname "${dest}")"
   # shellcheck disable=SC2086
   python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD LOCAL_MXID ${VARS}
   chmod 600 "${dest}"
   count=$((count+1))
 done < <(find "${TPL}" -name '*.tmpl' | sort)
-log "rendered ${count} config files into ${OUT_ROOT}"
+log "rendered ${count} config files for validation"
 
 [ "${VERIFY}" = 1 ] && { log "verify render complete (diff is the caller's job)"; exit 0; }
+
+# Keep registration credentials in the same managed render transaction.
+if [ -z "${REG_SHARED_SECRET:-}" ]; then
+  REG_SHARED_SECRET="$(mint)"
+  ( umask 077; printf "REG_SHARED_SECRET='%s'\n" "${REG_SHARED_SECRET}" >> "${SECRETS}" )
+  chmod 600 "${SECRETS}"
+fi
+printf '\nregistration_shared_secret: "%s"\n' "${REG_SHARED_SECRET}" >> "${RENDER_ROOT}/synapse/homeserver.yaml"
+python3 "${HERE}/hub/managed_config.py" "${OUT_ROOT}" "${RENDER_ROOT}"
 
 # --- runtime files Synapse needs beyond the YAMLs -------------------------
 mkdir -p "${OUT_ROOT}/synapse/media_store"
@@ -143,22 +154,6 @@ if [ ! -s "${SIGN}" ]; then
     log "WARN: could not generate a signing key — Synapse will not boot until one exists."
     log "  Fix: docker run --rm --entrypoint generate_signing_key ${SYN_IMAGE} -o /dev/stdout > synapse/localhost.signing.key"
   fi
-fi
-
-# registration_shared_secret: enables register_new_matrix_user for local-user
-# provisioning (homeserver.yaml has enable_registration:false; the shared secret
-# is the only account-creation path). Appended, not templated, so the config
-# render stays byte-faithful to the current working homeserver.yaml. Minted/
-# reused separately since it is not a template placeholder.
-if [ -z "${REG_SHARED_SECRET:-}" ]; then
-  REG_SHARED_SECRET="$(mint)"
-  ( umask 077; printf "REG_SHARED_SECRET='%s'\n" "${REG_SHARED_SECRET}" >> "${SECRETS}" ); chmod 600 "${SECRETS}"
-  log "minted REG_SHARED_SECRET into synapse/.hub-secrets.local"
-fi
-HS="${OUT_ROOT}/synapse/homeserver.yaml"
-if ! grep -q '^registration_shared_secret:' "${HS}" 2>/dev/null; then
-  printf '\nregistration_shared_secret: "%s"\n' "${REG_SHARED_SECRET}" >> "${HS}"
-  log "added registration_shared_secret to homeserver.yaml"
 fi
 
 # iMessage daemon config: render its as_token/hs_token from the SAME secrets as

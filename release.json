@@ -1,0 +1,8 @@
+{
+  "release": "0.2.0",
+  "update_format": 1,
+  "state_version": 1,
+  "reads_state_versions": [1],
+  "wire_version": 1,
+  "reads_wire_versions": [1]
+}

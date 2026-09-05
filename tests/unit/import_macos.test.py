@@ -6,14 +6,14 @@ import import_macos as im
 
 def test_normalize_drops_invalid_and_keeps_e164_and_email():
     raw = [
-        {"name": "Alice", "phones": ["+1 (555) 123-4567", "notaphone"], "emails": ["Alice@Example.COM"]},
+        {"name": "Alice", "phones": ["+1 (202) 555-4567", "notaphone"], "emails": ["Alice@Example.COM"]},
         {"name": "NoHandles", "phones": [], "emails": []},
     ]
     im._RAW_FOR_TEST = raw            # test seam: read_macos_contacts uses this if set
     out = im.read_macos_contacts()
     alice = [c for c in out if c["display_name"] == "Alice"][0]
     kinds = {(h["kind"], h["value"]) for h in alice["handles"]}
-    assert ("phone", "+15551234567") in kinds
+    assert ("phone", "+12025554567") in kinds
     assert ("email", "alice@example.com") in kinds
     assert all(h["value"] != "notaphone" for h in alice["handles"])
     assert all(c["display_name"] != "NoHandles" for c in out)  # no usable handle -> dropped
@@ -24,7 +24,7 @@ def test_import_once_writes_to_store():
     d = tempfile.mkdtemp()
     db_path = os.path.join(d, "contacts.db")
     im._RAW_FOR_TEST = [
-        {"name": "Alice", "phones": ["+1 555 123 4567"], "emails": []},
+        {"name": "Alice", "phones": ["+1 202 555 4567"], "emails": []},
     ]
     result = im.import_once(db_path)
     im._RAW_FOR_TEST = None
@@ -34,7 +34,7 @@ def test_import_once_writes_to_store():
     conn = cs.open_store(db_path)
     rows = cs.shared_since(conn, "imessage", 0)
     assert len(rows) == 1
-    assert rows[0]["network_id"] == "+15551234567"
+    assert rows[0]["network_id"] == "+12025554567"
 
 
 def test_import_once_fails_closed_on_read_error():
@@ -60,7 +60,7 @@ def test_import_once_fails_closed_on_read_error():
 
 def test_bare_national_number_uses_system_region_calling_code():
     im._RAW_FOR_TEST = [
-        {"name": "Carol", "phones": ["(555) 987-6543"], "emails": []},
+        {"name": "Carol", "phones": ["(202) 987-6543"], "emails": []},
     ]
     orig = im._get_system_region
     im._get_system_region = lambda: "US"
@@ -71,12 +71,12 @@ def test_bare_national_number_uses_system_region_calling_code():
         im._RAW_FOR_TEST = None
     carol = [c for c in out if c["display_name"] == "Carol"][0]
     values = {h["value"] for h in carol["handles"]}
-    assert "+15559876543" in values, values
+    assert "+12029876543" in values, values
 
 
 def test_phone_with_existing_country_code_is_unchanged_regardless_of_region():
     im._RAW_FOR_TEST = [
-        {"name": "Dave", "phones": ["+1 555 123 4567"], "emails": []},
+        {"name": "Dave", "phones": ["+1 202 555 4567"], "emails": []},
     ]
     orig = im._get_system_region
     im._get_system_region = lambda: "GB"  # deliberately different; must not matter
@@ -87,7 +87,7 @@ def test_phone_with_existing_country_code_is_unchanged_regardless_of_region():
         im._RAW_FOR_TEST = None
     dave = [c for c in out if c["display_name"] == "Dave"][0]
     values = {h["value"] for h in dave["handles"]}
-    assert "+15551234567" in values, values
+    assert "+12025554567" in values, values
 
 
 def test_00_international_prefix_converts_to_plus():
@@ -105,7 +105,7 @@ def test_bare_number_with_unmapped_region_is_dropped_and_counted():
     d = tempfile.mkdtemp()
     db_path = os.path.join(d, "contacts.db")
     im._RAW_FOR_TEST = [
-        {"name": "Frank", "phones": ["5559876543"], "emails": []},
+        {"name": "Frank", "phones": ["2029876543"], "emails": []},
     ]
     orig = im._get_system_region
     im._get_system_region = lambda: "ZZ"  # unmapped region
@@ -165,14 +165,14 @@ def _with_fake_osascript(script_body, fn):
 def test_subprocess_path_reads_fake_osascript_output():
     d = tempfile.mkdtemp()
     db_path = os.path.join(d, "contacts.db")
-    payload = '[{"name":"Gina","phones":["+1 555 000 1111"],"emails":["G@Example.com"]}]'
+    payload = '[{"name":"Gina","phones":["+1 202 555 1111"],"emails":["G@Example.com"]}]'
     result = _with_fake_osascript("printf '%s' '" + payload + "'",
                                   lambda: im.import_once(db_path))
     assert result == {"added": 2, "updated": 0, "soft_deleted": 0, "dropped_ambiguous": 0}, result
     import contacts_store as cs
     conn = cs.open_store(db_path)
     ids = {r["network_id"] for r in cs.shared_since(conn, "imessage", 0)}
-    assert ids == {"+15550001111", "g@example.com"}, ids
+    assert ids == {"+12025551111", "g@example.com"}, ids
 
 
 def test_subprocess_path_nonzero_exit_fails_closed():
@@ -197,7 +197,7 @@ def test_subprocess_path_retries_once_after_a_transient_failure():
     d = tempfile.mkdtemp()
     db_path = os.path.join(d, "contacts.db")
     marker = os.path.join(d, "first_call_done")
-    payload = '[{"name":"Hal","phones":["+1 555 000 2222"],"emails":[]}]'
+    payload = '[{"name":"Hal","phones":["+1 202 555 2222"],"emails":[]}]'
     body = ("if [ ! -f '%s' ]; then touch '%s'; exit 1; fi\nprintf '%%s' '%s'"
             % (marker, marker, payload))
     sleeps = []

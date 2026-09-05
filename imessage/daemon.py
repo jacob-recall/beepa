@@ -814,7 +814,11 @@ def poll_once():
     for chat, chat_id, marker in unchanged[:budget]:
         scan(chat, chat_id, marker)
 
-CONTACTS_DB = os.path.realpath(os.path.join(BASE, "..", "agents", "contacts", "contacts.db"))
+def contacts_db_path():
+    """Resolve mutable contacts independently of the active source release."""
+    root = os.environ.get("BEEPA_INSTALL_ROOT") or os.path.dirname(BASE)
+    return os.path.realpath(os.environ.get("CONTACTS_DB") or
+                            os.path.join(root, "agents", "contacts", "contacts.db"))
 
 def local_contact_name(handle):
     """display_name from the teammate's own contacts store (agents/contacts —
@@ -826,7 +830,7 @@ def local_contact_name(handle):
     if not handle:
         return None
     try:
-        db = sqlite3.connect("file:%s?mode=ro" % CONTACTS_DB, uri=True)
+        db = sqlite3.connect("file:%s?mode=ro" % contacts_db_path(), uri=True)
         try:
             r = db.execute(
                 "SELECT display_name FROM contacts WHERE network_id=? AND deleted=0",

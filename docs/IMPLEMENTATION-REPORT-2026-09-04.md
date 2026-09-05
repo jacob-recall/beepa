@@ -46,10 +46,10 @@ transition from unmanaged code has no prior managed release to roll back to.
 
 ## Verification and release limits
 
-All 62 discovered unit scripts passed in the final publication run, along with
+All 63 discovered unit scripts passed in the final publication run, along with
 114,235 JS/Python consent-conformance vectors (Python 3.9.6 and Node 26.8.1).
-CI separately pins Python 3.11.11 and Node 22.14.0; its hosted run is pending
-publication.
+CI separately pins Python 3.11.11 and Node 22.14.0; published commits trigger
+the [hosted verification workflow](https://github.com/jacob-recall/beepa/actions/workflows/verify.yml).
 The sync scale fixture uses 100 rooms and 100,000 event references after a
 simulated 72-hour outage. All 15 disposable sync scenarios passed. Additional
 integration checks exercise actual Synapse
@@ -63,6 +63,12 @@ The disposable nginx test also passed: login/discovery files created or
 atomically replaced after container startup were served correctly from external
 runtime storage. Temporary Git repositories exercised fast-forward fork
 propagation and divergence refusal.
+
+Hosted Linux verification exposed a bootstrap ownership issue masked by Docker
+Desktop. The views container now runs as the installing user while bootstrap
+files remain mode 600. Regression checks cover both host ownership and native
+Linux UID 1001. iMessage contact-name lookup also follows retained installation
+state when code moves into a staged release.
 
 Live iMessage checks also passed on the owner's Mac: local hub → iMessage →
 inbound return, and manager over Tailscale HTTPS → Direct proposal → local hub
@@ -84,8 +90,7 @@ No permission grant is assumed to transfer to another Mac.
 Backup commands create protected local files containing secrets. An encrypted
 off-device destination, retention policy and scheduled execution must be
 configured for the deployment. The owner has been asked for these choices and
-the second test Mac/account. CI is defined in the repository; a hosted run
-requires publishing the changes.
+the second test Mac/account.
 
 The owner subsequently authorized topical commits and publication after live
 verification. The iMessage and uplink daemons were restarted on the repaired

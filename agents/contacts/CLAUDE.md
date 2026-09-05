@@ -2,8 +2,8 @@
 
 A local, durable address-book store (`contacts_store.py`) plus a headless
 importer (`import_macos.py`) that reads macOS Contacts.app and keeps the
-store in sync. Python 3.9+ stdlib only (`sqlite3`, `subprocess`, `json`,
-`re`) — no pip dependencies.
+store in sync. Python 3.9+ with the hash-pinned phonenumberslite dependency
+in the managed host virtual environment (`requirements-host.txt`).
 
 ## What lives here
 
@@ -30,29 +30,15 @@ store in sync. Python 3.9+ stdlib only (`sqlite3`, `subprocess`, `json`,
     zero usable handles is dropped entirely (it can never be a
     `start-chat` target). A `_RAW_FOR_TEST` module-level seam lets tests
     inject raw contact dicts and skip the OS call entirely.
-  - **Phone country-code inference (fix round 1, I1).** A phone that
-    already carries a country code (leading `+`, or a `00` international
-    prefix) is normalized as-is — never touched further. A **bare**
-    national number (macOS commonly stores US numbers as e.g. `"(555)
-    123-4567"`, with no country code at all) is *not* naively prefixed
-    with `+` — doing that mints a fabricated, wrong E.164 value that
-    happens to pass the regex but will never match the real iMessage
-    handle. Instead, `_get_system_region()` reads the Mac's own region out
-    of `defaults read -g AppleLocale` (e.g. `"en_US"` -> `"US"`), and
-    `_REGION_CALLING_CODES` (a compact, hardcoded dict — not
-    libphonenumber-grade, see the bd follow-up below) maps that region to
-    a calling code, which gets prepended to the bare digits. This lookup
-    happens **once per import run**, not once per number
-    (`_normalize_raw_contacts` calls `_get_calling_code()` a single time
-    and threads the result through every phone in the batch).
-    - **Limitation, by design, not an oversight:** this only resolves a
-      bare number that belongs to the Mac's *own* region. A bare-format
-      number from a different country (e.g. a UK contact's local-format
-      number on a US-region Mac) has no signal to disambiguate and is
-      **dropped, never guessed** — counted in `import_once`'s
-      `dropped_ambiguous` so it's observable, not silently lost. See bd
-      issue `pm_mng-syy` for the real fix (a proper phone-number library
-      with per-contact region hints instead of one global region guess).
+  - **Phone normalization.** `phone_numbers.py` uses pinned libphonenumber
+    metadata. International prefixes are preserved; national numbers require
+    the configured `PHONE_REGION` or the Mac region, resolved once per batch.
+    Trunk prefixes and significant leading zeroes follow that region's rules.
+    Extensions/post-dial targets are refused for automatic person matching,
+    not collapsed to the base number. Missing metadata fails the import before
+    any store write. Numeric rejected/ambiguous handles are counted. A foreign
+    national-format number without its country/region remains ambiguous; the
+    importer does not infer nationality from a name.
   - **Leaves Contacts.app the way it found it.** `people()` launches
     Contacts.app; the script records `Contacts.running()` *before* that
     call and quits the app afterwards only if it was not running — an

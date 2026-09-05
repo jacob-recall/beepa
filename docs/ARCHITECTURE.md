@@ -1,6 +1,8 @@
 # Architecture — what actually exists and runs
 
-Written from a fresh code audit on 2026-08-28. Everything in this document was
+The inventory below is a historical snapshot from 2026-08-28. Current authority and lifecycle behavior are described in [SYSTEM-DESIGN.md](SYSTEM-DESIGN.md) and [UPDATES.md](UPDATES.md). Components added during the September reliability work are covered by the implementation plan.
+
+At the time of the original audit, everything in this document was
 verified against the code or the live system on that date unless explicitly
 marked **unverified**. Where this document disagrees with `README.md` history,
 `PLAN*.md`, or a `CLAUDE.md`, this document reflects observed reality; see
@@ -13,17 +15,17 @@ proposals).
 ## What this system is
 
 **Beepa** (repo `jacob-recall/beepa`, working dir `pm_mng`) is a self-hosted,
-localhost-only messaging hub with a manager-oversight layer:
+local messaging hub with a private Tailscale master layer:
 
 1. **A personal hub** that pulls one person's chats from six networks
    (WhatsApp, iMessage, Google Messages, Instagram, LinkedIn, X/Twitter) into a
    private Matrix homeserver on their own machine, with a no-build web UI.
 2. **A master-sync layer** that lets a teammate *opt in* to mirroring selected
    conversations, read-only, to an always-on "master" homeserver, where a
-   manager can read them and leave reply *suggestions* — but can never send.
+   manager can read and propose replies. Explicit Direct conversations permit guarded automatic sending by the teammate uplink.
 
 Everything is plain files: static ES-module web apps (no bundler, no npm),
-Python-stdlib daemons (no pip), and Docker Compose for the servers.
+Python host services, a small pinned host dependency set, and Docker Compose for the servers.
 
 ## Verified runtime inventory (live on 2026-08-28)
 

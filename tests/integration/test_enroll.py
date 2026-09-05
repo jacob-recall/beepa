@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Enrollment-flow integration test (PLAN-MASTER-SYNC.md §5.3 v1.5 / IMPL P3.2).
 
-Proves the one-time enrollment-code exchange against the RUNNING matrix-master
-homeserver (127.0.0.1:8018), end-to-end through the loopback serve endpoint the
+Proves the one-time enrollment-code exchange against a disposable master
+homeserver on an allocated loopback port, end-to-end through the loopback serve endpoint the
 uplink actually talks to (master/enroll.py serve) plus the teammate-side client
 (agents/uplink/enroll_client.py):
 
@@ -18,7 +18,7 @@ Never touches the live matrix-wa stack (8008/8009/8010) and does not re-run or
 weaken provisioning; it only mints/redeems codes and logs in as existing
 teammate accounts.
 
-Run:  python3 tests/integration/test_enroll.py
+Run:  tests/integration/run.sh --enrollment
 Exit: 0 all pass, 1 otherwise.
 """
 import contextlib
@@ -38,28 +38,24 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 MASTER_DIR = os.path.join(REPO, "master")
 ENROLL_PY = os.path.join(MASTER_DIR, "enroll.py")
 CLIENT_PY = os.path.join(REPO, "agents", "uplink", "enroll_client.py")
-MASTER_HS = "http://127.0.0.1:8018"
-
-STATE_DIR = os.environ.get(
-    "SYNCTEST_STATE_DIR",
-    "/private/tmp/claude-501/-Users-jkali-work-pm-mng/"
-    "736e7f1b-4fc4-40e9-a74a-c28f77e7200f/scratchpad/enroll-test")
-os.makedirs(STATE_DIR, exist_ok=True)
+from sandbox import load_manifest
+SANDBOX = load_manifest()
+MASTER_HS = SANDBOX["master_url"]
+STATE_DIR = SANDBOX["state_dir"]
 STORE = os.path.join(STATE_DIR, "enrollments.local")
-
-# import the enroll module so we can mint in-process and backdate for expiry.
 sys.path.insert(0, MASTER_DIR)
 os.environ["ENROLL_STORE"] = STORE
+os.environ["BEEPA_MASTER_STATE_DIR"] = SANDBOX["master_dir"]
+os.environ["MASTER_CS_BASE"] = MASTER_HS
+os.environ["MASTER_PUBLIC_URL"] = MASTER_HS
 import enroll  # noqa: E402
+sys.path.insert(0, REPO)
+from install_config import read_env
 
 
 # ------------------------------------------------------------------ helpers
 def load_tokens():
-    out = {}
-    with open(os.path.join(MASTER_DIR, "tokens.local")) as f:
-        for m in re.finditer(r"^(\w+)='([^']*)'", f.read(), re.M):
-            out[m.group(1)] = m.group(2)
-    return out
+    return read_env(os.path.join(SANDBOX["master_dir"], "tokens.local"))
 
 
 TOK = load_tokens()
@@ -133,11 +129,7 @@ def client_exchange(base, code, out):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if rc != 0:
         return rc, None
-    stored = {}
-    with open(out) as f:
-        for m in re.finditer(r"^(\w+)='([^']*)'", f.read(), re.M):
-            stored[m.group(1)] = m.group(2)
-    return rc, stored
+    return rc, read_env(out)
 
 
 # ------------------------------------------------------------------ the test
@@ -219,7 +211,7 @@ def run():
 
 
 if __name__ == "__main__":
-    print("== enrollment flow (master 127.0.0.1:8018) ==")
+    print("== disposable enrollment flow ==")
     ok = run()
     print("\nRESULT:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

@@ -25,51 +25,39 @@ what bounds the capability is the gate list under "Security invariants".
   teammate's own account) and `self.master(...)` (writes the MASTER
   homeserver as the teammate's *scoped* master account; any transport
   failure against master raises `MasterUnreachable` so the caller buffers).
-  Responsibilities, in `run()`'s loop order:
-  1. `reconcile()` — resolve every joined local room's effective
-     shared-state (via `consent.py`), diff against existing mirrors
-     (`reconcile.py`'s `reconcile_decisions`), create new mirrors
-     (`create_mirror`, which also backfills), delete revoked ones
-     (`delete_mirror`), then backfill/tail every kept-or-created room.
-  2. `tail_once()` — one `/sync` of the LOCAL homeserver; forwards new
-     timeline events in already-mirrored rooms via `forward_events()`.
-  3. `ensure_proposal_rooms()` / `pull_proposals()` — v2: idempotently
-     create the per-teammate master + local proposals rooms, then pull new
-     manager-authored `com.jkali.proposal` events down into the local one.
-     `forward_proposals()` files exactly one inbox artifact per proposal;
-     for a `direct` conversation that passes every gate the artifact is the
-     non-actionable record of a message this daemon already sent
-     (`_direct_send_gate()` → `_auto_send()`, D2).
-  4. `mirror_contacts()` — called inside `reconcile()`: mirrors the
-     teammate's address book (`agents/contacts/contacts.db`, written by the
-     hourly macOS importer) into a dedicated per-teammate master contacts
-     room as `com.jkali.contact` state events, one per handle. Each pass is
-     a **diff** (`reconcile.plan_contact_mirror`) of the desired set — rows
-     that are live *and* whose source resolves shared under the separate
-     contact-share policy (`consent.resolve_contact_share`) — against the
-     `contact_mirror` table: tombstones first (mirrored but no longer
-     live-shared), then pushes (live-shared but not mirrored, or mirrored at
-     a different version), capped per pass (`reconcile.PUSH_CAP`). So
-     switching a source on **backfills** its already-imported contacts, a
-     later import's new rows flow on the next pass, switching it off
-     tombstones them, and switching it back on re-pushes them.
-  SQLite state (`state.db`, chmod 600) holds `mirror_rooms`
-  (`local_room_id → master_room_id, source, last_synced_pos,
-  stamped_level` — the last `com.jkali.share_level` stamped on that mirror),
-  `event_map` (`local_event_id → master_event_id`, the up-direction
-  idempotency guard), `proposal_map` (`master_event_id → local_event_id,
-  outcome` — the down-direction guard plus D2's per-proposal outcome state:
-  `attempted`/`sent`/`ambiguous`/`fallback`), `contact_mirror`
-  (`(source, network_id) → mirrored_version, master_state_key` — the contact
-  mirror's memory), `direct_send_log` (`ts, room_hash` — the persisted
-  auto-send rate cap), `direct_send_audit` (`ts, master_event_id, room_hash,
-  outcome` — the durable auto-send audit trail; both tables are hash-only,
-  never a room id or a body), and `meta` (sync tokens, discovered
-  proposal/contacts room ids, the bound master identity, the auto-send
-  suspension marker). The schema is versioned with sqlite `user_version` —
-  anything that changes an EXISTING table's shape goes in
-  `Uplink._migrate_db()` with a `SCHEMA_VERSION` bump, because the
-  CREATE-IF-NOT-EXISTS init can only ever add new tables.
+  Durable archive support now lives in `durable_sync.py`. The scheduler runs
+  independent retry stages: revocation, retired-destination cleanup, reconciliation,
+  local ingestion, live delivery, proposal pull, one history page, one media retry,
+  and contacts on their own cadence. A contact-store failure cannot stop messages.
+  `tail_once()` commits source event IDs/gap jobs before advancing `sync_since`;
+  remote delivery has a separate confirmed ledger. Thus ingestion continues when
+  master sleeps. Never restore the old global-watermark-frozen assumption.
+
+  SQLite state remains mode 600. Existing `event_map` is a compatibility archive
+  consulted ONLY for explicitly adopted old mirror rooms. `delivery_map` is keyed
+  by `(master_room_id, local_event_id)`; each re-share creates a new generation.
+  `mirror_lifecycle` retains allocation/link/revocation stages; `pending_events`,
+  `history_jobs` and `history_refs` contain source references/cursors, not bodies.
+  Failed pagination has an explicit `incomplete` outcome. Empty pages with new
+  tokens continue; repeated tokens do not silently become completed history.
+  `delivery_attempts` records credential fingerprints before archive dispatch;
+  a lost response followed by token rotation becomes visible ambiguity instead
+  of assuming Matrix transaction deduplication spans tokens. `media_retry` tracks
+  transient blob failures and edits an existing placeholder when retrieval succeeds.
+  `retired_mirrors` preserves cleanup credentials for an old organization separately
+  from the newly active pairing. Nothing reuses those credentials to send content.
+
+  `proposal_map`, `direct_send_log` and `direct_send_audit` are the separate
+  **Direct safety ledger** and survive authority/epoch changes. An authority change
+  still drops proposal discovery/cursors, triggers a cold start and suspends Direct
+  until the existing acknowledgment gate passes. Archive data epoch changes do not
+  change the current authority or reset sending evidence/rate counters.
+  Optional `master_authority_id`, `master_data_epoch`, `master_enroll_url` metadata
+  supports same-scoped-account recovery. It requires retained per-install recovery
+  material and HTTPS (or loopback tests). Empty/disabled master_link is an explicit,
+  persisted disconnect; only a truly absent legacy record can adopt env credentials.
+  Never fall back to environment credentials after a persisted disconnect.
+
 - `consent.py` — pure Python port of `shared/model/consent.js`. **Must stay
   byte-parity with it** — same explicit three-level conversation model
   (`share`/`direct` mirror, absent-or-unrecognized is private, nothing
@@ -114,13 +102,12 @@ what bounds the capability is the gate list under "Security invariants".
   **and `tests/conformance/consent_conformance.py`** — the conformance
   harness proves parity on ~84k exhaustive+fuzz vectors and is the
   authority; any differing output or crash on either side is a red build.
-- **Revocation deletes, it does not just stop updating.** `delete_mirror()`
+- **Revocation durably retires access, not bytes.** `delete_mirror()`
   removes the master space-child link, kicks the manager, and leaves the
   room — a CS-API client (not a Synapse admin) cannot server-side-purge a
-  room, so the durable copy becomes unreachable-by-the-manager rather than
-  bytes-deleted; that satisfies §9's revocation requirement, and it is
-  intentional, not a shortcut — do not "fix" it into a hard delete without
-  re-reading §9 and the admin-purge note in the code.
+  room. Historical copies may remain readable under Matrix retention/history
+  semantics. Cleanup failures retain their stage and retry; a revoking room cannot
+  forward new content. Do not describe this as erasure or add a purge authority.
 - **Read-only enforcement on every mirror room, stamped at creation.**
   `create_mirror()`'s `power_level_content_override` sets
   `{users: {master_user: 100, manager_mxid: 0}, events_default: 50}` — the
@@ -129,13 +116,12 @@ what bounds the capability is the gate list under "Security invariants".
   narrower override (`events_default: 100`, `events: {com.jkali.proposal:
   50}`) so the manager can send *only* that one event type there, never
   `m.room.message`.
-- **Idempotency via `event_map`/`proposal_map`, watermark advances only on
-  confirmed delivery.** `forward_events()` filters through
-  `reconcile.select_new_events()` before posting; `tail_once()` and
-  `backfill()` only persist a new `last_synced_pos` after the forward
-  succeeded (an exception, including `MasterUnreachable`, propagates before
-  the watermark write). Never move a watermark write earlier than the
-  corresponding master call's success.
+- **Delivery idempotency is destination-scoped.** `delivery_map` commits only
+  after a successful destination write. Source ingestion may checkpoint after
+  durable queue/gap references exist. Histories are discovered pagewise on disk,
+  then delivered chronologically; Direct history proposals always take cold-start
+  handling. Fresh room consent is checked before each outgoing message slice and
+  event. A request already in flight cannot be unsent.
 - **Proposal pull has hard limits, checked before every write:** the write
   target must equal the recorded `local_proposals_room` (checked in
   `forward_proposals()`, and it also refuses if that id collides with any
@@ -192,9 +178,10 @@ what bounds the capability is the gate list under "Security invariants".
   10. **Durable audit.** `direct_send_audit` rows plus the log line, both
       hash-only: no body, no room id, no handle — ever, on this path.
   11. **Master-identity binding.** `master_proposals_room`,
-      `proposal_sync_since` and `proposal_map` are keyed to `(master_hs,
-      master_user, manager_mxid)` in `meta`. Any change drops them (so the
-      next pull is a cold start) AND suspends auto-send, writing
+      `proposal_sync_since` are bound to `(master_hs,
+      master_user, manager_mxid)` in `meta`. Any change drops discovery/cursors
+      (so the next pull is a cold start), RETAINS `proposal_map` safety outcomes,
+      AND suspends auto-send, writing
       `com.jkali.direct_send_suspended`; it resumes only when the teammate's
       `com.jkali.direct_send_ack` matches that exact four-field tuple.
   The `com.jkali.auto_sent_from_proposal` field on the sent message is
@@ -244,13 +231,10 @@ what bounds the capability is the gate list under "Security invariants".
   `sha1(source|network_id)` state key is pseudonymous (E.164 is a small
   enumerable domain), not confidential; tombstones legitimately transmit
   keys of handles that were already on the master.
-- **Media re-upload has a size cap and always falls back safely.**
-  `_reupload_media()` returns `None` (→ v1 placeholder, never dropped or
-  blocked) on any failure: bad/missing/encrypted mxc, over
-  `UPLINK_MEDIA_MAX`, or a download/upload error. A placeholder is never
-  durably committed while master is truly unreachable — the subsequent
-  message `PUT` independently raises `MasterUnreachable` and the whole
-  forward rolls back with the daemon's normal buffer/retry.
+- **Media re-upload remains size bounded.** Permanent invalid/encrypted/oversize
+  inputs use the existing placeholder. Transient errors additionally create a
+  durable media retry; a successful retry edits the placeholder and preserves
+  server-derived attribution. Consent is checked again before retry dispatch.
 - **Secrets and state are mode 600.** `state.db` is chmod'd 600 on open;
   the enrollment env file `enroll_client.py` writes is 600. Never widen
   either.

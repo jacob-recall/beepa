@@ -104,15 +104,16 @@ ever returned (F6) — the credential never touches a Matrix room.
   (`agents/contacts/contacts.db`), opened **read-only** (`sqlite mode=ro`, so
   this process can never create or migrate it), soft-deleted rows excluded,
   rows filtered to the known source ids (`CONTACTS_SOURCES`, kept in step with
-  the uplink's `SOURCE_ID_TO_LABEL`), and capped at `CONTACTS_MAX` (2000)
-  because this server is single-threaded. `apps/user` uses it to offer a
+  the uplink's `SOURCE_ID_TO_LABEL`), in keyset pages of `CONTACTS_MAX` (2000), returning `next_cursor`.
+  The authorized JSON request body may supply that cursor; the UI reads every
+  page and shows a failure if any later page cannot be loaded. `apps/user` uses it to offer a
   per-contact share override for contacts that have no conversation (e.g. an
   alerting bot), which no conversation row could otherwise reach.
   - **Deliberately a POST, not a GET (F1).** This helper's GETs are ungated
     liveness-only by design; a GET here would be unauthenticated, and adding
     one would also widen the shared `Access-Control-Allow-Methods` header for
     every other endpoint.
-  - **Parameterless.** The path is a fixed literal with no query string, so the
+  - **Fixed path.** Pagination is in the JSON body, never a query string, so the
     one diagnostic line (`_diag`, which logs `self.path`) cannot leak a handle.
   - **Host allowlist (F1b).** In addition to `_authorized()`, the `Host` header
     must be `127.0.0.1:<bound port>` or `localhost:<bound port>` — DNS-rebinding
@@ -214,3 +215,8 @@ Do **not** trigger a fully-authorized `/start` in an unattended test: it
 reads the user's Chrome cookies, fires a Keychain prompt, and starts a real
 login against the live bridge. Verify the guards + health only; test the
 happy path live.
+
+Host services now use generated `org.beepa.*` launchd jobs and the managed
+Python runtime. Legacy plist files are compatibility templates, not files to
+copy directly. Request bodies have bounded length and a total read deadline;
+rejected or incomplete bodies never start bridge login or cookie capture.

@@ -1,0 +1,66 @@
+{
+  "date": "2026-09-04",
+  "live_paths": [
+    {
+      "path": "local",
+      "status": "passed",
+      "native_outcome": "confirmed",
+      "direct_outcome": null,
+      "native_source_counts": {
+        "outgoing": 1,
+        "incoming": 1
+      },
+      "master_archive_verified": [
+        {
+          "direction": "local_event",
+          "manager_readable": true,
+          "from_me": true
+        },
+        {
+          "direction": "inbound_event",
+          "manager_readable": true,
+          "from_me": false
+        }
+      ]
+    },
+    {
+      "path": "master",
+      "status": "passed",
+      "native_outcome": "confirmed",
+      "direct_outcome": "sent",
+      "native_source_counts": {
+        "outgoing": 1,
+        "incoming": 1
+      },
+      "master_archive_verified": [
+        {
+          "direction": "local_event",
+          "manager_readable": true,
+          "from_me": true
+        },
+        {
+          "direction": "inbound_event",
+          "manager_readable": true,
+          "from_me": false
+        }
+      ]
+    }
+  ],
+  "master_transport": {
+    "https": true,
+    "tailscale_address": true,
+    "manager_authenticated": true
+  },
+  "native_unchanged": true,
+  "tested_code_sha256": {
+    "imessage/daemon.py": "4c7183d21f3818ca8365553d5f74c72c1b0aa5143596b62dcaa27cd68d36e450",
+    "agents/uplink/uplink.py": "81b14a6e0585fd21d2308dfefcd6adab0dfc8dbb3f46230aa1fb4fc89ba7a750",
+    "agents/uplink/durable_sync.py": "def3e694c5e600a209a85920b94c5b596601df85fb5218ada1fd0e2b2a9a0e7e",
+    "tests/live/imessage_paths_verify.py": "7b1ce83bc5332cf811ef846f294ed0e12b8ece4e4782de67366a1b9e850d3e91"
+  },
+  "earlier_failed_nonce_recovered_without_resend": true,
+  "limitations": [
+    "Same Mac with real Tailscale HTTPS route; no second-device canary",
+    "Fresh-device macOS grants and other networks live sends not verified"
+  ]
+}

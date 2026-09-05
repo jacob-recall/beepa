@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Integration harness for the uplink one-way sync (PLAN-MASTER-SYNC §13, P2.4/P2.5).
 
-Drives the twelve edge-case scenarios end-to-end against TWO real running
-homeservers:
+Drives scenarios against TWO disposable homeservers provisioned by sandbox.py.
+The details below describe their modeled roles, not live service dependencies:
 
   * TEST-USER hub  — an ISOLATED throwaway Synapse (server_name: localhost) on
     127.0.0.1:8028, brought up by tests/integration/docker-compose.test.yml
     (compose project matrix-synctest). This models ONE teammate's LOCAL stack.
     It is fully separate from the live matrix-wa stack (8008/8009/8010) — this
     harness NEVER touches matrix-wa.
-  * MASTER hub     — the already-running matrix-master Synapse on 127.0.0.1:8018.
+  * MASTER hub     — an isolated throwaway master on an allocated loopback port.
     The uplink writes here as @alice:master (a scoped teammate account). We
     assert on master state.
 
@@ -23,8 +23,7 @@ way shared/ui/sources.js does); sets consent via account-data
 agents/uplink/uplink.py as a subprocess; and asserts on the MASTER homeserver.
 
 Pure python3 stdlib. Run:  python3 tests/integration/harness.py
-Requires the two stacks up (see the module docstring of the compose file and
-master/docker-compose.master.yml). Prints a JSON summary of all scenarios.
+Run tests/integration/run.sh to create both stacks; no live credentials are read.
 """
 import base64
 import glob
@@ -53,27 +52,20 @@ UPLINK_PY = os.path.join(REPO, "agents", "uplink", "uplink.py")
 sys.path.insert(0, os.path.join(REPO, "agents", "contacts"))
 import contacts_store  # noqa: E402
 
-TEST_HS = "http://127.0.0.1:8028"
-MASTER_HS = "http://127.0.0.1:8018"
+from sandbox import load_manifest
+SANDBOX = load_manifest()
+TEST_HS = SANDBOX["local_url"]
+MASTER_HS = SANDBOX["master_url"]
 LOCAL_SERVER = "localhost"
-SHARED_SECRET = "synctest7vLFrjd2mgbLeXhlbrTufckryNEgivyCqioYmTwsTlVQ6rkXd8"
-
-# Scratch dir for uplink state DBs + logs (outside the repo).
-STATE_DIR = os.environ.get(
-    "SYNCTEST_STATE_DIR",
-    "/private/tmp/claude-501/-Users-jkali-work-pm-mng/"
-    "736e7f1b-4fc4-40e9-a74a-c28f77e7200f/scratchpad/uplink-state")
+SHARED_SECRET = SANDBOX["local_secret"]
+STATE_DIR = SANDBOX["state_dir"]
 
 
-# ------------------------------------------------------------------ master creds
 def load_master_tokens():
-    path = os.path.join(REPO, "master", "tokens.local")
+    path = os.path.join(SANDBOX["master_dir"], "tokens.local")
     with open(path) as f:
         txt = f.read()
-    out = {}
-    for m in re.finditer(r"^(\w+)='([^']*)'", txt, re.M):
-        out[m.group(1)] = m.group(2)
-    return out
+    return dict(re.findall(r"^(\w+)='([^']*)'", txt, re.M))
 
 
 MASTER = load_master_tokens()
@@ -668,8 +660,8 @@ def scenario_3_offline_catchup():
 
 def scenario_4_master_offline():
     """docker stop the master synapse; post local messages; confirm the uplink
-    buffers and does NOT advance its watermark; docker start it -> messages
-    deliver, still exactly once."""
+    durably ingests references while delivery is frozen; docker start it ->
+    messages deliver, still exactly once."""
     e = fresh_env("s4")
     imsg_space = create_space(e["tuser_tok"], "iMessage")
     rid = make_convo(e, imsg_space, "Wei Chen")
@@ -687,9 +679,11 @@ def scenario_4_master_offline():
         # let the tail settle and record the watermark
         time.sleep(4)
         wm_before = meta_get(e["db_path"], "sync_since")
+        with sqlite3.connect(e["db_path"]) as db:
+            delivered_before = db.execute("SELECT count(*) FROM delivery_map").fetchone()[0]
 
         # MASTER GOES OFFLINE.
-        docker(["stop", "matrix-master-synapse-1"])
+        docker(["stop", SANDBOX["master_container"]])
         base_count_unknown = True  # can't read master while down
 
         # Post local messages while master is unreachable.
@@ -703,10 +697,14 @@ def scenario_4_master_offline():
         wm_during = meta_get(e["db_path"], "sync_since")
         log_snapshot = tail_log(e["log_path"], 40)
         buffered_flag = ("master unreachable" in log_snapshot.lower()
-                         or "buffering" in log_snapshot.lower())
+                         or "buffering" in log_snapshot.lower()
+                         or "masterunreachable" in log_snapshot.lower())
+        with sqlite3.connect(e["db_path"]) as db:
+            delivered_during = db.execute("SELECT count(*) FROM delivery_map").fetchone()[0]
+            queued_during = db.execute("SELECT count(*) FROM pending_events").fetchone()[0]
 
         # MASTER COMES BACK.
-        docker(["start", "matrix-master-synapse-1"])
+        docker(["start", SANDBOX["master_container"]])
         wait_master_health()
         wait_until(
             lambda: all(any(m["body"] == b for m in master_messages(master_room))
@@ -715,17 +713,19 @@ def scenario_4_master_offline():
     finally:
         stop_uplink(proc)
         # Safety: make absolutely sure master is running for later scenarios.
-        docker(["start", "matrix-master-synapse-1"], check=False)
+        docker(["start", SANDBOX["master_container"]], check=False)
         wait_master_health()
 
     final = master_messages(master_room)
     counts = {b: sum(1 for m in final if m["body"] == b) for b in buffered}
     dupes = {b: c for b, c in counts.items() if c != 1}
-    # Watermark must NOT have advanced while master was unreachable (§7/§8.2).
-    wm_frozen = (wm_before == wm_during)
-    ok = buffered_flag and wm_frozen and (not dupes)
-    ev = ("buffered_log=%s watermark_frozen=%s(before=%r during=%r) all_once=%s dupes=%s"
-          % (buffered_flag, wm_frozen, wm_before, wm_during, not dupes, dupes))
+    # Ingestion and delivery are independent: source cursor may advance only
+    # because durable references exist, while confirmed delivery cannot advance.
+    delivery_frozen = delivered_before == delivered_during
+    ingestion_durable = wm_before != wm_during and queued_during >= len(buffered)
+    ok = buffered_flag and delivery_frozen and ingestion_durable and (not dupes)
+    ev = ("buffered_log=%s delivery_frozen=%s ingestion_durable=%s pending=%s all_once=%s dupes=%s"
+          % (buffered_flag, delivery_frozen, ingestion_durable, queued_during, not dupes, dupes))
     return ok, ev
 
 
@@ -2034,6 +2034,43 @@ def scenario_14_direct_proposal_autosend():
     return ok, "; ".join(ev)
 
 
+def scenario_15_revocation_retains_history():
+    """Existing authority contract: stop future copies; do not promise erasure."""
+    e = fresh_env("s15")
+    source = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, source, "Revocation retention fixture")
+    marker = "s15-before-" + uniq("retained")
+    post_msg(e["contact_tok"], room, marker)
+    set_override(e["tuser_tok"], e["tuser_id"], room, "share")
+    proc = start_uplink(e)
+    try:
+        destination = wait_until(lambda: mirror_of(e["db_path"], room), timeout=45,
+                                 desc="s15 mirror")[0]
+        master(MASTER_MANAGER_TOKEN, "POST", "/_matrix/client/v3/rooms/"
+               + urllib.parse.quote(destination, safe="") + "/join", {})
+        wait_until(lambda: any(m["body"] == marker for m in master_messages(destination, MASTER_MANAGER_TOKEN)),
+                   timeout=45, desc="s15 manager reads original history")
+        set_override(e["tuser_tok"], e["tuser_id"], room, "private")
+        wait_until(lambda: mirror_of(e["db_path"], room) is None, timeout=45,
+                   desc="s15 cleanup complete")
+        private_marker = "s15-after-" + uniq("private")
+        post_msg(e["contact_tok"], room, private_marker)
+        time.sleep(4)
+        retained = master_messages(destination, MASTER_MANAGER_TOKEN)
+        joined = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/joined_rooms")["joined_rooms"]
+        old_readable = any(m["body"] == marker for m in retained)
+        no_new_copy = not any(m["body"] == private_marker for m in retained)
+        with sqlite3.connect(e["db_path"]) as db:
+            no_pending = db.execute("SELECT count(*) FROM pending_events WHERE local_room_id=?", (room,)).fetchone()[0] == 0
+        unlinked = destination not in space_children(MASTER_SPACE_ALICE, MASTER_ALICE_TOKEN)
+        kicked = destination not in joined
+        return (old_readable and no_new_copy and no_pending and unlinked and kicked,
+                "historical_message_still_readable=%s future_copy_stopped=%s queue_empty=%s unlinked=%s manager_kicked=%s"
+                % (old_readable, no_new_copy, no_pending, unlinked, kicked))
+    finally:
+        stop_uplink(proc)
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2049,6 +2086,7 @@ SCENARIOS = [
     ("12_contact_share_and_propose", scenario_12_contact_share_and_propose),
     ("13_contact_backfill_on_enable", scenario_13_contact_backfill_on_enable),
     ("14_direct_proposal_autosend", scenario_14_direct_proposal_autosend),
+    ("15_revocation_retains_history", scenario_15_revocation_retains_history),
 ]
 
 

@@ -71,6 +71,28 @@ stay human-tested; see the checklist below.
 
 ## Running it
 
+For an existing configured iMessage self-chat that is already Direct, verify
+both paths without changing consent or authorizing a different master:
+
+```sh
+python3 tests/live/imessage_paths_verify.py --i-am-sending-to-myself
+```
+
+This sends one unique local message, waits for confirmed native acceptance and
+an actual inbound self-ghost event, then repeats through a manager proposal.
+The manager request must use HTTPS resolving to a Tailscale address. It stops
+after a failure, never counts outgoing echoes as receiving, and checks that
+the native executable's inode and hash stayed unchanged. `--paths local` or
+`--paths master` selects one path; `--output` writes private diagnostic evidence.
+It requires existing account credentials and a warmed-up, unsuspended Direct
+binding. It does not create a portal, alter sharing or acknowledge suspension.
+
+The September 4 release verification found and fixed a real late-inbound bug:
+a self-message can arrive with a timestamp older than its outgoing echo,
+leaving the chat marker unchanged. The bridge now periodically rescans tails
+with bounded, fair scheduling. See the sanitized
+[live verification record](../../docs/review-evidence/2026-09-04-live-validation.json).
+
 Requires this install's own local hub credentials — the same
 `LOCAL_HS_URL` / `LOCAL_USER` / `LOCAL_TOKEN` shape as
 `agents/uplink/uplink.env.local` (see `agents/uplink/CLAUDE.md`), read from

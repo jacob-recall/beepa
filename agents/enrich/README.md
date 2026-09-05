@@ -16,7 +16,7 @@ container.
 
 | Source | Where | Query |
 |---|---|---|
-| WhatsApp | postgres `mautrix_whatsapp` in `matrix-wa-postgres-1` | `portal` (1:1, `room_type='dm'`) joined to `whatsmeow_lid_map` on the LID extracted from `other_user_id` (`lid-<LID>`), giving the real `pn` phone |
+| WhatsApp | postgres `mautrix_whatsapp` in `the configured Compose postgres service` | `portal` (1:1, `room_type='dm'`) joined to `whatsmeow_lid_map` on the LID extracted from `other_user_id` (`lid-<LID>`), giving the real `pn` phone |
 | Google Messages | postgres `mautrix_gmessages`, same container | `portal` joined to `ghost`, reading `ghost.metadata->>'phone'` |
 | iMessage | sqlite `imessage/state.db` (bridge-local map, **not** macOS `chat.db`) | `map.chat_id`/`map.room_id`; 1:1 chats are shaped `any;-;<handle>` |
 
@@ -28,32 +28,17 @@ read-only (`file:...?mode=ro`).
 
 ## Normalization rules
 
-- **`_norm_phone(raw)`** — general-purpose normalizer to strict E.164
-  (`^\+[1-9]\d{6,14}$`). A value that already carries a `+` (or a `00`
-  international dial prefix) is validated as given. A **bare** all-digit
-  value with no leading `+` is only accepted if it's long enough (≥11
-  digits) to already be carrying a country code itself — a shorter bare
-  digit string is indistinguishable from a national number missing its
-  country code, so it's dropped rather than guessed. This mirrors the
-  "never fabricate a country code" philosophy of
-  `agents/contacts/import_macos.py`'s `_normalize_phone`, minus the
-  system-region guess (there's no region signal available here).
+- **`_norm_phone(raw)`** uses the shared `phone_numbers.py` metadata parser.
+  This resolver has no region signal, so a freeform value must carry an explicit
+  `+` or `00` international prefix. Bare digits are never inferred from length.
+  Extensions, post-dial targets and malformed values are excluded from matching.
 
-- **`_norm_wa_pn(raw)`** — WhatsApp's `whatsmeow_lid_map.pn` is a
-  different case: by whatsmeow's own construction it's *always* digits
-  that already include the country code (that's what `pn` means), just
-  missing the leading `+`. Applying `_norm_phone`'s ambiguity-guard
-  length gate here would wrongly drop legitimate numbers from countries
-  with a short (1–2 digit) calling code, which total fewer than 11
-  digits. So this just adds `+` and strict-validates the result — no
-  length gate, because the source itself isn't ambiguous.
+- **`_norm_wa_pn(raw)`** explicitly marks WhatsApp's `pn` field as a provider ID
+  whose digits include the country code. Only that attested source gets a `+`
+  prepended before metadata validation.
 
-- **gmessages phone filter** — kept only if it's already strict E.164 as
-  stored. Deliberately *not* run through either normalizer above: an SMS
-  short code or an RCS business id shaped `<slug>@rbm.goog` could
-  otherwise survive non-digit stripping and be misread as a phone
-  number. A plain regex match against the raw value is the only correct
-  filter here.
+- **gmessages phone filter** accepts only an explicit `+` phone validated by the
+  shared parser. SMS short codes and RCS business identifiers are excluded.
 
 - **`_parse_imessage_handle(chat_id)`** — the 1:1 shape is exactly
   `any;-;<handle>` (splitting on `;-;` yields exactly two parts, the

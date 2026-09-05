@@ -20,9 +20,10 @@
 import { api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { S } from '../../shared/state.js';
+import { syncHealthText } from './sync-health.js';
 
 const LINK_TYPE = 'com.jkali.master_link';
-const DEFAULT_ENROLL = 'http://127.0.0.1:8019';
+const DEFAULT_ENROLL = '';
 
 // The exchange to a REMOTE master can't be a direct browser fetch — apps/user's
 // CSP connect-src is loopback-only by design. So we hand {master_url, code} to
@@ -52,7 +53,7 @@ function adPath() {
 
 async function readLink() {
   try { return await api('GET', adPath()); }
-  catch (e) { return {}; }   // 404 = not connected
+  catch (e) { if (e.status === 404 || e.code === 404) return {}; throw e; }
 }
 
 export async function initOrgLinkUI() {
@@ -70,11 +71,15 @@ export async function initOrgLinkUI() {
   const status = el('p', '');
   status.id = 'orglink-status';
   card.appendChild(status);
+  const syncStatus = el('p', 'muted');
+  syncStatus.id = 'orglink-sync-status';
+  card.appendChild(syncStatus);
 
   const urlField = el('div', 'field');
   urlField.appendChild(el('label', '', 'Master URL'));
   const urlIn = el('input', 'input');
   urlIn.id = 'orglink-url'; urlIn.value = DEFAULT_ENROLL; urlIn.spellcheck = false; urlIn.autocomplete = 'off';
+  urlIn.placeholder = 'https://your-master.tailnet.ts.net:8443';
   urlField.appendChild(urlIn);
 
   const codeField = el('div', 'field');
@@ -95,6 +100,8 @@ export async function initOrgLinkUI() {
   disconnectBtn.classList.add('hidden');
   actions.appendChild(connectBtn);
   actions.appendChild(disconnectBtn);
+  const refreshBtn = el('button', '', 'Refresh status');
+  actions.appendChild(refreshBtn);
   card.appendChild(actions);
 
   const warn = el('p', 'error');
@@ -118,10 +125,13 @@ export async function initOrgLinkUI() {
   function clearWarn() { warn.textContent = ''; warn.classList.add('hidden'); }
 
   async function refresh() {
+    const currentUser = S.userId;
     const link = await readLink();
-    const connected = link && link.master_token && link.master_hs_url;
+    if (S.userId !== currentUser) return;
+    const connected = link && link.enabled !== false && link.master_token && link.master_hs_url;
     status.replaceChildren();
     if (connected) {
+      if (link.master_enroll_url && !urlIn.value) urlIn.value = link.master_enroll_url;
       status.appendChild(el('span', 'tag tag-accent-2',
         'Connected — ' + sanitizeLine(link.master_user || '') + ' @ ' + sanitizeLine(link.master_hs_url || '')));
       disconnectBtn.classList.remove('hidden');
@@ -131,7 +141,18 @@ export async function initOrgLinkUI() {
       disconnectBtn.classList.add('hidden');
       connectBtn.textContent = 'Connect';
     }
+    syncStatus.textContent = '';
+    if (connected) {
+      try {
+        const health = await api('GET', '/_matrix/client/v3/user/' + encodeURIComponent(currentUser) + '/account_data/com.beepa.sync_health');
+        if (S.userId === currentUser) syncStatus.textContent = syncHealthText(health);
+      } catch (e) {
+        if (S.userId === currentUser) syncStatus.textContent = e.status === 404 || e.code === 404
+          ? syncHealthText(null) : 'Sync status could not be loaded. Refresh to try again.';
+      }
+    }
   }
+  refreshBtn.addEventListener('click', () => refresh().catch(e => showWarn('Could not refresh: ' + String(e.message || e))));
 
   connectBtn.addEventListener('click', async () => {
     clearWarn();
@@ -168,6 +189,9 @@ export async function initOrgLinkUI() {
         master_hs_url: creds.master_hs_url, master_user: creds.master_user,
         master_token: creds.master_token, manager_mxid: creds.manager_mxid,
         master_space: creds.master_space,
+        master_enroll_url: base, enabled: true,
+        ...(creds.master_authority_id ? { master_authority_id: creds.master_authority_id } : {}),
+        ...(creds.master_data_epoch ? { master_data_epoch: creds.master_data_epoch } : {}),
       });
       codeIn.value = '';
       await refresh();
@@ -178,7 +202,7 @@ export async function initOrgLinkUI() {
 
   disconnectBtn.addEventListener('click', async () => {
     clearWarn();
-    try { await api('PUT', adPath(), {}); await refresh(); }
+    try { await api('PUT', adPath(), { enabled: false }); await refresh(); }
     catch (e) { showWarn('Could not disconnect: ' + String(e.message || e)); }
   });
 

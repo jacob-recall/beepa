@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import sys
 import urllib.error
 import urllib.request
@@ -40,6 +41,11 @@ _KEY_TO_ENV = {
     "master_token": "MASTER_TOKEN",
     "manager_mxid": "MANAGER_MXID",
     "master_space": "MASTER_SPACE",
+}
+OPTIONAL_KEY_TO_ENV = {
+    "master_authority_id": "MASTER_AUTHORITY_ID",
+    "master_data_epoch": "MASTER_DATA_EPOCH",
+    "master_enroll_url": "MASTER_ENROLL_URL",
 }
 
 
@@ -74,8 +80,8 @@ def write_env(data, out_path):
         raise RuntimeError("exchange response missing fields: %s" % ", ".join(hard))
     lines = ["# uplink enrollment credentials — mode 600, do NOT commit.",
              "# Written by enroll_client.py; source before running uplink.py."]
-    for jkey, env in _KEY_TO_ENV.items():
-        lines.append("%s='%s'" % (env, data.get(jkey, "")))
+    for jkey, env in {**_KEY_TO_ENV, **OPTIONAL_KEY_TO_ENV}.items():
+        lines.append("%s=%s" % (env, shlex.quote(str(data.get(jkey, "")))))
     payload = ("\n".join(lines) + "\n").encode()
     tmp = out_path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -91,6 +97,7 @@ def write_env(data, out_path):
 
 def exchange_and_store(enroll_url, code, out_path):
     data = exchange(enroll_url, code)
+    data["master_enroll_url"] = enroll_url.rstrip("/")
     write_env(data, out_path)
     return data
 

@@ -98,6 +98,8 @@ def make_uplink(policy, overrides, profiles=None, handles=NUMBERS,
         return urllib.error.HTTPError(path, 404, "Not Found", None, None)
 
     def local(method, path, body=None, query=None, timeout=60):
+        if method == "GET" and path.endswith("/account_data/com.jkali.master_link"):
+            raise nf(path)  # legacy env pairing, independent of contact policy
         assert method == "GET", path
         if path.endswith("/account_data/" + uplink.CONTACT_PROFILES_TYPE):
             if profiles is READ_ERROR:

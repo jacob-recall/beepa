@@ -467,10 +467,10 @@ check("rebinding: the suspension is surfaced to apps/user with the new tuple",
       and sus[0]["master_user"] == MASTER_USER
       and sus[0]["manager_mxid"] == NEW_MANAGER
       and isinstance(sus[0]["ts"], int))
-check("rebinding: the identity-keyed proposal state is invalidated (cold-start rule)",
+check("rebinding: discovery/cursor invalidated but prior proposal safety outcomes survive",
       u.meta_get("master_proposals_room") is None
       and u.meta_get("proposal_sync_since") is None
-      and u.db.execute("SELECT COUNT(*) FROM proposal_map").fetchone()[0] == 0)
+      and u.db.execute("SELECT COUNT(*) FROM proposal_map").fetchone()[0] > 0)
 n = fwd(u, [prop(sender=NEW_MANAGER)], suspended=suspended)
 check("rebinding: auto-send is refused while suspended",
       u.sends == [] and n == 1 and uplink.AUTO_SENT_KEY not in only_record(u))

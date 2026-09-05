@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import { syncHealthText } from '../../apps/user/sync-health.js';
+assert.match(syncHealthText(null), /Waiting/);
+const now = 1700000000000;
+assert.match(syncHealthText({ updated_at: now / 1000 - 300 }, now), /stale/);
+const queued = syncHealthText({ updated_at: now / 1000, pending_events: 3, media_retry: 2, history_incomplete: true, delivery_incomplete: true, token: 'never-display-me' }, now);
+assert.match(queued, /3 messages queued/);
+assert.match(queued, /2 attachments retrying/);
+assert.match(queued, /History catch-up is incomplete/);
+assert.doesNotMatch(queued, /never-display-me|caught up/i);
+console.log('sync_health: missing, stale, queued and private-field rendering passed');

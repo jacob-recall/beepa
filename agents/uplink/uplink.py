@@ -49,7 +49,9 @@ Config is via environment only (no config file, no secrets on argv):
   MASTER_SPACE   the teammate's per-user space room id on master (e.g. !RbaZ...:master)
 Optional:
   UPLINK_DB          state db path       (default: <this dir>/state.db)
-  UPLINK_BACKFILL    backfill message cap (default: 500)
+  UPLINK_BACKFILL    optional archive cap (default: 0 = all retained local history)
+  UPLINK_HISTORY_PAGE_SIZE  bounded discovery/delivery page (default/max: 200)
+  MASTER_ENROLL_URL  explicit HTTPS or loopback enrollment/recovery endpoint
   UPLINK_MEDIA_MAX   media re-upload byte cap (default: 26214400 = 25MB; over -> placeholder)
   UPLINK_SYNC_TIMEOUT  /sync long-poll ms for the LOCAL tail AND the master
                        proposal pull (default: 5000). The idle loop period is
@@ -84,6 +86,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import consent            # noqa: E402
 import reconcile          # noqa: E402
+import durable_sync       # noqa: E402
 
 # The durable address-book store (agents/contacts/contacts_store.py, Task 1) is
 # the SOURCE for the contact mirror. It is a sibling package; add its dir to the
@@ -95,19 +98,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- source detection: the known bridge spaces, mirroring shared/ui/sources.js.
 # A local room's source is the source-space (by m.room.name) it is a child of.
-SOURCE_LABEL_TO_ID = {
-    "WhatsApp": "whatsapp",
-    "iMessage": "imessage",
-    "Google Messages": "gmessages",
-    "Instagram": "instagram",
-    "LinkedIn": "linkedin",
-    "Twitter": "twitter",
-    "X": "twitter",
-}
-SOURCE_ID_TO_LABEL = {
-    "whatsapp": "WhatsApp", "imessage": "iMessage", "gmessages": "Google Messages",
-    "instagram": "Instagram", "linkedin": "LinkedIn", "twitter": "X",
-}
+sys.path.insert(0, os.path.normpath(os.path.join(BASE, "..", "..", "shared")))
+from source_catalog import SOURCES, SPACE_SOURCES
+SOURCE_LABEL_TO_ID = dict(SPACE_SOURCES, X="twitter")
+SOURCE_ID_TO_LABEL = {source["id"]: source["label"] for source in SOURCES if source["kind"] == "source"}
 
 SOURCE_TAG_TYPE = "com.jkali.source"        # state event on the mirror room (badge)
 # §12 phase 5 unified contacts: a conversation may belong to a contact profile
@@ -198,7 +192,7 @@ MIGRATED_FLAG = "migrated_explicit_levels"  # meta key, "1" once the pass comple
 #   0 = pre-S3 (mirror_rooms/event_map/proposal_map/contact_mirror/meta)
 #   1 = D2/D2b: proposal_map.outcome, mirror_rooms.stamped_level,
 #       direct_send_log, direct_send_audit
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # One-time re-PUT of the two proposal-room topics after the D2 copy change
 # (the old strings asserted an absolute that auto-send breaks, and a topic is
 # only written at room creation).
@@ -499,12 +493,21 @@ class Config:
             "master_token": self.master_token, "manager_mxid": self.manager_mxid,
             "master_space": self.master_space,
         }
+        self.master_enroll_url = (env.get("MASTER_ENROLL_URL") or "").rstrip("/")
+        self.master_authority_id = env.get("MASTER_AUTHORITY_ID") or ""
+        self.master_data_epoch = env.get("MASTER_DATA_EPOCH") or ""
+        self.install_id = env.get("BEEPA_INSTALL_ID") or ""
+        self.env_master.update(master_enroll_url=self.master_enroll_url,
+                               master_authority_id=self.master_authority_id,
+                               master_data_epoch=self.master_data_epoch)
         self.db_path = env.get("UPLINK_DB") or os.path.join(BASE, "state.db")
         # The address-book store the contact mirror reads (Task 1). Defaults to
         # the importer's sibling store; the integration harness repoints it.
         self.contacts_db = env.get("UPLINK_CONTACTS_DB") or os.path.normpath(
             os.path.join(BASE, "..", "contacts", "contacts.db"))
-        self.backfill = max(0, min(int(env.get("UPLINK_BACKFILL", "500")), 500))
+        self.backfill = max(0, int(env.get("UPLINK_BACKFILL", "0")))
+        self.history_page_size = max(1, min(int(env.get("UPLINK_HISTORY_PAGE_SIZE", "200")), 200))
+        self.imessage_bot = env.get("IMESSAGE_BOT_MXID") or "@imessagebot:" + self.local_user.split(":", 1)[-1]
         self.sync_timeout = int(env.get("UPLINK_SYNC_TIMEOUT", "5000"))
         self.reconcile_ms = int(env.get("UPLINK_RECONCILE_MS", "30000"))
         self.log_level = env.get("UPLINK_LOG_LEVEL", "INFO")
@@ -537,14 +540,14 @@ def _mx(base, token, method, path, body=None, query=None, timeout=60):
         return json.loads(raw) if raw else {}
 
 
-class Uplink:
+class Uplink(durable_sync.DurableSync):
     def __init__(self, cfg):
         self.cfg = cfg
         self.db = self._open_db(cfg.db_path)
         self.backoff = 1.0
         self.self_mxids = set()   # refreshed at the top of every reconcile()
         self._last_sourceless = None  # change-detector for the sourceless-share warning
-        self._last_reconcile = 0.0    # monotonic-enough throttle for reconcile()
+        self._last_reconcile = float("-inf")    # monotonic-enough throttle for reconcile()
         # D2-11: auto-send is suspended until refresh_direct_send_binding()
         # (called at the top of ensure_proposal_rooms) says otherwise.
         self._direct_suspended = True
@@ -556,8 +559,18 @@ class Uplink:
     def master(self, method, path, body=None, query=None, timeout=60):
         try:
             return _mx(self.cfg.master_hs, self.cfg.master_token, method, path, body, query, timeout)
-        except urllib.error.HTTPError:
-            raise  # a real API error (auth, forbidden, bad request) — surface it
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and not getattr(self, "_recovering", False):
+                self._recovering = True
+                try:
+                    if self.recover_master():
+                        # The rejected request could not dispatch under a 401.
+                        # A data-epoch transition invalidated its room, so let
+                        # the scheduler rebuild instead of retrying a stale URL.
+                        raise MasterUnreachable("credentials recovered; reconcile destination")
+                finally:
+                    self._recovering = False
+            raise
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             raise MasterUnreachable(str(e))
 
@@ -565,6 +578,9 @@ class Uplink:
     @staticmethod
     def _open_db(path):
         db = sqlite3.connect(path, check_same_thread=False)
+        if db.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
+            db.close()
+            raise ValueError("Uplink database needs a newer application release")
         db.execute(
             "CREATE TABLE IF NOT EXISTS mirror_rooms ("
             "local_room_id TEXT PRIMARY KEY, master_room_id TEXT UNIQUE, "
@@ -592,6 +608,7 @@ class Uplink:
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
         Uplink._migrate_db(db)
+        durable_sync.install_schema(db)
         try:
             os.chmod(path, 0o600)  # secrets/state 600 regardless of umask
         except OSError:
@@ -754,52 +771,34 @@ class Uplink:
         not under any known source space have source None and are left private.
         """
         join = (((sync_data or {}).get("rooms") or {}).get("join")) or {}
-        # First pass: find source spaces and their names.
-        space_source = {}
-        child_of = {}
+        roots, edges = {}, {}
         for rid, room in join.items():
-            # State from BOTH the `state` block and `timeline`: /sync delivers
-            # state only up to the start of the timeline window, so a recently
-            # added m.space.child (e.g. a portal linked after the last events)
-            # arrives in `timeline` and would otherwise be invisible here —
-            # leaving a shared room "sourceless" and silently unmirrored. Same
-            # guard the iMessage daemon and apps/master parseSnapshot use.
-            state_events = ((((room.get("state") or {}).get("events")) or [])
-                            + (((room.get("timeline") or {}).get("events")) or []))
-            name = None
-            children = []
-            for e in state_events:
-                if not isinstance(e, dict):
+            states = list((room.get("state") or {}).get("events") or []) + list((room.get("timeline") or {}).get("events") or [])
+            name, children = None, {}
+            for event in states:
+                if not isinstance(event, dict):
                     continue
-                t = e.get("type")
-                if t == "m.room.name":
-                    name = (e.get("content") or {}).get("name")
-                elif t == "m.space.child" and (e.get("content") or {}).get("via"):
-                    children.append(e.get("state_key"))
-            # Prefix match to mirror shared/ui/sources.js (buildConvos uses
-            # name.startsWith(spaceName)): real bridge spaces are named e.g.
-            # "WhatsApp (+1...)" / "Google Messages (email)", not the bare label.
-            # "X" is a whole-name label, so it is matched exactly (a prefix of
-            # "X" would swallow arbitrary chat names).
-            sid = None
-            if name:
-                for label, _sid in SOURCE_LABEL_TO_ID.items():
-                    if label == "X":
-                        if name == "X":
-                            sid = _sid
-                            break
-                    elif name.startswith(label):
-                        sid = _sid
+                if event.get("type") == "m.room.name":
+                    name = (event.get("content") or {}).get("name")
+                elif event.get("type") == "m.space.child":
+                    # A later empty state event removes the earlier edge.
+                    children[event.get("state_key")] = bool((event.get("content") or {}).get("via"))
+            edges[rid] = [child for child, active in children.items() if active and child in join]
+            if isinstance(name, str):
+                for label, sid in SOURCE_LABEL_TO_ID.items():
+                    if (name == label if label == "X" else name.startswith(label)):
+                        roots[rid] = sid
                         break
-            if sid:
-                space_source[rid] = sid
-                for c in children:
-                    child_of[c] = rid
         out = {}
-        for child_rid, space_rid in child_of.items():
-            src = space_source.get(space_rid)
-            if src:
-                out[child_rid] = src
+        for root, source in roots.items():
+            seen, pending = {root}, list(edges.get(root, []))
+            while pending:
+                child = pending.pop()
+                if child in seen or (child in roots and child != root):
+                    continue
+                seen.add(child)
+                out[child] = source
+                pending.extend(edges.get(child, []))
         return out
 
     @staticmethod
@@ -984,9 +983,17 @@ class Uplink:
         migrated = self.migrate_explicit_levels()
         sync_data = self.full_sync()
         desired, source_of, join, profile_of = self.desired_shared(sync_data, migrated)
+        for rid in self.existing_mirror_ids():
+            if self.mirror_status(rid) == "revoking":
+                desired[rid] = "private"
         plan = reconcile.reconcile_decisions(desired, self.existing_mirror_ids())
         log.info("reconcile: create=%d delete=%d keep=%d",
                  len(plan["create"]), len(plan["delete"]), len(plan["keep"]))
+        for rid in plan["delete"]:
+            self.mark_revoking(rid)
+        # Use the same bounded scheduler here: reconciliation must not bypass
+        # a room's persisted retry deadline (including server rate limits).
+        self.retry_revocations()
         for rid in plan["create"]:
             try:
                 # Stamp the mirror with the profile ONLY when the room is a member
@@ -1002,14 +1009,9 @@ class Uplink:
             except MasterUnreachable:
                 raise
             except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise  # scheduler must honor server Retry-After
                 log.warning("create_mirror %s failed: %s", rid, e)
-        for rid in plan["delete"]:
-            try:
-                self.delete_mirror(rid)
-            except MasterUnreachable:
-                raise
-            except urllib.error.HTTPError as e:
-                log.warning("delete_mirror %s failed: %s", rid, e)
         # D2b: re-stamp com.jkali.share_level on KEPT mirrors whose level
         # flipped in either direction (share <-> direct), plus the one-time
         # backfill of mirrors created before this stamp existed. A pure diff
@@ -1024,6 +1026,8 @@ class Uplink:
             except MasterUnreachable:
                 raise
             except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise  # scheduler must honor server Retry-After
                 log.warning("share_level re-stamp %s failed: %s", rid, e)
         # Keep kept mirrors' names in step with the local rooms (contact names
         # arrive late; mirrors created before them said "conversation" forever).
@@ -1033,6 +1037,8 @@ class Uplink:
             except MasterUnreachable:
                 raise
             except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise  # scheduler must honor server Retry-After
                 log.warning("mirror rename %s failed: %s", rid, e)
         # Backfill/tail every kept + freshly-created room.
         for rid in sorted(set(plan["create"]) | set(plan["keep"])):
@@ -1104,8 +1110,32 @@ class Uplink:
         labels its affordance "Propose", never "Send".
         """
         cfg = self.cfg
+        if not self.active_link_for_dispatch() or self.archive_level(local_room_id) not in reconcile.SHARE_LEVELS:
+            return None
         level = level if level in reconcile.SHARE_LEVELS else "share"
+        existing = self.mirror_for(local_room_id)
+        if existing:
+            self.sync_room(local_room_id)
+            return existing[0]
+        intent = self.db.execute("SELECT generation,status FROM mirror_lifecycle WHERE local_room_id=?", (local_room_id,)).fetchone()
+        generation = intent[0] if intent else __import__('uuid').uuid4().hex
+        self.db.execute("INSERT OR IGNORE INTO mirror_lifecycle(local_room_id,generation,status) VALUES (?,?,'allocating')", (local_room_id, generation))
+        self.db.commit()
+        alias_name = "beepa_mirror_" + generation
+        alias = "#" + alias_name + ":" + self._server_name(cfg.master_user)
+        adopted = None
+        if intent:
+            try:
+                adopted = self.master("GET", "/_matrix/client/v3/directory/room/" + urllib.parse.quote(alias, safe=""))["room_id"]
+                marker = self.master("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(adopted, safe="") + "/state/com.beepa.mirror_generation")
+                if marker != {"generation": generation, "owner": cfg.master_user, "source_room": local_room_id}:
+                    raise ValueError("mirror allocation marker mismatch")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
         initial_state = [
+            {"type": "com.beepa.mirror_generation", "state_key": "", "content": {
+                "generation": generation, "owner": cfg.master_user, "source_room": local_room_id}},
             {"type": SOURCE_TAG_TYPE, "state_key": "", "content": {"source": source or "unknown"}},
             {"type": SHARE_LEVEL_TYPE, "state_key": "", "content": {"level": level}},
             {"type": "m.space.parent", "state_key": cfg.master_space,
@@ -1119,6 +1149,7 @@ class Uplink:
             })
         body = {
             "name": name or "conversation",
+            "room_alias_name": alias_name,
             "preset": "private_chat",
             "invite": [cfg.manager_mxid],
             "creation_content": {"com.jkali.mirror_of": local_room_id},
@@ -1132,21 +1163,13 @@ class Uplink:
                 "state_default": 100,
             },
         }
-        res = self.master("POST", "/_matrix/client/v3/createRoom", body)
-        master_room_id = res["room_id"]
-        # Link the space -> child (so the master app groups it under this user).
-        self.master("PUT", "/_matrix/client/v3/rooms/"
-                    + urllib.parse.quote(cfg.master_space, safe="")
-                    + "/state/m.space.child/" + urllib.parse.quote(master_room_id, safe=""),
-                    {"via": [self._server_name(cfg.master_user)]})
-        self.db.execute(
-            "INSERT OR REPLACE INTO mirror_rooms "
-            "(local_room_id, master_room_id, source, last_synced_pos, stamped_level) "
-            "VALUES (?,?,?,?,?)",
-            (local_room_id, master_room_id, source, None, level))
+        master_room_id = adopted or self.master("POST", "/_matrix/client/v3/createRoom", body)["room_id"]
+        # Commit allocation before any space-link request can fail.
+        self.db.execute("INSERT INTO mirror_rooms (local_room_id,master_room_id,source,last_synced_pos,stamped_level) VALUES (?,?,?,?,?)",
+                        (local_room_id, master_room_id, source, None, level))
+        self.db.execute("UPDATE mirror_lifecycle SET status='linking' WHERE local_room_id=?", (local_room_id,))
         self.db.commit()
-        log.info("created mirror %s -> %s (source=%s)", local_room_id, master_room_id, source)
-        self.backfill(local_room_id, master_room_id)
+        self.sync_room(local_room_id)
         return master_room_id
 
     def delete_mirror(self, local_room_id):
@@ -1162,47 +1185,61 @@ class Uplink:
         if not row:
             return
         master_room_id, _, _ = row
+        self.mark_revoking(local_room_id)
         cfg = self.cfg
-        try:
-            self.master("PUT", "/_matrix/client/v3/rooms/"
-                        + urllib.parse.quote(cfg.master_space, safe="")
-                        + "/state/m.space.child/" + urllib.parse.quote(master_room_id, safe=""), {})
-        except urllib.error.HTTPError:
-            pass
-        for act, payload in (("kick", {"user_id": cfg.manager_mxid, "reason": "unshared"}),):
+        step = self.db.execute("SELECT revoke_step FROM mirror_lifecycle WHERE local_room_id=?", (local_room_id,)).fetchone()[0]
+        operations = [
+            ("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(cfg.master_space, safe="")
+             + "/state/m.space.child/" + urllib.parse.quote(master_room_id, safe=""), {}),
+            ("POST", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="") + "/kick",
+             {"user_id": cfg.manager_mxid, "reason": "unshared"}),
+            ("POST", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="") + "/leave", {}),
+        ]
+        for index in range(step, len(operations)):
+            method, path, body = operations[index]
             try:
-                self.master("POST", "/_matrix/client/v3/rooms/"
-                            + urllib.parse.quote(master_room_id, safe="") + "/" + act, payload)
-            except urllib.error.HTTPError:
-                pass
-        try:
-            self.master("POST", "/_matrix/client/v3/rooms/"
-                        + urllib.parse.quote(master_room_id, safe="") + "/leave", {})
-        except urllib.error.HTTPError:
-            pass
-        # Drop local mappings so a later re-share creates a fresh mirror.
+                self.master(method, path, body)
+            except urllib.error.HTTPError as exc:
+                # Kicking an already-departed manager is an idempotent success,
+                # but an arbitrary 403/404 is NOT evidence of successful cleanup.
+                if index == 2 and exc.code in (403, 404):
+                    joined = self.master("GET", "/_matrix/client/v3/joined_rooms").get("joined_rooms", [])
+                    if master_room_id in joined:
+                        raise
+                    self.db.execute("UPDATE mirror_lifecycle SET revoke_step=3 WHERE local_room_id=?", (local_room_id,))
+                    self.db.commit()
+                    continue
+                if index != 1 or exc.code not in (403, 404):
+                    raise
+                state = self.master("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="")
+                                    + "/state/m.room.member/" + urllib.parse.quote(cfg.manager_mxid, safe=""))
+                if state.get("membership") not in ("leave", "ban"):
+                    raise
+            self.db.execute("UPDATE mirror_lifecycle SET revoke_step=? WHERE local_room_id=?", (index + 1, local_room_id))
+            self.db.commit()
         self.db.execute("DELETE FROM mirror_rooms WHERE local_room_id=?", (local_room_id,))
+        self.db.execute("DELETE FROM mirror_lifecycle WHERE local_room_id=?", (local_room_id,))
+        self.db.execute("DELETE FROM legacy_mirrors WHERE master_room_id=?", (master_room_id,))
+        self.db.execute("DELETE FROM meta WHERE k=?", ("mname:" + local_room_id,))
         self.db.commit()
-        log.info("revoked mirror for %s (master room %s orphaned; admin purge optional)",
-                 local_room_id, master_room_id)
+        log.info("mirror access revoked; historical copies may remain on the master")
 
     # -- backfill + tail ----------------------------------------------------
     def backfill(self, local_room_id, master_room_id):
-        """Post the last N messages in chronological order, then set watermark."""
-        res = self.local("GET", "/_matrix/client/v3/rooms/"
-                         + urllib.parse.quote(local_room_id, safe="") + "/messages",
-                         query={"dir": "b", "limit": str(self.cfg.backfill)})
-        chunk = list(reversed(res.get("chunk") or []))  # oldest -> newest
-        posted = self.forward_events(local_room_id, master_room_id, chunk)
-        # Watermark starts at the sync 'from' token for this room's tail.
-        end = res.get("start")  # forward token for subsequent /messages if needed
-        if end:
-            self._set_watermark(local_room_id, self.meta_get("sync_since") or "")
-        log.info("backfill %s: posted %d/%d", local_room_id, posted, len(chunk))
+        """Schedule all retained history; discovery/delivery are restartable."""
+        self.schedule_history(local_room_id, master_room_id)
 
     def sync_room(self, local_room_id):
-        """Placeholder per-room catch-up hook; tail is driven by the global loop."""
-        return
+        row = self.mirror_for(local_room_id)
+        if not row or self.mirror_status(local_room_id) == "revoking":
+            return
+        if self.mirror_status(local_room_id) == "linking":
+            self.master("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(self.cfg.master_space, safe="")
+                        + "/state/m.space.child/" + urllib.parse.quote(row[0], safe=""),
+                        {"via": [self._server_name(self.cfg.master_user)]})
+            self.db.execute("UPDATE mirror_lifecycle SET status='history' WHERE local_room_id=?", (local_room_id,))
+            self.db.commit()
+        self.backfill(local_room_id, row[0])
 
     def _set_watermark(self, local_room_id, pos):
         self.db.execute("UPDATE mirror_rooms SET last_synced_pos=? WHERE local_room_id=?",
@@ -1220,8 +1257,10 @@ class Uplink:
         """
         row = self.mirror_for(local_room_id)
         source = row[1] if row else None
-        mapped = {r[0] for r in self.db.execute(
-            "SELECT local_event_id FROM event_map").fetchall()}
+        if self.mirror_status(local_room_id) == "revoking" or self.meta_get("link_disabled") == "1":
+            return 0
+        mapped = {e.get("event_id") for e in events if isinstance(e, dict)
+                  and self.delivery_for(master_room_id, e.get("event_id"))}
         order = [e.get("event_id") for e in events if isinstance(e, dict)]
         todo = set(reconcile.select_new_events(order, mapped))
         posted = 0
@@ -1231,6 +1270,13 @@ class Uplink:
             eid = e.get("event_id")
             if eid not in todo:
                 continue
+            # Fresh point-read before EACH event dispatch, not just before a
+            # potentially long history page. The resolver remains authoritative.
+            if not self.active_link_for_dispatch():
+                break
+            if self.archive_level(local_room_id) not in ("share", "direct"):
+                self.mark_revoking(local_room_id)
+                break
             etype = e.get("type")
             if etype == "m.room.message":
                 self._forward_message(local_room_id, master_room_id, source, e)
@@ -1277,7 +1323,7 @@ class Uplink:
                 body = r.read()
             return body, r.headers.get("Content-Type")
 
-    def _reupload_media(self, content):
+    def _reupload_media(self, content, local_room_id=None):
         """Download the media in `content` from LOCAL, re-upload to MASTER.
 
         Returns a NEW master mxc string on success, or None to signal the caller
@@ -1287,6 +1333,7 @@ class Uplink:
         PUT will independently raise MasterUnreachable and roll the whole forward
         back, so a placeholder is never durably committed in that case.
         """
+        self._media_retryable = False
         url = content.get("url")
         if not isinstance(url, str):
             return None                      # encrypted media carries `file`, not `url`
@@ -1304,41 +1351,51 @@ class Uplink:
                        + "/" + urllib.parse.quote(media_id, safe=""))
             data, ctype = self._http_bytes(
                 self.cfg.local_hs, self.cfg.local_token, "GET", dl_path,
-                timeout=120, max_bytes=self.cfg.media_max)
+                timeout=15, max_bytes=self.cfg.media_max)
             if not data:
                 return None
             up_ctype = (info.get("mimetype") if isinstance(info.get("mimetype"), str)
                         else None) or ctype or "application/octet-stream"
             filename = content.get("body") if isinstance(content.get("body"), str) else "file"
+            if local_room_id and (not self.active_link_for_dispatch() or self.archive_level(local_room_id) not in ("share", "direct")):
+                return None
             body, _ = self._http_bytes(
                 self.cfg.master_hs, self.cfg.master_token, "POST",
                 "/_matrix/media/v3/upload", query={"filename": filename},
-                data=data, content_type=up_ctype, timeout=180)
+                data=data, content_type=up_ctype, timeout=15)
             res = json.loads(body) if body else {}
             new_uri = res.get("content_uri")
             if isinstance(new_uri, str) and MXC_RE.match(new_uri):
                 return new_uri
             return None
         except Exception as e:                # noqa: BLE001 — any failure -> placeholder
-            log.warning("media re-upload failed (%s); falling back to placeholder", e)
+            self._media_retryable = (not isinstance(e, (ValueError, urllib.error.HTTPError))
+                                     or isinstance(e, urllib.error.HTTPError) and (e.code == 429 or e.code >= 500))
+            log.warning("media re-upload failed (%s); placeholder with tracked retry=%s", type(e).__name__, self._media_retryable)
             return None
 
     def _forward_message(self, local_room_id, master_room_id, source, ev):
         content = dict(ev.get("content") or {})
         sender = ev.get("sender") or ""
         rel = content.get("m.relates_to") or {}
+        replacement_target = None
         # Edit: an m.replace targeting a mapped local event -> edit the mirror.
         if rel.get("rel_type") == "m.replace":
             target_local = rel.get("event_id")
-            master_target = self.mapped_master_event(target_local)
+            master_target = self.delivery_for(master_room_id, target_local)
             if master_target:
-                content = dict(content)
+                replacement_target = master_target
+                replacement = content.get("m.new_content")
+                content = dict(replacement) if isinstance(replacement, dict) else dict(content)
                 content["m.relates_to"] = {"rel_type": "m.replace", "event_id": master_target}
+        content.pop("m.new_content", None)
         # Metadata the master app renders by (§8.2). from_me: the teammate's
         # own account OR one of their attested bridge ghosts (see
         # SELF_IDENTITIES_TYPE above) — phone-sent messages carry the ghost.
         content[FROM_ME_KEY] = (sender == self.cfg.local_user
-                                or sender in self.self_mxids)
+                                or sender in self.self_mxids
+                                or (source == "imessage" and sender == getattr(self.cfg, "imessage_bot", None)
+                                    and content.get(FROM_ME_KEY) is True))
         content[ORIGIN_TS_KEY] = ev.get("origin_server_ts")
         content[SOURCE_KEY] = source or "unknown"
         content[ORIGIN_SENDER_KEY] = self._display_name(local_room_id, sender)
@@ -1348,7 +1405,7 @@ class Uplink:
         # to the v1 placeholder — never drop or block the message.
         mt = content.get("msgtype")
         if mt in MEDIA_MSGTYPES:
-            new_uri = self._reupload_media(content)
+            new_uri = self._reupload_media(content, local_room_id)
             if new_uri:
                 content["url"] = new_uri            # swap local mxc -> master mxc
                 content.pop("file", None)           # never carry a local encrypted ref
@@ -1358,29 +1415,38 @@ class Uplink:
                 content = {k: v for k, v in content.items() if k not in ("url", "file", "info")}
                 content["body"] = MEDIA_LABELS[mt]
                 content[MEDIA_PLACEHOLDER_KEY] = True
+                if getattr(self, "_media_retryable", False):
+                    self.db.execute("INSERT OR IGNORE INTO media_retry(master_room_id,local_room_id,local_event_id) VALUES (?,?,?)",
+                                    (master_room_id, local_room_id, ev.get("event_id")))
+                    self.db.commit()
+        if replacement_target:
+            # Clients render m.new_content after an edit. It must carry the
+            # same trusted metadata and re-uploaded media as the outer event.
+            content["m.new_content"] = {k: v for k, v in content.items() if k != "m.relates_to"}
+        if not self.active_link_for_dispatch():
+            return
+        if self.archive_level(local_room_id) not in ("share", "direct"):
+            self.mark_revoking(local_room_id)
+            return
+        self.claim_delivery(master_room_id, ev.get("event_id"))
         txn = urllib.parse.quote(ev.get("event_id"), safe="")
         res = self.master("PUT", "/_matrix/client/v3/rooms/"
                           + urllib.parse.quote(master_room_id, safe="")
                           + "/send/m.room.message/uplink_" + txn, content)
-        self.db.execute(
-            "INSERT OR REPLACE INTO event_map (local_event_id, master_event_id) VALUES (?,?)",
-            (ev.get("event_id"), res.get("event_id")))
-        self.db.commit()
+        self.finish_delivery(master_room_id, ev.get("event_id"), res.get("event_id"))
 
     def _forward_redaction(self, master_room_id, ev):
         target_local = ev.get("redacts") or (ev.get("content") or {}).get("redacts")
-        master_target = self.mapped_master_event(target_local)
+        master_target = self.delivery_for(master_room_id, target_local)
         if not master_target:
             return
+        self.claim_delivery(master_room_id, ev.get("event_id"))
         txn = urllib.parse.quote(ev.get("event_id"), safe="")
         res = self.master("PUT", "/_matrix/client/v3/rooms/"
                           + urllib.parse.quote(master_room_id, safe="")
                           + "/redact/" + urllib.parse.quote(master_target, safe="")
                           + "/uplinkr_" + txn, {})
-        self.db.execute(
-            "INSERT OR REPLACE INTO event_map (local_event_id, master_event_id) VALUES (?,?)",
-            (ev.get("event_id"), res.get("event_id")))
-        self.db.commit()
+        self.finish_delivery(master_room_id, ev.get("event_id"), res.get("event_id"))
 
     @staticmethod
     def _server_name(mxid):
@@ -1610,7 +1676,7 @@ class Uplink:
         elif stored != key:
             self.db.execute("DELETE FROM meta WHERE k IN "
                             "('master_proposals_room','proposal_sync_since')")
-            self.db.execute("DELETE FROM proposal_map")
+            # Outcomes are a safety ledger and must survive authority changes.
             self.db.commit()
             ts = int(time.time() * 1000)
             self.meta_set(self.IDENTITY_META, key)
@@ -1838,10 +1904,16 @@ class Uplink:
         if self.db.execute("SELECT 1 FROM mirror_rooms WHERE master_room_id=?",
                             (local_proposals_room,)).fetchone():
             return 0
-        handled = {r[0]: r[1] for r in self.db.execute(
-            "SELECT master_event_id, outcome FROM proposal_map").fetchall()}
+        handled = {}
+        for event in events:
+            if isinstance(event, dict) and event.get("event_id"):
+                row = self.db.execute("SELECT outcome FROM proposal_map WHERE master_event_id=?", (event["event_id"],)).fetchone()
+                if row:
+                    handled[event["event_id"]] = row[0]
         posted = 0
         for ev in events:
+            if not self.active_link_for_dispatch():
+                return posted
             if not isinstance(ev, dict) or ev.get("type") != PROPOSAL_TYPE:
                 continue
             meid = ev.get("event_id")
@@ -1948,9 +2020,16 @@ class Uplink:
         data = self.master("GET", "/_matrix/client/v3/sync", query=query,
                            timeout=(self.cfg.sync_timeout // 1000) + 30)
         room = (((data.get("rooms") or {}).get("join")) or {}).get(mpr) or {}
+        timeline = room.get("timeline") or {}
+        if timeline.get("limited"):
+            self.schedule_history(lpr, mpr, timeline.get("prev_batch"),
+                                  self.meta_get("last_proposal_event"), direction="down",
+                                  boundary="gap:" + (data.get("next_batch") or "initial"))
         events = ((room.get("timeline") or {}).get("events")) or []
         posted = self.forward_proposals(mpr, lpr, events,
                                         cold_start=bool(cold_start), suspended=suspended)
+        if events and events[-1].get("event_id"):
+            self.meta_set("last_proposal_event", events[-1]["event_id"])
         # Advance the watermark only after forward_proposals returned (no local
         # write raised); proposal_map still guards against any replayed overlap.
         self.meta_set("proposal_sync_since", data.get("next_batch") or since or "")
@@ -1992,7 +2071,7 @@ class Uplink:
             data = self.local("GET", path)
         except urllib.error.HTTPError as e:
             return [] if e.code == 404 else None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError):
             return None
         profiles = data.get("profiles") if isinstance(data, dict) else None
         return profiles if isinstance(profiles, list) else []
@@ -2269,6 +2348,8 @@ class Uplink:
                 # sub-chunk window — up to OVERRIDE_RECHECK pushes between
                 # samples — is ACCEPTED and documented.
                 for i, row in enumerate(plan["push"]):
+                    if not self.active_link_for_dispatch():
+                        break
                     if i and i % self.OVERRIDE_RECHECK == 0:
                         fresh = self.read_contact_overrides()
                         if fresh is not None:
@@ -2307,19 +2388,42 @@ class Uplink:
             query["since"] = since
         data = self.local("GET", "/_matrix/client/v3/sync", query=query,
                           timeout=(self.cfg.sync_timeout // 1000) + 30)
+        # Apply account-data privacy changes before staging any batch event.
         join = (((data or {}).get("rooms") or {}).get("join")) or {}
+        for event in (data.get("account_data") or {}).get("events", []):
+            if event.get("type") == self.MASTER_LINK_TYPE:
+                link = event.get("content")
+                if not isinstance(link, dict) or not link.get("master_token") or link.get("disabled"):
+                    self.meta_set("link_disabled", "1")
+                    for rid in self.existing_mirror_ids():
+                        self.mark_revoking(rid)
+                    return
         for local_room_id, room in join.items():
             row = self.mirror_for(local_room_id)
             if not row:
-                continue  # only mirror rooms are tailed
+                continue
+            changed = [e for e in (room.get("account_data") or {}).get("events", [])
+                       if e.get("type") == consent.SHARE_OVERRIDE_TYPE]
+            if changed and consent.effective_level(changed[-1].get("content")) not in ("share", "direct"):
+                self.mark_revoking(local_room_id)
+                continue
+            if self.mirror_status(local_room_id) == "revoking":
+                continue
             master_room_id = row[0]
-            events = ((room.get("timeline") or {}).get("events")) or []
-            self.forward_events(local_room_id, master_room_id, events)
-            # Advance the per-room watermark only after the above succeeded.
-            self._set_watermark(local_room_id, data.get("next_batch") or "")
-        # Global sync token advances only after every room forwarded (no master
-        # failure raised MasterUnreachable above).
+            timeline = room.get("timeline") or {}
+            events = timeline.get("events") or []
+            if timeline.get("limited"):
+                cursor = timeline.get("prev_batch")
+                self.schedule_history(local_room_id, master_room_id, cursor,
+                                      self.meta_get("last_event:" + local_room_id),
+                                      boundary="gap:" + (data.get("next_batch") or cursor or "initial"))
+            self.enqueue_events(local_room_id, master_room_id, events)
+            if events and events[-1].get("event_id"):
+                self.meta_set("last_event:" + local_room_id, events[-1]["event_id"])
+        # Ingestion can advance: every event/gap reference is now durable. The
+        # delivery ledger is separate and is only committed after a master's 2xx.
         self.meta_set("sync_since", data.get("next_batch") or since or "")
+        self.meta_set("last_ingestion_success", str(int(time.time())))
 
     MASTER_LINK_TYPE = "com.jkali.master_link"  # local hub account-data (set by the user app)
 
@@ -2329,80 +2433,177 @@ class Uplink:
         organization, after it redeems an enrollment code) overrides the env
         fallback. Read outbound-only from the LOCAL hub with LOCAL_TOKEN.
         Returns True when a complete master config is available (connected)."""
-        link = None
         try:
             data = self.local("GET", "/_matrix/client/v3/user/%s/account_data/%s"
                               % (urllib.parse.quote(self.cfg.local_user), self.MASTER_LINK_TYPE))
-            if isinstance(data, dict) and data.get("master_token") and data.get("master_hs_url"):
-                link = data
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log.debug("master_link read: HTTP %s", e.code)
-        except Exception as e:
-            log.debug("master_link read failed: %s", e)
-        src = link or {}
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                return False  # an unreadable consent/control state fails closed
+            data = None       # legacy installs may adopt env only when absent
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError):
+            return False
+        if data is not None:
+            if not isinstance(data, dict) or (data.get("disabled") or data.get("enabled") is False) or not all(data.get(k) for k in
+                    ("master_hs_url", "master_user", "master_token", "manager_mxid", "master_space")):
+                self.meta_set("link_disabled", "1")
+                cleanup = self.meta_get("cleanup_connection")
+                if cleanup:
+                    previous = json.loads(cleanup)
+                    for key, value in previous.items():
+                        setattr(self.cfg, key, value)
+                for rid in self.existing_mirror_ids():
+                    self.mark_revoking(rid)
+                return False
+            self.meta_set("link_disabled", "0")
+            src = data
+        else:
+            if self.meta_get("link_disabled") == "1":
+                return False
+            src = {}
+        self._control_fingerprint = self.control_fingerprint(data)
+        runtime = self.meta_get("master_runtime")
+        if runtime:
+            overlay = json.loads(runtime)
+            if overlay.get("control_fingerprint") == self._control_fingerprint:
+                src = overlay["link"]
         em = self.cfg.env_master
-        self.cfg.master_hs    = (src.get("master_hs_url") or em["master_hs"] or "").rstrip("/")
-        self.cfg.master_user  = src.get("master_user")  or em["master_user"]  or ""
+        prior_identity = (self.cfg.master_hs, self.cfg.master_user, self.cfg.manager_mxid)
+        self.cfg.master_hs = (src.get("master_hs_url") or em["master_hs"] or "").rstrip("/")
+        self.cfg.master_user = src.get("master_user") or em["master_user"] or ""
         self.cfg.master_token = src.get("master_token") or em["master_token"] or ""
         self.cfg.manager_mxid = src.get("manager_mxid") or em["manager_mxid"] or ""
         self.cfg.master_space = src.get("master_space") or em["master_space"] or ""
-        return bool(self.cfg.master_hs and self.cfg.master_user
-                    and self.cfg.master_token and self.cfg.master_space)
+        connected = bool(self.cfg.master_hs and self.cfg.master_user and self.cfg.master_token and self.cfg.master_space)
+        if connected:
+            if prior_identity != (self.cfg.master_hs, self.cfg.master_user, self.cfg.manager_mxid):
+                self.cfg.master_enroll_url = ""
+                self.cfg.master_authority_id = ""
+                self.cfg.master_data_epoch = ""
+            self.cfg.master_enroll_url = (src.get("master_enroll_url") or em.get("master_enroll_url") or "").rstrip("/")
+            self.cfg.master_authority_id = src.get("master_authority_id") or em.get("master_authority_id") or ""
+            self.cfg.master_data_epoch = src.get("master_data_epoch") or em.get("master_data_epoch") or ""
+            self.destination_binding(self.cfg.master_authority_id, self.cfg.master_data_epoch)
+            self.meta_set("cleanup_connection", json.dumps({key: getattr(self.cfg, key) for key in
+                ("master_hs", "master_user", "master_token", "manager_mxid", "master_space")}))
+        return connected
+
+    @staticmethod
+    def retry_delay(error, attempt=0):
+        """Honor Matrix/server rate limits; jitter ordinary transient backoff."""
+        import random
+        delay = None
+        if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+            try:
+                delay = float((error.headers or {}).get("Retry-After"))
+            except (TypeError, ValueError):
+                try:
+                    delay = float(json.loads(error.read()).get("retry_after_ms")) / 1000
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        if delay is not None:
+            return max(0.1, delay)  # never shorten an explicit server limit
+        return min(60.0, 2 ** min(attempt, 6)) * random.uniform(0.8, 1.0)
+
+    def run_stage(self, name, action):
+        """Failure isolation: contacts/archive failures cannot stop ingestion."""
+        schedules = getattr(self, "_stage_retry", {})
+        self._stage_retry = schedules
+        until, attempt = schedules.get(name, (0, 0))
+        if time.monotonic() < until:
+            return False
+        try:
+            action()
+            schedules.pop(name, None)
+            self.db.execute("DELETE FROM meta WHERE k=?", ("stage_error:" + name,))
+            self.db.commit()
+            return True
+        except (MasterUnreachable, urllib.error.HTTPError, urllib.error.URLError,
+                OSError, ValueError, sqlite3.Error) as exc:
+            delay = self.retry_delay(exc, attempt)
+            schedules[name] = (time.monotonic() + delay, attempt + 1)
+            # No exception text: database/network messages can contain PII.
+            try:
+                self.meta_set("stage_error:" + name, type(exc).__name__)
+            except sqlite3.Error:
+                log.error("unable to persist sync health; uplink state storage needs attention")
+            log.warning("sync stage %s failed (%s); retry in %.1fs", name, type(exc).__name__, delay)
+            return False
+
+    def retired_request(self, connection, method, path, body):
+        return _mx(connection["master_hs"], connection["master_token"], method, path, body, timeout=15)
+
+    def retry_revocations(self):
+        row = self.db.execute("SELECT local_room_id,attempts FROM mirror_lifecycle "
+                              "WHERE status='revoking' AND next_attempt<=? "
+                              "ORDER BY next_attempt,rowid LIMIT 1", (time.time(),)).fetchone()
+        if row:
+            self.run_cleanup("mirror_lifecycle", "local_room_id=?", (row[0],), row[1],
+                             lambda: self.delete_mirror(row[0]))
+
+    def run_cleanup(self, table, where, keys, attempt, action):
+        """One bounded room per stage turn; failed rooms cannot starve others.
+
+        Only internal fixed table/column names reach this helper. Room failures
+        carry their own durable deadline instead of suspending the whole stage.
+        Database failures still escape to run_stage's storage-error handling.
+        """
+        try:
+            action()
+        except (MasterUnreachable, urllib.error.HTTPError, urllib.error.URLError,
+                OSError, ValueError) as exc:
+            delay = self.retry_delay(exc, attempt)
+            self.db.execute("UPDATE " + table + " SET next_attempt=?,attempts=?,error=? WHERE " + where,
+                            (time.time() + delay, attempt + 1, type(exc).__name__) + keys)
+            self.db.commit()
+            log.warning("room cleanup failed (%s); retry in %.1fs", type(exc).__name__, delay)
 
     def run(self):
         log.info("uplink starting: local=%s (master resolved per-loop from env or "
                  "com.jkali.master_link account-data)", self.cfg.local_hs)
         while True:
             try:
-                if not self.refresh_master_config():
-                    if getattr(self, "_conn_state", None) is not False:
-                        self._conn_state = False
-                        log.info("not connected to a master — connect from the user app: "
-                                 "Settings > Connect to organization")
-                    time.sleep(30)
+                resolved = []
+                config_ok = self.run_stage("configuration", lambda: resolved.append(self.refresh_master_config()))
+                connected = config_ok and bool(resolved and resolved[0])
+                self._conn_state = connected
+                # Cleanup retains the last known credential on explicit unlink;
+                # no fresh messages or proposals are dispatched while disabled.
+                self.run_stage("revocation", self.retry_revocations)
+                self.run_stage("retired_revocation", self.retry_retired_mirrors)
+                if time.monotonic() - getattr(self, "_last_health", float("-inf")) >= 30:
+                    self._last_health = time.monotonic()
+                    self.run_stage("health", self.publish_health)
+                if not connected:
+                    time.sleep(5)
                     continue
-                if getattr(self, "_conn_state", None) is not True:
-                    self._conn_state = True
-                    log.info("connected to master %s (space %s)",
-                             self.cfg.master_user, self.cfg.master_space)
-                # Reconcile (full initial /sync + consent resolution) is the
-                # expensive pass — keep it on its own cadence while the two
-                # cheap long-polls below spin the loop every few seconds.
-                now = time.time()
+                if self.meta_get(MIGRATED_FLAG) != "1":
+                    self.run_stage("migration", self.migrate_explicit_levels)
+                    if self.meta_get(MIGRATED_FLAG) != "1":
+                        time.sleep(1)
+                        continue  # D0 barrier before ANY archive/Direct dispatch
+                now = time.monotonic()
                 if now - self._last_reconcile >= self.cfg.reconcile_ms / 1000.0:
-                    self.reconcile()
-                    # §12 phase 5: mirror shared address-book contacts up AFTER
-                    # the conversation reconcile. Consent-gated + exactly-once;
-                    # a master outage raises MasterUnreachable and is buffered
-                    # by the handler below (cursor left unadvanced).
-                    self.mirror_contacts()
-                    self._last_reconcile = now
-                self.tail_once()
-                # V2 proposal channel: ensure the dedicated proposals rooms exist,
-                # then pull any new manager proposals DOWN into the local one. Both
-                # steps are outbound-only and write com.jkali.proposal exclusively.
-                self.ensure_proposal_rooms()
-                self.pull_proposals()
-                self.backoff = 1.0
-            except MasterUnreachable as e:
-                log.warning("master unreachable (%s); buffering, retry in %.0fs "
-                            "(watermark NOT advanced)", e, self.backoff)
-                time.sleep(self.backoff)
-                self.backoff = min(self.backoff * 2, 60.0)
-            except urllib.error.HTTPError as e:
-                log.error("http error: %s", e)
-                time.sleep(5)
-            except sqlite3.OperationalError:
-                # Transient contacts.db lock (e.g. the hourly importer holds a
-                # RESERVED write while mirror_contacts tries to write) that the
-                # busy_timeout could not clear. This is recoverable — the next
-                # reconcile pass retries. Log count-only (never the exception
-                # text, which could name a handle) and continue; the
-                # exactly-once cursor logic is untouched because a failed
-                # contacts write never advanced it.
-                log.warning("transient contacts.db lock; retrying next pass")
-                time.sleep(5)
+                    self._last_reconcile = now  # throttle even on failed reconcile
+                    self.run_stage("reconcile", self.reconcile)
+                if now - getattr(self, "_last_recovery", float("-inf")) >= 60:
+                    self._last_recovery = now
+                    self.run_stage("recovery", self.refresh_recovery)
+                self.run_stage("ingestion", self.tail_once)
+                if self.meta_get("link_disabled") == "1":
+                    continue
+                self.run_stage("delivery", self.deliver_pending)
+                def proposals():
+                    self.ensure_proposal_rooms()
+                    self.pull_proposals()
+                    self.deliver_proposal_pending()
+                self.run_stage("proposals", proposals)
+                self.run_stage("history", self.history_slice)
+                self.run_stage("media", self.retry_media_slice)
+                last_contacts = getattr(self, "_last_contacts", float("-inf"))
+                if now - last_contacts >= self.cfg.reconcile_ms / 1000.0:
+                    self._last_contacts = now
+                    self.run_stage("contacts", self.mirror_contacts)
+                time.sleep(0.1)
             except KeyboardInterrupt:
                 log.info("uplink stopping")
                 return

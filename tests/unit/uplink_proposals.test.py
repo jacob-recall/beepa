@@ -47,6 +47,9 @@ def make_uplink(recorded="!props:localhost", mirrors=()):
     these tests passing against a shape the daemon no longer uses.
     """
     u = object.__new__(uplink.Uplink)
+    # This fixture isolates proposal framing/dedup; live connection-control
+    # reads are covered by uplink_durable_sync.test.py.
+    u.active_link_for_dispatch = lambda: True
     u.db = uplink.Uplink._open_db(
         os.path.join(tempfile.mkdtemp(prefix="uplink-props-"), "state.db"))
     for local_id, master_id in mirrors:

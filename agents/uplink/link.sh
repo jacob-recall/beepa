@@ -19,6 +19,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
 ENROLL_URL="${1:-}"
 CODE="${2:-}"
 
@@ -71,13 +72,27 @@ case "${LOCAL_USER}" in
 esac
 
 # --- 2. redeem the code -> MASTER_* scoped creds (to a temp file) ---
-ENVFILE="${HERE}/uplink.env.local"
+if [ -z "${BEEPA_INSTALL_ROOT:-}" ]; then
+  BEEPA_INSTALL_ROOT="$(python3 - "${REPO_ROOT}" <<'PYROOT'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from install_config import read_manifest
+root = Path(sys.argv[1]).resolve()
+manifest = read_manifest(root)
+print(manifest['state_root'] if manifest and manifest.get('state_initialized') else root)
+PYROOT
+)"
+fi
+export BEEPA_INSTALL_ROOT
+ENVFILE="${BEEPA_INSTALL_ROOT}/agents/uplink/uplink.env.local"
+mkdir -p "$(dirname "${ENVFILE}")"
 umask 077
 MASTER_ENV="$(mktemp "${TMPDIR:-/tmp}/uplink.master.XXXXXX")"
 trap 'rm -f "${MASTER_ENV}"' EXIT
 
 log "redeeming enrollment code against ${ENROLL_URL} ..."
-/usr/bin/python3 "${HERE}/enroll_client.py" \
+python3 "${HERE}/enroll_client.py" \
   --enroll-url="${ENROLL_URL}" --code="${CODE}" --out="${MASTER_ENV}" \
   || fail "enrollment redemption failed (code may be used/expired); env file left unchanged"
 
@@ -93,43 +108,39 @@ set +a
 [ -n "${MASTER_SPACE:-}" ]  || fail "exchange did not return MASTER_SPACE"
 
 # --- 3. write the combined uplink env file (mode 600), atomically ---
-TMP="${ENVFILE}.tmp.$$"
-{
-  echo "# uplink env — mode 600, do NOT commit. Written by agents/uplink/link.sh."
-  echo "# LOCAL_* = this install's own hub; MASTER_* = scoped master credentials."
-  echo "LOCAL_HS_URL='${LOCAL_HS_URL}'"
-  echo "LOCAL_USER='${LOCAL_USER}'"
-  echo "LOCAL_TOKEN='${LOCAL_TOKEN}'"
-  echo "MASTER_HS_URL='${MASTER_HS_URL}'"
-  echo "MASTER_USER='${MASTER_USER}'"
-  echo "MASTER_TOKEN='${MASTER_TOKEN}'"
-  echo "MANAGER_MXID='${MANAGER_MXID:-}'"
-  echo "MASTER_SPACE='${MASTER_SPACE}'"
-} > "${TMP}"
-chmod 600 "${TMP}"
-mv "${TMP}" "${ENVFILE}"
-chmod 600 "${ENVFILE}"
-log "wrote ${ENVFILE} (mode 600)"
+export LOCAL_HS_URL LOCAL_USER LOCAL_TOKEN
+export MASTER_HS_URL MASTER_USER MASTER_TOKEN MASTER_SPACE
+export MANAGER_MXID MASTER_AUTHORITY_ID MASTER_DATA_EPOCH MASTER_ENROLL_URL
+python3 - "${ENVFILE}" <<'PYCODE'
+import json, os, shlex, sys, tempfile, urllib.parse, urllib.request
+out = sys.argv[1]
+keys = ('LOCAL_HS_URL','LOCAL_USER','LOCAL_TOKEN','MASTER_HS_URL','MASTER_USER',
+        'MASTER_TOKEN','MANAGER_MXID','MASTER_SPACE','MASTER_AUTHORITY_ID',
+        'MASTER_DATA_EPOCH','MASTER_ENROLL_URL')
+fd, tmp = tempfile.mkstemp(prefix='.uplink-env-', dir=os.path.dirname(out))
+with os.fdopen(fd, 'w') as stream:
+    for key in keys:
+        stream.write(key + '=' + shlex.quote(os.environ.get(key, '')) + '\n')
+os.replace(tmp, out)
+# Explicitly reconnect through the same control record used by the UI.
+# Merely writing environment credentials cannot undo a persisted disconnect.
+link = {key.lower().replace('master_hs_url', 'master_hs_url'): os.environ.get(key, '')
+        for key in keys if key.startswith('MASTER_') or key == 'MANAGER_MXID'}
+path = '/_matrix/client/v3/user/' + urllib.parse.quote(os.environ['LOCAL_USER'], safe='') + '/account_data/com.jkali.master_link'
+request = urllib.request.Request(os.environ['LOCAL_HS_URL'].rstrip('/') + path,
+    data=json.dumps(link).encode(), method='PUT', headers={
+        'Authorization': 'Bearer ' + os.environ['LOCAL_TOKEN'], 'Content-Type': 'application/json'})
+with urllib.request.urlopen(request, timeout=30) as response:
+    response.read()
+PYCODE
+log "wrote ${ENVFILE} (mode 600) and connected this local hub"
 
-# --- 4. install + (re)load the launchd uplink daemon ---
-PLIST_SRC="${HERE}/com.jkali.uplink.plist"
-LA_DIR="${HOME}/Library/LaunchAgents"
-PLIST_DEST="${LA_DIR}/com.jkali.uplink.plist"
-if [ -f "${PLIST_SRC}" ] && command -v launchctl >/dev/null 2>&1; then
-  mkdir -p "${LA_DIR}"
-  # Rewrite the repo plist's placeholder paths to THIS checkout (same rule as
-  # setup.sh install_agent) — a raw cp shipped /Users/jkali/... paths onto
-  # other machines and the uplink never started.
-  REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
-  sed "s#/Users/jkali/work/pm_mng#${REPO_ROOT}#g" "${PLIST_SRC}" > "${PLIST_DEST}"
-  launchctl unload "${PLIST_DEST}" 2>/dev/null || true
-  if launchctl load "${PLIST_DEST}" 2>/dev/null; then
-    log "loaded launchd daemon com.jkali.uplink"
-  else
-    log "could not launchctl load; start it manually: launchctl load '${PLIST_DEST}'"
-  fi
+# --- 4. install the same portable launchd service used by setup ---
+REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
+if command -v launchctl >/dev/null 2>&1; then
+  python3 "${REPO_ROOT}/install_config.py" --root "${REPO_ROOT}" install-agent uplink
 else
-  log "launchctl or plist unavailable; run the uplink manually: bash '${HERE}/run-uplink.sh'"
+  log "launchctl unavailable; run bash '${HERE}/run-uplink.sh'"
 fi
 
 cat >&2 <<DONE
@@ -138,7 +149,7 @@ cat >&2 <<DONE
   - The uplink daemon is installed and syncing your SHARED conversations up to
     the master. Nothing you have not shared ever leaves this machine.
   - Choose what to share in your teammate app (apps/user): per-conversation,
-    per-source, or global Share-All.
+    using explicit Private, Share, or Direct levels.
   - Logs: ${HERE}/logs/uplink.log and uplink.err
-  - To stop: launchctl unload '${PLIST_DEST}'
+  - To disconnect: use Settings > Disconnect in Beepa.
 DONE

@@ -1,6 +1,7 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
+import { nativeOnly } from '../installation.js';
 import { $, el, sanitize, sanitizeLine } from './el.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
 import { S, runtime } from '../state.js';
@@ -595,6 +596,11 @@ function buildConnections() {
   checklist.id = 'imsg-checklist';
   im.appendChild(checklist);
   holder.appendChild(im);
+  if (nativeOnly()) {
+    wa.remove();
+    connectionsBuilt = true;
+    return;
+  }
 
   // Google Messages card — ONE-CLICK connect via the loopback helper (:8020).
   // The browser can't read Chrome cookies or `docker exec` the bridge, so the

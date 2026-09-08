@@ -169,6 +169,9 @@ def ensure_manifest(root, role='teammate', env=None):
     root = Path(root).resolve()
     env = os.environ if env is None else env
     existing = read_manifest(root)
+    if existing and existing.get('profile') == 'imessage':
+        from multi_account import require_owner
+        require_owner(existing)
     requested_state = env.get('BEEPA_STATE_ROOT')
     if existing and requested_state and Path(requested_state).expanduser().resolve() != Path(existing['state_root']).resolve():
         raise ValueError('Existing runtime cannot be relocated by changing BEEPA_STATE_ROOT')
@@ -330,6 +333,10 @@ def ensure_runtime(root, requirements=None):
 
 def install_agent(root, name, launch_dir=None, code_root=None):
     """Explicit installer action. Boot out legacy label before enabling replacement."""
+    data = read_manifest(root)
+    if data and data.get('profile') == 'imessage':
+        from multi_account import require_owner
+        require_owner(data)
     launch_dir = Path(launch_dir or Path.home() / 'Library/LaunchAgents')
     target = launch_dir / ('org.beepa.' + name + '.plist')
     legacy = launch_dir / ('com.jkali.' + name + '.plist')

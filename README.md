@@ -36,6 +36,9 @@ Current documentation:
 
 Installation identity is adopted from existing configuration or supplied/derived from the computer account on first install. Keep the credentials delivered during setup.
 
+For two iMessage accounts in separate macOS users, see the new
+[multi-account setup and acceptance gates](docs/MULTI-ACCOUNT-MAC.md).
+
 ## Setup (per machine)
 
 ```sh

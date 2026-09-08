@@ -1,3 +1,4 @@
+import { nativeOnly } from '../../shared/installation.js';
 // apps/user/orglink.js — Settings > "Connect to organization".
 //
 // The user pastes the master enroll URL + a one-time enrollment code (from their
@@ -117,6 +118,14 @@ export async function initOrgLinkUI() {
   cmd.textContent = "bash agents/uplink/link.sh '<master-url>' '<code>'";
   note.appendChild(cmd);
   card.appendChild(note);
+  if (nativeOnly()) {
+    urlField.classList.add('hidden');
+    codeField.classList.add('hidden');
+    connectBtn.classList.add('hidden');
+    sub.textContent = 'Connect this iMessage account using the setup command below. You can check sync status or disconnect here.';
+    note.firstChild.textContent = 'Run this command from your Beepa installation folder to connect this account: ';
+    cmd.textContent = "python3 multi_account.py link '<master-url>'";
+  }
 
   const mount = $('command-groups') || settings;
   mount.insertBefore(card, mount.firstChild);

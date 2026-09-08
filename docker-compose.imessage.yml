@@ -1,0 +1,43 @@
+# One iMessage hub per installation. Use multi_account.py, not raw compose.
+# Host ports are provided by the persisted installation profile.
+services:
+  postgres:
+    image: postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: synapse
+      # Cluster-wide C locale + UTF8: Synapse requires LC_COLLATE=C, LC_CTYPE=C
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix -d synapse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host ports: reachable only on the compose network.
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.159.0@sha256:edf259d2b575b669a3e81024918ab8d5cfb7d2fba5a53c9e09695f1abc5645cb
+    restart: unless-stopped
+    environment:
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
+    volumes:
+      - ./synapse:/data
+    ports:
+      - "127.0.0.1:${BEEPA_SYNAPSE_PORT:-8008}:8008"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  views:
+    extends:
+      file: docker-compose.apps.yml
+      service: views
+
+volumes:
+  postgres-data:

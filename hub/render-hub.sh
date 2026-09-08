@@ -39,6 +39,10 @@ VARS="$(grep -rhoE '\$\{('"${KNOWN}"')\}' "${TPL}" \
 DB_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- || true)"
 [ -n "${DB_PASSWORD}" ] || { log "FATAL: POSTGRES_PASSWORD not set in .env"; exit 1; }
 export DB_PASSWORD
+# Instance endpoints are read from persisted state, including during updates.
+instance_env="$(python3 "${HERE}/multi_account.py" --root "${STATE_ROOT}" endpoints)"
+eval "${instance_env}"
+export LOCAL_HS_URL BEEPA_IMESSAGE_PORT
 
 # Resolve the same installed identity used by provisioning and login helpers.
 LOCAL_MXID="$(python3 "${HERE}/install_config.py" --root "${STATE_ROOT}" identity)"
@@ -81,10 +85,11 @@ while IFS= read -r tmpl; do
   rel="${tmpl#"${TPL}/"}"; dest="${RENDER_ROOT}/${rel%.tmpl}"
   mkdir -p "$(dirname "${dest}")"
   # shellcheck disable=SC2086
-  python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD LOCAL_MXID ${VARS}
+  python3 "${HERE}/hub/_render_subst.py" "${tmpl}" "${dest}" DB_PASSWORD LOCAL_MXID BEEPA_IMESSAGE_PORT ${VARS}
   chmod 600 "${dest}"
   count=$((count+1))
 done < <(find "${TPL}" -name '*.tmpl' | sort)
+python3 "${HERE}/multi_account.py" --root "${STATE_ROOT}" filter-render "${RENDER_ROOT}"
 log "rendered ${count} config files for validation"
 
 [ "${VERIFY}" = 1 ] && { log "verify render complete (diff is the caller's job)"; exit 0; }
@@ -166,7 +171,7 @@ if [ -f "${IMSG_TMPL}" ] && [ ! -f "${IMSG_DEST}" ]; then
   mkdir -p "$(dirname "${IMSG_DEST}")"
   CLI_PATH="${OUT_ROOT}/imessage/bin/imessage-cli"; export CLI_PATH
   python3 "${HERE}/hub/_render_subst.py" "${IMSG_TMPL}" "${IMSG_DEST}" \
-    AS_TOKEN_IMESSAGE HS_TOKEN_IMESSAGE CLI_PATH LOCAL_MXID
+    AS_TOKEN_IMESSAGE HS_TOKEN_IMESSAGE CLI_PATH LOCAL_MXID LOCAL_HS_URL BEEPA_IMESSAGE_PORT
   chmod 600 "${IMSG_DEST}"
   log "wrote imessage/daemon.json (tokens match imessage-registration.yaml; still fill self_handle + provide bin/imessage-cli)"
 fi

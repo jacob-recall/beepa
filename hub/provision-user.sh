@@ -11,7 +11,9 @@ log()  { printf '[provision-user] %s\n' "$*" >&2; }
 fail() { printf '[provision-user] ERROR: %s\n' "$*" >&2; exit 1; }
 
 STATE_ROOT="${BEEPA_INSTALL_ROOT:-${HERE}}"
-HS="${LOCAL_HS_URL:-http://127.0.0.1:8008}"
+instance_env="$(python3 "${HERE}/multi_account.py" --root "${STATE_ROOT}" endpoints)"
+eval "${instance_env}"
+HS="${LOCAL_HS_URL}"
 LOCAL_MXID="$(python3 "${HERE}/install_config.py" --root "${STATE_ROOT}" identity)"
 LP="${LOCAL_MXID#@}"; LP="${LP%%:*}"
 CREDS="${HUB_USER_CREDS:-${STATE_ROOT}/hub/.local-user.local}"       # stored password (600)
@@ -138,5 +140,5 @@ if [ -n "${APP_TOKEN}" ]; then
   chmod 600 "${APP_SESSION}"
   log "passwordless login enabled for apps/user (no password screen)"
 else
-  log "APP LOGIN (fallback) -> username: ${LP}   password: ${LOCAL_PASSWORD}"
+  log "App bootstrap unavailable; credentials are retained in ${CREDS} (mode 600)."
 fi

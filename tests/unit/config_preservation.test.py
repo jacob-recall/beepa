@@ -57,6 +57,7 @@ class ConfigTests(unittest.TestCase):
             root = Path(tmp)
             shutil.copytree(ROOT / 'hub', root / 'hub', ignore=shutil.ignore_patterns('.local-user.local'))
             shutil.copy2(ROOT / 'install_config.py', root / 'install_config.py')
+            shutil.copy2(ROOT / 'multi_account.py', root / 'multi_account.py')
             (root / '.env').write_text('POSTGRES_PASSWORD=synthetic\nLOCAL_LOCALPART=casey\n')
             (root / 'synapse').mkdir()
             (root / 'synapse/localhost.signing.key').write_text('synthetic-preserved-signing-key')

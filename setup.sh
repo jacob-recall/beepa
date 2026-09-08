@@ -16,6 +16,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if python3 "${HERE}/multi_account.py" --root "${HERE}" is-imessage; then
+  exec python3 "${HERE}/multi_account.py" --root "${HERE}" install
+else
+  profile_status=$?
+  [ "${profile_status}" = 1 ] || exit "${profile_status}"
+fi
 log() { printf '[setup] %s\n' "$*" >&2; }
 
 # --- preflight: ensure Docker is installed AND running ---

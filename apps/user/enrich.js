@@ -1,3 +1,4 @@
+import { nativeOnly } from '../../shared/installation.js';
 // Conversation-number enrichment → auto-merge contacts by phone number.
 //
 // A trusted local loopback helper (same origin gate as the connect helpers in
@@ -65,6 +66,7 @@ function liveRooms() {
 // to rooms the user is in, auto-merge, and persist only if something changed.
 // Fail-soft throughout: an unreachable/erroring helper does nothing, no error UI.
 async function autoMergeContacts() {
+  if (nativeOnly()) return;
   if (mergeDone) return;
   try {
     // The feed may not be seeded yet at app init. Do NOT consume the one pass on

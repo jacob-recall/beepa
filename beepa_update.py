@@ -194,8 +194,12 @@ class Updater:
 
     def compositions(self, manifest, release):
         result = []
+        if manifest.get('profile') == 'imessage':
+            from multi_account import require_owner
+            require_owner(manifest)
         if 'teammate' in manifest['roles']:
-            result.append(('teammate', manifest['compose_project'], 'docker-compose.yml', '.env'))
+            result.append(('teammate', manifest['compose_project'],
+                           'docker-compose.imessage.yml' if manifest.get('profile') == 'imessage' else 'docker-compose.yml', '.env'))
         if 'master' in manifest['roles']:
             result.append(('master', manifest['master_compose_project'], 'master/docker-compose.master.yml', 'master/.env'))
             if 'teammate' not in manifest['roles']:
@@ -213,11 +217,14 @@ class Updater:
             if role in ('teammate', 'local-ui'):
                 overlay = self.meta / ('views-' + release.name + '.json')
                 view_config = views_overlay(state, release)
+                if manifest.get('profile') == 'imessage':
+                    from multi_account import instance_overlay
+                    view_config = instance_overlay(manifest, release, view_config)
                 if role == 'local-ui':
                     view_config['services'] = {'views': view_config['services']['views']}
                 atomic_write(overlay, json.dumps(view_config))
                 cmd.extend(['-f', str(overlay)])
-                if role == 'teammate':
+                if role == 'teammate' and manifest.get('profile') != 'imessage':
                     cmd.extend(['--profile', 'bridge', '--profile', 'client'])
             rows.append((role, cmd))
         return rows
@@ -303,6 +310,8 @@ class Updater:
         state = Path(manifest['state_root']) if manifest.get('state_initialized') else self.root
         env = dict(os.environ, BEEPA_INSTALL_ROOT=str(state), OUT_ROOT=str(state),
                    BEEPA_MASTER_STATE_DIR=str(runtime_path(self.root, 'master/.env').parent))
+        if manifest.get('profile') == 'imessage':
+            env['BEEPA_USER_APP_URL'] = 'http://127.0.0.1:%d/apps/user/index.html' % manifest['ports']['app']
         if 'teammate' in manifest['roles']:
             self.command(['/bin/bash', release / 'hub/render-hub.sh'], env=env)
         if 'master' in manifest['roles']:

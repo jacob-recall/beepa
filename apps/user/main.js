@@ -24,6 +24,7 @@ setOnUnauthorized(forgetSession);
 // ---- session ----
 function forgetSession() {
   S.token = null; S.userId = null;
+  S.timestampCorrections?.clear();
   runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null; runtime.twitter.mgmtRoomId = null;
   for (const k of Object.keys(runtime)) runtime[k].connected = false;
   S.syncRunning = false;

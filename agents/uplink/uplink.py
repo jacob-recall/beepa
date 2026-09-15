@@ -100,6 +100,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # A local room's source is the source-space (by m.room.name) it is a child of.
 sys.path.insert(0, os.path.normpath(os.path.join(BASE, "..", "..", "shared")))
 from source_catalog import SOURCES, SPACE_SOURCES
+from message_timestamps import stamp_timestamp, valid_ts, ORIGIN_TS, TS_SOURCE, CORRECTION_TYPE
 SOURCE_LABEL_TO_ID = dict(SPACE_SOURCES, X="twitter")
 SOURCE_ID_TO_LABEL = {source["id"]: source["label"] for source in SOURCES if source["kind"] == "source"}
 
@@ -1374,7 +1375,25 @@ class Uplink(durable_sync.DurableSync):
             log.warning("media re-upload failed (%s); placeholder with tracked retry=%s", type(e).__name__, self._media_retryable)
             return None
 
+    def timestamp_event(self, local_room_id, source, ev):
+        """Overlay an authorized local history repair; never alter send gates."""
+        content = ev.get('content') or {}
+        if source != 'imessage' or (content.get(TS_SOURCE) == 'imessage' and valid_ts(content.get(ORIGIN_TS))):
+            return ev
+        try:
+            correction = self.local('GET', '/_matrix/client/v3/rooms/' + urllib.parse.quote(local_room_id, safe='')
+                + '/state/' + CORRECTION_TYPE + '/' + urllib.parse.quote(ev.get('event_id') or '', safe=''))
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            return ev
+        if (correction.get('version') == 1 and correction.get('source') == 'imessage'
+                and valid_ts(correction.get('origin_ts'))):
+            return dict(ev, content=dict(content, **{ORIGIN_TS: correction['origin_ts'], TS_SOURCE: 'imessage'}))
+        return ev
+
     def _forward_message(self, local_room_id, master_room_id, source, ev):
+        ev = self.timestamp_event(local_room_id, source, ev)
         content = dict(ev.get("content") or {})
         sender = ev.get("sender") or ""
         rel = content.get("m.relates_to") or {}
@@ -1396,7 +1415,7 @@ class Uplink(durable_sync.DurableSync):
                                 or sender in self.self_mxids
                                 or (source == "imessage" and sender == getattr(self.cfg, "imessage_bot", None)
                                     and content.get(FROM_ME_KEY) is True))
-        content[ORIGIN_TS_KEY] = ev.get("origin_server_ts")
+        stamp_timestamp(content, ev)
         content[SOURCE_KEY] = source or "unknown"
         content[ORIGIN_SENDER_KEY] = self._display_name(local_room_id, sender)
         # Media (v1.5): re-upload the blob from LOCAL to the MASTER media store and

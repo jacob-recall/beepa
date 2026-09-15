@@ -28,6 +28,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(BASE), 'shared'))
+from message_timestamps import native_metadata
 # Importing the module is inert: tests and diagnostics never open the installed
 # database/configuration or invoke the native executable. main() initializes it.
 CFG = {}
@@ -916,7 +918,9 @@ def _relay_message(chat_id, room, chat_name, is_group, m):
     mid = str(m.get("id") or "")
     if not mid:
         raise ValueError("source message ID required")
-    extra = {"com.jkali.from_me": True} if from_me else None
+    extra = native_metadata(m)
+    if from_me:
+        extra["com.jkali.from_me"] = True
     sender = BOT_ID if from_me else ensure_ghost(sender_handle, m.get("senderName") or sender_handle)
     if not from_me:
         ghost_join(sender, room)
@@ -1058,7 +1062,9 @@ def reconcile_edit(chat_id, m):
     # renders right-aligned as "You". from_me here comes from the engine's
     # isSender and the stored sender is BOT_ID (@imessagebot) for own messages, so
     # the marker is never emitted on a ghost-authored edit (M-22 intact).
-    from_me_extra = {"com.jkali.from_me": True} if from_me else None
+    from_me_extra = native_metadata(m)
+    if from_me:
+        from_me_extra["com.jkali.from_me"] = True
     try:
         result = send_replace(room, sender, target_event, text, from_me_extra,
                               txn=component_txn(room, target_msg, "edit:" + sha(text)))

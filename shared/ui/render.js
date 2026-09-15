@@ -2,6 +2,7 @@
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
 import { feedPreviewFromEvent } from '../model/message_preview.js';
+import { messageTimestamp } from '../model/message_timestamps.js';
 import { api } from '../matrix/client.js';
 import { $, el, sanitize, sanitizeLine, txn, appendLinkified } from './el.js';
 import { IMSG_BOT_MXID } from './sources.js';
@@ -135,8 +136,12 @@ function renderMessageEvent(ev) {
   if (resolved.kind === 'text' || resolved.kind === 'notice') appendLinkified(bodyNode, resolved.text);
   else bodyNode.textContent = resolved.text;
   bubble.appendChild(bodyNode);
-  bubble.appendChild(el('div', 'when', convoTime(ev.origin_server_ts)));
-  box.appendChild(bubble);
+  bubble.appendChild(el('div', 'when', convoTime(messageTimestamp(ev, S.timestampCorrections?.get(S.openRoomId)))));
+  const ts = messageTimestamp(ev, S.timestampCorrections?.get(S.openRoomId));
+  bubble.dataset.messageTs = String(ts);
+  const later = Array.from(box.children).find(node => Number(node.dataset?.messageTs) > ts);
+  if (later) box.insertBefore(bubble, later);
+  else box.appendChild(bubble);
 
   while (box.childElementCount > 200) {             // CV-D1: bounded, drop oldest
     const first = box.firstElementChild;

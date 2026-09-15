@@ -53,6 +53,8 @@ class DurableSyncTests(unittest.TestCase):
             return self.events[urllib.parse.unquote(path.rsplit('/', 1)[1])]
         if '/state/m.room.member/' in path:
             return {'displayname': 'Fixture'}
+        if '/state/com.beepa.timestamp_correction/' in path:
+            raise urllib.error.HTTPError('', 404, '', {}, None)
         raise AssertionError((method, path, query))
 
     def master(self, method, path, body=None, query=None, **kwargs):

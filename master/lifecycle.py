@@ -401,6 +401,15 @@ class MasterOps:
                         with archive.extractfile(member) as source, destination.open('wb') as target:
                             shutil.copyfileobj(source,target)
                         destination.chmod(0o600)
+                # Optional password state must match the restored database.
+                # A snapshot predating an override contains a derived manager
+                # password, so retaining today's override would break login.
+                override_relative = Path('synapse/.manager-password.local')
+                if not (staged/'master'/override_relative).is_file():
+                    destination = self.master/override_relative
+                    if self.master not in destination.resolve().parents:
+                        raise ValueError('Restore destination escapes master state')
+                    destination.unlink(missing_ok=True)
                 for path in (staged/'master').rglob('*'):
                     if not path.is_file() or path.name == 'recovery.local.json':
                         continue
@@ -489,7 +498,7 @@ class MasterOps:
         revoked = set(registry.get('revoked_users',{}))
         users = enroll.known_teammates()
         for name in ['manager']+users:
-            token = enroll._login(enroll._cs_base(),name,enroll.derive_password('manager' if name=='manager' else 'teammate',name))
+            token = enroll._login(enroll._cs_base(),name,enroll.account_password('manager' if name=='manager' else 'teammate',name))
             if name in revoked:
                 enroll._deactivate_account(enroll._cs_base(),token,name,enroll.derive_password('teammate',name))
             else:

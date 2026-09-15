@@ -234,6 +234,44 @@ class LifecycleTest(unittest.TestCase):
                              b'operator_setting: retained\n')
         self.ops.verify_backup(backup)
 
+    def check_manager_password_restore(self, snapshot_password):
+        override = self.root/'master/synapse/.manager-password.local'
+        (self.root/'master/tokens.local').write_text(
+            "MASTER_MANAGER_USER='@manager:fixture'\n"
+            "MASTER_MANAGER_TOKEN='synthetic-manager-token'\n")
+        if snapshot_password is not None:
+            override.write_text(json.dumps(snapshot_password))
+            override.chmod(0o600)
+        backup = self.ops.backup(self.root/'password-backup')
+        override.write_text(json.dumps('newer local password'))
+        override.chmod(0o644)
+        sanitized = []
+
+        def inspect_run(args, **kwargs):
+            if 'sanitize-restored-auth' in args:
+                sanitized.append(True)
+                if snapshot_password is None:
+                    self.assertFalse(override.exists())
+                else:
+                    self.assertEqual(json.loads(override.read_text()), snapshot_password)
+                    self.assertEqual(override.stat().st_mode & 0o777, 0o600)
+            return self.ops.fake_run(args, **kwargs)
+
+        self.ops.run = inspect_run
+        self.assertTrue(self.ops.restore(backup)['restored'])
+        self.assertEqual(sanitized, [True])
+        if snapshot_password is None:
+            self.assertFalse(override.exists())
+        else:
+            self.assertEqual(json.loads(override.read_text()), snapshot_password)
+            self.assertEqual(override.stat().st_mode & 0o777, 0o600)
+
+    def test_restore_without_manager_override_removes_stale_local_password(self):
+        self.check_manager_password_restore(None)
+
+    def test_restore_with_manager_override_restores_snapshot_password_and_mode(self):
+        self.check_manager_password_restore('snapshot manager password')
+
     def test_existing_cluster_password_replaces_only_database_scalar(self):
         yaml = 'server_name: master\ndatabase:\n  name: psycopg2\n  args:\n    password: "old"\n    host: postgres\nmacaroon_secret_key: "preserve"\n'
         result = lifecycle.with_database_password(yaml, 'new"password')

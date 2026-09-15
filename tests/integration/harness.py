@@ -2071,6 +2071,57 @@ def scenario_15_revocation_retains_history():
         stop_uplink(proc)
 
 
+def scenario_16_original_timestamps():
+    """Native time survives delayed import; repair writes state, not messages."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('repair_timestamps', os.path.join(REPO, 'imessage', 'repair_timestamps.py'))
+    repair = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(repair)
+    e = fresh_env('s16')
+    space = create_space(e['tuser_tok'], 'iMessage')
+    room = make_convo(e, space, 'Timestamp fixture')
+    native = 1704110400000
+    post_media_event(e['tuser_tok'], room, {'msgtype': 'm.text', 'body': 'native fixture',
+        'com.jkali.origin_ts': native, 'com.beepa.timestamp_source': 'imessage'})
+    legacy = post_msg(e['tuser_tok'], room, 'legacy fixture')
+    base = '/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='')
+    local(e['tuser_tok'], 'PUT', base + '/state/com.beepa.timestamp_correction/' + urllib.parse.quote(legacy, safe=''),
+          {'version': 1, 'source': 'imessage', 'origin_ts': native + 1000})
+    set_override(e['tuser_tok'], e['tuser_id'], room, 'share')
+    proc = start_uplink(e)
+    try:
+        row = wait_until(lambda: mirror_of(e['db_path'], room), timeout=45, desc='timestamp mirror')
+        destination = row[0]
+        messages = wait_until(lambda: (lambda m: m if len(m) == 2 else None)(master_messages(destination)),
+                              timeout=45, desc='timestamp messages')
+    finally:
+        stop_uplink(proc)
+    if [m['origin_ts'] for m in messages] != [native, native + 1000]:
+        return False, 'original timestamp was lost'
+    target = messages[0]['event_id']
+    def request(method, path, body=None):
+        try:
+            return master(MASTER_ALICE_TOKEN, method, path, body)
+        except MxError as exc:
+            raise urllib.error.HTTPError('', exc.code, '', {}, None)
+    journal = []
+    first = repair.correction(request, destination, target, native - 1000,
+                              lambda sender: sender == MASTER_ALICE_USER, True, lambda *v: journal.append(v))
+    again = repair.correction(request, destination, target, native - 1000,
+                              lambda sender: sender == MASTER_ALICE_USER, True, lambda *v: journal.append(v))
+    unchanged = master_messages(destination) == messages
+    # Initial-sync timeline filtering must retain correction state and messages.
+    result = master(MASTER_ALICE_TOKEN, 'GET', '/_matrix/client/v3/sync', query={'timeout': 0,
+        'filter': json.dumps({'room': {'rooms': [destination], 'timeline': {'limit': 5,
+            'not_types': ['com.beepa.timestamp_correction']}}})})
+    snap = result['rooms']['join'][destination]
+    state = snap.get('state', {}).get('events', [])
+    state_ok = any(ev['type'] == 'com.beepa.timestamp_correction' and ev['state_key'] == target for ev in state)
+    return first == 'corrected' and again == 'already_correct' and unchanged and state_ok, (
+        'native/repaired source times preserved; original messages unchanged=%s; correction state survives filter=%s; rerun=%s'
+        % (unchanged, state_ok, again))
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2087,6 +2138,7 @@ SCENARIOS = [
     ("13_contact_backfill_on_enable", scenario_13_contact_backfill_on_enable),
     ("14_direct_proposal_autosend", scenario_14_direct_proposal_autosend),
     ("15_revocation_retains_history", scenario_15_revocation_retains_history),
+    ("16_original_timestamps", scenario_16_original_timestamps),
 ]
 
 

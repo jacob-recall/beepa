@@ -20,6 +20,12 @@ what bounds the capability is the gate list under "Security invariants".
 
 ## What lives here
 
+- Original message dates: `shared/message_timestamps.py` preserves native
+  `com.jkali.origin_ts` across delivery and media retry. Legacy local corrections
+  are read from `com.beepa.timestamp_correction` state before archive replay.
+  These fields are display/archive metadata, never Direct freshness inputs.
+  See `docs/TIMESTAMP-REPAIR.md` for source-machine repair and the peer contract.
+
 - `uplink.py` — the daemon (`Uplink` class + `main()`). Two transports:
   `self.local(...)` (reads the teammate's LOCAL homeserver as the
   teammate's own account) and `self.master(...)` (writes the MASTER

@@ -295,6 +295,9 @@ def write_plist(root, name, dest, code_root=None):
             'IMESSAGE_STATE_DIR': str(state / 'imessage'),
         },
     }
+    if data and data.get('all_networks'):
+        for key, port_key in (('BEEPA_APP_PORT', 'app'), ('BEEPA_GMESSAGES_PORT', 'gmessages'), ('BEEPA_SESSION_PORT', 'session')):
+            config['EnvironmentVariables'][key] = str(data['ports'][port_key])
     if interval:
         config['StartInterval'] = interval
     else:

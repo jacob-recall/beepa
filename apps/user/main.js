@@ -1,3 +1,4 @@
+import { resolveLoginName } from '../../shared/installation.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -24,6 +25,7 @@ setOnUnauthorized(forgetSession);
 // ---- session ----
 function forgetSession() {
   S.token = null; S.userId = null;
+  S.timestampCorrections?.clear();
   runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null; runtime.twitter.mgmtRoomId = null;
   for (const k of Object.keys(runtime)) runtime[k].connected = false;
   S.syncRunning = false;
@@ -58,7 +60,7 @@ function forgetSession() {
 async function signIn(user, pass) {
   const body = {
     type: 'm.login.password',
-    identifier: { type: 'm.id.user', user },
+    identifier: { type: 'm.id.user', user: resolveLoginName(user) },
     password: pass,
     initial_device_display_name: 'Bridge Hub',
   };
@@ -274,7 +276,7 @@ async function enterApp() {
 }
 
 // ---- wiring ----
-document.addEventListener('DOMContentLoaded', () => {
+function initializeApp() {
   $('btn-signin').addEventListener('click', async () => {
     const err = $('signin-error');
     err.classList.add('hidden');
@@ -353,4 +355,12 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (e) {}
     showAuth(false);
   })();
-});
+}
+
+// The instance entry point imports this module dynamically, possibly after
+// DOMContentLoaded. Initialize immediately when the document is already ready.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeApp, { once: true });
+} else {
+  initializeApp();
+}

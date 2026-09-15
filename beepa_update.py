@@ -199,7 +199,7 @@ class Updater:
             require_owner(manifest)
         if 'teammate' in manifest['roles']:
             result.append(('teammate', manifest['compose_project'],
-                           'docker-compose.imessage.yml' if manifest.get('profile') == 'imessage' else 'docker-compose.yml', '.env'))
+                           'docker-compose.imessage.yml' if manifest.get('profile') == 'imessage' and not manifest.get('all_networks') else 'docker-compose.yml', '.env'))
         if 'master' in manifest['roles']:
             result.append(('master', manifest['master_compose_project'], 'master/docker-compose.master.yml', 'master/.env'))
             if 'teammate' not in manifest['roles']:
@@ -224,7 +224,7 @@ class Updater:
                     view_config['services'] = {'views': view_config['services']['views']}
                 atomic_write(overlay, json.dumps(view_config))
                 cmd.extend(['-f', str(overlay)])
-                if role == 'teammate' and manifest.get('profile') != 'imessage':
+                if role == 'teammate' and (manifest.get('profile') != 'imessage' or manifest.get('all_networks')):
                     cmd.extend(['--profile', 'bridge', '--profile', 'client'])
             rows.append((role, cmd))
         return rows

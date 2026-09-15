@@ -59,10 +59,11 @@ from http_limits import BoundedBodyMixin
 # so BOTH are allowed; nothing else is (never "*"). An off-machine or foreign
 # origin is still refused. These are aliases of the user's OWN app, not a
 # widening to any other site.
-APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
+from helper_config import app_origins, helper_port
+APP_ORIGINS = app_origins()
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8020
+DEFAULT_PORT = helper_port('gmessages')
 
 # Server-held state for the single in-flight login. The client never sees or
 # supplies this — /wait uses ONLY what /start stored here (F2).

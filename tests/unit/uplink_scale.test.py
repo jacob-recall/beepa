@@ -48,6 +48,8 @@ with tempfile.TemporaryDirectory(prefix='beepa-uplink-scale-') as directory:
                         origin_server_ts=old_ts, content={'msgtype': 'm.text', 'body': 'fixture'})
         if '/state/m.room.member/' in path:
             return {'displayname': 'Fixture'}
+        if '/state/com.beepa.timestamp_correction/' in path:
+            raise urllib.error.HTTPError('fixture', 404, 'no correction', {}, None)
         raise AssertionError((method, path))
 
     daemon.local = local

@@ -62,6 +62,12 @@ rc_login:
     per_second: 0.15
     burst_count: 10
 
+# Local bridge imports also emit membership events through the message limiter.
+# Match the bounded local-join budget so initial imports do not stall.
+rc_message:
+  per_second: 20
+  burst_count: 300
+
 rc_joins:
   local:
     per_second: 20

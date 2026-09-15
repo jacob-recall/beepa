@@ -107,3 +107,4 @@ agents/contacts/logs/
 /master/.beepa-config
 /imessage/bin
 /imessage/tmp
+.beepa-timestamp-repair/

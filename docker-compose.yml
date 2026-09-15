@@ -29,7 +29,7 @@ services:
     volumes:
       - ./synapse:/data
     ports:
-      - "127.0.0.1:8008:8008"
+      - "127.0.0.1:${BEEPA_SYNAPSE_PORT:-8008}:8008"
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,7 +90,7 @@ services:
 
   mautrix-twitter:
     # X (Twitter) DM bridge. Cookie/session login like Instagram & LinkedIn.
-    image: dock.mau.dev/mautrix/twitter:latest@sha256:3d744f87953e1441eac229e4440debd46831e0b8a34a0cc13f2a57b11e237b44
+    image: dock.mau.dev/mautrix/twitter:latest@sha256:88b89f396cff859e6f087e64c4bd179ec99d76fbe76f09edbdbd056d256d8c22
     restart: unless-stopped
     environment:
       UID: "${HOST_UID:-501}"
@@ -139,7 +139,7 @@ services:
       - ./element/config.json:/app/config.json:ro
       - ./element/nginx-default.conf.template:/etc/nginx/templates/default.conf.template:ro
     ports:
-      - "127.0.0.1:8009:80"
+      - "127.0.0.1:${BEEPA_ELEMENT_PORT:-8009}:80"
     # opt-in escape hatch for media/group-admin/debug — `docker compose --profile escape up -d element`
     profiles: ["escape"]
 

@@ -28,6 +28,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(BASE), 'shared'))
+from message_timestamps import native_metadata
 # Importing the module is inert: tests and diagnostics never open the installed
 # database/configuration or invoke the native executable. main() initializes it.
 CFG = {}
@@ -470,6 +472,8 @@ def _extract_json(raw):
     return json.loads("\n".join(buf))
 
 def cli_json(*args, timeout=60):
+    if CFG.get('receive_only') and (not args or args[0] not in ('chats', 'chat', 'messages', 'message', 'current-user', 'state', 'version')):
+        raise RuntimeError('receive_only: native mutation refused')
     argv = [CLI, "--no-events", "--json", *args]
     p = _runner(argv, capture_output=True, timeout=timeout, shell=False)
     if p.returncode != 0:
@@ -490,6 +494,8 @@ class EngineOutcome:
 
 def _engine_mut(args, timeout):
     """Keep the signed CLI's own authorization preflight; no Python TCC gate."""
+    if CFG.get('receive_only'):
+        return EngineOutcome('refused', 'receive_only')
     try:
         p = _runner([CLI, *args], capture_output=True, timeout=timeout, shell=False)
     except subprocess.TimeoutExpired:
@@ -544,7 +550,13 @@ def engine_create_chat(handle, message):
 
 # ---------------------------------------------------------------- attachments (M-4)
 def decode_asset_url(src):
-    """Engine srcURL: asset://$accountID/<hex-encoded absolute path>."""
+    """Decode native file/asset URLs; callers still enforce realpath allowlists."""
+    if str(src).startswith("file:"):
+        parsed = urllib.parse.urlsplit(str(src))
+        if parsed.netloc not in ("", "localhost") or parsed.query or parsed.fragment:
+            return None
+        path = urllib.parse.unquote(parsed.path)
+        return path if path.startswith("/") and "\0" not in path else None
     m = re.match(r"^asset://[^/]+/([0-9a-fA-F]+)$", str(src))
     if not m:
         return None
@@ -635,10 +647,53 @@ def ensure_space():
     log.info("space created")
     return sid
 
+def owner_api(method, path, body=None):
+    """Use only this installation's local owner credentials for room enrollment."""
+    import shlex
+    root = os.environ.get("BEEPA_INSTALL_ROOT")
+    if not root:
+        raise ValueError("installation root required for automatic sharing")
+    values = {}
+    with open(os.path.join(root, "agents/uplink/local.env.local")) as stream:
+        for line in stream:
+            key, sep, value = line.strip().partition("=")
+            if sep and key in ("LOCAL_USER", "LOCAL_HS_URL", "LOCAL_TOKEN"):
+                parsed = shlex.split(value)
+                values[key] = parsed[0] if len(parsed) == 1 else ""
+    if values.get("LOCAL_USER") != USER_ID or values.get("LOCAL_HS_URL", "").rstrip("/") != HS:
+        raise ValueError("owner credentials do not match this bridge")
+    req = urllib.request.Request(HS + path, method=method,
+        data=None if body is None else json.dumps(body).encode(), headers={
+            "Authorization": "Bearer " + values["LOCAL_TOKEN"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response)
+
+
+def apply_new_conversation_default(room):
+    if CFG.get("new_conversation_share") is not True:
+        return
+    flag = "default_share_applied:" + room
+    if meta_get(flag) == "1":
+        return
+    encoded = urllib.parse.quote(room, safe="")
+    path = ("/_matrix/client/v3/user/" + urllib.parse.quote(USER_ID, safe="")
+            + "/rooms/" + encoded + "/account_data/com.jkali.share_override")
+    try:
+        owner_api("GET", path)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        owner_api("PUT", path, {"state": "share"})
+    # Any existing explicit choice (including Private) wins over the default.
+    owner_api("POST", "/_matrix/client/v3/rooms/" + encoded + "/join", {})
+    meta_set(flag, "1")
+
+
 def ensure_portal(chat_id, chat_name, is_group):
     room = room_for_chat(chat_id)
     if room:
         ensure_portal_link(chat_id, room)
+        apply_new_conversation_default(room)
         return room
     space = ensure_space()
     room = create_or_recover_room({
@@ -655,6 +710,7 @@ def ensure_portal(chat_id, chat_name, is_group):
     }, "portal:" + chat_id)
     # Allocation is durable before the independent space-link operation.
     map_add(chat_id, room)
+    apply_new_conversation_default(room)
     ensure_portal_link(chat_id, room)
     log.info("portal created chat=%s", sha(chat_id)[:8])
     try:
@@ -771,10 +827,30 @@ def sync_portal_name(chat, chat_id):
     except Exception:
         log.info("portal rename failed chat=%s", sha(chat_id)[:8])
 
+def all_chat_pages():
+    """Read native inbox pages without dropping older conversations."""
+    items, seen_ids, seen_cursors = [], set(), set()
+    args = ()
+    while True:
+        page = cli_json("chats", *args)
+        if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+            raise ValueError("invalid chat page")
+        for chat in page["items"]:
+            if isinstance(chat, dict) and chat.get("id") not in seen_ids:
+                seen_ids.add(chat.get("id"))
+                items.append(chat)
+        if not page.get("hasMore"):
+            return items
+        cursor = page.get("oldestCursor")
+        if not cursor or str(cursor) in seen_cursors:
+            raise ValueError("chat pagination did not advance")
+        seen_cursors.add(str(cursor))
+        args = ("--before", str(cursor))
+
+
 def poll_once():
     _backfill_posted[0] = 0  # throughput budget per pass, never a lifetime ceiling
-    data = cli_json("chats")
-    items = data.get("items", []) if isinstance(data, dict) else []
+    items = all_chat_pages()
     now = time.monotonic()
     interval = max(1.0, float(CFG.get("tail_rescan_seconds", 30)))
     budget = max(1, int(CFG.get("tail_rescan_chats_per_poll", 8)))
@@ -916,7 +992,9 @@ def _relay_message(chat_id, room, chat_name, is_group, m):
     mid = str(m.get("id") or "")
     if not mid:
         raise ValueError("source message ID required")
-    extra = {"com.jkali.from_me": True} if from_me else None
+    extra = native_metadata(m)
+    if from_me:
+        extra["com.jkali.from_me"] = True
     sender = BOT_ID if from_me else ensure_ghost(sender_handle, m.get("senderName") or sender_handle)
     if not from_me:
         ghost_join(sender, room)
@@ -929,7 +1007,7 @@ def _relay_message(chat_id, room, chat_name, is_group, m):
         # fallback, never an on-disk path that may change after redownload.
         key = "attachment:" + str(att.get("id") or index)
         previous = component_get(room, mid, key)
-        if previous:
+        if previous and previous[1] != "refused_invalid_path":
             primary_event = previous[0] or primary_event
             continue
         path = decode_asset_url(att.get("srcURL") or "")
@@ -1058,7 +1136,9 @@ def reconcile_edit(chat_id, m):
     # renders right-aligned as "You". from_me here comes from the engine's
     # isSender and the stored sender is BOT_ID (@imessagebot) for own messages, so
     # the marker is never emitted on a ghost-authored edit (M-22 intact).
-    from_me_extra = {"com.jkali.from_me": True} if from_me else None
+    from_me_extra = native_metadata(m)
+    if from_me:
+        from_me_extra["com.jkali.from_me"] = True
     try:
         result = send_replace(room, sender, target_event, text, from_me_extra,
                               txn=component_txn(room, target_msg, "edit:" + sha(text)))

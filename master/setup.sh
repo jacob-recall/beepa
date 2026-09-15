@@ -60,9 +60,9 @@ if [ "${BEEPA_UPDATE:-0}" = 1 ]; then
 fi
 
 # --- shared secrets: reuse if present, else mint + persist (0600) ---
-# TEAMMATE_PASSWORD_KEY is the ONLY root of every master-side account password
-# (teammates + manager): master/enroll.py derives each password from it with
-# HMAC-SHA256, so no password is ever stored (see master/CLAUDE.md). This
+# TEAMMATE_PASSWORD_KEY is the root of derived master-side account passwords:
+# master/enroll.py uses HMAC-SHA256 for teammates and, by default, the manager.
+# A separate operator-selected manager override is preserved (see master/CLAUDE.md). This
 # script is the single writer of this file; enroll.py/provision.sh only read
 # it and fail loudly if the key is absent.
 #

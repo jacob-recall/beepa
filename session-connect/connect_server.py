@@ -94,7 +94,8 @@ if _ENRICH_DIR not in sys.path:
     sys.path.insert(0, _ENRICH_DIR)
 import number_resolver  # agents/enrich/number_resolver.py — SELECT-only, fail-soft
 
-APP_ORIGINS = ("http://127.0.0.1:8011", "http://localhost:8011")
+from helper_config import app_origins, helper_port
+APP_ORIGINS = app_origins()
 SERVER_NETWORKS = ("twitter", "linkedin", "instagram")
 ENRICH_NUMBERS_PATH = "/enrich/numbers"
 ENROLL_EXCHANGE_PATH = "/enroll/exchange"
@@ -112,7 +113,7 @@ CONTACTS_SOURCES = ("whatsapp", "imessage", "gmessages",
 CONTACTS_MAX = 2000   # P3: this server is single-threaded; bound the response.
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8021
+DEFAULT_PORT = helper_port('session')
 MAX_BODY = 64 * 1024  # /input bodies are tiny (a passcode); cap defensively.
 ENROLL_TIMEOUT = 15   # seconds — per-socket timeout on the outbound exchange
 ENROLL_MAX_RESP = 16 * 1024  # the exchange returns 5 tiny fields; cap tightly so

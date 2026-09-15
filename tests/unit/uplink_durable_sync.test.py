@@ -53,6 +53,8 @@ class DurableSyncTests(unittest.TestCase):
             return self.events[urllib.parse.unquote(path.rsplit('/', 1)[1])]
         if '/state/m.room.member/' in path:
             return {'displayname': 'Fixture'}
+        if '/state/com.beepa.timestamp_correction/' in path:
+            raise urllib.error.HTTPError('', 404, '', {}, None)
         raise AssertionError((method, path, query))
 
     def master(self, method, path, body=None, query=None, **kwargs):
@@ -206,6 +208,16 @@ class DurableSyncTests(unittest.TestCase):
         self.assertEqual(self.u.meta_get('sync_since'), 'new-sync')
         self.assertEqual(self.u.db.execute('SELECT cursor FROM history_jobs').fetchone()[0], 'opaque-gap')
         self.assertEqual(self.u.db.execute('SELECT local_event_id FROM pending_events').fetchone()[0], '$live')
+
+    def test_share_event_schedules_reconcile_before_mirror_exists(self):
+        self.u._last_reconcile = 123
+        self.u.local = lambda *a, **k: {'next_batch': 'new', 'rooms': {'join': {ROOM: {
+            'account_data': {'events': [{'type': 'com.jkali.share_override',
+                                         'content': {'state': 'share'}}]}}}}}
+        self.u.tail_once()
+        self.assertEqual(self.u._last_reconcile, float('-inf'))
+        self.assertIsNone(self.u.mirror_for(ROOM))
+        self.assertEqual(self.u.meta_get('sync_since'), 'new')
 
     def test_current_batch_private_precedes_new_messages(self):
         self.seed()

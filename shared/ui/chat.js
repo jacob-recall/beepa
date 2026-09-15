@@ -5,6 +5,8 @@ import { ROOMID_RE, api } from '../matrix/client.js';
 import { $, el, sanitizeLine, txn } from './el.js';
 import { setActiveNav, showSection, setDetailMode } from './nav.js';
 import { convoResolveContent, renderMessageEvent } from './render.js';
+import { messageTimestamp, timestampCorrections } from '../model/message_timestamps.js';
+import { IMSG_BOT_MXID } from './sources.js';
 import { buildPlatBadge, setActiveConvoRow } from './rows.js';
 import { S, convoSeen, feedModel, runtime } from '../state.js';
 
@@ -125,15 +127,15 @@ async function openConvo(roomId) {
   // the first pass through it for this open and every cached event renders.
   const cached = cacheGet(roomId);
   if (cached && cached.length) {
-    for (const ev of cached) renderMessageEvent(ev);
+    for (const ev of cached.slice().sort((a, b) => messageTimestamp(a, S.timestampCorrections?.get(roomId)) - messageTimestamp(b, S.timestampCorrections?.get(roomId)))) renderMessageEvent(ev);
     if (box) box.scrollTop = box.scrollHeight;
   }
 
   try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50';
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
     const data = await api('GET', q);
     if (!current()) return;
-    const chunk = Array.isArray(data.chunk) ? data.chunk.slice().reverse() : [];  // b -> chronological
+    const chunk = Array.isArray(data.chunk) ? data.chunk.slice().sort((a, b) => messageTimestamp(a, S.timestampCorrections?.get(roomId)) - messageTimestamp(b, S.timestampCorrections?.get(roomId))) : [];
     cacheAppend(roomId, chunk.filter(isCacheable));   // keep the cache warm regardless of the guard below
     if (S.openRoomId === roomId) {                    // guard: user may have switched rooms mid-fetch
       // renderMessageEvent dedups via convoSeen against whatever the cache
@@ -176,6 +178,16 @@ async function startConvoWatch(roomId) {
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[watchRoom];                 // read ONLY the open room's timeline
       if (room && room.timeline && Array.isArray(room.timeline.events) && S.openRoomId === watchRoom) {
+        const corrections = timestampCorrections(room.timeline.events, IMSG_BOT_MXID);
+        if (corrections.size) {
+          if (!S.timestampCorrections) S.timestampCorrections = new Map();
+          const merged = new Map(S.timestampCorrections.get(watchRoom) || []);
+          for (const [id, ts] of corrections) merged.set(id, ts);
+          S.timestampCorrections.set(watchRoom, merged);
+          convoSeen.clear();
+          $('convo-messages')?.replaceChildren();
+          for (const ev of (cacheGet(watchRoom) || []).slice().sort((a, b) => messageTimestamp(a, merged) - messageTimestamp(b, merged))) renderMessageEvent(ev);
+        }
         const toCache = [];
         for (const ev of room.timeline.events) {
           if (S.openRoomId !== watchRoom) break;      // client guard: drop if the room changed

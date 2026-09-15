@@ -24,6 +24,7 @@ export const S = {
   openRoomId: null,
   convoRunning: false, convoSince: null,
   selfMxids: new Set(),
+  timestampCorrections: new Map(),
 };
 export const convosBySource = {};
 export const runtime = {

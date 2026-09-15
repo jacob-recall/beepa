@@ -42,6 +42,9 @@
 #room-head { display: flex; align-items: center; gap: 12px; padding: 10px 16px; flex: 0 0 auto; }
 #room-back { width: 32px; height: 32px; flex: none; }
 #room-messages { flex: 1; min-height: 0; overflow-y: auto; }
+.message-copies { max-width: 100%; margin-top: 4px; color: var(--color-muted); font-size: 12px; }
+.message-copies > summary { cursor: pointer; }
+.message-copies > .msg-row { max-width: 100%; margin-top: 8px; }
 #convo-placeholder { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--color-muted); pointer-events: none; }
 #msgr-convo.no-selection #detail-room { display: none; }
 #msgr-convo.no-selection:not(:has(.detail-panel:not(.hidden))) #convo-placeholder { display: flex; }

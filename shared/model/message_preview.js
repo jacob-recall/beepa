@@ -1,5 +1,6 @@
 // Pure display shaping: no session, DOM, transport or send imports.
-function feedPreviewFromEvent(ev) {
+import { messageTimestamp } from './message_timestamps.js';
+function feedPreviewFromEvent(ev, corrections) {
   if (!ev || ev.type !== 'm.room.message' || !ev.content) return null;
   let content = ev.content;
   const rel = content['m.relates_to'];
@@ -16,7 +17,7 @@ function feedPreviewFromEvent(ev) {
   else if (mt === 'm.audio') { body = 'Audio'; }
   else if (mt === 'm.file')  { body = 'File'; }
   else { return null; }                             // anything else is not a previewable message
-  return { body, ts: typeof ev.origin_server_ts === 'number' ? ev.origin_server_ts : 0 };
+  return { body, ts: messageTimestamp(ev, corrections) };
 }
 
 function feedRelTime(ts) {

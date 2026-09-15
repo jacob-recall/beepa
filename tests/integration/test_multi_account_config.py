@@ -40,6 +40,15 @@ def main():
                 for mount in service.get('volumes', []):
                     if mount['type'] == 'bind' and mount['target'] in ('/data', '/usr/share/nginx/runtime/apps'):
                         assert mount['source'].startswith(str(root.resolve())), mount['target']
+            # Nested file mounts into a read-only directory require an existing
+            # mountpoint in that directory (Docker Desktop/runc enforce this).
+            mounts = config['services']['views'].get('volumes', [])
+            for child in mounts:
+                for parent in mounts:
+                    prefix = parent['target'].rstrip('/') + '/'
+                    if parent.get('read_only') and child['target'].startswith(prefix):
+                        target = Path(parent['source']) / child['target'][len(prefix):]
+                        assert target.exists(), 'Missing read-only nested mount target: ' + str(target)
             configs.append(config)
         assert configs[0]['name'] != configs[1]['name']
         assert configs[0]['volumes']['postgres-data']['name'] != configs[1]['volumes']['postgres-data']['name']

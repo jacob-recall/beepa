@@ -52,6 +52,20 @@ whitelist, recency sort, a tailing long-poll) locally instead:
   the flag cannot be spoofed by another party sharing the room.
 - `startTail()` — a room-scoped long-poll tail, the master-app-local
   equivalent of `shared/ui/chat.js`'s `startConvoWatch`.
+- History and live sync share an event-ID set per room-open. Every open and
+  tail owns an epoch and session token; obsolete history, overlay and sync
+  responses must not render or advance another tail's cursor, even when the
+  same room is reopened. Do not replace these checks with just a room-ID test.
+- A mirrored outgoing `com.jkali.auto_sent_from_proposal` acknowledges that
+  exact proposal ID and removes its suggestion overlay. Equal text alone is
+  not acknowledgement and must not hide a different proposal.
+- `nativeEchoGroups()` groups a complete matching iMessage copy of a marked
+  proposal send (whole text, or consecutive newline components within 60s)
+  into an expandable disclosure. All underlying events remain readable;
+  this is display grouping, not a delivery receipt or send deduplication.
+  Arbitrary identical messages, partial matches, incoming events, edits and
+  other platforms remain separate. The bridge's whole-body echo ledger can
+  miss native text/link splitting; never treat those copies as more proposals.
 - `groupByProfile()` / `buildProfileGroup()` — reads the `com.jkali.profile`
   room-state stamp the uplink writes only on mirror rooms belonging to a
   *shared* contact profile, and clusters them under one header (§12 phase 5).
@@ -62,6 +76,13 @@ this file's local re-implementations still match the new shape — they are
 now a deliberate, documented duplication, not an oversight.
 
 ## Security invariants (do not weaken)
+
+- Timestamp repair is a read-only display overlay from room state
+  `com.beepa.timestamp_correction`, keyed by the existing master event ID.
+  Accept it only from the room's verified create sender. It changes display
+  dates/order without replacement message bubbles or message/body writes.
+  `shared/model/message_timestamps.js` is a pure leaf shared with the personal
+  app. See `docs/TIMESTAMP-REPAIR.md`; keep it in the gateway asset allowlist.
 
 - **No composer, no send call, anywhere in this file — except the one
   documented proposal write.** Never add a `PUT

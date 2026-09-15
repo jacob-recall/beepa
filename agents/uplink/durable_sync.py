@@ -536,6 +536,8 @@ class DurableSync:
             self.mark_revoking(room)
             return
         event = self.local('GET', '/_matrix/client/v3/rooms/' + q(room) + '/event/' + q(eid))
+        source = (self.mirror_for(room) or (None, 'unknown'))[1]
+        event = self.timestamp_event(room, source, event)
         content = dict(event.get('content') or {})
         uri = self._reupload_media(content, room)
         if not uri:
@@ -557,7 +559,8 @@ class DurableSync:
         content['com.jkali.from_me'] = (sender == self.cfg.local_user or sender in self.self_mxids
             or source == 'imessage' and sender == getattr(self.cfg, 'imessage_bot', None)
             and content.get('com.jkali.from_me') is True)
-        content['com.jkali.origin_ts'] = event.get('origin_server_ts')
+        from message_timestamps import stamp_timestamp
+        stamp_timestamp(content, event)
         content['com.jkali.source'] = source
         content['com.jkali.origin_sender'] = self._display_name(room, sender)
         # Edit the existing placeholder; do not duplicate the archive message.

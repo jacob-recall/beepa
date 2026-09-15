@@ -17,12 +17,29 @@ Elliot's Messages → Elliot's native bridge → Elliot's local hub → Elliot's
 David's Messages  → David's native bridge  → David's local hub  → David's uplink ──┘
 ```
 
-This change adds a fresh-install `imessage` profile. It starts only PostgreSQL,
-Synapse, the user interface, native iMessage, and uplink. It does not install the
-five other network bridges, browser-cookie helpers or Contacts importer. The
-existing full-network installation path stays available. Converting an existing
-installation, multiple native accounts inside ONE macOS user, or putting both
-bridges into one Synapse are outside this change.
+The `imessage` profile initially starts PostgreSQL, Synapse, the user interface,
+native iMessage, and uplink. An existing isolated installation can now enable all
+supported networks in place:
+
+```sh
+python3 multi_account.py enable-networks
+python3 multi_account.py install
+```
+
+This retains the installation identity, Compose project, database volumes, login
+credentials, and native receive-only setting. It backs up configuration under
+`.beepa-config/before-all-networks`, enables WhatsApp, Google Messages, Meta,
+LinkedIn and X bridges, and adds per-installation browser connection helpers.
+Each provider still requires its own sign-in. For slot 1, helpers use ports 8120
+and 8121 and accept Elliot's app origin on 8111. No provider sign-in or outbound
+message is performed by this upgrade.
+
+On this Mac, Elliot's expanded stack and both helpers were verified running on
+2026-09-08. The served UI uses the full connection list and preserves the `elliot`
+login alias. The complete discovered test suite passed. David's separate handoff
+stack uses ports 18008/18011; the slot-2 examples below are generic assignments,
+not instructions to migrate David's existing state. David must remain receive-only;
+none of the outbound acceptance examples below are authorized for his account.
 
 The master already accepts separate teammate enrollments. There is no master
 protocol, consent, external-send retry, or iMessage ghost-namespace migration.

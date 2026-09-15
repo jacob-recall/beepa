@@ -1,7 +1,7 @@
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
-import { nativeOnly } from '../installation.js';
+import { nativeOnly, helperBase } from '../installation.js';
 import { $, el, sanitize, sanitizeLine } from './el.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
 import { S, runtime } from '../state.js';
@@ -240,7 +240,7 @@ function confirmModal(title, text, typed) {
 // which targets the Matrix homeserver). The custom X-Beepa-Connect header +
 // application/json content-type force a CORS preflight, and the helper only
 // echoes this app's origin — so only this local app can drive a connect.
-const GMSG_CONNECT_BASE = 'http://127.0.0.1:8020';
+const GMSG_CONNECT_BASE = helperBase('gmessages');
 const GMSG_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };
 
 async function runGmessagesConnect(btn, out, fallback) {
@@ -334,7 +334,7 @@ async function sessionConnectBase() {
       }
     }
   } catch (e) { /* fall back to the default below */ }
-  _sessionConnectBase = 'http://127.0.0.1:8021';
+  _sessionConnectBase = helperBase('session');
   return _sessionConnectBase;
 }
 const SESSION_CONNECT_HEADERS = { 'Content-Type': 'application/json', 'X-Beepa-Connect': '1' };

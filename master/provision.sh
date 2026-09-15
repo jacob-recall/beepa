@@ -59,13 +59,15 @@ ROSTER="$(python3 "${HERE}/roster.py" "${PERSISTED_TEAMMATES}" "${MASTER_TEAMMAT
   || fail "invalid teammate roster"
 read -r -a TEAMMATES <<< "${ROSTER}"
 
-# Passwords are DERIVED, never stored: master/enroll.py provision-account
+# Passwords are derived by default: master/enroll.py provision-account
 # registers/logs-in each account from TEAMMATE_PASSWORD_KEY (synapse/
 # .secrets.local, written by master/setup.sh) and migrates any legacy stored
 # password on the way. MANAGER_PW in the environment is only a legacy-
 # migration input for a manager account that predates derivation; it is never
 # defaulted and never persisted. The manager's console login password is
 # `python3 master/enroll.py password manager --manager`.
+# An operator-selected manager override in synapse/.manager-password.local
+# is honored by the same resolver; teammate passwords stay derived.
 ENROLL_PY="${HERE}/enroll.py"
 
 # provision-account prints {"mxid","token","migrated"} on stdout; nothing
@@ -78,7 +80,7 @@ provision_account() {
 json_field() { python3 -c 'import sys,json;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 
 # Keep saved scoped tokens stable when they still authenticate as the expected
-# account. provision-account still validates/migrates the derived password.
+# account. provision-account still validates/migrates the configured password.
 token_valid() {
   local token="$1" expected="$2"
   [ -n "${token}" ] || return 1
@@ -134,14 +136,14 @@ JSON
 }
 
 # =========================== run ===========================
-log "provisioning @${MANAGER_LP}:${SERVER} (derived password; migrating any legacy one)"
+log "provisioning @${MANAGER_LP}:${SERVER} (configured password; migrating any legacy one)"
 acct=$(provision_account "${MANAGER_LP}" --manager) || fail "manager provisioning failed — see enroll.py stderr above"
 MANAGER_TOKEN=$(printf '%s' "${acct}" | json_field token) || fail "manager: no token in provision-account output"
 if token_valid "${MASTER_MANAGER_TOKEN:-}" "@${MANAGER_LP}:${SERVER}"; then
   MANAGER_TOKEN="${MASTER_MANAGER_TOKEN}"
 fi
 [ -n "${MANAGER_TOKEN}" ] || fail "manager: empty token"
-[ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${MANAGER_LP}: migrated to derived password (existing sessions kept)"
+[ "$(printf '%s' "${acct}" | json_field migrated)" = "True" ] && log "  @${MANAGER_LP}: migrated to configured password (existing sessions kept)"
 
 # Per-teammate: account+token via provision-account (derived password, legacy
 # migrated + its PW_ line dropped from the state file), then the space. bash

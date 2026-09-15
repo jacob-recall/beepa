@@ -1,4 +1,4 @@
-import { nativeOnly } from '../../shared/installation.js';
+import { nativeOnly, helperBase } from '../../shared/installation.js';
 // apps/user/orglink.js — Settings > "Connect to organization".
 //
 // The user pastes the master enroll URL + a one-time enrollment code (from their
@@ -44,7 +44,7 @@ async function sessionConnectBase() {
       }
     }
   } catch (e) { /* fall back to the default below */ }
-  _sessionConnectBase = 'http://127.0.0.1:8021';
+  _sessionConnectBase = helperBase('session');
   return _sessionConnectBase;
 }
 

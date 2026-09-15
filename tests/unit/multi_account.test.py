@@ -56,6 +56,39 @@ class MultiAccountTests(unittest.TestCase):
                 self.assertIn('instance.js', index)
                 self.assertEqual(source['/usr/share/nginx/runtime/apps'], Path(data['state_root']) / 'apps')
 
+    def test_enabling_all_networks_retains_account_and_native_state(self):
+        root, data = self.account('alice', 1, 501)
+        state = Path(data['state_root'])
+        cfg.atomic_write(state / 'imessage/daemon.json', '{"receive_only": true, "self_handle": "alice@example.test"}')
+        original_native = (state / 'imessage/daemon.json').read_bytes()
+        password = cfg.read_env(state / '.env')['POSTGRES_PASSWORD']
+        with patch.object(m.os, 'getuid', return_value=501):
+            m.enable_networks(root)
+            m.enable_networks(root)
+            expanded = cfg.read_manifest(root)
+            self.assertEqual(expanded['install_id'], data['install_id'])
+            self.assertEqual(expanded['compose_project'], data['compose_project'])
+            self.assertEqual(expanded['local_localpart'], data['local_localpart'])
+            self.assertEqual(expanded['local_cs_base'], data['local_cs_base'])
+            self.assertEqual(cfg.read_env(state / '.env')['POSTGRES_PASSWORD'], password)
+            self.assertEqual((state / 'imessage/daemon.json').read_bytes(), original_native)
+            command = dict(Updater(root).compositions(expanded, ROOT))['teammate']
+            self.assertIn(str(ROOT / 'docker-compose.yml'), command)
+            self.assertIn('bridge', command)
+            overlay = json.loads(Path(command[command.index('--profile') - 1]).read_text())
+            self.assertIn('mautrix-twitter', overlay['services'])
+            volumes = overlay['services']['views']['volumes']
+            source = {v['target']: Path(v['source']) for v in volumes}
+            entry = source['/usr/share/nginx/html/apps/user/instance.js'].read_text()
+            index = source['/usr/share/nginx/html/apps/user/index.html'].read_text()
+            self.assertIn('"profile": "full"', entry)
+            self.assertIn('http://127.0.0.1:8120', entry)
+            self.assertIn('http://127.0.0.1:8121', index)
+            self.assertNotIn('http://127.0.0.1:18021', index)
+            plist = cfg.write_plist(root, 'session-connect', root / 'session.plist')
+            self.assertEqual(plist['EnvironmentVariables']['BEEPA_APP_PORT'], '8111')
+            self.assertEqual(plist['EnvironmentVariables']['BEEPA_SESSION_PORT'], '8121')
+
     def test_owner_and_slot_changes_refused_without_mutating_state(self):
         root, data = self.account('alice', 1, 501)
         before = (root / '.beepa-install.json').read_bytes()
@@ -73,6 +106,17 @@ class MultiAccountTests(unittest.TestCase):
         self.assertEqual(again['install_id'], data['install_id'])
         self.assertEqual(again['self_handle'], data['self_handle'])
         self.assertEqual(before, (root / '.env').read_bytes())
+
+    def test_failed_enrollment_command_does_not_echo_one_time_code(self):
+        import contextlib
+        import io
+        error = subprocess.CalledProcessError(1, ['link.sh', 'https://example.test', 'synthetic-secret-code'])
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['multi_account.py', '--root', str(self.base), 'install']), patch.object(m, 'install', side_effect=error), contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit):
+                m.main()
+        self.assertNotIn('synthetic-secret-code', output.getvalue())
+        self.assertIn('exit 1', output.getvalue())
 
     def test_occupied_port_is_not_adopted(self):
         with socket.socket() as listener:
@@ -108,6 +152,8 @@ class MultiAccountTests(unittest.TestCase):
         self.assertIn('host.docker.internal:%d' % daemon['port'], registration)
         self.assertIn(daemon['as_token'], registration)
         self.assertIn(daemon['hs_token'], registration)
+        self.assertIn('    aliases:', registration)
+        self.assertIn('^#imessage_.*:localhost$', registration)
         homeserver = (state / 'synapse/homeserver.yaml').read_text()
         self.assertIn('/data/imessage-registration.yaml', homeserver)
         self.assertNotIn('/data/meta-registration.yaml', homeserver)

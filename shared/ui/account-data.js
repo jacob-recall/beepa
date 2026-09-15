@@ -1,4 +1,5 @@
 import { feedPreviewFromEvent } from '../model/message_preview.js';
+import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../model/message_timestamps.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -7,7 +8,7 @@ import { logConsole, updateImsgCard } from './connections.js';
 import { sanitizeLine } from './el.js';
 import { renderMessageEvent } from './render.js';
 import { scheduleFeedRender } from './search.js';
-import { SOURCES, handleMgmtEvent, reactToBotReply, sendCmd, startSync } from './sources.js';
+import { SOURCES, IMSG_BOT_MXID, handleMgmtEvent, reactToBotReply, sendCmd, startSync } from './sources.js';
 import { S, convosBySource, feedManualHidden, feedModel } from '../state.js';
 
 const MXID_RE = /^@[^:]+:localhost$/;      // shape gate for account_data-listed mxids
@@ -26,7 +27,7 @@ async function fetchSnapshot() {
     // source-view load too, via refreshConvos). The last real message is
     // normally within the last few events, and bridge-side message backfill —
     // not a bigger window — is what fills empty rooms for correct ordering.
-    room: { timeline: { limit: 6 }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
+    room: { timeline: { limit: 6, not_types: [CORRECTION_TYPE] }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
     presence: { types: [] }, account_data: { types: [] },
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
@@ -42,6 +43,9 @@ function parseSnapshot(data) {
     // window, not the `state` block, so state-only misses its children.
     // Functional only: children are still ROOMID_RE ∩ S.joinedSet-gated below (D-5).
     const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
+    const corrections = timestampCorrections(stateEvents, IMSG_BOT_MXID);
+    if (!S.timestampCorrections) S.timestampCorrections = new Map();
+    S.timestampCorrections.set(rid, corrections);
     const seenChild = new Set();
     for (const e of stateEvents) {
       if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
@@ -54,9 +58,8 @@ function parseSnapshot(data) {
     for (let i = tl.length - 1; i >= 0; i--) {
       const e = tl[i];
       if (e.type === 'm.room.message' && e.content && typeof e.content.body === 'string') {
-        info.lastBody = e.content.body;
-        info.lastTs = typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0;
-        break;
+        const ts = messageTimestamp(e, corrections);
+        if (ts >= info.lastTs) { info.lastBody = e.content.body; info.lastTs = ts; }
       }
     }
     rooms[rid] = info;
@@ -115,13 +118,14 @@ async function refreshConvos() {
 // bridged filename/body. Reactions/redactions/receipts/typing/state are not
 // messages and return null (they never update lastBody/lastTs).
 // HF-5: keep only the LAST qualifying message in a room's timeline slice.
-function feedLastPreview(room) {
+function feedLastPreview(room, corrections) {
   const tl = (room && room.timeline && room.timeline.events) || [];
+  let best = null;
   for (let i = tl.length - 1; i >= 0; i--) {
-    const p = feedPreviewFromEvent(tl[i]);
-    if (p) return p;
+    const p = feedPreviewFromEvent(tl[i], corrections);
+    if (p && (!best || p.ts > best.ts)) best = p;
   }
-  return null;
+  return best;
 }
 
 // ---- Self-identity detection (self-align) — build path. COSMETIC ONLY:
@@ -227,11 +231,12 @@ async function seedFeed() {
     for (const c of (convosBySource[s.id] || [])) {
       if (seen.has(c.id)) continue;                 // HF-6: first SOURCES order wins
       seen.add(c.id);
-      const p = feedLastPreview(join[c.id]);        // HF-4 whitelist
+      const corrections = S.timestampCorrections?.get(c.id);
+      const p = feedLastPreview(join[c.id], corrections);
       const existing = feedModel.get(c.id);
       if (existing) {
         existing.name = c.title;                    // refresh name; keep original attribution
-        if (p && p.ts > existing.lastTs) { existing.lastBody = p.body; existing.lastTs = p.ts; }
+        if (p && (p.ts > existing.lastTs || corrections?.size)) { existing.lastBody = p.body; existing.lastTs = p.ts; }
       } else {
         feedModel.set(c.id, {
           id: c.id, name: c.title,                  // c.title already sanitizeLine'd by buildConvos
@@ -319,7 +324,8 @@ function feedIngest(data) {
   let changed = false, sawUnknown = false;
   for (const rid of Object.keys(join)) {
     if (!feedModel.has(rid)) { sawUnknown = true; continue; }  // HF-3: ignore unknown room ids
-    const p = feedLastPreview(join[rid]);            // HF-4/HF-5: last qualifying message only
+    if ((join[rid]?.timeline?.events || []).some(e => e.type === CORRECTION_TYPE)) scheduleFeedRevalidate();
+    const p = feedLastPreview(join[rid], S.timestampCorrections?.get(rid));
     if (!p) continue;
     const rec = feedModel.get(rid);
     if (p.ts >= rec.lastTs) { rec.lastBody = p.body; rec.lastTs = p.ts; changed = true; }

@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'shared'))
 
 
 class DaemonTest(unittest.TestCase):
@@ -38,6 +40,7 @@ class DaemonTest(unittest.TestCase):
         self.d.ensure_ghost = lambda *a: '@contact:test'
         self.d.ghost_join = lambda *a: None
         self.d.map_add('chat', '!portal:test')
+        self.real_cli_json = self.d.cli_json
         self.d.cli_json = lambda *a, **k: {'items': [self.message()]}
         self.d._runner = lambda *a, **k: self.fail('unexpected native CLI call')
         self.d.mx = lambda *a, **k: self.fail('unexpected Matrix call')
@@ -61,6 +64,29 @@ class DaemonTest(unittest.TestCase):
         handler.do_PUT()
         return replies[-1]
 
+    def test_new_conversation_default_shares_and_joins_once(self):
+        import urllib.error
+        self.d.CFG['new_conversation_share'] = True
+        calls = []
+        def owner(method, path, body=None):
+            calls.append((method, body))
+            if method == 'GET':
+                raise urllib.error.HTTPError(path, 404, 'missing', {}, None)
+            return {}
+        self.d.owner_api = owner
+        self.d.apply_new_conversation_default('!new:test')
+        self.d.apply_new_conversation_default('!new:test')
+        self.assertEqual(calls, [('GET', None), ('PUT', {'state': 'share'}), ('POST', {})])
+
+    def test_new_conversation_default_preserves_private_and_is_opt_in(self):
+        calls = []
+        self.d.owner_api = lambda method, path, body=None: calls.append(method) or {'state': 'private'}
+        self.d.apply_new_conversation_default('!new:test')
+        self.assertEqual(calls, [])
+        self.d.CFG['new_conversation_share'] = True
+        self.d.apply_new_conversation_default('!new:test')
+        self.assertEqual(calls, ['GET', 'POST'])
+
     def test_inbound_retry_after_matrix_failure(self):
         calls = []
         def matrix(*args, **kwargs):
@@ -76,6 +102,26 @@ class DaemonTest(unittest.TestCase):
                 pass
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.d.event_map_get('chat', 'message1')[0], '$accepted')
+
+    def test_receive_only_refuses_every_native_mutation_without_spawning_cli(self):
+        self.d.CFG['receive_only'] = True
+        calls = []
+        self.d._runner = lambda *a, **k: calls.append(a) or self.fail('native mutation escaped receive-only gate')
+        for fn, args in ((self.d.engine_send, ('chat', 'synthetic')),
+                         (self.d.engine_send_file, ('chat', '/synthetic')),
+                         (self.d.engine_react, ('message', 'heart')),
+                         (self.d.engine_unreact, ('message', 'heart')),
+                         (self.d.engine_edit, ('message', 'synthetic')),
+                         (self.d.engine_create_chat, ('synthetic@example.invalid', 'synthetic'))):
+            with self.subTest(operation=fn.__name__):
+                outcome = fn(*args)
+                self.assertEqual((outcome.state, outcome.reason), ('refused', 'receive_only'))
+        self.assertEqual(calls, [])
+
+    def test_receive_only_rejects_mutation_through_json_wrapper(self):
+        self.d.CFG['receive_only'] = True
+        with self.assertRaisesRegex(RuntimeError, 'receive_only'):
+            self.real_cli_json('send', 'synthetic-chat', 'synthetic-body')
 
     def test_outbound_known_failure_is_not_acknowledged_as_done(self):
         self.d.engine_send = lambda *a: False
@@ -404,6 +450,28 @@ class DaemonTest(unittest.TestCase):
         with self.assertRaises(OSError):
             self.d._relay_message('chat', '!portal:test', '', False, other)
         self.assertIsNone(self.d.component_get('!portal:test', 'missingfile', 'attachment:0'))
+
+    def test_native_file_attachment_recovers_refusal_without_duplicate(self):
+        path = Path(self.tmp.name) / 'native picture.png'
+        path.write_bytes(b'fixture')
+        attachment = {'id': 'file1', 'srcURL': path.as_uri()}
+        message = dict(self.message(attachments=[attachment]), text='', timestamp=1789432828000)
+        self.d.component_put('!portal:test', 'message1', 'attachment:file1', '', 'refused_invalid_path')
+        calls = []
+        self.d.upload_media = lambda *a: 'mxc://test/image'
+        self.d.mx = lambda method, url, content, **kw: calls.append(content) or {'event_id': '$image'}
+        self.d._relay_message('chat', '!portal:test', '', False, message)
+        self.d._relay_message('chat', '!portal:test', '', False, message)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['com.jkali.origin_ts'], message['timestamp'])
+        self.assertEqual(self.d.component_get('!portal:test', 'message1', 'attachment:file1'), ('$image', 'confirmed'))
+
+    def test_native_file_urls_keep_path_boundaries(self):
+        for url in ('file://remote/tmp/picture', 'file:relative', 'file:///tmp/a%00b', 'file:///tmp/a?query'):
+            self.assertIsNone(self.d.decode_asset_url(url))
+        outside = Path(self.tmp.name) / 'outside-link'
+        outside.symlink_to('/etc/hosts')
+        self.assertFalse(self.d.safe_engine_path(self.d.decode_asset_url(outside.as_uri())))
 
     def test_zero_exit_does_not_claim_recipient_delivery(self):
         self.d._runner = lambda *a, **k: subprocess.CompletedProcess(a, 0, b'', b'')

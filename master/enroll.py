@@ -39,7 +39,7 @@ Operations
 
   provision-account <localpart> [--manager]
       Used by provision.sh. Register the account if absent (shared-secret
-      flow), log in with the DERIVED password (below), migrating a legacy
+      flow), log in with the configured password (below), migrating a legacy
       stored password or a previous-key derivation to the current one on the
       way (logout_devices=false, so nobody's existing token dies), drop that
       account's legacy secret line from .provision-state.local, and print
@@ -47,14 +47,14 @@ Operations
       or a shell variable.
 
   password <localpart> [--manager]
-      Print the derived password for an account (operator convenience — the
+      Print the configured password for an account (operator convenience — the
       manager's console login). It prints a secret: never redirect it to a
       file and never wire it into `serve` (there is deliberately no HTTP
       route for it).
 
 Security invariants
 -------------------
-  * NO PASSWORD IS STORED. Every master-side account password is derived:
+  * Account passwords are derived by default:
         teammate: urlsafe_b64(HMAC-SHA256(KEY, b"beepa-teammate-password-v1\\0" + localpart))[:32]
         manager : urlsafe_b64(HMAC-SHA256(KEY, b"beepa-manager-password-v1\\0"  + "manager"  ))[:32]
     KEY = the ASCII bytes of TEAMMATE_PASSWORD_KEY in master/synapse/
@@ -65,9 +65,13 @@ Security invariants
     side account), which REGISTRATION_SHARED_SECRET in the same file already
     implied. Honest caveats: a key read at time T also compromises accounts
     created after T; rotation (TEAMMATE_PASSWORD_KEY_PREV, see master/
-    CLAUDE.md) touches every account. Never copy the key anywhere the
+    CLAUDE.md) touches accounts using derived passwords. Never copy the key anywhere the
     registration secret is not (not tokens.local, not .env, not a plist).
     This is the ONLY implementation of the derivation; never re-implement it.
+    An operator-selected manager password may override the derivation in
+    synapse/.manager-password.local (a JSON string, mode 600, gitignored).
+    Provisioning, password lookup and restore honor this override; teammate
+    passwords always remain derived. Setup preserves it and backup includes it.
   * The returned token is minted by password-logging-in AS the teammate, so it
     is inherently limited to that teammate: @alice's code can never yield a
     token that writes @bob's rooms — Synapse enforces per-account authorization.
@@ -78,7 +82,7 @@ Security invariants
     space ids / roster from master/.provision-state.local (both mode 600,
     produced by provision.sh). The state file carries NO secrets any more;
     a legacy PW_<U> / MANAGER_PW line is read once by provision-account, used
-    to migrate that account to the derived password, and removed.
+    to migrate that account to the configured password, and removed.
 
 Env overrides (mainly for tests):
   ENROLL_STORE     path to the code store           (default: master/enrollments.local)
@@ -112,6 +116,7 @@ DATA_DIR = os.path.abspath(os.environ.get("BEEPA_MASTER_STATE_DIR") or os.path.j
 STATE_FILE = os.path.join(DATA_DIR, ".provision-state.local")
 TOKENS_FILE = os.path.join(DATA_DIR, "tokens.local")
 SECRETS_FILE = os.path.join(DATA_DIR, "synapse", ".secrets.local")
+MANAGER_PASSWORD_FILE = os.path.join(DATA_DIR, "synapse", ".manager-password.local")
 DEFAULT_STORE = os.path.join(DATA_DIR, "enrollments.local")
 DEFAULT_CS_BASE = "http://127.0.0.1:8018"
 DEFAULT_SERVE_PORT = 8019
@@ -294,7 +299,7 @@ def _login(cs_base, localpart, password):
 
 
 # --------------------------------------------------------- derived passwords
-# See the module docstring's "NO PASSWORD IS STORED" invariant. This is the
+# See the module docstring's password invariants. This is the
 # single implementation of the derivation; provision.sh calls it through the
 # provision-account / password subcommands, never through a shell copy.
 _KEY_MIN_LEN = 32
@@ -342,6 +347,23 @@ def derive_password(kind, localpart, key=None):
     mac = hmac.new(key, _PW_DOMAINS[kind] + localpart.encode("ascii"),
                    hashlib.sha256).digest()
     return base64.urlsafe_b64encode(mac).decode("ascii")[:32]
+
+
+def account_password(kind, localpart):
+    """Resolve the configured password, with an optional manager-only override."""
+    derived = derive_password(kind, localpart)
+    if kind != "manager":
+        return derived
+    try:
+        with open(MANAGER_PASSWORD_FILE) as f:
+            password = json.load(f)
+    except FileNotFoundError:
+        return derived
+    except (ValueError, OSError) as e:
+        raise EnrollError("cannot read manager password override") from e
+    if not isinstance(password, str) or not password:
+        raise EnrollError("manager password override must be a non-empty JSON string")
+    return password
 
 
 def _try_login(cs_base, localpart, password):
@@ -419,33 +441,36 @@ def _remove_shell_vars(path, keys):
 
 
 def provision_account(localpart, manager=False):
-    """Register-if-absent + login for one account, migrating to the derived
-    password if the account still carries a legacy or previous-key one.
+    """Register-if-absent + login, migrating to the configured password.
 
     Order (crash-safe: every step is idempotent and the state file is only
     touched after the server-side rotation is confirmed):
-      1. register with the DERIVED password via the shared-secret flow
+      1. register with the configured password via the shared-secret flow
          (skip if the account exists);
-      2. try login with the derived password — the steady state;
-      3. else try the previous key's derivation (rotation), then the legacy
+      2. try login with the configured password — the steady state;
+      3. else try the current derivation (manager override), previous key's
+         derivation (rotation), then the legacy
          stored password (PW_<U>/MANAGER_PW in .provision-state.local; for
          the manager also the MANAGER_PW env var) — on success, rotate to
-         the derived password (_change_password, logout_devices=False) and
-         re-login with the derived value to prove the rotation took;
+         configured password (_change_password, logout_devices=False) and
+         re-login with that value to prove the rotation took;
       4. drop the account's legacy secret line from the state file;
       5. return {"mxid", "token", "migrated"} — the ONLY output.
     """
     kind = "manager" if manager else "teammate"
-    derived = derive_password(kind, localpart)
+    password = account_password(kind, localpart)
     cs_base = _cs_base()
-    _register_account(cs_base, _shared_secret(), localpart, derived)
+    _register_account(cs_base, _shared_secret(), localpart, password)
     mxid = "@%s:%s" % (localpart, _server_name())
 
-    token = _try_login(cs_base, localpart, derived)
+    token = _try_login(cs_base, localpart, password)
     migrated = False
     if token is None:
         _cur, prev = _password_keys()
         candidates = []
+        current_derived = derive_password(kind, localpart)
+        if current_derived != password:
+            candidates.append(current_derived)
         if prev is not None:
             candidates.append(derive_password(kind, localpart, key=prev))
         st = _state()
@@ -457,13 +482,13 @@ def provision_account(localpart, manager=False):
         for old in candidates:
             tok = _try_login(cs_base, localpart, old)
             if tok is not None:
-                _change_password(cs_base, tok, localpart, old, derived)
-                token = _login(cs_base, localpart, derived)  # prove it took
+                _change_password(cs_base, tok, localpart, old, password)
+                token = _login(cs_base, localpart, password)  # prove it took
                 migrated = True
                 break
         if token is None:
             raise EnrollError(
-                "cannot log in as @%s: neither the derived password, a "
+                "cannot log in as @%s: neither the configured password, a "
                 "previous-key derivation, nor a legacy stored password works. "
                 "If this account predates key-derived passwords, its password "
                 "is unknown — reset it server-side or re-create the account."
@@ -1132,12 +1157,12 @@ def main(argv=None):
 
     pa = sub.add_parser("provision-account",
                         help="register-if-absent + login (migrating to the "
-                             "derived password); prints {mxid, token, migrated}")
+                             "configured password); prints {mxid, token, migrated}")
     pa.add_argument("localpart")
     pa.add_argument("--manager", action="store_true")
 
     pw = sub.add_parser("password",
-                        help="print the DERIVED password for an account "
+                        help="print the configured password for an account "
                              "(secret: never redirect to a file)")
     pw.add_argument("localpart")
     pw.add_argument("--manager", action="store_true")
@@ -1152,8 +1177,8 @@ def main(argv=None):
         return 0
     if args.cmd == "password":
         try:
-            print(derive_password("manager" if args.manager else "teammate",
-                                  args.localpart))
+            print(account_password("manager" if args.manager else "teammate",
+                                   args.localpart))
         except EnrollError as e:
             sys.stderr.write("enroll: %s\n" % e)
             return 2

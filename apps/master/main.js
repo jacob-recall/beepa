@@ -32,6 +32,7 @@ import {
 import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers } from './hidden.js';
 import { masterTransport } from './transport.js';
 import { PLATFORM_ICON, PLATFORM_LABEL } from '../../shared/model/source_catalog.js';
+import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../../shared/model/message_timestamps.js';
 
 // Per-browser hidden-teammate labels (localStorage). Convenience only.
 const HIDDEN_KEY = 'beepa_hidden_teammates';
@@ -105,6 +106,10 @@ const MS = {
   lastDayKey: null,    // last rendered day-divider key, reset per room open (see renderBubble)
   tailRunning: false,
   tailSince: null,
+  roomSeen: new Set(), // event IDs shared by history and live sync, reset per open
+  sentProposals: new Set(), // proposal IDs acknowledged by mirrored outgoing events
+  roomEvents: new Map(), // recent raw events for reversible native-echo grouping
+  roomRows: new Map(),
   pollTimer: null,
   // Join backpressure: room ids whose /join returned a hard (non-429 4xx)
   // failure this session are never retried — a permanently-refused invite must
@@ -115,6 +120,9 @@ const MS = {
   skippedUnverified: { spaces: 0, children: 0 },
   hidden: new Set(),   // teammate labels this browser omits from lists
 };
+
+let roomEpoch = 0;
+let activeTail = null;
 
 setOnUnauthorized(forgetSession);
 
@@ -128,7 +136,7 @@ setOnUnauthorized(forgetSession);
 // ===========================================================================
 async function fetchSnapshot() {
   const filter = encodeURIComponent(JSON.stringify({
-    room: { timeline: { limit: 5 }, state: { lazy_load_members: true } },
+    room: { timeline: { limit: 5, not_types: [CORRECTION_TYPE] }, state: { lazy_load_members: true } },
     presence: { types: [] }, account_data: { types: [] },
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
@@ -205,10 +213,8 @@ async function loadMediaInto(bodyNode, resolved) {
 // time the uplink stamped), not origin_server_ts — a normal client cannot
 // backdate server timestamps, so historical backfill posted in one burst
 // would otherwise cluster at sync-time instead of showing true history order.
-function mirrorTs(ev) {
-  const c = ev && ev.content;
-  const ots = c && typeof c['com.jkali.origin_ts'] === 'number' ? c['com.jkali.origin_ts'] : null;
-  return ots != null ? ots : (typeof ev.origin_server_ts === 'number' ? ev.origin_server_ts : 0);
+function mirrorTs(ev, corrections = MS.rooms[MS.openRoomId]?.timestampCorrections) {
+  return messageTimestamp(ev, corrections);
 }
 
 // Display-only name for an mxid. The trust predicate (./invites.js localpart)
@@ -296,11 +302,12 @@ function parseSnapshot(data) {
         if (!seenChild.has(e.state_key)) { seenChild.add(e.state_key); info.children.push(e.state_key); }
       }
     }
+    info.timestampCorrections = timestampCorrections(stateEvents, info.createSender);
     const tl = (r.timeline && r.timeline.events) || [];
     for (const ev of tl) {
       const resolved = resolveMirrorContent(ev);
       if (!resolved) continue;
-      const ts = mirrorTs(ev);
+      const ts = mirrorTs(ev, info.timestampCorrections);
       if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; }
     }
     rooms[rid] = info;
@@ -942,12 +949,72 @@ function maybeInsertDayDivider(box, ts) {
   box.appendChild(el('div', 'day-divider', dayLabel(ts)));
 }
 
+// iMessage can return the paragraphs of a manager send as separate native
+// messages. Preserve those records, but group a COMPLETE, exact copy beneath
+// the originating send. This is presentation, never send dedup or delivery
+// evidence: matching text alone cannot establish either. Unrelated repeated
+// messages, incoming messages, edits, partial matches and other platforms stay
+// separate. The disclosure lets the manager inspect every original event.
+function nativeEchoGroups(events) {
+  const sorted = events.filter(e => e && e.type === 'm.room.message')
+    .slice().sort((a, b) => mirrorTs(a) - mirrorTs(b));
+  const groups = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const original = sorted[i], c = original.content || {};
+    if (c['com.jkali.source'] !== 'imessage' || c['com.jkali.from_me'] !== true ||
+        typeof c['com.jkali.auto_sent_from_proposal'] !== 'string' || !c['com.jkali.auto_sent_from_proposal'] ||
+        c.msgtype !== 'm.text' || typeof c.body !== 'string' || !c.body.trim() || c['m.relates_to']) continue;
+    const variants = [[c.body], c.body.split(/\r?\n/).map(s => s.trim()).filter(Boolean)];
+    for (const parts of variants) {
+      const copies = sorted.slice(i + 1, i + 1 + parts.length);
+      if (copies.length !== parts.length || !copies.every((e, index) => {
+        const ec = e.content || {}, elapsed = mirrorTs(e) - mirrorTs(original);
+        return e.event_id !== original.event_id && ec.msgtype === 'm.text' &&
+          ec['com.jkali.source'] === 'imessage' && ec['com.jkali.from_me'] === true &&
+          ec['com.jkali.origin_sender'] === 'iMessage bridge bot' &&
+          !ec['com.jkali.auto_sent_from_proposal'] && !ec['m.relates_to'] &&
+          elapsed >= 0 && elapsed <= 60000 && ec.body === parts[index];
+      })) continue;
+      groups.push({ originalId: original.event_id, copyIds: copies.map(e => e.event_id) });
+      i += copies.length;
+      break;
+    }
+  }
+  return groups;
+}
+
+function reconcileNativeEchoes() {
+  const box = $('room-messages');
+  if (!box) return;
+  for (const group of nativeEchoGroups([...MS.roomEvents.values()])) {
+    const original = MS.roomRows.get(group.originalId);
+    const copies = group.copyIds.map(id => MS.roomRows.get(id));
+    if (!original || !box.contains(original) || copies.some(row => !row || !box.contains(row))) continue;
+    let details = original.querySelector('.message-copies');
+    if (!details) {
+      details = el('details', 'message-copies');
+      details.appendChild(el('summary', '', 'Matching iMessage copies (' + copies.length + ')'));
+      original.appendChild(details);
+    }
+    for (const row of copies) if (row.parentNode !== details) details.appendChild(row);
+  }
+}
+
 function renderBubble(ev) {
   const box = $('room-messages');
   if (!box) return;
   const resolved = resolveMirrorContent(ev);
   if (!resolved) return;                              // reaction/redaction/state/etc. — skip
+  const eventId = ev && ev.event_id;
+  if (typeof eventId !== 'string' || !eventId || MS.roomSeen.has(eventId)) return;
+  MS.roomSeen.add(eventId);
   const sent = !!(ev.content && ev.content['com.jkali.from_me'] === true);
+  const proposalId = sent && ev.content['com.jkali.auto_sent_from_proposal'];
+  if (typeof proposalId === 'string' && proposalId) {
+    MS.sentProposals.add(proposalId);
+    const suggestion = box.querySelector('.msg-row.suggested');
+    if (suggestion && suggestion.dataset.proposalId === proposalId) suggestion.remove();
+  }
   // Who to show on a received bubble: the uplink stamps the ORIGIN sender's
   // display name (resolved from the teammate-local room's member state) as
   // com.jkali.origin_sender. The raw ev.sender is always the teammate's own
@@ -960,6 +1027,7 @@ function renderBubble(ev) {
   maybeInsertDayDivider(box, ts);
 
   const row = el('div', 'msg-row ' + (sent ? 'sent' : 'recv'));
+  row.dataset.eventId = eventId;
   // Header line: small source-platform badge + who + role/time (mockup 1g:
   // a source logo on every bubble, not just the room header).
   const meta = el('div', 'msg-meta');
@@ -983,6 +1051,13 @@ function renderBubble(ev) {
   bubble.appendChild(bodyNode);
   row.appendChild(bubble);
   box.appendChild(row);
+  MS.roomEvents.set(eventId, ev);
+  MS.roomRows.set(eventId, row);
+  while (MS.roomEvents.size > 300) {
+    const oldest = MS.roomEvents.keys().next().value;
+    MS.roomEvents.delete(oldest);
+    MS.roomRows.delete(oldest);
+  }
   // v1.5: when this bubble carries a real re-uploaded master mxc, replace the
   // static label with the fetched media (falls back to the label on any error).
   if (resolved.kind === 'media' && resolved.mxc) loadMediaInto(bodyNode, resolved);
@@ -998,7 +1073,14 @@ async function openRoom(roomId) {
   // stale/typed id (same discipline as apps/user's openConversation).
   if (!ROOMID_RE.test(roomId) || !MS.rooms[roomId]) return;
   stopTail();
+  const epoch = roomEpoch;
+  const session = S.token;
+  const current = () => epoch === roomEpoch && S.token === session && MS.openRoomId === roomId;
   MS.openRoomId = roomId;
+  MS.roomSeen.clear();
+  MS.sentProposals.clear();
+  MS.roomEvents.clear();
+  MS.roomRows.clear();
   const rec = MS.rooms[roomId];
   MS.openRoomUser = rec.userLabel || null;
   MS.openRoomSourceId = rec.sourceId || null;
@@ -1031,18 +1113,21 @@ async function openRoom(roomId) {
   setDetailMode('room');
 
   try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=100';
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=100&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
     const data = await api('GET', q);
-    if (MS.openRoomId !== roomId) return;             // navigated away mid-fetch
+    if (!current()) return;                         // includes reopening the same room
     const chunk = Array.isArray(data.chunk) ? data.chunk : [];
     // §8.2/§11: sort by com.jkali.origin_ts — backfill can arrive out of
     // chronological order, so timeline/arrival order is not display order.
     const sorted = chunk.slice().sort((a, c2) => mirrorTs(a) - mirrorTs(c2));
     for (const ev of sorted) renderBubble(ev);
+    reconcileNativeEchoes();
   } catch (e) {
-    roomStatus('Could not load messages: ' + String(e.message || e));
+    if (current()) roomStatus('Could not load messages: ' + String(e.message || e));
   }
+  if (!current()) return;
   await loadSuggestionOverlay();
+  if (!current()) return;
   if (box) box.scrollTop = box.scrollHeight;
   startTail(roomId);
 }
@@ -1053,37 +1138,70 @@ async function openRoom(roomId) {
 // from shared/ui/chat.js's startConvoWatch, which lives in the same file as
 // sendConvoMessage (see header). Read-only: appends via renderBubble only.
 async function startTail(roomId) {
-  if (MS.tailRunning) return;
+  if (!S.token || MS.openRoomId !== roomId || activeTail) return;
+  const owner = { roomId, token: S.token, epoch: roomEpoch, since: null };
+  activeTail = owner;
+  const current = () => activeTail === owner && roomEpoch === owner.epoch &&
+    S.token === owner.token && MS.openRoomId === owner.roomId;
   MS.tailRunning = true;
   MS.tailSince = null;
-  while (MS.tailRunning && S.token && MS.openRoomId === roomId) {
+  try {
+  while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
         room: { rooms: [roomId], timeline: { limit: 20 }, state: { types: [] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
-        (MS.tailSince ? '&since=' + encodeURIComponent(MS.tailSince) : '');
+        (owner.since ? '&since=' + encodeURIComponent(owner.since) : '');
       const data = await api('GET', q);
-      MS.tailSince = data.next_batch;
+      if (!current()) return;
+      owner.since = data.next_batch;
+      MS.tailSince = owner.since;
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[roomId];
       if (room && room.timeline && Array.isArray(room.timeline.events) && MS.openRoomId === roomId) {
-        for (const ev of room.timeline.events) {
-          if (MS.openRoomId !== roomId) break;
+        const rec = MS.rooms[roomId];
+        const corrections = timestampCorrections(room.timeline.events, rec?.createSender);
+        if (corrections.size) {
+          rec.timestampCorrections = new Map(rec.timestampCorrections || []);
+          for (const [id, ts] of corrections) rec.timestampCorrections.set(id, ts);
+          const existing = [...MS.roomEvents.values()];
+          const box = $('room-messages');
+          const suggestion = box?.querySelector('.msg-row.suggested');
+          box?.replaceChildren();
+          MS.roomSeen.clear(); MS.roomRows.clear(); MS.lastDayKey = null;
+          for (const ev of existing.sort((a, b) => mirrorTs(a) - mirrorTs(b))) renderBubble(ev);
+          if (suggestion) box.appendChild(suggestion);
+        }
+        for (const ev of room.timeline.events.slice().sort((a, b) => mirrorTs(a) - mirrorTs(b))) {
           renderBubble(ev);
         }
+        reconcileNativeEchoes();
         pinSuggestion();
         const box = $('room-messages');
         if (box) box.scrollTop = box.scrollHeight;
       }
     } catch (e) {
-      if (!S.token) { MS.tailRunning = false; return; }
+      if (!current()) return;
       await new Promise(r => setTimeout(r, 3000));
     }
   }
+  } finally {
+    if (activeTail === owner) { activeTail = null; MS.tailRunning = false; }
+  }
 }
-function stopTail() { MS.tailRunning = false; MS.openRoomId = null; MS.openRoomUser = null; MS.openRoomSourceId = null; MS.openMirrorOf = null; MS.openProposalCtx = null; }
+function stopTail() {
+  roomEpoch += 1;
+  activeTail = null;
+  MS.tailRunning = false;
+  MS.tailSince = null;
+  MS.openRoomId = null;
+  MS.openRoomUser = null;
+  MS.openRoomSourceId = null;
+  MS.openMirrorOf = null;
+  MS.openProposalCtx = null;
+}
 
 // ===========================================================================
 // Compose-proposal — the ONE place the manager can write (PLAN §2 v2 / §7).
@@ -1167,9 +1285,10 @@ function pinSuggestion() {
   if (row && row !== box.lastElementChild) box.appendChild(row);
 }
 
-function showSuggestion(body) {
+function showSuggestion(body, proposalId) {
   const box = $('room-messages');
   if (!box) return;
+  if (proposalId && MS.sentProposals.has(proposalId)) return;
   const text = sanitize(body);
   if (!text) return;
   let row = box.querySelector('.msg-row.suggested');
@@ -1185,6 +1304,7 @@ function showSuggestion(body) {
     box.appendChild(row);
   }
   const bodyNode = row.querySelector('.body');
+  row.dataset.proposalId = proposalId || '';
   if (bodyNode && bodyNode.getAttribute('contenteditable') !== 'true') bodyNode.textContent = text;
   pinSuggestion();
   box.scrollTop = box.scrollHeight;
@@ -1226,14 +1346,16 @@ function startSuggestionEdit(e) {
 
 async function loadSuggestionOverlay() {
   const ctx = MS.openProposalCtx;
+  const epoch = roomEpoch;
+  const session = S.token;
   if (!ctx || !ctx.proposalsRoomId || !ctx.targetRoom || !ctx.mirrorRoomId) return;
   if (!ROOMID_RE.test(ctx.proposalsRoomId) || !MS.proposalsRoomSet.has(ctx.proposalsRoomId)) return;
   try {
     const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(ctx.proposalsRoomId) + '/messages?dir=b&limit=100';
     const data = await api('GET', q);
-    if (MS.openRoomId !== ctx.mirrorRoomId) return;
+    if (roomEpoch !== epoch || S.token !== session || MS.openProposalCtx !== ctx) return;
     const latest = latestRoomProposal(Array.isArray(data.chunk) ? data.chunk : [], ctx.targetRoom);
-    if (latest) showSuggestion(latest.body);
+    if (latest) showSuggestion(latest.body, latest.eventId);
   } catch (e) { /* overlay is optional; the write path still works */ }
 }
 
@@ -1348,11 +1470,12 @@ async function submitProposal(opts) {
   try {
     // NOTE: event type is the literal 'com.jkali.proposal'. This is the only
     // write endpoint in apps/master and it targets ONLY a proposals room.
-    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
+    const result = await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
       + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
+    if (MS.openProposalCtx !== ctx) return;
     if (input) input.value = '';
     proposalStatus('');
-    showSuggestion(body);
+    showSuggestion(body, result && result.event_id);
   } catch (e) {
     proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
   }
@@ -1856,7 +1979,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel };
+export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {

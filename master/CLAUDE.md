@@ -34,7 +34,7 @@ stack from here; never merge the two compose files.**
   working.
 - `provision.sh` — idempotent: provisions `@manager:master` and each roster
   teammate through `enroll.py provision-account` (registration via the
-  shared secret + login with the **derived** password — see below — and a
+  shared secret + login with the configured password — see below — and a
   one-shot migration of any legacy stored password, `logout_devices:false`
   so existing sessions survive), then creates one Matrix **space** per
   teammate (`space:<user>`) owned by that teammate with `@manager` invited
@@ -56,7 +56,7 @@ stack from here; never merge the two compose files.**
   the same TLS reverse proxy as the CS API, so it adds no new public
   surface. Reads mxid/space/base-URL facts from `tokens.local` (600).
 
-  **Passwords are derived, never stored.** Every master-side account
+  **Passwords are derived by default.** Without an override, an account's
   password = `urlsafe_b64(HMAC-SHA256(TEAMMATE_PASSWORD_KEY, domain +
   localpart))[:32]`, key = the ASCII value in `synapse/.secrets.local`
   (written ONLY by `master/setup.sh`; `enroll.py`/`provision.sh` fail
@@ -75,6 +75,15 @@ stack from here; never merge the two compose files.**
   the "no secrets on a script's stdout" rule below, because the
   alternative is storing it. `provision-account` (used by `provision.sh`)
   prints only `{mxid, token, migrated}`.
+  **Custom manager password:** `synapse/.manager-password.local` may hold
+  a non-empty JSON string (mode 600, gitignored). `account_password()` uses
+  it for the manager only; provisioning, password lookup and restore all
+  honor it. Teammate passwords remain derived. Setup leaves this file
+  intact, and backups include it with `synapse/`. Provisioning can migrate
+  the manager from the current derived password to the override while
+  retaining existing sessions. A later custom-password change must also
+  change the live account password; editing the file alone cannot migrate
+  from an unknown previous custom password.
   **Key rotation:** `TEAMMATE_PASSWORD_KEY_PREV=<old>
   TEAMMATE_PASSWORD_KEY=<new> master/setup.sh` (for these two keys env
   wins over the file; value and set-ness are captured before the file is

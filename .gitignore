@@ -108,3 +108,6 @@ agents/contacts/logs/
 /imessage/bin
 /imessage/tmp
 .beepa-timestamp-repair/
+
+# Private repair evidence and database backups.
+.beepa-repair-verification/

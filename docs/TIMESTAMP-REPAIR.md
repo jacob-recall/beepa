@@ -38,6 +38,36 @@ recreated. Incomplete pagination is reported. Repeating the tool skips already
 correct metadata. Rerun after pending archive deliveries complete if any
 destination mapping was unavailable. Reload the interfaces after repair.
 
+## Refused native attachments
+
+The native CLI can return `file:` URLs as well as `asset:` URLs. The bridge
+decodes local file URLs and still applies its realpath allowlist. Remote file
+hosts and paths outside the allowlist remain refused.
+
+For an existing installation, audit the retained refused-component receipts:
+
+```sh
+python3 imessage/repair_attachments.py --root <installation-root>
+```
+
+Review the counts. To apply, stop **only this account's** iMessage launch agent,
+run the command with `--apply`, and restart the same agent even if repair fails.
+Use the detected installed label (`org.beepa.imessage-daemon` or its legacy
+equivalent), owner UID and existing plist; do not reinstall or rebuild the CLI.
+
+The apply command requires the agent stopped. It backs up both SQLite stores
+and the daemon configuration, journals each stable component transaction under
+`.beepa-repair-verification/`, and adds only the current user's native
+`Library/Messages/Attachments` and `Library/Messages/StickerCache` directories
+to the existing allowlist. It retries exact refused components only in existing,
+currently shared, live rooms, preserving native dates and confirmed receipts.
+It does not create rooms, change sharing, send native messages or reset ledgers.
+
+Rerun the audit afterward and check each recovered component's local event and
+current master delivery mapping. Native loading/unavailable files and private
+or retired destinations remain skipped. This tool does not force an iCloud
+download or claim that older, never-imported native history is complete.
+
 ## Peer compatibility contract
 
 Historical corrections use a separate room **state** event:

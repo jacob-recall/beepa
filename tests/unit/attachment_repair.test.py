@@ -111,6 +111,14 @@ class AttachmentRepair(unittest.TestCase):
         self.assertEqual(self.run_repair()['counts'],{'native_attachment_loading':1})
         self.assertFalse(self.sent)
 
+    def test_path_refusals_are_recoverable_only_inside_reviewed_roots(self):
+        self.db.execute("UPDATE inbound_component SET status='refused_path'")
+        self.db.commit()
+        self.assertEqual(self.run_repair()['counts'],{'would_recover':1})
+        self.message['attachments'][0]['srcURL']='file:///etc/hosts'
+        self.assertEqual(self.run_repair()['counts'],{'path_not_allowed':1})
+        self.assertFalse(self.sent)
+
 
 if __name__=='__main__':
     unittest.main()

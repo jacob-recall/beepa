@@ -30,8 +30,10 @@ def main():
     up=sqlite3.connect(f'file:{state}/agents/uplink/state.db?mode=ro',uri=True)
     d.CLI=config['cli_path']
     native_roots=[str((Path.home()/'Library/Messages'/name).resolve()) for name in ('Attachments','StickerCache')]
-    allowed=[os.path.realpath(p) for p in config['attachment_allow_prefixes']]+native_roots
-    rows=db.execute("select m.chat_id,c.room_id,c.msg_id,c.component,c.status from inbound_component c join map m on m.room_id=c.room_id where c.status='refused_invalid_path'").fetchall()
+    configured_roots=[os.path.realpath(p) for p in config['attachment_allow_prefixes']]
+    additions=[p for p in native_roots if p not in configured_roots]
+    allowed=configured_roots+native_roots
+    rows=db.execute("select m.chat_id,c.room_id,c.msg_id,c.component,c.status from inbound_component c join map m on m.room_id=c.room_id where c.status IN ('refused_invalid_path','refused_path')").fetchall()
     counts=collections.Counter();entries=[];candidates=[]
     def shared(room):
         mirror=up.execute("select m.master_room_id from mirror_rooms m join mirror_lifecycle l on l.local_room_id=m.local_room_id where m.local_room_id=? and m.source='imessage' and l.status='live'",(room,)).fetchone()
@@ -94,7 +96,7 @@ def main():
             try:
                 if not shared(room):entry['outcome']='sharing_changed';save();continue
                 current=d.component_get(room,mid,key)
-                if not current or current[1]!='refused_invalid_path':entry['outcome']='mapping_changed';save();continue
+                if not current or current[1] not in ('refused_invalid_path','refused_path'):entry['outcome']='mapping_changed';save();continue
                 events=d.mx('GET','/_matrix/client/v3/rooms/'+r.q(room)+'/state',user=d.BOT_ID)
                 assert any(e.get('type')=='m.room.create' and e.get('sender')==d.BOT_ID for e in events)
                 sender=d.BOT_ID if m.get('isSender') is True else d.ensure_ghost(str(m.get('senderID') or entry['chat'].rsplit(';',1)[-1]),m.get('senderName') or '')
@@ -116,7 +118,7 @@ def main():
         counts=collections.Counter(x['outcome'] for x in entries);journal['counts']=dict(counts);save()
     else:
         r.atomic_write(folder/'attachments-audit.json',json.dumps({'entries':entries,'counts':dict(counts)},indent=2)+'\n')
-    print(json.dumps({'apply':apply,'counts':dict(counts),'evidence':str(folder)},indent=2))
+    print(json.dumps({'apply':apply,'counts':dict(counts),'native_media_allowlist_additions':additions,'evidence':str(folder)},indent=2))
 
 
 if __name__ == '__main__':

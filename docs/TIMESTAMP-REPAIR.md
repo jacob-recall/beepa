@@ -55,7 +55,9 @@ For an existing installation, audit the retained refused-component receipts:
 python3 imessage/repair_attachments.py --root <installation-root>
 ```
 
-Review the counts. To apply, stop **only this account's** iMessage launch agent,
+Review the counts and proposed native-media allowlist additions. Apply when
+either recoveries or allowlist additions are proposed, including installations
+with no recoverable historical attachments yet. To apply, stop **only this account's** iMessage launch agent,
 run the command with `--apply`, and restart the same agent even if repair fails.
 Use the detected installed label (`org.beepa.imessage-daemon` or its legacy
 equivalent), owner UID and existing plist; do not reinstall or rebuild the CLI.

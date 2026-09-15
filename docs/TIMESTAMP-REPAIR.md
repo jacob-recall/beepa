@@ -29,6 +29,11 @@ under `.beepa-timestamp-repair/<run>/`. This directory contains private state,
 is ignored by Git, and is restricted to the owner. It does not copy message
 bodies into the journal or rewrite original Matrix events.
 
+For a remote master, add `--workers 4` (up to 8) to each command to check
+independent mapped components concurrently. Target validation and fresh sharing
+checks are unchanged. Each worker has its own read-only mapping connection;
+journal updates remain serialized and durable before every correction write.
+
 The tool pages native history only for already-mapped chats and matches exact
 native IDs through `imessage/state.db`'s `event_map`/`inbound_component` and
 uplink destination mappings. It corrects local display timestamps and currently

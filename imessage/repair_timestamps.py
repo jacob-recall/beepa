@@ -5,6 +5,8 @@ Default is a read-only audit. --apply writes only timestamp-correction state.
 Original message events, bodies, native sends and dispatch ledgers are untouched.
 """
 import argparse
+import concurrent.futures
+import threading
 import importlib.util
 import json
 import os
@@ -106,6 +108,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(os.environ.get('BEEPA_INSTALL_ROOT', CODE_ROOT)))
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--workers', type=int, default=1, choices=range(1, 9),
+                        help='Concurrent independent mapped-component checks (1-8; default 1)')
     args = parser.parse_args()
     manifest = read_manifest(args.root) or {}
     state = Path(manifest.get('state_root') or args.root).resolve()
@@ -170,33 +174,49 @@ def main():
         journal_path = folder / 'journal.json'
         atomic_write(journal_path, json.dumps(journal, indent=2) + '\n')
 
+    journal_lock = threading.Lock()
+    counts_lock = threading.Lock()
+    worker_state = threading.local()
+
+    def worker_db():
+        if not hasattr(worker_state, 'db'):
+            worker_state.db = sqlite3.connect('file:' + str(state / 'agents/uplink/state.db') + '?mode=ro', uri=True)
+        return worker_state.db
+
     def record(destination, path, previous, wanted):
         key = destination + ':' + path
-        journal['entries'].setdefault(key, {'previous': previous, 'wanted': wanted})
-        atomic_write(journal_path, json.dumps(journal, indent=2) + '\n')
+        with journal_lock:
+            journal['entries'].setdefault(key, {'previous': previous, 'wanted': wanted})
+            atomic_write(journal_path, json.dumps(journal, indent=2) + '\n')
 
     def count(destination, outcome):
         key = destination + '_' + outcome
-        counts[key] = counts.get(key, 0) + 1
+        increment(key)
+
+    def increment(key):
+        with counts_lock:
+            counts[key] = counts.get(key, 0) + 1
 
     local_domain = ':' + config['domain']
     allowed_local = lambda sender: isinstance(sender, str) and (
         sender == config['bot_id'] or sender.startswith('@imessage_') and sender.endswith(local_domain))
     checked_rooms = set()
-    for chat, room, mid, eid in records:
+    def repair_record(item):
+        chat, room, mid, eid = item
+        database = up_db if args.workers == 1 else worker_db()
         if mid not in native[chat]:
-            counts['source_unavailable'] += 1
-            continue
+            increment('source_unavailable')
+            return
         ts = native[chat][mid]
         if not valid_ts(ts):
-            counts['invalid_timestamp'] += 1
-            continue
+            increment('invalid_timestamp')
+            return
         ts = int(ts)
         if room not in checked_rooms:
             state_events = get_optional(local, '/_matrix/client/v3/rooms/' + q(room) + '/state')
             if state_events is None:
                 count('local', 'room_unavailable')
-                continue
+                return
             if not any(e.get('type') == 'm.room.create' and e.get('sender') == config['bot_id'] for e in state_events):
                 raise ValueError('Local room ownership mismatch')
             checked_rooms.add(room)
@@ -204,23 +224,23 @@ def main():
                              lambda *values: record('local', *values))
         count('local', outcome)
         if outcome in ('refused_target', 'target_unavailable'):
-            continue
-        mirror = up_db.execute("SELECT master_room_id FROM mirror_rooms WHERE local_room_id=? AND source='imessage'", (room,)).fetchone()
+            return
+        mirror = database.execute("SELECT master_room_id FROM mirror_rooms WHERE local_room_id=? AND source='imessage'", (room,)).fetchone()
         level_path = '/_matrix/client/v3/user/' + q(cfg.local_user) + '/rooms/' + q(room) + '/account_data/' + consent.SHARE_OVERRIDE_TYPE
         level = consent.effective_level(get_optional(local_user, level_path))
         if not master or not mirror or level not in ('share', 'direct'):
-            counts['master_private_or_unmapped'] += 1
-            continue
-        lifecycle = up_db.execute('SELECT status FROM mirror_lifecycle WHERE local_room_id=?', (room,)).fetchone()
+            increment('master_private_or_unmapped')
+            return
+        lifecycle = database.execute('SELECT status FROM mirror_lifecycle WHERE local_room_id=?', (room,)).fetchone()
         if lifecycle and lifecycle[0] == 'revoking':
-            counts['master_private_or_unmapped'] += 1
-            continue
-        target = up_db.execute('SELECT master_event_id FROM delivery_map WHERE master_room_id=? AND local_event_id=?', (mirror[0], eid)).fetchone()
-        if not target and up_db.execute('SELECT 1 FROM legacy_mirrors WHERE master_room_id=?', (mirror[0],)).fetchone():
-            target = up_db.execute('SELECT master_event_id FROM event_map WHERE local_event_id=?', (eid,)).fetchone()
+            increment('master_private_or_unmapped')
+            return
+        target = database.execute('SELECT master_event_id FROM delivery_map WHERE master_room_id=? AND local_event_id=?', (mirror[0], eid)).fetchone()
+        if not target and database.execute('SELECT 1 FROM legacy_mirrors WHERE master_room_id=?', (mirror[0],)).fetchone():
+            target = database.execute('SELECT master_event_id FROM event_map WHERE local_event_id=?', (eid,)).fetchone()
         if not target or not target[0]:
-            counts['master_private_or_unmapped'] += 1
-            continue
+            increment('master_private_or_unmapped')
+            return
         # Fresh explicit sharing and unchanged pairing gate every remote write.
         if args.apply:
             current = get_optional(local_user, '/_matrix/client/v3/user/' + q(cfg.local_user) + '/account_data/com.jkali.master_link')
@@ -229,6 +249,14 @@ def main():
         count('master', correction(master, mirror[0], target[0], ts,
                                   lambda sender: sender == link['master_user'], args.apply,
                                   lambda *values: record('master', *values)))
+    if args.workers == 1:
+        for item in records:
+            repair_record(item)
+    else:
+        # Independent event/state keys; each worker owns its read-only SQLite
+        # connection. The journal is durably serialized before every PUT.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            list(executor.map(repair_record, records))
     counts['applied'] = args.apply
     if journal_path:
         journal['result'] = counts

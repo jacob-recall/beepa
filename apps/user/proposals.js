@@ -16,6 +16,8 @@ import { confirmModal } from '../../shared/ui/connections.js';
 import { setDetailMode } from '../../shared/ui/nav.js';
 import { feedRelTime, scheduleFeedRender, setFeedRenderHook } from '../../shared/ui/search.js';
 import { pendingDrafts, retiredDrafts } from '../../shared/model/attention.js';
+import { setScheduleRooms, setScheduleChangeHook, ingestScheduleEvents, schedulesForRoom,
+         attachScheduled, cancelSchedule, sendHeldNow, acceptProposalSchedule, initScheduleUI } from './scheduled.js';
 import { S, feedModel } from '../../shared/state.js';
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
@@ -67,9 +69,14 @@ function parseProposal(e) {
   // Cosmetic: who suggested it (the uplink pins created_by to the server-stamped
   // manager; the app shows only the localpart). Never an authorization input.
   const createdBy = typeof c.created_by === 'string' ? c.created_by : '';
+  // F7 manager-TIMED suggestion: the instant the manager asked it to go out.
+  // Cosmetic for a share-level room (the ghost shows the time and offers
+  // "Accept schedule", which writes the teammate's OWN scheduled_send); for a
+  // direct room the daemon holds it and runs the twelve gates at that instant.
+  const sendAt = (typeof c.send_at === 'number' && isFinite(c.send_at) && Math.floor(c.send_at) === c.send_at) ? c.send_at : 0;
   const room = c.target_room;
   if (typeof room === 'string' && room) {
-    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous, createdBy };
+    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous, createdBy, sendAt };
   }
   const identifier = typeof c.target_identifier === 'string' ? c.target_identifier.trim() : '';
   if (identifier && validHandle(identifier)) {
@@ -180,13 +187,18 @@ async function proposalsRooms() {
 }
 async function fetchProposals() {
   const out = [];
-  for (const rid of await proposalsRooms()) {
+  const raw = [];
+  const rooms = await proposalsRooms();
+  setScheduleRooms(rooms);          // F7: the same rooms carry the schedule events
+  for (const rid of rooms) {
     const data = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/messages?dir=b&limit=100');
     for (const e of (Array.isArray(data.chunk) ? data.chunk : [])) {
+      raw.push(e);
       const p = parseProposal(e);
       if (p) out.push(p);
     }
   }
+  ingestScheduleEvents(raw);        // classification is from event content only
   return out;
 }
 
@@ -263,7 +275,7 @@ function attachDrafts(proposals, handled, feed) {
     if (!p || p.kind !== 'room' || p.autoSent || p.ambiguous) continue;
     if (handled && typeof handled.has === 'function' && handled.has(p.eventId)) continue;
     if (!byRoom.has(p.targetRoom)) byRoom.set(p.targetRoom, []);
-    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template, createdBy: p.createdBy || '' });
+    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template, createdBy: p.createdBy || '', sendAt: p.sendAt || 0 });
   }
   let rooms = 0;
   for (const rec of feed.values()) {
@@ -324,9 +336,76 @@ function ghostBubble(d, idx, total, roomId) {
     // draftPending retires them visibly (struck through, Restore) on render.
     afterHandled();
   });
-  bar.appendChild(edit); bar.appendChild(dismiss); bar.appendChild(send);
+  bar.appendChild(edit); bar.appendChild(dismiss);
+  if (d.sendAt) {
+    // F7: the manager asked for a time. Accepting makes it the TEAMMATE'S own
+    // scheduled send from then on — a separate event they authored, which is
+    // the only thing the daemon's teammate queue will ever fire.
+    bar.appendChild(el('span', 'ghost-st', 'for ' + clockTime(d.sendAt)));
+    const take = el('button', 'ghost-send', 'Accept schedule'); take.type = 'button';
+    take.addEventListener('click', (e) => { e.stopPropagation(); acceptProposalSchedule(d); });
+    bar.appendChild(take);
+  }
+  bar.appendChild(send);
   g.appendChild(bar);
   return g;
+}
+
+// Local wall-clock time for a scheduled instant (textContent only).
+function clockTime(ms) {
+  try { return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+  catch (e) { return ''; }
+}
+
+// F7: the scheduled-send cluster, rendered in the SAME ghost container as the
+// manager suggestions. State comes from scheduled.js's pure classification over
+// event content — never from localStorage.
+function scheduleGhosts(wrap, roomId) {
+  for (const s of schedulesForRoom(roomId)) {
+    if (s.state === 'cancelled') continue;
+    if ((s.state === 'sent' || s.state === 'refused' || s.state === 'ambiguous')
+        && Date.now() - (s.outcomeTs || 0) > 6 * 60 * 60 * 1000) continue;   // transient
+    const g = el('div', 'ghost ' + (s.state === 'scheduled' ? 'scheduled' : s.state === 'held' ? 'held' : 'retired'));
+    g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
+    const bar = el('div', 'ghost-bar');
+    const label = {
+      scheduled: 'Scheduled for ' + clockTime(s.sendAt),
+      held: 'Held: ' + heldReason(s.reason),
+      sent: 'sent at ' + clockTime(s.sendAt),
+      refused: 'Not sent: ' + heldReason(s.reason),
+      ambiguous: 'May already have been sent — check above before replying',
+    }[s.state] || s.state;
+    bar.appendChild(el('span', 'ghost-st', label));
+    if (s.state === 'held') {
+      const now = el('button', 'ghost-link', 'Send now'); now.type = 'button';
+      now.addEventListener('click', async (e) => { e.stopPropagation(); now.disabled = true; await sendHeldNow(s); now.disabled = false; });
+      bar.appendChild(now);
+    }
+    if (s.state === 'scheduled' || s.state === 'held') {
+      const stop = el('button', 'ghost-link', 'Cancel'); stop.type = 'button';
+      stop.addEventListener('click', (e) => { e.stopPropagation(); cancelSchedule(s.eventId); });
+      bar.appendChild(stop);
+    }
+    g.appendChild(bar);
+    wrap.appendChild(g);
+  }
+}
+
+// The daemon's reason strings, in the teammate's words. An unknown reason is
+// shown verbatim rather than hidden — a refusal nobody can read is a silent one.
+function heldReason(reason) {
+  return {
+    superseded: 'the conversation moved on',
+    late: 'the sync service was not running at that time',
+    cap: 'too many automatic messages in this conversation this hour',
+    sanitize: 'the message could not be sent as written',
+    cancel_unreadable: 'the cancel state could not be read',
+    target: 'that conversation is not a schedulable chat',
+    horizon: 'the time was too far ahead',
+    send_at: 'the time was not valid',
+    interrupted: 'the sync service was interrupted mid-send',
+    already_handled: 'it was already handled another way',
+  }[reason] || (reason || 'unknown');
 }
 
 // Send every pending ghost in order (oldest first), one at a time, stopping on
@@ -360,8 +439,10 @@ function renderGhost(roomId) {
   const pending = pendingNewestFirst.slice().sort((a, b) => a.ts - b.ts);     // oldest first = send order
   const retired = retiredDrafts(rec.drafts, rec.lastTs, Date.now());
   const ambiguous = allProposals.filter(p => p && p.kind === 'room' && p.ambiguous && p.targetRoom === roomId);
-  if (!pending.length && !retired.length && !ambiguous.length) return;
+  const scheduled = schedulesForRoom(roomId).filter(s => s.state !== 'cancelled');
+  if (!pending.length && !retired.length && !ambiguous.length && !scheduled.length) return;
   const wrap = el('div', 'ghosts');
+  scheduleGhosts(wrap, roomId);
   for (const a of ambiguous.slice(0, 1)) {
     const g = el('div', 'ghost ambiguous');
     g.appendChild(el('div', 'ghost-text', sanitize(a.body)));
@@ -405,6 +486,7 @@ function renderGhost(roomId) {
 
 function afterHandled() {
   attachDrafts(allProposals, loadHandled(), feedModel);
+  attachScheduled(feedModel);
   scheduleFeedRender();
   if (S.openRoomId) renderGhost(S.openRoomId);
   renderIdentifierRows();
@@ -465,8 +547,8 @@ function renderDetail(p) {
 async function refresh() {
   let proposals;
   try { proposals = await fetchProposals(); } catch (e) { return; }
-  const sig = (arr) => arr.map((p) => p.eventId).sort().join(',');
-  if (sig(proposals) === sig(allProposals)) { if (S.openRoomId) renderGhost(S.openRoomId); return; }
+  // fetchProposals also re-ingested the schedule events, so always re-run the
+  // attach/render pass: a schedule change moves nothing in `proposals`.
   allProposals = proposals;
   afterHandled();
 }
@@ -474,6 +556,14 @@ let pollTimer = null;
 
 function initProposalsUI() {
   setComposerGhostHook(renderGhost);
+  // F7: a schedule written/cancelled here re-attaches the row indicators and
+  // repaints the open room's cluster, same as a draft change does.
+  setScheduleChangeHook(() => {
+    attachScheduled(feedModel);
+    scheduleFeedRender();
+    if (S.openRoomId) renderGhost(S.openRoomId);
+  });
+  try { initScheduleUI(); } catch (e) { /* the clock button stays unwired on error */ }
   setFeedRenderHook(() => { renderIdentifierRows(); if (S.openRoomId) renderGhost(S.openRoomId); });
   setAfterSendHook((roomId) => {
     // A reply typed by the teammate retires every pending draft for the room.

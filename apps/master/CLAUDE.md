@@ -131,6 +131,15 @@ now a deliberate, documented duplication, not an oversight.
   redirecting it somewhere new. A successful room-targeted write is shown
   only in this console as a right-side `suggested` bubble (overlay on the
   mirror timeline — never an `m.room.message` in the conversation).
+- **A time on a suggestion is a FIELD, not a new write.** F7's clock button adds
+  an optional integer `send_at` (24h horizon, validated by the pure
+  `proposalSendAt()`) to the same single `com.jkali.proposal` write — no new
+  endpoint, no new event type, no send path. What it means is decided entirely
+  on the teammate's machine: for a non-Direct conversation it is a label on an
+  ordinary draft that the teammate converts into THEIR own schedule, and for a
+  Direct one the uplink parks the proposal and re-runs all twelve of its gates
+  at that instant on a freshly re-read copy. A refusal there files the ordinary
+  draft; this console never gets a "send it anyway" affordance.
 - **The write surface is exactly `{POST /login, POST /logout, POST
   /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn}, POST
   ENROLL_BASE/admin/add-teammate, POST ENROLL_BASE/admin/delete-teammate}`** — asserted at build time by

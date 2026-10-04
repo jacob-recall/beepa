@@ -75,6 +75,26 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   ("Sent directly"), a `com.jkali.send_ambiguous` one is the labelled "may
   already have been sent" row, and both are classified **from event content
   only**, never from `localStorage`. Neither is ever sendable with one click.
+- `scheduled.js` — F7 teammate self-schedule. The composer's clock button and
+  ⌘⏎ open a NATIVE `<input type="datetime-local">` (min now+1min, max now+30d);
+  confirming writes a `com.jkali.scheduled_send` `{target_room, body, send_at,
+  created_by}` into the teammate's own local proposals room. **This app never
+  fires a schedule and never sends one** — `agents/uplink/` does, behind its own
+  gates. Cancel is a `com.jkali.scheduled_cancel` STATE event whose `state_key`
+  IS the scheduled event id, which is what makes the daemon's fire-time
+  point-read a single unambiguous question. The ghost cluster shows scheduled /
+  held / sent / refused items, and "Send now" on a held one goes through
+  `sendConvoMessage` with the re-read body and then cancels the schedule.
+  **Classification (`classifySchedules`) is from event content ONLY** — the
+  scheduled_send, the cancel state event and the daemon's
+  `com.jkali.scheduled_outcome` records — never `localStorage`, so a fresh
+  profile and a poisoned one agree. `scheduleRefusal()` is the pure write-time
+  gate and refuses what the daemon would refuse later (a leading `!`, a
+  non-attributed or management-room target, a time outside the window); the
+  4000-char `sanitize()` clamp applies to what is written. The clock-skew
+  refusal (>5 min vs the server's `Date` header) is **UX, not a security
+  boundary**: the daemon re-checks everything at fire time, and an unreadable
+  server clock does not block scheduling.
 - `style.css` — app-specific styling for the share controls, proposal
   cards, and contact cards (shared layout/typography lives in `shared/`'s
   CSS, loaded by `index.html`).
@@ -152,6 +172,14 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   /send/m.room.message` directly — they all funnel through this one
   function. If you add a new feature that needs to send a message, call
   `sendConvoMessage`, never re-implement the guard.
+- **A schedule is an INTENT RECORD, not a send.** `scheduled.js` adds no send
+  path: its only writes are a `com.jkali.scheduled_send` timeline event and a
+  `com.jkali.scheduled_cancel` state event, both into the discovered proposals
+  room and never into a conversation. "Send now" on a held schedule is the
+  ordinary `sendConvoMessage` guard with an explicit target. A manager's timed
+  suggestion is still only a draft here — "Accept schedule" writes the
+  TEAMMATE'S own scheduled_send, so from then on the daemon is acting on their
+  intent, not the manager's.
 - **A proposal is a suggestion, never an instruction to send.** `proposals.js`
   never auto-sends: every action requires the teammate to press a button, and
   "Send" still goes through the same guard as typing.

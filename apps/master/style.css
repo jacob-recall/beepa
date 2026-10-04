@@ -134,3 +134,7 @@
 .list-title-sub.health { font-size: 11px; }
 .list-title-sub.health.warn { color: #c9810a; }
 .teammate-rail-btn .warn-dot { position: absolute; left: 4px; top: 4px; width: 8px; height: 8px; border-radius: 50%; background: #d64545; }
+
+/* F7: the manager's optional send-at picker, inline under the suggest bar. */
+#proposal-schedule-pane { display: flex; gap: 8px; align-items: center; padding: 6px 10px; font-size: 12px; }
+#proposal-schedule-pane.hidden { display: none; }

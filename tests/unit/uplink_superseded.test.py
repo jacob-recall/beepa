@@ -53,6 +53,32 @@ check("reaction is not activity", gate is None)
 
 check("superseded is a loud gate", "superseded" not in uplink.Uplink.QUIET_GATES)
 
+# F7 fix 8: room_quiet_since gains exempt_own_scheduled, OFF by default. The
+# manager-proposal evaluation never passes it, so a message the teammate
+# SCHEDULED still supersedes a manager suggestion; the teammate's own scheduled
+# queue passes it, so their own queued messages do not supersede each other.
+own_sched = {"chunk": [{"type": "m.room.message", "sender": "@me:localhost",
+                        "origin_server_ts": now - 100,
+                        "content": {"msgtype": "m.text", "body": "mine",
+                                    "com.jkali.from_schedule": "$s1"}}]}
+u = make(own_sched)
+check("exempt_own_scheduled defaults OFF (a scheduled message supersedes a proposal)",
+      u.room_quiet_since("!t:localhost", now - 5000) is False)
+u = make(own_sched)
+check("exempt_own_scheduled=True exempts this daemon's own scheduled send",
+      u.room_quiet_since("!t:localhost", now - 5000, exempt_own_scheduled=True) is True)
+u = make(own_sched)
+body, gate = u._direct_send_gate(ev, clean, cold_start=False, suspended=False)
+check("a manager proposal is still superseded by the teammate's scheduled message",
+      gate == "superseded")
+forged = {"chunk": [{"type": "m.room.message", "sender": "@whatsapp_555:localhost",
+                     "origin_server_ts": now - 100,
+                     "content": {"msgtype": "m.text", "body": "forged",
+                                 "com.jkali.from_schedule": "$s1"}}]}
+u = make(forged)
+check("a remote party forging from_schedule never earns the exemption",
+      u.room_quiet_since("!t:localhost", now - 5000, exempt_own_scheduled=True) is False)
+
 # Queueable bursts: the daemon's OWN auto-send (local_user + provenance key) is not "the
 # conversation moved on"; a teammate-typed message (local_user, no key) and a remote
 # message that forges the key both still supersede.

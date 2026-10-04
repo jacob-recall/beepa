@@ -117,7 +117,7 @@ lives where, security invariants, and how to run/test each piece:
   compose project `matrix-master`, its own ports), provisioning, and the
   v1.5 enrollment-code flow.
 - `tests/CLAUDE.md` — unit tests + the consent conformance harness, all wired into tests/run.sh (consent
-  parity, uplink reconcile logic, and more), and the 14-scenario
+  parity, uplink reconcile logic, and more), and the 23-scenario
   integration harness that drives two real homeservers end to end.
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)
@@ -144,6 +144,13 @@ the teammate's own uplink sends it into the conversation with no review
 click, which makes the manager identity a bounded remote send capability on
 that teammate's real accounts for those conversations; what bounds it is
 D2's twelve gates in `agents/uplink/`.
+
+**Two daemon send paths (F7):** the uplink's Direct auto-send is bounded by a
+live manager identity plus a live consent read, and its scheduled send — a
+message the teammate wrote and timed themselves — is bounded by a durable
+record of the teammate's own intent that later checks can only weaken; they are
+separate gate functions on purpose, and losing `state.db` cancels schedules
+rather than replaying them.
 
 **Security model, in one line per layer:** render whitelist + anti-spoof
 from_me gate (shared UI) → the consent resolver as the authorization boundary

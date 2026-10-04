@@ -6,10 +6,26 @@ authenticates to the teammate's LOCAL homeserver (read) and to the MASTER
 homeserver (write, as the teammate's own scoped account). It never listens on a
 socket and never holds a bridge session or external send-capability.
 
-It sends into a conversation in exactly ONE case (direct-share-level plan, D2):
-a conversation the teammate has explicitly set to the 'direct' level auto-sends
-manager proposals, with no review click, through _auto_send(). That path is
-gated by the eleven checks in _direct_send_gate()/_auto_send() — server-stamped
+It has TWO send paths into a conversation, and they are deliberately separate
+code, not one path with a switch:
+
+  1. Direct auto-send (direct-share-level plan, D2) — a conversation the
+     teammate has explicitly set to the 'direct' level auto-sends MANAGER
+     proposals with no review click, through _direct_send_gate()/_auto_send().
+     Bounded by a LIVE manager identity plus a LIVE consent point-read.
+  2. Scheduled send (roadmap F7) — a message the TEAMMATE wrote and scheduled
+     themselves, dispatched at send_at through _scheduled_send_gate()/
+     _scheduled_dispatch(). Bounded by a durable record of the teammate's own
+     intent that every later check can only weaken: a fresh re-read proving
+     they authored it, a fail-closed cancellation point-read, the same
+     sanitization, a fire window that never fires late in silence, a 30-day
+     horizon, an attributed non-space target, the shared rate cap, and the
+     superseded check. Losing state.db CANCELS schedules; the queue is never
+     rebuilt by rescanning a room.
+  A manager-TIMED proposal is path 1 deferred: the same twelve gates on a fresh
+  re-read at send_at, with D2-3's anchor moved to send_at.
+
+Path 1 is gated by the twelve checks in _direct_send_gate()/_auto_send() — server-stamped
 manager sender, send-grade sanitization, freshness, mirrored-target membership,
 a FRESH consent point-read at send time, a persisted per-room hourly cap,
 intent-recorded-before-dispatch, exactly one non-actionable inbox record either
@@ -159,6 +175,27 @@ DIRECT_SEND_ACK_TYPE = "com.jkali.direct_send_ack"
 # affordance ("Send" only for 'direct'). Cosmetic on the master side — the
 # authorization is the teammate-side consent point-read in D2.5.
 SHARE_LEVEL_TYPE = "com.jkali.share_level"
+# ---- F7 (roadmap §F7): SCHEDULED SEND — the daemon's SECOND send path -----
+# Bounded by a durable record of the TEAMMATE'S OWN intent, which later checks
+# can only weaken, never widen. The teammate's browser writes a
+# com.jkali.scheduled_send into their LOCAL proposals room; this daemon only
+# ever READS that type (it is never written here — tests/unit/
+# uplink_scheduled_send.test.py asserts that statically) and WRITES exactly one
+# com.jkali.scheduled_outcome per terminal transition. Cancellation is a STATE
+# event whose state_key is the scheduled event id, point-read at fire time.
+SCHEDULED_SEND_TYPE = "com.jkali.scheduled_send"        # READ-ONLY here (teammate-authored)
+SCHEDULED_CANCEL_TYPE = "com.jkali.scheduled_cancel"    # STATE event, state_key = scheduled event id
+SCHEDULED_OUTCOME_TYPE = "com.jkali.scheduled_outcome"  # the one terminal record this daemon files
+# Cosmetic provenance on the dispatched message (same role, and the same
+# "never a trust input", as AUTO_SENT_FROM_PROPOSAL_KEY). room_quiet_since's
+# exempt_own_scheduled leg reads it ONLY together with the server-stamped
+# sender being this account.
+FROM_SCHEDULE_KEY = "com.jkali.from_schedule"
+SCHEDULED_FIRE_WINDOW_MS = 10 * 60 * 1000               # S-4: never a late silent fire
+SCHEDULED_HORIZON_MS = 30 * 24 * 60 * 60 * 1000         # S-5: teammate self-schedule horizon
+SCHEDULED_MANAGER_HORIZON_MS = 24 * 60 * 60 * 1000      # manager-timed horizon
+SCHEDULED_BATCH = 50                                    # rows examined per pass
+SCHEDULED_BUDGET_S = 5                                  # per-pass wall budget (= deliver_pending's)
 DIRECT_SEND_BODY_MAX = 8000                 # D2.2 send-grade clamp (= sendConvoMessage's)
 DIRECT_SEND_FRESH_MS = 10 * 60 * 1000       # D2.3 replay bound: 10 minutes
 SUPERSEDED_SCAN_LIMIT = 10                  # D2-12: newest local messages to inspect
@@ -202,7 +239,10 @@ MIGRATED_FLAG = "migrated_explicit_levels"  # meta key, "1" once the pass comple
 #   0 = pre-S3 (mirror_rooms/event_map/proposal_map/contact_mirror/meta)
 #   1 = D2/D2b: proposal_map.outcome, mirror_rooms.stamped_level,
 #       direct_send_log, direct_send_audit
-SCHEMA_VERSION = 2
+#   3 = F7 scheduled send: direct_send_audit.source (the discriminator that
+#       says whether master_event_id names a MASTER proposal event or a LOCAL
+#       scheduled_send event)
+SCHEMA_VERSION = 3
 # One-time re-PUT of the two proposal-room topics after the D2 copy change
 # (the old strings asserted an absolute that auto-send breaks, and a topic is
 # only written at room creation).
@@ -378,6 +418,14 @@ def sanitize_proposal_content(content, sender, event_id, origin_ts):
         }
         if c.get("template") is True:
             out["template"] = True
+        # F7 manager-timed: an INT (never a bool — `True` is an int in Python)
+        # unix-ms instant the manager asked this suggestion to go out at. Inert
+        # data on every path except the manager-timed one, where it is the
+        # freshness anchor; the horizon and the level are checked there, not
+        # here. Room proposals only: there is no scheduled start-a-new-chat.
+        send_at = c.get("send_at")
+        if isinstance(send_at, int) and not isinstance(send_at, bool):
+            out["send_at"] = send_at
         return out
 
     # ---- person-targeted proposal ----
@@ -696,6 +744,28 @@ class Uplink(durable_sync.DurableSync):
         db.execute(                      # which rooms THIS daemon joined
             "CREATE TABLE IF NOT EXISTS daemon_joined ("
             "room_hash TEXT PRIMARY KEY, ts INTEGER)")
+        # F7 scheduled send. SEPARATE STORAGE from proposal_map/direct_send_log
+        # on purpose: no body and no room id are stored here — a room is named
+        # only by its hash, and the body is re-read from the teammate's own
+        # event at fire time. `authorship` is written ONCE at arm time and is
+        # what routes a row to its own gate+dispatcher ('teammate') or to the
+        # unchanged twelve D2 gates ('manager').
+        #   state: armed | refuse_pending | cancel_pending | attempted   (live)
+        #          sent | held | refused | ambiguous | cancelled         (terminal)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS scheduled_sends ("
+            "event_id TEXT PRIMARY KEY, room_hash TEXT NOT NULL, send_at INTEGER NOT NULL, "
+            "origin_ts INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, "
+            "outcome_ts INTEGER, authorship TEXT NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS scheduled_sends_due "
+                   "ON scheduled_sends (state, send_at)")
+        # The non-space, source-ATTRIBUTED room set from the last reconcile
+        # pass, hash-only. S-6 reads it: a scheduled send may only target a room
+        # the source detector attributes to a bridge source, which is the same
+        # bound that keeps a bridge MANAGEMENT room out of the mirror set.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS attributed_rooms ("
+            "room_hash TEXT PRIMARY KEY, ts INTEGER NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
         Uplink._migrate_db(db)
@@ -729,6 +799,14 @@ class Uplink(durable_sync.DurableSync):
           - direct_send_audit — the durable auto-send audit trail (D2.10).
         Both new tables are hash-only: a room id is stored as room_hash, never
         in the clear, and no message body is ever recorded.
+
+        v3 (F7 scheduled send):
+          - direct_send_audit.source — 'direct' (master_event_id names a MASTER
+            com.jkali.proposal), 'schedule' (it names a LOCAL
+            com.jkali.scheduled_send) or 'manager_schedule' (a manager-timed
+            proposal). The column exists because the audit table's
+            master_event_id now holds ids from two different homeservers, and a
+            reader must be able to tell which.
         """
         version = db.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
@@ -736,7 +814,11 @@ class Uplink(durable_sync.DurableSync):
         # Column adds are guarded individually: a db created by a LATER
         # schema-init that already has the column must not fail the ALTER.
         for table, column, decl in (("proposal_map", "outcome", "TEXT"),
-                                    ("mirror_rooms", "stamped_level", "TEXT")):
+                                    ("mirror_rooms", "stamped_level", "TEXT"),
+                                    ("direct_send_audit", "source", "TEXT")):
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                              (table,)).fetchone():
+                continue   # created below (or by the init block) with the column present
             cols = {r[1] for r in db.execute("PRAGMA table_info(%s)" % table).fetchall()}
             if column not in cols:
                 db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
@@ -748,7 +830,8 @@ class Uplink(durable_sync.DurableSync):
             "ON direct_send_log (room_hash, ts)")
         db.execute(
             "CREATE TABLE IF NOT EXISTS direct_send_audit ("
-            "ts INTEGER NOT NULL, master_event_id TEXT, room_hash TEXT, outcome TEXT)")
+            "ts INTEGER NOT NULL, master_event_id TEXT, room_hash TEXT, outcome TEXT, "
+            "source TEXT)")
         db.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)  # int constant, not input
         db.commit()
 
@@ -923,6 +1006,49 @@ class Uplink(durable_sync.DurableSync):
                 out[child] = source
                 pending.extend(edges.get(child, []))
         return out
+
+    @staticmethod
+    def space_ids_from_sync(sync_data):
+        """Every joined room whose m.room.create says it is an m.space.
+
+        sources_from_sync() attributes a source SPACE's children, and some of
+        those children are themselves spaces (Discord's "Direct Messages"), so
+        attribution alone does not mean "a conversation". F7's S-6 needs that
+        distinction, and this is the cheapest honest way to get it: the same
+        state+timeline scan sources_from_sync already does.
+        """
+        join = (((sync_data or {}).get("rooms") or {}).get("join")) or {}
+        out = set()
+        for rid, room in join.items():
+            events = list(((room.get("state") or {}).get("events")) or []) \
+                + list(((room.get("timeline") or {}).get("events")) or [])
+            for e in events:
+                if (isinstance(e, dict) and e.get("type") == "m.room.create"
+                        and (e.get("content") or {}).get("type") == "m.space"):
+                    out.add(rid)
+                    break
+        return out
+
+    def persist_attributed_rooms(self, source_of, spaces):
+        """F7 fix 6: record this reconcile pass's NON-SPACE attributed rooms.
+
+        Hash-only, and a full replace — reconcile's /sync is the authority, so a
+        room that stopped being attributed (its source space was left, the
+        bridge renamed it) stops being a legal scheduled-send target on the
+        same pass. S-6 reads this table; nothing else does.
+        """
+        now = int(time.time())
+        rows = [(self._room_hash(rid), now) for rid in source_of if rid not in spaces]
+        self.db.execute("DELETE FROM attributed_rooms")
+        self.db.executemany(
+            "INSERT OR REPLACE INTO attributed_rooms (room_hash, ts) VALUES (?,?)", rows)
+        self.db.commit()
+
+    def room_is_attributed(self, local_room_id):
+        """S-6: is this room in the last reconcile pass's attributed set?"""
+        return bool(self.db.execute(
+            "SELECT 1 FROM attributed_rooms WHERE room_hash=?",
+            (self._room_hash(local_room_id),)).fetchone())
 
     @staticmethod
     def room_name_from_sync(room):
@@ -1278,6 +1404,10 @@ class Uplink(durable_sync.DurableSync):
         # a transient error would be lost there, not retried.
         self._last_invites = (((sync_data or {}).get("rooms") or {}).get("invite")) or {}
         desired, source_of, join, profile_of = self.desired_shared(sync_data, migrated)
+        # F7 S-6's target set. Persisted from the SAME snapshot the mirroring
+        # decision uses, and independent of consent: a scheduled send is the
+        # teammate's own message, so attribution (not sharing) is its bound.
+        self.persist_attributed_rooms(source_of, self.space_ids_from_sync(sync_data))
         for rid in self.existing_mirror_ids():
             if self.mirror_status(rid) == "revoking":
                 desired[rid] = "private"
@@ -2089,7 +2219,7 @@ class Uplink(durable_sync.DurableSync):
         except Exception:                          # noqa: BLE001 — fail closed
             return "private"
 
-    def room_quiet_since(self, local_room_id, since_ts):
+    def room_quiet_since(self, local_room_id, since_ts, exempt_own_scheduled=False):
         """D2-12: True iff NO m.room.message in the target room is newer than
         since_ts. The daemon-side twin of the app's draft-retirement rule: a
         proposal the conversation has moved past is never auto-sent (that is
@@ -2098,6 +2228,14 @@ class Uplink(durable_sync.DurableSync):
         An EMPTY page reads as quiet (a new room); a non-list chunk or any
         error reads as NOT quiet. Reduces the double text to the one-round-trip
         window between this read and the PUT; it cannot eliminate it.
+
+        F7: `exempt_own_scheduled` additionally ignores THIS daemon's own
+        scheduled sends (server-stamped sender == local_user AND a string
+        com.jkali.from_schedule), exactly as the Direct leg already ignores its
+        own auto-sends — a queue of the teammate's own scheduled messages going
+        out in order is not the conversation moving on. It is OFF by default,
+        and the manager-proposal evaluation NEVER passes it: a manager-timed
+        send must still be superseded by anything the teammate scheduled.
         """
         if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
             return False
@@ -2126,6 +2264,9 @@ class Uplink(durable_sync.DurableSync):
             content = e.get("content") if isinstance(e.get("content"), dict) else {}
             if e.get("sender") == self.cfg.local_user and isinstance(content.get(AUTO_SENT_FROM_PROPOSAL_KEY), str):
                 continue
+            if (exempt_own_scheduled and e.get("sender") == self.cfg.local_user
+                    and isinstance(content.get(FROM_SCHEDULE_KEY), str)):
+                continue
             ts = e.get("origin_server_ts")
             if isinstance(ts, int) and not isinstance(ts, bool) and ts > since_ts:
                 return False
@@ -2148,20 +2289,34 @@ class Uplink(durable_sync.DurableSync):
             (room_hash, cutoff)).fetchone()[0]
         return used < self.cfg.direct_send_cap
 
-    def _audit_direct_send(self, master_event_id, room_hash, outcome):
-        """D2-10: durable, hash-only auto-send audit row (no body, no room id)."""
+    def _audit_direct_send(self, master_event_id, room_hash, outcome, source="direct"):
+        """D2-10 / S-11: durable, hash-only audit row (no body, no room id).
+
+        `source` discriminates WHICH homeserver master_event_id belongs to:
+        'direct' = a MASTER com.jkali.proposal, 'schedule' = a LOCAL
+        com.jkali.scheduled_send, 'manager_schedule' = a manager-timed proposal.
+        """
         self.db.execute(
-            "INSERT INTO direct_send_audit (ts, master_event_id, room_hash, outcome) "
-            "VALUES (?,?,?,?)", (int(time.time()), master_event_id, room_hash, outcome))
+            "INSERT INTO direct_send_audit (ts, master_event_id, room_hash, outcome, source) "
+            "VALUES (?,?,?,?,?)", (int(time.time()), master_event_id, room_hash, outcome, source))
         self.db.commit()
 
-    def _direct_send_gate(self, ev, clean, cold_start, suspended):
+    def _direct_send_gate(self, ev, clean, cold_start, suspended, freshness_anchor_ms=None):
         """Every D2 gate, in order. Returns (body_to_send, failed_gate).
 
         body_to_send is the SANITIZED text and is non-None only when ALL gates
         passed; otherwise it is None and failed_gate names the first refusal
         (used for the hash-only log line and the audit row). No gate here has a
         side effect except D2-6's prune, so a refusal costs nothing.
+
+        `freshness_anchor_ms` is F7's ONE documented delta and DEFAULTS to the
+        event's own origin_server_ts, which makes the ordinary Direct path
+        byte-identical to before. A manager-TIMED proposal passes its `send_at`
+        instead, so D2-3 bounds the FIRE instant (send_at <= now <
+        send_at+10min) rather than the authoring instant. D2-12 is NOT affected:
+        it keeps comparing against min(the proposal's own origin_server_ts,
+        now_ms), so everything said in the conversation while the suggestion sat
+        waiting still supersedes it.
         """
         # D2-11 first, before anything is read: a rebound (or never
         # re-confirmed) master identity cannot send, whatever else is true.
@@ -2201,8 +2356,17 @@ class Uplink(durable_sync.DurableSync):
         if not isinstance(ots, int) or isinstance(ots, bool):
             return None, "freshness"
         now_ms = int(time.time() * 1000)
-        if ots > now_ms + 60000 or (now_ms - ots) > DIRECT_SEND_FRESH_MS:
-            return None, "freshness"              # stale, or implausibly future-dated
+        if freshness_anchor_ms is None:
+            if ots > now_ms + 60000 or (now_ms - ots) > DIRECT_SEND_FRESH_MS:
+                return None, "freshness"          # stale, or implausibly future-dated
+        else:
+            if not isinstance(freshness_anchor_ms, int) or isinstance(freshness_anchor_ms, bool):
+                return None, "freshness"
+            # F7: no early fire and no late silent fire — the window opens AT
+            # send_at (no +60s tolerance) and closes 10 minutes later.
+            if not (freshness_anchor_ms <= now_ms
+                    < freshness_anchor_ms + DIRECT_SEND_FRESH_MS):
+                return None, "freshness"
         # D2-4: POSITIVE target check — the proposal must be room-targeted AND
         # that room must be a member of the mirrored set. A person-targeted
         # (start-new-chat) proposal has no target_room and is NEVER auto-sent;
@@ -2227,6 +2391,12 @@ class Uplink(durable_sync.DurableSync):
         # proposal time CLAMPED TO NOW — D2-3 tolerates +60s of future-dating,
         # and a future ots would otherwise hide real activity in that window
         # from this gate.
+        # F7: D2-12 KEEPS its own anchor — min(ots, now_ms), the proposal's own
+        # server stamp clamped to now — even when D2-3's anchor moved to
+        # send_at. Freshness is the only documented delta. Using send_at here
+        # would make every message between "the manager wrote it" and "it was
+        # due" invisible to this gate, which is precisely the double text the
+        # gate exists to stop (integration scenario 23).
         if not self.room_quiet_since(target, min(ots, now_ms)):
             return None, "superseded"
         return body, None
@@ -2373,6 +2543,20 @@ class Uplink(durable_sync.DurableSync):
                 self.db.commit()
                 handled[meid] = "fallback"
                 continue
+            # F7 manager-timed: a proposal carrying send_at for a `direct` room
+            # is PARKED (no artifact yet) and evaluated at send_at by
+            # scheduled_manager_once() through these same twelve gates. Anything
+            # else about it — a share-level room, a cold start, a suspended
+            # identity, a bad horizon — files the ordinary draft right now, and
+            # the teammate's app offers "Accept schedule" on it instead.
+            if isinstance(clean.get("send_at"), int) and not isinstance(clean.get("send_at"), bool):
+                if self._arm_manager_schedule(meid, ev, clean, cold_start, suspended):
+                    handled[meid] = "scheduled"
+                    continue
+                self._file_proposal_record(local_proposals_room, meid, clean, "fallback")
+                handled[meid] = "fallback"
+                posted += 1
+                continue
             body, gate = self._direct_send_gate(ev, clean, cold_start, suspended)
             if body is None:
                 # Refused: the ordinary actionable draft the teammate sends
@@ -2457,6 +2641,423 @@ class Uplink(durable_sync.DurableSync):
         self.meta_set("proposal_sync_since", data.get("next_batch") or since or "")
         if posted:
             log.info("proposals: pulled %d new -> local room %s", posted, lpr)
+
+    # -- F7: the SECOND send path — the teammate's own scheduled send --------
+    #
+    # This is a DELIBERATELY SEPARATE gate and dispatcher, not a branch in the
+    # Direct ones. The two capabilities are different in kind and must not share
+    # a code path whose conditions could be loosened for one and silently widen
+    # the other: Direct is bounded by a LIVE manager identity plus a live
+    # consent read, while a scheduled send is bounded by a DURABLE RECORD OF THE
+    # TEAMMATE'S OWN INTENT that every later check can only weaken. Only pure
+    # leaves are shared (sanitize_send_body, room_quiet_since,
+    # direct_send_under_cap, _room_hash, _audit_direct_send).
+    #
+    # Gates, cheap first, network last (S-1..S-8 below; S-9..S-11 live in
+    # _scheduled_dispatch). What is deliberately ABSENT, and why:
+    #   D2-1 manager identity — S-1 replaces it: the author must be the teammate
+    #        themselves, server-stamped, on a fresh re-read.
+    #   D2-5 consent point-read — this is the teammate's OWN message, so consent
+    #        to share it with a manager is not the question. S-6 (an attributed,
+    #        non-space conversation room) is the boundary instead.
+    #   D2-3 cold start — the arming rows live ONLY in state.db, so losing state
+    #        CANCELS every schedule. The queue is never reconstructed by
+    #        rescanning the room; a lost db cannot replay history as real sends.
+    #   D2-4 mirrored-target membership — replaced by S-6; a scheduled send must
+    #        work in a conversation the teammate never shared.
+    #   D2-11 suspension — that binds the MASTER identity, which has no part in
+    #        a message the teammate scheduled for themselves.
+    def _file_scheduled_outcome(self, event_id, target_room, state, reason, send_at,
+                                sent_event_id=None):
+        """Write THE one com.jkali.scheduled_outcome for a terminal transition.
+
+        Shaped like _file_proposal_record: a deterministic txn id
+        (schedout_<event_id>_<state>) so a replay is homeserver-idempotent, the
+        hardcoded event TYPE literal, the recorded local proposals room as the
+        only target, and the state.db row updated ONLY after the 2xx (a failed
+        write leaves the row non-terminal and the next pass retries it — it
+        never re-sends, because the send's own outcome is already recorded).
+        No body is ever in this record; the app re-reads the teammate's own
+        scheduled_send event for that.
+        """
+        lpr = self.meta_get("local_proposals_room")
+        if not lpr:
+            return
+        content = {
+            "scheduled_event_id": event_id,
+            "target_room": target_room,
+            "state": state,
+            "reason": reason or "",
+            "send_at": send_at if isinstance(send_at, int) and not isinstance(send_at, bool) else 0,
+            "outcome_ts": int(time.time() * 1000),
+        }
+        if sent_event_id:
+            content["sent_event_id"] = sent_event_id
+        self.local("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(lpr, safe="")
+                   + "/send/" + SCHEDULED_OUTCOME_TYPE + "/schedout_"
+                   + urllib.parse.quote(event_id, safe="") + "_" + state, content)
+        self.db.execute("UPDATE scheduled_sends SET state=?, reason=?, outcome_ts=? WHERE event_id=?",
+                        (state, reason, int(time.time() * 1000), event_id))
+        self.db.commit()
+
+    def _arm_scheduled(self, local_proposals_room, events):
+        """Arm (or cancel) teammate schedules from tail_once's own /sync.
+
+        tail_once already streams the LOCAL proposals room unfiltered, so there
+        is no second local sync cursor to keep: rows are inserted here, BEFORE
+        meta sync_since advances, which is what makes a schedule impossible to
+        miss. Every check here is repeated at fire time against a FRESH re-read,
+        which is the authority — arming is bookkeeping, never authorization.
+        A cancel state event seen here marks the row, but S-2's point-read is
+        still what decides.
+        """
+        now_ms = int(time.time() * 1000)
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            etype = e.get("type")
+            if etype == SCHEDULED_CANCEL_TYPE:
+                key = e.get("state_key")
+                if isinstance(key, str) and key:
+                    self.db.execute(
+                        "UPDATE scheduled_sends SET state='cancel_pending', reason='cancelled' "
+                        "WHERE event_id=? AND state IN ('armed','refuse_pending')", (key,))
+                continue
+            if etype != SCHEDULED_SEND_TYPE:
+                continue
+            eid = e.get("event_id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            if e.get("sender") != self.cfg.local_user:
+                continue           # only the teammate can schedule their own send
+            c = e.get("content") if isinstance(e.get("content"), dict) else {}
+            ots = e.get("origin_server_ts")
+            ots = ots if isinstance(ots, int) and not isinstance(ots, bool) else now_ms
+            send_at = c.get("send_at")
+            target = c.get("target_room")
+            reason = None
+            if not isinstance(send_at, int) or isinstance(send_at, bool) or send_at <= 0:
+                reason = "send_at"
+            elif send_at - ots > SCHEDULED_HORIZON_MS:
+                reason = "horizon"
+            elif not isinstance(target, str) or not ROOMID_RE.match(target):
+                reason = "target"
+            self.db.execute(
+                "INSERT OR IGNORE INTO scheduled_sends (event_id, room_hash, send_at, origin_ts, "
+                "state, reason, authorship) VALUES (?,?,?,?,?,?,'teammate')",
+                (eid, self._room_hash(target if isinstance(target, str) else ""),
+                 send_at if isinstance(send_at, int) and not isinstance(send_at, bool) else 0,
+                 ots, "refuse_pending" if reason else "armed", reason))
+        self.db.commit()
+
+    def _scheduled_send_gate(self, event_id, now_ms):
+        """S-1..S-8 for ONE teammate-scheduled send.
+
+        Returns (body, target_room, send_at, outcome). `outcome` is None when
+        every gate passed; otherwise it is (state, reason) with state in
+        ('held', 'refused', 'cancelled'), or the sentinel ('wait', None) for a
+        row that is simply not due yet (no state change, no record, no log).
+        `target_room` is carried for the OUTCOME RECORD only and is never a
+        decision input before S-6 validates it.
+        """
+        lpr = self.meta_get("local_proposals_room")
+        # -- S-1 authorship, from a FRESH re-read of the teammate's own event.
+        # The server-stamped sender, the event type and the room are checked
+        # together; content.created_by is cosmetic and feeds nothing. A 4xx
+        # (gone, redacted, not ours) is a refusal; anything else RAISES so
+        # run_stage backs the stage off — a transient blip must neither fire
+        # nor silently drop a schedule.
+        try:
+            ev = self.local("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(lpr, safe="")
+                            + "/event/" + urllib.parse.quote(event_id, safe=""))
+        except urllib.error.HTTPError as e:
+            if isinstance(e.code, int) and 400 <= e.code < 500 and e.code != 429:
+                return None, None, None, ("refused", "authorship")
+            raise
+        if (not isinstance(ev, dict)
+                or ev.get("sender") != self.cfg.local_user
+                or ev.get("type") != SCHEDULED_SEND_TYPE
+                or ev.get("room_id") != lpr):
+            return None, None, None, ("refused", "authorship")
+        content = ev.get("content") if isinstance(ev.get("content"), dict) else {}
+        raw_target = content.get("target_room")
+        record_target = (raw_target if isinstance(raw_target, str) and ROOMID_RE.match(raw_target)
+                         else None)
+        send_at = content.get("send_at")
+        send_at = send_at if isinstance(send_at, int) and not isinstance(send_at, bool) else None
+        # -- S-2 not cancelled. A STATE event keyed by the scheduled event id;
+        # 404 is the only "not cancelled" answer and ANY other failure HOLDS.
+        try:
+            self.local("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(lpr, safe="")
+                       + "/state/" + SCHEDULED_CANCEL_TYPE + "/"
+                       + urllib.parse.quote(event_id, safe=""))
+            return None, record_target, send_at, ("cancelled", "cancelled")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return None, record_target, send_at, ("held", "cancel_unreadable")
+        except Exception:                          # noqa: BLE001 — fail closed to a HOLD
+            return None, record_target, send_at, ("held", "cancel_unreadable")
+        # -- S-3 send-grade sanitization, verbatim (leading '!' refused).
+        body = sanitize_send_body(content.get("body"))
+        if body is None:
+            return None, record_target, send_at, ("held", "sanitize")
+        # -- S-4 fire window: no early fire, and never a late SILENT fire.
+        if send_at is None:
+            return None, record_target, None, ("refused", "send_at")
+        if now_ms < send_at:
+            return None, record_target, send_at, ("wait", None)
+        if now_ms >= send_at + SCHEDULED_FIRE_WINDOW_MS:
+            return None, record_target, send_at, ("held", "late")
+        # -- S-5 horizon, against the SERVER stamp (checked at arm time too).
+        ots = ev.get("origin_server_ts")
+        if not isinstance(ots, int) or isinstance(ots, bool):
+            return None, record_target, send_at, ("refused", "horizon")
+        if send_at - ots > SCHEDULED_HORIZON_MS:
+            return None, record_target, send_at, ("refused", "horizon")
+        # -- S-6 target. The attributed set is this install's own last reconcile
+        # pass (non-space only), so a bridge MANAGEMENT room, a source space,
+        # the proposals room itself and any master mirror room all fail here.
+        # There is no consent gate: this is the teammate's own message.
+        if record_target is None or record_target == lpr:
+            return None, record_target, send_at, ("refused", "target")
+        if not self.room_is_attributed(record_target):
+            return None, record_target, send_at, ("refused", "target")
+        if self.db.execute("SELECT 1 FROM mirror_rooms WHERE master_room_id=?",
+                           (record_target,)).fetchone():
+            return None, record_target, send_at, ("refused", "target")
+        # -- S-7 the SHARED persisted rolling per-room cap.
+        if not self.direct_send_under_cap(self._room_hash(record_target)):
+            return None, record_target, send_at, ("held", "cap")
+        # -- S-8 superseded, anchored on the SERVER stamp of the scheduling
+        # event (never content.created_ts). Only this daemon's own scheduled
+        # sends are exempt; anything the teammate typed, and anything remote,
+        # holds the message instead of double-texting.
+        if not self.room_quiet_since(record_target, ots, exempt_own_scheduled=True):
+            return None, record_target, send_at, ("held", "superseded")
+        return body, record_target, send_at, None
+
+    def _scheduled_dispatch(self, event_id, local_room_id, body):
+        """S-9/10/11: send ONE scheduled message. (state, reason, sent_event_id).
+
+        Sibling of _auto_send, never a caller of it. Same ordering property: the
+        'attempted' state and the rate-cap tick are COMMITTED BEFORE the PUT, so
+        a crash after this point recovers as "may already have been sent" and is
+        never replayed as a second send. The txn id is deterministic
+        (sched_<event_id>) so even a retry the homeserver did receive dedups.
+        """
+        room_hash = self._room_hash(local_room_id)
+        self.db.execute("UPDATE scheduled_sends SET state='attempted' WHERE event_id=?",
+                        (event_id,))
+        self.db.execute("INSERT INTO direct_send_log (ts, room_hash) VALUES (?,?)",
+                        (int(time.time()), room_hash))
+        self.db.commit()
+        txn = "sched_" + urllib.parse.quote(event_id, safe="")
+        content = {"msgtype": "m.text", "body": body, FROM_SCHEDULE_KEY: event_id}
+        try:
+            res = self.local("PUT", "/_matrix/client/v3/rooms/"
+                             + urllib.parse.quote(local_room_id, safe="")
+                             + "/send/m.room.message/" + txn, content)
+        except urllib.error.HTTPError as e:
+            if isinstance(e.code, int) and 400 <= e.code < 500:
+                self._audit_direct_send(event_id, room_hash, "sched:refused", source="schedule")
+                log.warning("scheduled send refused by the local hs (HTTP %s) room=%s",
+                            e.code, room_hash)
+                return "refused", "local_http_%s" % e.code, None
+            self._audit_direct_send(event_id, room_hash, "sched:ambiguous", source="schedule")
+            log.warning("scheduled send outcome UNKNOWN (HTTP %s) room=%s", e.code, room_hash)
+            return "ambiguous", "dispatched", None
+        except Exception as e:                     # noqa: BLE001 — dispatched, unknown
+            self._audit_direct_send(event_id, room_hash, "sched:ambiguous", source="schedule")
+            log.warning("scheduled send outcome UNKNOWN (%s) room=%s", type(e).__name__, room_hash)
+            return "ambiguous", "dispatched", None
+        self._audit_direct_send(event_id, room_hash, "sched:sent", source="schedule")
+        log.info("scheduled send: 1 message sent room=%s", room_hash)
+        sent = res.get("event_id") if isinstance(res, dict) else None
+        return "sent", None, (sent if isinstance(sent, str) and sent else None)
+
+    def scheduled_once(self):
+        """One pass of the TEAMMATE-scheduled queue (run() stage 'scheduled').
+
+        Runs ABOVE the connectivity and link_disabled gates: a message the
+        teammate scheduled on their own account has nothing to do with the
+        master being reachable, or with the organization link being on.
+        Bounded like deliver_pending: at most one DISPATCH per pass, a bounded
+        number of record writes, and a 5s wall budget.
+        """
+        if not self.meta_get("local_proposals_room"):
+            return
+        started = time.monotonic()
+        # S-10 crash recovery FIRST: intent was recorded, the result is unknown,
+        # no record exists yet. Never re-sent.
+        for eid, send_at in self.db.execute(
+                "SELECT event_id, send_at FROM scheduled_sends WHERE state='attempted' "
+                "AND authorship='teammate' ORDER BY send_at LIMIT ?",
+                (SCHEDULED_BATCH,)).fetchall():
+            self._file_scheduled_outcome(eid, None, "ambiguous", "interrupted", send_at)
+            log.warning("recovered an interrupted scheduled send as AMBIGUOUS (no re-send)")
+        # Arm-time refusals and cancellations noticed by tail_once get their one
+        # record here, in the stage that owns those writes.
+        for eid, state, reason, send_at in self.db.execute(
+                "SELECT event_id, state, reason, send_at FROM scheduled_sends "
+                "WHERE state IN ('refuse_pending','cancel_pending') AND authorship='teammate' "
+                "ORDER BY rowid LIMIT ?", (SCHEDULED_BATCH,)).fetchall():
+            if time.monotonic() - started >= SCHEDULED_BUDGET_S:
+                return
+            self._file_scheduled_outcome(
+                eid, None, "refused" if state == "refuse_pending" else "cancelled",
+                reason, send_at)
+        due = self.db.execute(
+            "SELECT event_id FROM scheduled_sends WHERE state='armed' AND authorship='teammate' "
+            "AND send_at<=? ORDER BY send_at LIMIT ?",
+            (int(time.time() * 1000), SCHEDULED_BATCH)).fetchall()
+        for (eid,) in due:
+            if time.monotonic() - started >= SCHEDULED_BUDGET_S:
+                return
+            body, target, send_at, outcome = self._scheduled_send_gate(
+                eid, int(time.time() * 1000))
+            if outcome is not None:
+                state, reason = outcome
+                if state == "wait":
+                    continue                       # not due after all; no record, no noise
+                self._audit_direct_send(eid, self._room_hash(target) if target else None,
+                                        "sched:" + state + (":" + reason if reason else ""),
+                                        source="schedule")
+                self._file_scheduled_outcome(eid, target, state, reason, send_at)
+                continue
+            state, reason, sent_id = self._scheduled_dispatch(eid, target, body)
+            self._file_scheduled_outcome(eid, target, state, reason, send_at, sent_id)
+            return                                 # one dispatch per pass
+
+    # -- F7: manager-TIMED proposals (the Direct path, deferred to send_at) --
+    # Nothing about D2 changes here. The proposal is parked, and at send_at the
+    # SAME _direct_send_gate() runs on a FRESH re-read of the master event with
+    # all twelve gates, plus the three preconditions below. The only delta is
+    # D2-3's anchor (send_at instead of the authoring time), passed as
+    # freshness_anchor_ms. Any gate failure files the ordinary draft — a manager
+    # never gets a "held, send it anyway" affordance.
+    def _mark_schedule(self, event_id, state, reason):
+        self.db.execute("UPDATE scheduled_sends SET state=?, reason=?, outcome_ts=? "
+                        "WHERE event_id=?", (state, reason, int(time.time() * 1000), event_id))
+        self.db.commit()
+
+    def _arm_manager_schedule(self, master_event_id, ev, clean, cold_start, suspended):
+        """Park a manager-timed proposal; True when armed (no artifact yet)."""
+        if cold_start or suspended:
+            return False
+        send_at = clean.get("send_at")
+        ots = ev.get("origin_server_ts")
+        if not isinstance(send_at, int) or isinstance(send_at, bool):
+            return False
+        if not isinstance(ots, int) or isinstance(ots, bool):
+            return False
+        # 24h horizon for manager-timed, and never a "schedule" that is really
+        # an immediate send wearing a timestamp.
+        if send_at <= ots or send_at - ots > SCHEDULED_MANAGER_HORIZON_MS:
+            return False
+        target = clean.get("target_room")
+        if not isinstance(target, str) or not ROOMID_RE.match(target):
+            return False
+        if not self.mirror_for(target):
+            return False
+        if self.read_room_level(target) != "direct":
+            return False       # share/private: the ordinary draft, timed in the app
+        self.db.execute(
+            "INSERT OR REPLACE INTO scheduled_sends (event_id, room_hash, send_at, origin_ts, "
+            "state, reason, authorship) VALUES (?,?,?,?,'armed',NULL,'manager')",
+            (master_event_id, self._room_hash(target), send_at, ots))
+        self.db.execute("INSERT OR REPLACE INTO proposal_map "
+                        "(master_event_id, local_event_id, outcome) VALUES (?,?,'scheduled')",
+                        (master_event_id, None))
+        self.db.commit()
+        self._audit_direct_send(master_event_id, self._room_hash(target), "sched:armed",
+                                source="manager_schedule")
+        return True
+
+    def scheduled_manager_once(self):
+        """One pass of the manager-TIMED queue (runs with the proposals stage)."""
+        mpr = self.meta_get("master_proposals_room")
+        lpr = self.meta_get("local_proposals_room")
+        if not mpr or not lpr:
+            return
+        due = self.db.execute(
+            "SELECT event_id, send_at FROM scheduled_sends WHERE state='armed' "
+            "AND authorship='manager' AND send_at<=? ORDER BY send_at LIMIT ?",
+            (int(time.time() * 1000), SCHEDULED_BATCH)).fetchall()
+        recover = self.db.execute(
+            "SELECT event_id, send_at FROM scheduled_sends WHERE state='attempted' "
+            "AND authorship='manager' ORDER BY send_at LIMIT ?", (SCHEDULED_BATCH,)).fetchall()
+        if not due and not recover:
+            return
+        # P-a: the organization link must be live for this dispatch, exactly as
+        # it must be for an immediate one. P-b: a rebound (or never re-confirmed)
+        # master identity suspends it, whatever the schedule says.
+        if not self.active_link_for_dispatch():
+            return
+        if self.refresh_direct_send_binding():
+            self._direct_suspended = True
+            return
+        started = time.monotonic()
+        for meid, send_at in recover + due:
+            if time.monotonic() - started >= SCHEDULED_BUDGET_S:
+                return
+            row = self.db.execute("SELECT outcome FROM proposal_map WHERE master_event_id=?",
+                                  (meid,)).fetchone()
+            prior = row[0] if row else None
+            # P-c: a proposal that already reached a terminal outcome (it was
+            # auto-sent, drafted or withdrawn by another path) never fires.
+            if prior not in ("scheduled", "attempted"):
+                self._mark_schedule(meid, "refused", "already_handled")
+                continue
+            try:
+                ev = self.master("GET", "/_matrix/client/v3/rooms/"
+                                 + urllib.parse.quote(mpr, safe="")
+                                 + "/event/" + urllib.parse.quote(meid, safe=""))
+            except urllib.error.HTTPError as e:
+                if isinstance(e.code, int) and 400 <= e.code < 500 and e.code != 429:
+                    self._mark_schedule(meid, "refused", "gone")
+                    continue
+                raise
+            clean = self._sanitize_proposal(ev)
+            if clean is None:
+                self._mark_schedule(meid, "refused", "malformed")
+                continue
+            room_hash = self._room_hash(clean.get("target_room"))
+            if prior == "attempted":
+                # D2-9 crash recovery for a scheduled dispatch: never re-sent.
+                content = dict(clean)
+                content[SEND_AMBIGUOUS_KEY] = True
+                self._file_proposal_record(lpr, meid, content, "ambiguous")
+                self._audit_direct_send(meid, room_hash, "sched:ambiguous_recovered",
+                                        source="manager_schedule")
+                self._mark_schedule(meid, "ambiguous", "interrupted")
+                log.warning("recovered an interrupted scheduled direct send as AMBIGUOUS "
+                            "(no re-send): %s", meid)
+                continue
+            body, gate = self._direct_send_gate(ev, clean, cold_start=False, suspended=False,
+                                                freshness_anchor_ms=send_at)
+            if body is None:
+                if gate in self.QUIET_GATES:
+                    log.debug("scheduled proposal not auto-sent (%s)", gate)
+                else:
+                    log.warning("scheduled direct send REFUSED at gate '%s' room=%s",
+                                gate, room_hash)
+                self._audit_direct_send(meid, room_hash, "sched:refused:" + str(gate),
+                                        source="manager_schedule")
+                # The ORDINARY draft, never a hold affordance for the manager.
+                self._file_proposal_record(lpr, meid, clean, "fallback")
+                self._mark_schedule(meid, "refused", gate)
+                continue
+            outcome, sent_id = self._auto_send(meid, clean["target_room"], body)
+            content = dict(clean)
+            if outcome == "sent":
+                content[AUTO_SENT_KEY] = True
+                if sent_id:
+                    content[SENT_EVENT_ID_KEY] = sent_id
+            elif outcome == "ambiguous":
+                content[SEND_AMBIGUOUS_KEY] = True
+            self._file_proposal_record(lpr, meid, content, outcome)
+            self._mark_schedule(meid, "sent" if outcome == "sent" else outcome, None)
+            return                                 # one dispatch per pass
 
     # -- contact mirror (§12 phase 5, Task 6, LOCAL contacts.db -> MASTER) ---
     # Address-book contacts (PII) leave the machine ONLY when consent says so.
@@ -2835,6 +3436,16 @@ class Uplink(durable_sync.DurableSync):
                           timeout=(self.cfg.sync_timeout // 1000) + 30)
         # Apply account-data privacy changes before staging any batch event.
         join = (((data or {}).get("rooms") or {}).get("join")) or {}
+        # F7 fix 10: arm teammate schedules from THIS unfiltered local /sync,
+        # BEFORE meta sync_since can advance below — no second local cursor, and
+        # no batch that advances the cursor without the schedules in it. First,
+        # because the link-disabled check below can return early and a schedule
+        # is the teammate's own message, unrelated to the organization link.
+        lpr = self.meta_get("local_proposals_room")
+        if lpr and lpr in join:
+            section = join[lpr] or {}
+            self._arm_scheduled(lpr, list(((section.get("state") or {}).get("events")) or [])
+                                + list(((section.get("timeline") or {}).get("events")) or []))
         # ONE policy read for this whole tail: an override CHANGE below is
         # resolved against the CURRENT account default, so clearing an override
         # under a 'direct' default is not a revocation (and a per-room read
@@ -3036,6 +3647,10 @@ class Uplink(durable_sync.DurableSync):
                 # no fresh messages or proposals are dispatched while disabled.
                 self.run_stage("revocation", self.retry_revocations)
                 self.run_stage("retired_revocation", self.retry_retired_mirrors)
+                # F7: the teammate's OWN scheduled sends are local-only work and
+                # must fire whether or not the master is reachable or the
+                # organization link is on — hence above both gates below.
+                self.run_stage("scheduled", self.scheduled_once)
                 if time.monotonic() - getattr(self, "_last_health", float("-inf")) >= 30:
                     self._last_health = time.monotonic()
                     self.run_stage("health", self.publish_health)
@@ -3068,6 +3683,7 @@ class Uplink(durable_sync.DurableSync):
                     self.ensure_proposal_rooms()
                     self.pull_proposals()
                     self.deliver_proposal_pending()
+                    self.scheduled_manager_once()   # F7 manager-timed, below the connectivity gate
                 self.run_stage("proposals", proposals)
                 self.run_stage("history", self.history_slice)
                 self.run_stage("media", self.retry_media_slice)

@@ -411,6 +411,15 @@ button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(
 .convo .stripe .seg { display: block; border-radius: 2px; }
 .seg.unread, .pill.unread { background: #2f6fed; }
 .seg.draft, .pill.draft { background: #7c5cd6; }
+.seg.scheduled, .pill.scheduled { background: #1b8a6b; }   /* F7: scheduled send (clock) */
+.pill.scheduled { color: #fff; font-size: 11px; }
+.ghost.scheduled { border-color: #1b8a6b; background: #e6f4ef; }
+.ghost.scheduled .ghost-bar, .ghost.held .ghost-bar { color: #136b53; }
+.ghost.held { border-style: solid; border-color: #c9810a; background: #fbeed3; }
+#convo-schedule-pane { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 10px; border-top: 1px solid var(--color-border); font-size: 12px; }
+#convo-schedule-pane.hidden { display: none; }
+#convo-schedule-error:empty { display: none; }
+#convo-schedule-error { color: #b4312c; }
 .seg.overdue, .pill.overdue { background: #c9810a; }
 .seg.reconnect, .pill.reconnect { background: #d64545; }
 .convo .avatar { width: 40px; height: 40px; flex: 0 0 40px; font-size: 14px; position: relative; overflow: visible; }

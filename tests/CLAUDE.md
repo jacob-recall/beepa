@@ -57,6 +57,12 @@ historical and the runner generates all configuration itself.
   private. Contact sharing is separate. Match JS/Python resolver cases.
 - Direct sends retain current manager/target/freshness/rate/identity gates.
   Stale proposals and ambiguous external sends must not be replayed as new sends.
+- Scheduled sends are a SEPARATE gate and dispatcher, never a branch of the
+  Direct ones. Keep: the fire-time re-read of the teammate's own event, the
+  fail-closed cancellation point-read, the fire window (never a late silent
+  fire), the attributed non-space target set, the shared rate counter, and the
+  rule that losing the local queue cancels schedules instead of replaying them.
+  The daemon must never WRITE a `com.jkali.scheduled_send`.
 - A disconnected link suppresses forwarding even if environment credentials
   remain. Failed revocation cleanup remains durable and retryable.
 - History/discovery gaps, re-share generations and master epochs have separate

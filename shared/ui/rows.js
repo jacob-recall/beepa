@@ -34,6 +34,7 @@ function rowFlags(rec) {
   return indicatorsFor({
     unread: rec.unread,
     draft: pendingDrafts(rec.drafts, rec.lastTs).length,
+    scheduled: rec.scheduled,   // F7: count of scheduled sends still waiting
     reconnect: !!(rec.sourceId && runtime[rec.sourceId] && runtime[rec.sourceId].needsReconnect),
   });
 }
@@ -59,6 +60,7 @@ function buildSide(rec, flags, unreadCount, draftCount) {
   if (rec.lastTs) side.appendChild(el('span', 'when', feedRelTime(rec.lastTs)));
   if (flags.includes('unread')) side.appendChild(el('span', 'pill unread', String(unreadCount)));
   if (flags.includes('draft')) side.appendChild(el('span', 'pill draft', String(draftCount)));
+  if (flags.includes('scheduled')) side.appendChild(el('span', 'pill scheduled', '◴'));
   if (flags.includes('reconnect')) {
     // #4: a bridge login is per-account, so a dead login (needsReconnect, set by
     // updateCardStatus) surfaces on every conversation from that source.
@@ -106,7 +108,7 @@ function buildFeedRow(r) {
 // clusters (S.expandedClusters) get a sub-row per member beneath (search.js).
 function buildClusterRow(item) {
   const newest = item.members[0];
-  const flags = indicatorsFor({ unread: item.unread, draft: item.draft,
+  const flags = indicatorsFor({ unread: item.unread, draft: item.draft, scheduled: item.scheduled,
     reconnect: item.members.some(m => m.sourceId && runtime[m.sourceId] && runtime[m.sourceId].needsReconnect) });
   const row = el('div', 'convo cluster');
   row.appendChild(buildStripe(flags));

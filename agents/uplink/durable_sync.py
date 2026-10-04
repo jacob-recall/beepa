@@ -643,6 +643,15 @@ class DurableSync:
         counts['last_delivery'] = int(self.meta_get('last_delivery_success') or 0) or None
         oldest = self.db.execute('SELECT min(origin_ts) FROM pending_events WHERE error IS NULL').fetchone()[0]
         counts['oldest_pending_ts'] = oldest / 1000 if oldest else None
+        # F7: scheduled sends still waiting, and the ones the daemon HELD (the
+        # teammate has to act on those in the app). Counts and unix seconds only.
+        counts['scheduled_pending'] = self.db.execute(
+            "SELECT count(*) FROM scheduled_sends WHERE state IN ('armed','attempted')").fetchone()[0]
+        counts['scheduled_held'] = self.db.execute(
+            "SELECT count(*) FROM scheduled_sends WHERE state='held'").fetchone()[0]
+        oldest_sched = self.db.execute(
+            "SELECT min(send_at) FROM scheduled_sends WHERE state='armed'").fetchone()[0]
+        counts['oldest_scheduled_ts'] = int(oldest_sched // 1000) if oldest_sched else None
         counts['connected'] = bool(getattr(self, '_conn_state', self.cfg.master_token)) and self.meta_get('link_disabled') != '1'
         counts['errors'] = {row[0].split(':', 1)[1]: row[1] for row in self.db.execute(
             "SELECT k,v FROM meta WHERE k LIKE 'stage_error:%'").fetchall()}
@@ -669,6 +678,7 @@ class DurableSync:
     HEALTH_TO_MASTER_FIELDS = ('pending_events', 'proposal_pending', 'media_retry', 'history_pages_pending',
                                'history_incomplete', 'revocations_pending', 'delivery_incomplete',
                                'delivery_refused', 'last_ingestion', 'last_delivery', 'oldest_pending_ts',
+                               'scheduled_pending', 'scheduled_held', 'oldest_scheduled_ts',
                                'connected', 'updated_at')
 
     def publish_health_to_master(self, health):

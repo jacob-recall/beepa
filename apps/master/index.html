@@ -86,7 +86,13 @@
               <div id="proposal-stack"></div>
               <div id="proposal-compose">
                 <input id="proposal-input" placeholder="Message" spellcheck="true" autocomplete="off">
+                <button id="proposal-schedule" type="button" title="Suggest a time" aria-label="Suggest a time">&#9716;</button>
                 <button id="proposal-send" type="button" class="primary">Suggest a reply</button>
+              </div>
+              <div id="proposal-schedule-pane" class="hidden">
+                <span>Send at</span>
+                <input id="proposal-schedule-when" type="datetime-local">
+                <button id="proposal-schedule-clear" type="button">Clear</button>
               </div>
               <div id="proposal-status" class="proposal-status hidden"></div>
             </div>

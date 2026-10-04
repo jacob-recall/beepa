@@ -7,6 +7,7 @@ import { bridgeInvitesToJoin } from './invites.js';
 import { initContactsUI, openAddToContact } from './contacts.js';
 import { autoMergeContacts } from './enrich.js';
 import { initProposalsUI } from './proposals.js';
+import { openSchedulePicker } from './scheduled.js';
 import { initOrgLinkUI } from './orglink.js';
 import { sendConvoMessage, stopConvoWatch } from '../../shared/ui/chat.js';
 import { ROOMID_RE, api, setOnUnauthorized } from '../../shared/matrix/client.js';
@@ -384,6 +385,9 @@ document.addEventListener('DOMContentLoaded', () => {
   if (convoSend) convoSend.addEventListener('click', () => sendConvoMessage());
   const convoInput = $('convo-input');
   if (convoInput) convoInput.addEventListener('keydown', (e) => {
+    // F7: Cmd/Ctrl+Enter opens the schedule picker (it never sends); plain
+    // Enter is the unchanged guarded send path.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); openSchedulePicker(); return; }
     if (e.key === 'Enter') { e.preventDefault(); sendConvoMessage(); }
   });
 

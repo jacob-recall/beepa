@@ -4,7 +4,10 @@
 // imports this leaf directly — it carries no shared/ui import, so importing
 // it adds no send path to the master bundle). No DOM, no network, no S.
 
-const INDICATOR_ORDER = ['unread', 'draft', 'overdue', 'reconnect'];
+// F7: 'scheduled' (a clock) is its own indicator, never folded into
+// 'draft' — a message the teammate queued is a different promise from a
+// suggestion waiting for them.
+const INDICATOR_ORDER = ['unread', 'draft', 'scheduled', 'overdue', 'reconnect'];
 
 function initials(name) {
   const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
@@ -60,7 +63,7 @@ function clusterFeed(records, roomProfile) {
     if (!p) { order.push({ kind: 'single', rec, lastTs: rec.lastTs || 0 }); continue; }
     let c = clusters.get(p.id);
     if (!c) {
-      c = { kind: 'cluster', profileId: p.id, displayName: p.displayName || '', members: [], lastTs: 0, unread: 0, draft: 0 };
+      c = { kind: 'cluster', profileId: p.id, displayName: p.displayName || '', members: [], lastTs: 0, unread: 0, draft: 0, scheduled: 0 };
       clusters.set(p.id, c);
       order.push(c);
     }
@@ -68,6 +71,7 @@ function clusterFeed(records, roomProfile) {
     c.members.push(rec);
     c.unread += (typeof rec.unread === 'number' && rec.unread > 0) ? rec.unread : 0;
     c.draft += pend;
+    c.scheduled += (typeof rec.scheduled === 'number' && rec.scheduled > 0) ? rec.scheduled : 0;
     if ((rec.lastTs || 0) > c.lastTs) c.lastTs = rec.lastTs || 0;
   }
   for (const c of clusters.values()) c.members.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));

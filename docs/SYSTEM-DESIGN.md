@@ -77,6 +77,47 @@ met. Historical catch-up does not turn stale proposals into fresh sends.
 Durable outcome and ambiguity records prevent blindly resending an uncertain
 external action. These records and rate counters survive archive rebuilds.
 
+## Scheduled send
+
+The local uplink has **two** send paths into a conversation, bounded by
+different things and implemented as separate code rather than one path with a
+switch.
+
+1. **Direct auto-send** is bounded by a live manager identity and a live
+   consent read, as described above.
+2. **Scheduled send** is a message the teammate wrote and scheduled
+   themselves. It is bounded by a durable record of the teammate's own intent
+   that every later check can only weaken: the daemon re-reads that event at
+   fire time and requires the server-stamped author to be the teammate, the
+   event type and room to match, no cancellation (a state event keyed by the
+   scheduled event, where only a definite "absent" counts and any read failure
+   holds), the same send-grade content rules, a fire window that never fires
+   late in silence, a 30-day horizon, a source-attributed non-space
+   conversation target, the same rate allowance the Direct path consumes, and a
+   conversation that has not moved on. There is deliberately no consent gate:
+   it is the teammate's own message, so attribution — not sharing — is the
+   boundary. There is deliberately no cold-start rule either, because the
+   schedule queue lives only in local durable state: **losing that state
+   cancels schedules**, and the queue is never reconstructed by rescanning a
+   room, so a restored copy can never replay history as real sends.
+
+The manager may put a time on a suggestion. For a conversation that is not
+Direct this is only a label: it arrives as an ordinary draft, and accepting it
+writes the teammate's *own* schedule, which from then on is theirs. For a
+Direct conversation the suggestion is parked and re-evaluated at that time
+against every one of the Direct checks on a freshly re-read copy, with a single
+difference — freshness is measured against the requested time instead of the
+authoring time. The "conversation has moved on" check is *not* moved, so
+anything said while the suggestion waited still refuses it. Any refusal files
+the ordinary draft; the manager never gets a "send it anyway" affordance.
+
+The teammate-scheduled queue runs above the connectivity gate, so it fires with
+the master unreachable or the organization link off. The browser refuses to
+create a schedule when its clock disagrees with the server's by more than five
+minutes; that is a usability guard, **not** a security boundary — the daemon's
+clock is the only one that decides when anything fires, and it re-checks every
+condition at that moment.
+
 ## Copies and revocation
 
 Mirror rooms are owned by the teammate's scoped master account. The manager
@@ -100,6 +141,7 @@ delivery mapping, so the previous generation's receipts do not suppress it.
 | Local Matrix/bridge stores | Source history and network sessions |
 | Uplink lifecycle/history queues | Pending event references, source pagination, generation mappings, cleanup and incomplete outcomes |
 | Direct outcome ledger | Records accepted/refused/uncertain proposals and rate accounting; retained across rebuilds |
+| Scheduled send queue | Arming rows for the teammate's own scheduled messages and for parked manager-timed suggestions; holds no message body and no room identifier, only a hash. Losing it cancels schedules by design |
 | iMessage journal | Inbound component receipts and outbound event claims/outcomes; retries do not imply delivery |
 | Master recovery registry | Stable master authority, data epoch, scoped installation verifiers and revocations outside the archive DB |
 

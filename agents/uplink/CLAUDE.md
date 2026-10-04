@@ -7,16 +7,29 @@ dedicated local room. Python 3.9+ stdlib only (`urllib` + `sqlite3`) — no
 pip dependencies. PLAN-MASTER-SYNC.md §5.4/§7/§8; PLAN-MASTER-SYNC-IMPL.md
 Phase 2/3/4.
 
-**This daemon can send** — in exactly one case. A conversation the teammate
-has explicitly set to the `direct` level auto-sends manager proposals into
-that conversation, with no review click
-(`docs/superpowers/plans/2026-09-02-direct-share-level.md`, D2). Every other
-level, and any failed gate, still lands in the teammate's proposal inbox as
-an ordinary draft they send themselves. The honest posture that follows: once
-any conversation is `direct`, the manager identity on the master is a **remote
-send capability on the teammate's real messaging accounts for those
-conversations**, executed here. The master still holds no teammate credential;
-what bounds the capability is the gate list under "Security invariants".
+**This daemon has TWO send paths**, and they are deliberately separate code —
+not one path with a switch — because they are bounded by different things:
+
+1. **Direct auto-send** (`docs/superpowers/plans/2026-09-02-direct-share-level.md`,
+   D2). A conversation the teammate has explicitly set to the `direct` level
+   auto-sends MANAGER proposals into that conversation with no review click.
+   Bounded by a **live manager identity plus a live consent point-read**. Every
+   other level, and any failed gate, still lands in the teammate's proposal
+   inbox as an ordinary draft they send themselves. The honest posture that
+   follows: once any conversation is `direct`, the manager identity on the
+   master is a **remote send capability on the teammate's real messaging
+   accounts for those conversations**, executed here. The master still holds no
+   teammate credential; what bounds the capability is D2's twelve gates below.
+2. **Scheduled send** (roadmap F7). A message the TEAMMATE wrote and scheduled
+   themselves goes out at `send_at`. Bounded by a **durable record of the
+   teammate's own intent that every later check can only weaken** — there is no
+   manager in it at all. The manager cannot create one, and a manager-TIMED
+   suggestion for a non-`direct` room is still only a draft until the teammate
+   accepts it, at which point the schedule is *theirs*.
+
+A manager-TIMED proposal for a `direct` room is path 1 deferred: the SAME
+twelve gates on a fresh re-read at `send_at`, with one documented delta
+(D2-3's freshness anchor). It is never path 2.
 
 ## What lives here
 
@@ -304,6 +317,94 @@ what bounds the capability is the gate list under "Security invariants".
   The `com.jkali.auto_sent_from_proposal` field on the sent message is
   **cosmetic** (F14) — forgeable by anything holding the teammate token, and
   it must never feed the `from_me` gate or any other trust decision.
+- **The scheduled send is the SECOND send path, and its eleven gates are a
+  SEPARATE function (F7).** `_scheduled_send_gate()` + `_scheduled_dispatch()`
+  are siblings of `_direct_send_gate()`/`_auto_send()`, never callers or
+  branches of them; the only things shared are pure leaves
+  (`sanitize_send_body`, `room_quiet_since`, `direct_send_under_cap`,
+  `_room_hash`, `_audit_direct_send`). The two capabilities are different in
+  kind, and a condition loosened for one must not be able to widen the other.
+  Gates in order, cheap first, network last:
+  1. **S-1 Authorship, from a FRESH re-read.** `GET
+     /rooms/{local_proposals_room}/event/{id}` at fire time: the SERVER-stamped
+     `sender` must be `cfg.local_user`, the `type` must be
+     `com.jkali.scheduled_send`, and the event's `room_id` must be the recorded
+     local proposals room — all three together. `content.created_by` is
+     cosmetic. A 4xx is `refused:authorship`; any other error RAISES, so a
+     transient blip neither fires nor drops a schedule.
+  2. **S-2 Not cancelled.** A point-read of the `com.jkali.scheduled_cancel`
+     STATE event whose `state_key` IS the scheduled event id. **404 is the only
+     "not cancelled"**; 200 is terminal; ANY other error HOLDS (fail closed).
+     The cancel seen in `tail_once` only marks the row — this read decides.
+  3. **S-3 Send-grade sanitization**, `sanitize_send_body()` verbatim, including
+     the leading-`!` bridge-command refusal.
+  4. **S-4 Fire window.** `send_at` must be an int (never a bool) and
+     `send_at <= now < send_at + 10min`. Earlier is "not yet" (no record, no
+     log); later is **held**, never a late silent fire.
+  5. **S-5 Horizon.** `send_at - origin_server_ts <= 30 days`, checked at arm
+     AND at fire, against the server stamp.
+  6. **S-6 Target.** `ROOMID_RE` ∩ the persisted `attributed_rooms` set ∩ not a
+     space ∩ not the proposals room ∩ not any `mirror_rooms.master_room_id`.
+     **There is deliberately NO consent gate** — this is the teammate's own
+     message, so sharing is not the question; attribution is the boundary, and
+     it is the same thing that keeps a bridge MANAGEMENT room out of the mirror
+     set. `attributed_rooms` is the non-space output of `sources_from_sync()`,
+     re-persisted (hash-only) on every reconcile pass.
+  7. **S-7 Rate cap.** `direct_send_under_cap()` — the SAME `direct_send_log`
+     counter the Direct path uses, so the two cannot be used to double a room's
+     unattended budget.
+  8. **S-8 Superseded.** `room_quiet_since(target, the SCHEDULING EVENT's
+     server `origin_server_ts`, exempt_own_scheduled=True)`. Only this daemon's
+     own scheduled sends are exempt; a message the teammate typed, and anything
+     remote (even one forging `com.jkali.from_schedule`), still holds it.
+  9. **S-9 Intent before dispatch.** The `attempted` state and the cap tick are
+     COMMITTED before the PUT; the txn id is the deterministic
+     `sched_<event_id>`; the content is
+     `{msgtype, body, com.jkali.from_schedule}`.
+  10. **S-10 One outcome record either way.** A local 4xx is `refused` (nothing
+      sent); a transport failure or 5xx is `ambiguous` and is NEVER re-sent; a
+      crash after intent recovers to `ambiguous` on the next pass (mirrors
+      D2-9).
+  11. **S-11 Hash-only audit row**, with the new `source` discriminator.
+  **Deliberately ABSENT, and why.** D2-1 (manager identity) — S-1 replaces it.
+  D2-5 (consent point-read) — the teammate's own message; S-6 is the boundary.
+  D2-3 (cold start) — unnecessary *and* replaced by something stronger: the
+  arming rows live ONLY in `state.db`, so **state loss CANCELS schedules**. The
+  queue is never reconstructed by rescanning the room, so a restored or lost db
+  can never replay history as real sends. D2-4 (mirrored-target membership) —
+  S-6; a scheduled send must work in a conversation the teammate never shared.
+  D2-11 (suspension) — that binds the MASTER identity, which has no part here.
+- **Scheduled state is SEPARATE storage, and it holds no body and no room id.**
+  `scheduled_sends(event_id PK, room_hash, send_at, origin_ts, state, reason,
+  outcome_ts, authorship)`. `authorship` is written ONCE at arm time and routes
+  the row to its own gate (`teammate`) or to the unchanged twelve D2 gates
+  (`manager`). The body is re-read from the teammate's own event at fire time;
+  the room is only ever a hash. **The daemon never WRITES a
+  `com.jkali.scheduled_send`** — it only reads them, and writes exactly one
+  `com.jkali.scheduled_outcome` per terminal transition
+  (`{scheduled_event_id, target_room, state, reason, send_at, outcome_ts,
+  sent_event_id?}` — no body). `tests/unit/uplink_scheduled_send.test.py`
+  asserts that statically over this file and `durable_sync.py`.
+- **Manager-TIMED proposals re-run ALL TWELVE D2 gates at `send_at`.**
+  `_arm_manager_schedule()` parks a `send_at` proposal whose target resolves
+  `direct` (24h horizon, never a cold start, never a suspended identity, and
+  never a `send_at` at or before the authoring time) with NO inbox artifact
+  yet; `scheduled_manager_once()` then needs P-a `active_link_for_dispatch()`,
+  P-b not suspended, P-c no terminal `proposal_map` outcome, and re-reads the
+  MASTER event before calling `_direct_send_gate()` itself. The ONE delta is
+  `freshness_anchor_ms`, which defaults to the event's `origin_server_ts` so
+  existing behaviour is byte-identical and carries `send_at` only here. **D2-12
+  is NOT moved**: it still compares against `min(the proposal's own
+  origin_server_ts, now_ms)`, so everything said while the suggestion waited
+  supersedes it. Any gate failure files the ORDINARY draft — the manager never
+  gets a "held, send it anyway" affordance.
+- **The teammate-scheduled stage runs ABOVE the connectivity gate.** A message
+  the teammate scheduled on their own account is local work and must fire with
+  the master asleep or the organization link off, so `run_stage("scheduled",
+  …)` sits beside revocation/health; the manager-timed stage runs with
+  `proposals`, below that gate. Schedules are armed from `tail_once`'s own
+  unfiltered local `/sync` (the local proposals room is already in it), BEFORE
+  `meta sync_since` advances — there is no second local sync cursor.
 - **What the uplink stamps on the master, and who may write it.**
   Mirror-room STATE: `com.jkali.source` / `com.jkali.profile` /
   `com.jkali.share_level` / `com.jkali.mirror_of`, plus
@@ -398,6 +499,7 @@ python3 tests/unit/uplink_reconcile.test.py
 python3 tests/unit/uplink_direct_send.test.py    # D2 auto-send gates + schema
 python3 tests/unit/uplink_share_level.test.py    # D2b share-level stamping
 python3 tests/unit/uplink_superseded.test.py    # D2-12 superseded gate + inbound stamp stripping
+python3 tests/unit/uplink_scheduled_send.test.py # F7 scheduled send: S-1..S-11 + manager-timed
 python3 tests/unit/uplink_read_state.test.py    # com.jkali.read_state mirroring
 python3 tests/unit/uplink_contact_overrides.test.py  # per-contact override gates
 python3 tests/unit/uplink_invites.test.py       # invites stage: ack gate, caps, memo
@@ -450,6 +552,11 @@ See `tests/CLAUDE.md`.
    `com.jkali.source`/`com.jkali.profile`/`com.jkali.share_level`/
    `com.jkali.mirror_of`), remember `apps/master/main.js`'s
    `parseSnapshot()` is what reads it — update both sides together.
+4b. **Never merge the two send paths.** Do not add a sender switch or a
+   scheduling branch to `_direct_send_gate()`/`_auto_send()`, and do not call
+   either from the scheduled path. Only pure leaves are shared. If a change
+   seems to need a shared gate function, it is widening one capability with the
+   other's conditions.
 5. **Never widen the auto-send path.** Adding a caller of `_auto_send()`,
    reordering `_direct_send_gate()`, moving the `'attempted'` write after
    the PUT, making a gate advisory, or letting a gate failure drop a

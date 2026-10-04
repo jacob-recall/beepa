@@ -29,6 +29,13 @@ assert.deepEqual(retiredDrafts(drafts, 15, 100000, 2000).map(d => d.id), []);
 
 assert.deepEqual(indicatorsFor({ unread: 2, draft: 1, overdue: 0, reconnect: true }), ['unread', 'draft', 'reconnect']);
 assert.deepEqual(indicatorsFor({}), []);
+// F7: 'scheduled' is its own indicator, ordered between draft and overdue,
+// and never implied by a draft.
+assert.deepEqual(indicatorsFor({ unread: 1, draft: 1, scheduled: 2, overdue: 1, reconnect: true }),
+  ['unread', 'draft', 'scheduled', 'overdue', 'reconnect']);
+assert.deepEqual(indicatorsFor({ scheduled: 1 }), ['scheduled']);
+assert.deepEqual(indicatorsFor({ draft: 1 }), ['draft'], 'a draft never implies a schedule');
+assert.deepEqual(indicatorsFor({ scheduled: 0 }), []);
 
 const recs = [
   { id: '!wa:l', name: 'Maya (WA)', lastTs: 50, unread: 2, sourceId: 'whatsapp', drafts: [{ ts: 60 }] },
@@ -44,6 +51,9 @@ assert.deepEqual(items[0].members.map(m => m.id), ['!wa:l', '!ig:l']);
 assert.equal(items[0].unread, 2);
 assert.equal(items[0].lastTs, 50);
 assert.equal(items[0].draft, 1, 'cluster draft count = pending drafts across members');
+assert.equal(clusterFeed([{ id: '!wa:l', lastTs: 50, scheduled: 2, drafts: [] },
+                          { id: '!ig:l', lastTs: 10, scheduled: 1, drafts: [] }], profile)[0].scheduled,
+  3, 'cluster scheduled count sums its members');
 assert.equal(items[1].kind, 'single');
 // a plain object map works too, and an unknown room stays single
 assert.equal(clusterFeed(recs, { '!wa:l': { id: 'p1', displayName: 'M' } }).length, 3);

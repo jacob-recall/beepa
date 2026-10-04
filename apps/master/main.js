@@ -1720,7 +1720,10 @@ function roomProposals(events, targetRoom) {
     if (!body) continue;
     const ts = typeof e.content.origin_ts === 'number' ? e.content.origin_ts
       : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
-    out.push({ body, eventId: e.event_id, ts });
+    // F7 manager-timed: the instant this suggestion was asked to go out.
+    const sa = e.content.send_at;
+    const sendAt = (typeof sa === 'number' && isFinite(sa) && Math.floor(sa) === sa) ? sa : 0;
+    out.push({ body, eventId: e.event_id, ts, sendAt });
   }
   return out.sort((a, b) => b.ts - a.ts);
 }
@@ -1786,6 +1789,9 @@ function renderSuggestionStack() {
     const label = s.sending ? 'sending…' : { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
       retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'pending · not seen yet' }[s.state];
     bar.appendChild(el('span', 'ghost-st', label));
+    if (s.sendAt && (s.state === 'pending' || s.state === 'seen')) {
+      bar.appendChild(el('span', 'ghost-st', '· timed for ' + shortTime(s.sendAt)));
+    }
     if (s.state === 'pending' || s.state === 'seen') {
       const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';
       edit.title = 'Edit in the bar; Enter files a new suggestion';
@@ -1842,6 +1848,45 @@ function buildIdentifierProposalContent({ source, identifier, display, body } = 
     created_by: S.userId,
     origin_ts: Date.now(),
   };
+}
+
+// ---- F7 manager-timed suggestion ------------------------------------------
+// A time is an OPTIONAL field on the same single write; it adds no endpoint and
+// no send path. The teammate's daemon decides what it means: for a `direct`
+// room it parks the proposal and re-runs all twelve D2 gates at that instant;
+// for anything else it is an ordinary draft whose ghost offers the teammate
+// "Accept schedule", which writes THEIR own scheduled send. Horizon 24h.
+const PROPOSAL_SCHEDULE_MAX_MS = 24 * 60 * 60 * 1000;
+const PROPOSAL_SCHEDULE_MIN_MS = 60 * 1000;
+
+// PURE: the send_at to stamp, or null for "send it now", or the string reason
+// the chosen time is refused. Exported for tests/unit/scheduled_send.test.js.
+function proposalSendAt(raw, now) {
+  if (typeof raw !== 'string' || !raw) return null;
+  const t = Date.parse(raw);
+  if (!isFinite(t)) return 'Pick a valid time.';
+  if (t < now + PROPOSAL_SCHEDULE_MIN_MS) return 'Pick a time at least a minute from now.';
+  if (t > now + PROPOSAL_SCHEDULE_MAX_MS) return 'Pick a time within the next 24 hours.';
+  return Math.floor(t);
+}
+
+function proposalScheduleLocalValue(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function toggleProposalSchedule() {
+  const pane = $('proposal-schedule-pane');
+  const when = $('proposal-schedule-when');
+  if (!pane || !when) return;
+  if (!pane.classList.contains('hidden')) { pane.classList.add('hidden'); when.value = ''; return; }
+  const now = Date.now();
+  when.min = proposalScheduleLocalValue(now + PROPOSAL_SCHEDULE_MIN_MS);
+  when.max = proposalScheduleLocalValue(now + PROPOSAL_SCHEDULE_MAX_MS);
+  pane.classList.remove('hidden');
+  when.focus();
 }
 
 // The single guarded write in this app. Defense in depth:
@@ -1924,6 +1969,12 @@ async function submitProposal(opts) {
     created_by: S.userId,
     origin_ts: Date.now(),
   };
+  const whenEl = $('proposal-schedule-when');
+  const pane = $('proposal-schedule-pane');
+  const timed = (pane && !pane.classList.contains('hidden') && whenEl)
+    ? proposalSendAt(whenEl.value, Date.now()) : null;
+  if (typeof timed === 'string') { proposalStatus(timed, true); return; }
+  if (typeof timed === 'number') content.send_at = timed;
   const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
   // QUEUEABLE: clear the bar and show the ghost BEFORE the write completes, so
   // the next Enter can follow at once; origin_ts preserves the order. The
@@ -2463,7 +2514,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot, healthText, hopLagMs, medianLagMs };
+export { proposalSendAt, buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot, healthText, hopLagMs, medianLagMs };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {
@@ -2555,6 +2606,10 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   // Compose-proposal wiring (the one write path — a proposal, not a send).
   const psend = $('proposal-send');
   if (psend) psend.addEventListener('click', () => { submitProposal().catch(() => {}); });
+  const psched = $('proposal-schedule');
+  if (psched) psched.addEventListener('click', () => toggleProposalSchedule());
+  const pclear = $('proposal-schedule-clear');
+  if (pclear) pclear.addEventListener('click', () => toggleProposalSchedule());
   const pinput = $('proposal-input');
   if (pinput) pinput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); submitProposal().catch(() => {}); }

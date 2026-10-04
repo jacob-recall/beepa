@@ -2223,6 +2223,251 @@ def scenario_18_daemon_joins_invite_no_mirror():
                   'conversation was explicitly shared.')
 
 
+
+# ------------------------------------------------------------------ F7 helpers
+def sched_rows(db_path):
+    """Every scheduled_sends row: {event_id: (state, reason, authorship)}."""
+    if not os.path.exists(db_path):
+        return {}
+    db = sqlite3.connect(db_path)
+    try:
+        return {r[0]: (r[1], r[2], r[3]) for r in db.execute(
+            "SELECT event_id, state, reason, authorship FROM scheduled_sends").fetchall()}
+    finally:
+        db.close()
+
+
+def write_schedule(e, lpr, target, body, send_at):
+    """The teammate's browser gesture: a com.jkali.scheduled_send they authored."""
+    res = local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/"
+                + urllib.parse.quote(lpr, safe="") + "/send/com.jkali.scheduled_send/"
+                + uniq("sched"),
+                {"target_room": target, "body": body, "send_at": int(send_at),
+                 "created_by": e["tuser_id"]})
+    return res["event_id"]
+
+
+def cancel_schedule(e, lpr, event_id):
+    """Cancellation is a STATE event keyed by the scheduled event id."""
+    local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/"
+          + urllib.parse.quote(lpr, safe="") + "/state/com.jkali.scheduled_cancel/"
+          + urllib.parse.quote(event_id, safe=""), {"ts": int(time.time() * 1000)})
+
+
+def schedule_outcomes(e, lpr, event_id):
+    return [(x.get("content") or {}) for x in
+            local_events_of_type(e["tuser_tok"], lpr, "com.jkali.scheduled_outcome")
+            if (x.get("content") or {}).get("scheduled_event_id") == event_id]
+
+
+def proposals_room_ready(e):
+    """Start the uplink, wait for the local proposals room, return (proc, lpr)."""
+    proc = start_uplink(e)
+    lpr = wait_until(lambda: meta_get(e["db_path"], "local_proposals_room"),
+                     timeout=45, desc="local proposals room")
+    return proc, lpr
+
+
+def scenario_19_schedule_fires_once_across_restart():
+    """A teammate schedule survives a daemon restart ACROSS send_at and fires
+    exactly once. The arming row lives only in state.db, which is what makes the
+    restart the real test: nothing is reconstructed by rescanning the room."""
+    e = fresh_env("s19")
+    space = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, space, "Schedule Target")
+    post_msg(e["contact_tok"], room, "s19 seed")
+    marker = "SCHED-" + uniq("s19")
+    proc, lpr = proposals_room_ready(e)
+    try:
+        # The room must be ATTRIBUTED (S-6) before the schedule can fire; that
+        # set is persisted by reconcile, not by sharing.
+        wait_until(lambda: sqlite3.connect(e["db_path"]).execute(
+            "SELECT count(*) FROM attributed_rooms").fetchone()[0], timeout=45,
+            desc="s19 attributed set")
+        send_at = time.time() * 1000 + 25000
+        eid = write_schedule(e, lpr, room, marker, send_at)
+        wait_until(lambda: sched_rows(e["db_path"]).get(eid), timeout=45, desc="s19 armed")
+    finally:
+        stop_uplink(proc)                      # DOWN across send_at
+    sent_while_down = [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                       if (m.get("content") or {}).get("body") == marker]
+    time.sleep(max(0.0, (send_at - time.time() * 1000) / 1000.0) + 2)
+    proc = start_uplink(e)
+    try:
+        sent = wait_until(
+            lambda: [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                     if (m.get("content") or {}).get("body") == marker] or None,
+            timeout=60, desc="s19 scheduled message fires after restart")
+        time.sleep(8)                          # several more loop cycles
+        again = [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                 if (m.get("content") or {}).get("body") == marker]
+        outs = schedule_outcomes(e, lpr, eid)
+        row = sched_rows(e["db_path"]).get(eid)
+    finally:
+        stop_uplink(proc)
+    provenance = (sent[0].get("content") or {}).get("com.jkali.from_schedule") if sent else None
+    ok = (not sent_while_down and len(again) == 1 and len(outs) == 1
+          and outs[0].get("state") == "sent" and bool(outs[0].get("sent_event_id"))
+          and "body" not in outs[0] and provenance == eid and row and row[0] == "sent")
+    return ok, ("no_send_while_daemon_down=%s sent_count=%d(want 1) outcome_records=%d(want 1) "
+                "outcome_state=%r provenance=%s row=%r"
+                % (not sent_while_down, len(again), len(outs),
+                   outs[0].get("state") if outs else None, provenance == eid, row))
+
+
+def scenario_20_schedule_held_when_conversation_moves_on():
+    """S-8: any message in the target after the schedule was written HOLDS it —
+    visibly, with a reason — instead of double-texting."""
+    e = fresh_env("s20")
+    space = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, space, "Moved On")
+    post_msg(e["contact_tok"], room, "s20 seed")
+    marker = "HELD-" + uniq("s20")
+    proc, lpr = proposals_room_ready(e)
+    try:
+        wait_until(lambda: sqlite3.connect(e["db_path"]).execute(
+            "SELECT count(*) FROM attributed_rooms").fetchone()[0], timeout=45,
+            desc="s20 attributed set")
+        send_at = time.time() * 1000 + 20000
+        eid = write_schedule(e, lpr, room, marker, send_at)
+        wait_until(lambda: sched_rows(e["db_path"]).get(eid), timeout=45, desc="s20 armed")
+        post_msg(e["contact_tok"], room, "s20 they replied first")
+        outs = wait_until(lambda: schedule_outcomes(e, lpr, eid) or None,
+                          timeout=60, desc="s20 held record")
+        time.sleep(6)
+        sent = [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                if (m.get("content") or {}).get("body") == marker]
+        outs = schedule_outcomes(e, lpr, eid)
+    finally:
+        stop_uplink(proc)
+    ok = (not sent and len(outs) == 1 and outs[0].get("state") == "held"
+          and outs[0].get("reason") == "superseded")
+    return ok, ("nothing_sent=%s outcome_records=%d(want 1) state=%r reason=%r"
+                % (not sent, len(outs), outs[0].get("state") if outs else None,
+                   outs[0].get("reason") if outs else None))
+
+
+def scenario_21_cancel_before_send_at():
+    """A cancel STATE event before send_at stops the send; the daemon's
+    fire-time point-read is what decides, so the record says 'cancelled'."""
+    e = fresh_env("s21")
+    space = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, space, "Cancelled")
+    post_msg(e["contact_tok"], room, "s21 seed")
+    marker = "CANCEL-" + uniq("s21")
+    proc, lpr = proposals_room_ready(e)
+    try:
+        wait_until(lambda: sqlite3.connect(e["db_path"]).execute(
+            "SELECT count(*) FROM attributed_rooms").fetchone()[0], timeout=45,
+            desc="s21 attributed set")
+        send_at = time.time() * 1000 + 20000
+        eid = write_schedule(e, lpr, room, marker, send_at)
+        wait_until(lambda: sched_rows(e["db_path"]).get(eid), timeout=45, desc="s21 armed")
+        cancel_schedule(e, lpr, eid)
+        outs = wait_until(lambda: schedule_outcomes(e, lpr, eid) or None,
+                          timeout=60, desc="s21 cancelled record")
+        time.sleep(max(0.0, (send_at - time.time() * 1000) / 1000.0) + 8)
+        sent = [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                if (m.get("content") or {}).get("body") == marker]
+        outs = schedule_outcomes(e, lpr, eid)
+    finally:
+        stop_uplink(proc)
+    ok = not sent and len(outs) == 1 and outs[0].get("state") == "cancelled"
+    return ok, ("nothing_sent=%s outcome_records=%d(want 1) state=%r"
+                % (not sent, len(outs), outs[0].get("state") if outs else None))
+
+
+def scenario_22_schedule_fires_with_master_unreachable():
+    """The teammate's own scheduled message is LOCAL work. It must fire with the
+    master down — the stage deliberately runs above the connectivity gate."""
+    e = fresh_env("s22")
+    space = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, space, "Offline Master")
+    post_msg(e["contact_tok"], room, "s22 seed")
+    marker = "OFFLINE-" + uniq("s22")
+    proc, lpr = proposals_room_ready(e)
+    try:
+        wait_until(lambda: sqlite3.connect(e["db_path"]).execute(
+            "SELECT count(*) FROM attributed_rooms").fetchone()[0], timeout=45,
+            desc="s22 attributed set")
+        docker(["stop", SANDBOX["master_container"]])
+        try:
+            send_at = time.time() * 1000 + 15000
+            eid = write_schedule(e, lpr, room, marker, send_at)
+            sent = wait_until(
+                lambda: [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                         if (m.get("content") or {}).get("body") == marker] or None,
+                timeout=90, desc="s22 scheduled message fires with master down")
+            outs = schedule_outcomes(e, lpr, eid)
+        finally:
+            docker(["start", SANDBOX["master_container"]], check=False)
+            wait_master_health()
+    finally:
+        stop_uplink(proc)
+    ok = len(sent) == 1 and len(outs) == 1 and outs[0].get("state") == "sent"
+    return ok, ("sent_with_master_down=%d(want 1) outcome_state=%r"
+                % (len(sent), outs[0].get("state") if outs else None))
+
+
+def scenario_23_manager_timed_direct_superseded():
+    """A manager-TIMED proposal for a `direct` room re-runs all twelve D2 gates
+    at send_at. A message that arrives in between supersedes it, so the teammate
+    gets the ORDINARY draft and nothing is sent — never a hold affordance for
+    the manager."""
+    e = fresh_env("s23")
+    space = create_space(e["tuser_tok"], "iMessage")
+    room = make_convo(e, space, "Timed Direct")
+    post_msg(e["contact_tok"], room, "s23 seed")
+    set_override(e["tuser_tok"], e["tuser_id"], room, "direct")
+    proc, lpr = proposals_room_ready(e)
+    try:
+        wait_until(lambda: mirror_of(e["db_path"], room), timeout=45, desc="s23 mirror")
+        mpr = wait_until(lambda: meta_get(e["db_path"], "master_proposals_room"),
+                         timeout=45, desc="s23 master proposals room")
+        master(MASTER_MANAGER_TOKEN, "POST", "/_matrix/client/v3/rooms/"
+               + urllib.parse.quote(mpr, safe="") + "/join", {})
+        # The first pull is always a cold start (D2.3), so prime it with an
+        # ordinary proposal before the timed one — exactly as scenario 14 does.
+        primer = "S23PRIMER-" + uniq("p")
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/"
+               + urllib.parse.quote(mpr, safe="") + "/send/com.jkali.proposal/" + uniq("prop"),
+               {"target_room": room, "body": primer, "created_by": MASTER_MANAGER_USER,
+                "origin_ts": int(time.time() * 1000)})
+        wait_until(lambda: [x for x in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                            if (x.get("content") or {}).get("body") == primer] or None,
+                   timeout=45, desc="s23 cold-start primer")
+        marker = "TIMED-" + uniq("t")
+        send_at = int(time.time() * 1000 + 25000)
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/"
+               + urllib.parse.quote(mpr, safe="") + "/send/com.jkali.proposal/" + uniq("prop"),
+               {"target_room": room, "body": marker, "created_by": MASTER_MANAGER_USER,
+                "origin_ts": int(time.time() * 1000), "send_at": send_at})
+        armed = wait_until(lambda: [k for k, v in sched_rows(e["db_path"]).items()
+                                    if v[2] == "manager"] or None,
+                           timeout=45, desc="s23 manager-timed row armed")
+        parked = [x for x in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                  if (x.get("content") or {}).get("body") == marker]
+        # The conversation moves on BEFORE send_at.
+        post_msg(e["contact_tok"], room, "s23 they answered first")
+        time.sleep(max(0.0, (send_at - time.time() * 1000) / 1000.0) + 12)
+        recs = [x for x in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                if (x.get("content") or {}).get("body") == marker]
+        sent = [m for m in local_events_of_type(e["tuser_tok"], room, "m.room.message")
+                if (m.get("content") or {}).get("body") == marker]
+        row = sched_rows(e["db_path"]).get(armed[0])
+    finally:
+        stop_uplink(proc)
+    content = (recs[0].get("content") or {}) if recs else {}
+    ordinary = (bool(recs) and not content.get("com.jkali.auto_sent")
+                and not content.get("com.jkali.send_ambiguous"))
+    ok = (not parked and len(recs) == 1 and ordinary and not sent
+          and row and row[0] == "refused" and row[1] == "superseded")
+    return ok, ("parked_without_artifact=%s inbox_records=%d(want 1) ordinary_draft=%s "
+                "nothing_sent=%s row=%r"
+                % (not parked, len(recs), ordinary, not sent, row))
+
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2242,6 +2487,11 @@ SCENARIOS = [
     ("16_original_timestamps", scenario_16_original_timestamps),
     ("17_discord_dms", scenario_17_discord_dms),
     ("18_daemon_joins_invite_no_mirror", scenario_18_daemon_joins_invite_no_mirror),
+    ("19_schedule_fires_once_across_restart", scenario_19_schedule_fires_once_across_restart),
+    ("20_schedule_held_when_conversation_moves_on", scenario_20_schedule_held_when_conversation_moves_on),
+    ("21_cancel_before_send_at", scenario_21_cancel_before_send_at),
+    ("22_schedule_fires_with_master_unreachable", scenario_22_schedule_fires_with_master_unreachable),
+    ("23_manager_timed_direct_superseded", scenario_23_manager_timed_direct_superseded),
 ]
 
 

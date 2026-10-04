@@ -126,3 +126,18 @@ writes the app performs; 572 rooms attributed, spaces excluded; Google Messages
 accounts were not touched; the owner deploys to them separately. The
 unattended invite stage stays inert on this machine until the teammate app
 is reloaded once (server-side ack 404 at the time of writing).
+
+## Schedule send (F7) — shipped and live-tested (2026-10-03, 23:21)
+
+Implemented per spec §7 (separate scheduled gate and dispatcher, cancel as
+a state event, hold-not-drop, arming from the existing local sync, stage
+above the master-connectivity gate, manager-timed Direct re-running all
+twelve gates). Independent verifier confirmed all ten claims; five new
+two-homeserver integration scenarios pass (fires once across a daemon
+restart; held when the thread moves on; cancel; fires with the master
+unreachable; manager-timed superseded ⇒ ordinary draft).
+
+Live test on the owner's self-chat: a message scheduled 75 s out was armed
+within 2 s, fired by the uplink 3 s after its time, delivered by the
+iMessage daemon (its 8th confirmed send), mirrored to the master as sent,
+and recorded as a body-free `sent` outcome. Nothing was sent twice.

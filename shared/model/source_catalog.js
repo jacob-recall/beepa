@@ -59,6 +59,19 @@ export const SOURCES = Object.freeze([
     "blurb": "Bridge your LinkedIn messages: sign into linkedin.com, then run the connect helper — it links automatically; chats appear as rooms in Element."
   },
   {
+    "id": "discord",
+    "label": "Discord",
+    "kind": "source",
+    "botMxid": "@discordbot:localhost",
+    "spaceName": "Discord",
+    "childSpaceNames": [
+      "Direct Messages"
+    ],
+    "canStartChat": false,
+    "icon": "🎮",
+    "blurb": "Connect your Discord DMs and group DMs. Server channels are not included."
+  },
+  {
     "id": "twitter",
     "label": "X",
     "kind": "source",

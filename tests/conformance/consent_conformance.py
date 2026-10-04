@@ -73,7 +73,7 @@ SCALARS = [None, True, False, 0, 1, -1, 5, 9007199254740991, "5"]
 # "imessage\n" / "!a:local\n": Python's `$` matches before a trailing newline,
 # JS's does not — these canaries prove both sides use end-of-STRING anchoring.
 SOURCE_IDS = ["imessage", "whatsapp", "gmessages", "linkedin", "twitter",
-              "instagram", "5", "0", "1", "", "constructor", "__proto__", "toString",
+              "instagram", "discord", "5", "0", "1", "", "constructor", "__proto__", "toString",
               "imessage\n"]
 ROOM_IDS = ["!a:local", "!b:local", "!c:local", "", "constructor", "__proto__", "5",
             "!a:local\n"]

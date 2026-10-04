@@ -123,6 +123,21 @@ services:
     profiles: ["bridge"]
     # No host ports: appservice listens on the compose network only (29336).
 
+  mautrix-discord:
+    image: dock.mau.dev/mautrix/discord:v0.7.7@sha256:065405ca2f961b2687ca577c4eb65592c139d641342a9611d98b5394f30cf84a
+    restart: unless-stopped
+    environment:
+      UID: "${HOST_UID:-501}"
+      GID: "${HOST_GID:-20}"
+    volumes:
+      - ./discord:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+    profiles: ["bridge"]
+
   # (the legacy `hub` service on :8010 was retired 2026-08-28 — apps/user on
   #  the views server below is the daily driver; see docs/SIMPLIFICATION-PLAN.md P1)
 

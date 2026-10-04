@@ -16,6 +16,7 @@ sf = uplink.Uplink.sources_from_sync
 
 def space(name, child):
     return {"state": {"events": [
+        {"type": "m.room.create", "content": {"type": "m.space"}},
         {"type": "m.room.name", "content": {"name": name}},
         {"type": "m.space.child", "state_key": child, "content": {"via": ["x"]}}]}}
 def conv():
@@ -39,6 +40,16 @@ if got != expected:
     fails.append("source map %r != expected %r" % (got, expected))
 if "!c5:localhost" in got:
     fails.append("over-match: non-source space 'Zero2One @ UIUC' assigned a source")
+
+discord_sync = {'rooms': {'join': {
+    '!discord:localhost': space('Discord', '!dms:localhost'),
+    '!dms:localhost': space('Direct Messages', '!dm:localhost'),
+    '!dm:localhost': {'state': {'events': [{'type': 'm.room.name', 'content': {'name': 'Discord DM'}}]}},
+}}}
+assert sf(discord_sync)['!dm:localhost'] == 'discord'
+discord_sync['rooms']['join']['!dms:localhost']['timeline'] = {'events': [
+    {'type': 'm.space.child', 'state_key': '!dm:localhost', 'content': {}}]}
+assert '!dm:localhost' not in sf(discord_sync)
 
 if fails:
     for f in fails:

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from install_config import AGENTS, MANIFEST, atomic_write, ensure_manifest, ensure_runtime, install_agent, read_manifest, read_env, save_manifest
 
 STATE_PATHS = (
-    '.env', MANIFEST, 'synapse', 'whatsapp', 'meta', 'gmessages', 'linkedin', 'twitter',
+    '.env', MANIFEST, 'synapse', 'whatsapp', 'meta', 'gmessages', 'linkedin', 'twitter', 'discord',
     'element/config.json', 'hub/.local-user.local', '.beepa-config',
     'master/.env', 'master/.beepa-config', 'master/synapse', 'master/tokens.local', 'master/.provision-state.local',
     'master/enrollments.local', 'master/identity', 'master/recovery', 'master/recovery.local.json',
@@ -59,7 +59,11 @@ def inventory(root):
     for relative in SECRET_PATHS:
         path = runtime_path(root, relative)
         if path.is_file():
-            result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            if relative == 'synapse/.hub-secrets.local':
+                for name, value in read_env(path).items():
+                    result[relative + ':' + name] = hashlib.sha256(value.encode()).hexdigest()
+            else:
+                result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     data = read_manifest(root)
     if data:
         cli = Path(data['imessage_cli_path'])
@@ -106,7 +110,7 @@ class Journal:
 
 def changed_config_services(paths):
     mapping = {'whatsapp': 'mautrix-whatsapp', 'meta': 'mautrix-meta', 'gmessages': 'mautrix-gmessages',
-               'linkedin': 'mautrix-linkedin', 'twitter': 'mautrix-twitter', 'synapse': 'synapse'}
+               'linkedin': 'mautrix-linkedin', 'twitter': 'mautrix-twitter', 'discord': 'mautrix-discord', 'synapse': 'synapse'}
     return sorted({mapping[p.split('/')[0]] for p in paths if p.split('/')[0] in mapping})
 
 
@@ -125,7 +129,11 @@ def views_overlay(root, release):
                                         {'type': 'bind', 'source': str(release / 'element/nginx-default.conf.template'), 'target': '/etc/nginx/templates/default.conf.template', 'read_only': True}]}}
     for service, relative in [('synapse', 'synapse'), ('mautrix-whatsapp', 'whatsapp'),
                               ('mautrix-meta', 'meta'), ('mautrix-gmessages', 'gmessages'),
-                              ('mautrix-linkedin', 'linkedin'), ('mautrix-twitter', 'twitter')]:
+                              ('mautrix-linkedin', 'linkedin'), ('mautrix-twitter', 'twitter'),
+                              ('mautrix-discord', 'discord')]:
+        if service == 'mautrix-discord' and (not (release / 'docker-compose.yml').is_file()
+                or 'mautrix-discord:' not in (release / 'docker-compose.yml').read_text()):
+            continue
         services[service] = {'volumes': [{'type': 'bind', 'source': str((root / relative).resolve()), 'target': '/data'}]}
     return {'services': services}
 
@@ -310,11 +318,19 @@ class Updater:
         # SQLite migrations belong to each daemon, are idempotent and run only
         # when it next starts. Native executable and provisioning are untouched.
         for role, cmd in compositions:
-            services = journal.data['running'].get(role, [])
+            services = list(journal.data['running'].get(role, []))
+            if (role == 'teammate' and any(service.startswith('mautrix-') for service in services)
+                    and (release / 'postgres-init/02-discord.sql').is_file()):
+                self.command(cmd + ['up', '-d', '--wait', 'postgres'])
+                self.command(cmd + ['exec', '-T', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1',
+                                    '-U', 'matrix', '-d', 'synapse', '-f',
+                                    '/docker-entrypoint-initdb.d/02-discord.sql'])
+                if 'mautrix-discord' not in services:
+                    services.append('mautrix-discord')
             if services:
                 self.command(cmd + ['up', '-d'] + services)
                 if role == 'teammate':
-                    rendered = self.root / '.beepa-config/last-render.json'
+                    rendered = state / '.beepa-config/last-render.json'
                     changes = json.loads(rendered.read_text()).get('changed', []) if rendered.exists() else []
                     restart = [s for s in changed_config_services(changes) if s in services]
                     if restart:

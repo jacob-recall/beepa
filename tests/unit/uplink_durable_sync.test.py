@@ -140,7 +140,8 @@ class DurableSyncTests(unittest.TestCase):
         def edge(target):
             return {'type': 'm.space.child', 'state_key': target, 'content': {'via': ['local']}}
         data = {'rooms': {'join': {
-            '!root:local': room([{'type': 'm.room.name', 'content': {'name': 'WhatsApp'}}, edge('!community:local')]),
+            '!root:local': room([{'type': 'm.room.create', 'content': {'type': 'm.space'}},
+                                 {'type': 'm.room.name', 'content': {'name': 'WhatsApp'}}, edge('!community:local')]),
             '!community:local': room([edge(ROOM), edge('!root:local')]),
             ROOM: room([]),
         }}}

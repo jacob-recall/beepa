@@ -46,7 +46,7 @@ no terminal**:
 | Helper | Port | Covers |
 |---|---|---|
 | `gmessages-connect` | 8020 | Google Messages |
-| `session-connect` | 8021 | Instagram, LinkedIn, X |
+| `session-connect` | 8021 | Instagram, LinkedIn, X, Discord |
 
 Open the app and use the Connect buttons:
 
@@ -54,7 +54,13 @@ Open the app and use the Connect buttons:
 http://127.0.0.1:8011/apps/user/index.html
 ```
 
-**WhatsApp is the one exception** — it's QR-based, not one-click: send
+**Discord** — open Connections → Discord → Connect (scan QR), then scan and
+approve with the Discord mobile app. DMs and group DMs are supported; server
+channels and starting new DMs are outside this release. The card includes a
+local token fallback for QR/CAPTCHA failures. See [Discord support](docs/DISCORD.md)
+for limits and the live acceptance procedure.
+
+**WhatsApp** — it's QR-based: send
 `login qr` to `@whatsappbot:localhost` (or use the app's Connections card),
 then on your phone: WhatsApp → Settings → Linked devices → Link a device →
 scan.

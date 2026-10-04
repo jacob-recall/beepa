@@ -116,6 +116,8 @@ http://127.0.0.1:8011/apps/user/index.html
 
 Then, using the **Connect** buttons in the app (no terminal):
 - **WhatsApp** — scan the QR with your phone.
+- **Discord** — scan and approve with the Discord mobile app; DMs and group
+  DMs only. See [Discord support](DISCORD.md) for token fallback and limits.
 - **Instagram / LinkedIn / X** — one click each; sign in on the tab that opens.
 - **Google Messages** — one click, then tap the matching emoji on your phone.
 

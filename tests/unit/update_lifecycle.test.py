@@ -19,6 +19,28 @@ spec.loader.exec_module(m)
 
 
 class UpdateTests(unittest.TestCase):
+    def test_adding_bridge_secrets_preserves_existing_fingerprints(self):
+        (self.root / 'synapse').mkdir()
+        path = self.root / 'synapse/.hub-secrets.local'
+        path.write_text("AS_TOKEN_WHATSAPP='synthetic-existing'\n")
+        before = m.inventory(self.root)
+        path.write_text(path.read_text() + "AS_TOKEN_DISCORD='synthetic-new'\n")
+        after = m.inventory(self.root)
+        self.assertTrue(all(after.get(key) == value for key, value in before.items()))
+        path.write_text("AS_TOKEN_WHATSAPP='rotated'\nAS_TOKEN_DISCORD='synthetic-new'\n")
+        changed = m.inventory(self.root)
+        self.assertTrue(any(changed.get(key) != value for key, value in before.items()))
+
+    def test_discord_runtime_survives_updates_without_breaking_old_release_overlay(self):
+        release = self.root / 'release'
+        release.mkdir()
+        (release / 'docker-compose.yml').write_text('services:\n  mautrix-discord:\n    image: pinned\n')
+        overlay = m.views_overlay(self.root, release)
+        self.assertEqual(overlay['services']['mautrix-discord']['volumes'][0]['source'], str((self.root / 'discord').resolve()))
+        self.assertIn('discord', m.STATE_PATHS)
+        (release / 'docker-compose.yml').write_text('services: {}\n')
+        self.assertNotIn('mautrix-discord', m.views_overlay(self.root, release)['services'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

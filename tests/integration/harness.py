@@ -2122,6 +2122,57 @@ def scenario_16_original_timestamps():
         % (unchanged, state_ok, again))
 
 
+def scenario_17_discord_dms():
+    environment = fresh_env('discord')
+    token = environment['tuser_tok']
+    identity = environment['tuser_id']
+    root = create_space(token, 'Discord')
+    dms = create_space(token, 'Direct Messages')
+    link_child(token, root, dms)
+    direct = make_convo(environment, dms, 'Discord DM')
+    group = make_convo(environment, dms, 'Discord group DM')
+    third, third_token = register_user(uniq('third'))
+    local(token, 'POST', '/_matrix/client/v3/rooms/' + group + '/invite', {'user_id': third})
+    join_room(third_token, group)
+    post_msg(environment['contact_tok'], direct, 'Discord incoming')
+    own_event = post_msg(token, direct, 'Discord outgoing')
+    original = local(token, 'GET', '/_matrix/client/v3/rooms/' + direct + '/event/' + own_event)
+    post_msg(third_token, group, 'Private group history')
+    set_override(token, identity, direct, 'share')
+    process = start_uplink(environment)
+    try:
+        direct_mirror = wait_until(lambda: mirror_of(environment['db_path'], direct), desc='nested Discord DM')[0]
+        messages = wait_until(lambda: (lambda result: result if len(result) == 2 else None)(master_messages(direct_mirror)), desc='Discord messages')
+        assert mirror_of(environment['db_path'], group) is None, 'Group inherited sharing'
+        assert master_source_tag(direct_mirror) == 'discord'
+        outgoing = next(message for message in messages if message['body'] == 'Discord outgoing')
+        incoming = next(message for message in messages if message['body'] == 'Discord incoming')
+        assert outgoing['from_me'] is True and not incoming['from_me']
+        assert outgoing['origin_ts'] == original['origin_server_ts']
+        set_override(token, identity, group, 'share')
+        group_mirror = wait_until(lambda: mirror_of(environment['db_path'], group), desc='Discord group share')[0]
+        wait_until(lambda: master_messages(group_mirror), desc='Discord group history')
+        media = upload_media(TEST_HS, environment['contact_tok'], TINY_PNG, 'image/png', 'discord.png')
+        post_media_event(environment['contact_tok'], group, {'msgtype': 'm.image', 'body': 'discord.png', 'url': media,
+            'info': {'mimetype': 'image/png', 'size': len(TINY_PNG)}})
+        mirrored = wait_until(lambda: next((message for message in master_messages(group_mirror) if message['msgtype'] == 'm.image'), None), desc='Discord media')
+        assert download_media(MASTER_HS, MASTER_ALICE_TOKEN, mirrored['url']) == TINY_PNG
+    finally:
+        stop_uplink(process)
+    post_msg(environment['contact_tok'], direct, 'Offline Discord message')
+    process = start_uplink(environment)
+    try:
+        wait_until(lambda: len(master_messages(direct_mirror)) == 3, desc='Discord restart catch-up')
+        assert len(master_messages(group_mirror)) == 2
+        set_override(token, identity, group, 'private')
+        wait_until(lambda: mirror_of(environment['db_path'], group) is None, desc='Discord group revoke')
+        post_msg(third_token, group, 'Revoked group message')
+        assert mirror_of(environment['db_path'], direct) is not None
+    finally:
+        stop_uplink(process)
+    return True, 'Nested DM/group DM consent, authorship, timestamps, media reupload, restart catch-up without duplicates and revocation verified with synthetic Matrix events.'
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2139,6 +2190,7 @@ SCENARIOS = [
     ("14_direct_proposal_autosend", scenario_14_direct_proposal_autosend),
     ("15_revocation_retains_history", scenario_15_revocation_retains_history),
     ("16_original_timestamps", scenario_16_original_timestamps),
+    ("17_discord_dms", scenario_17_discord_dms),
 ]
 
 

@@ -14,6 +14,23 @@ spec.loader.exec_module(m)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_discord_registration_is_added_to_legacy_config_without_replacing_operator_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            (stage / 'synapse').mkdir(parents=True)
+            (root / 'synapse').mkdir()
+            original = 'server_name: localhost\napp_service_config_files:\n  - /data/registration.yaml\ncustom: preserved\n'
+            (root / 'synapse/homeserver.yaml').write_text(original)
+            (stage / 'synapse/homeserver.yaml').write_text(original.replace('preserved', 'default'))
+            (stage / 'synapse/discord-registration.yaml').write_text('id: discord\n')
+            m.activate(root, stage)
+            m.activate(root, stage)
+            result = (root / 'synapse/homeserver.yaml').read_text()
+            self.assertEqual(result.count('/data/discord-registration.yaml'), 1)
+            self.assertIn('custom: preserved', result)
+            self.assertIn('/data/registration.yaml', result)
+
     def test_operator_change_survives_upstream_disjoint_change(self):
         self.assertEqual(m.merge('history: 500\nport: 10\n', 'history: 9000\nport: 10\n',
                                  'history: 500\nport: 20\n'), 'history: 9000\nport: 20\n')

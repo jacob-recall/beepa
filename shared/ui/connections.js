@@ -4,6 +4,7 @@
 import { $, el, sanitize, sanitizeLine } from './el.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
 import { S, runtime } from '../state.js';
+import { discordCard } from './discord.js';
 
 // ---- console ----
 function logConsole(who, text, srcId) {
@@ -521,6 +522,7 @@ function buildConnections() {
   const holder = $('bridge-cards');
   if (!holder) return;
   holder.replaceChildren();
+  holder.appendChild(discordCard(sessionConnectBase, confirmModal));
 
   // WhatsApp card
   const wa = el('div', 'bridge-card settings-bridge');

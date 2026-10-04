@@ -22,7 +22,7 @@ const TW = SOURCES.find(s => s.id === 'twitter');
 const IMSG_BOT_MXID = IMSG.botMxid;                // '@imessagebot:localhost'
 
 // Future sources: inert placeholders in the Connections view until deployed.
-const PLANNED_SOURCES = ['Telegram', 'Signal', 'Discord', 'Slack'];
+const PLANNED_SOURCES = ['Telegram', 'Signal', 'Slack'];
 
 // ---- WhatsApp command surface (portal-scoped commands excluded) ----
 const COMMAND_GROUPS = [
@@ -159,6 +159,7 @@ const TW_COMMAND_GROUPS = [
   ]},
 ];
 function groupsFor(sourceId) {
+  if (sourceId === 'discord') return [];
   if (sourceId === 'imessage') return IMSG_COMMAND_GROUPS;
   if (sourceId === 'gmessages') return GMSG_COMMAND_GROUPS;
   if (sourceId === 'instagram') return IG_COMMAND_GROUPS;

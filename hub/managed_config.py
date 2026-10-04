@@ -8,6 +8,7 @@ Persistent whole-file overrides may be supplied under .beepa-config/overrides/.
 import argparse
 import difflib
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -17,6 +18,19 @@ from install_config import atomic_write
 
 class ConfigConflict(ValueError):
     pass
+
+
+def discord_registration(text):
+    registration = '/data/discord-registration.yaml'
+    match = re.search(r'^app_service_config_files:[ \t]*(?:#.*)?$', text, re.MULTILINE)
+    if not match:
+        raise ConfigConflict('Discord requires a block app_service_config_files list in synapse/homeserver.yaml')
+    tail = text[match.end():]
+    end = re.search(r'^\S', tail.lstrip('\n'), re.MULTILINE)
+    block = tail.lstrip('\n')[:end.start()] if end else tail
+    if re.search(r'^\s*-\s*[\"\x27]?' + re.escape(registration) + r'[\"\x27]?[ \t]*(?:#.*)?$', block, re.MULTILINE):
+        return text
+    return text[:match.end()] + '\n  - ' + registration + text[match.end():]
 
 
 def merge(base, local, incoming):
@@ -76,6 +90,8 @@ def activate(root, stage):
                 conflicts.append(str(relative))
                 atomic_write(meta / 'conflicts' / (str(relative) + '.incoming'), incoming)
                 continue
+        if str(relative) == 'synapse/homeserver.yaml' and (stage / 'synapse/discord-registration.yaml').is_file():
+            merged = discord_registration(merged)
         plans.append((dest, prior, override, incoming, merged))
     if conflicts:
         raise ConfigConflict('Configuration conflicts: %s. Review .beepa-config/conflicts; effective files unchanged.' % ', '.join(conflicts))

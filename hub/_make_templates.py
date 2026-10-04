@@ -18,6 +18,7 @@ REGS = {
     "LINKEDIN":  "synapse/linkedin-registration.yaml",
     "META":      "synapse/meta-registration.yaml",
     "TWITTER":   "synapse/twitter-registration.yaml",
+    "DISCORD":   "synapse/discord-registration.yaml",
 }
 # bridge key -> its config.yaml (imessage has no mautrix config; it uses daemon.json)
 CONFIGS = {
@@ -26,6 +27,7 @@ CONFIGS = {
     "LINKEDIN":  "linkedin/config.yaml",
     "META":      "meta/config.yaml",
     "TWITTER":   "twitter/config.yaml",
+    "DISCORD":   "discord/config.yaml",
 }
 # Each containerized bridge ALSO reads its OWN registration.yaml from its data
 # dir (same tokens as the synapse/ copy Synapse loads). If it's absent on a
@@ -38,6 +40,7 @@ BRIDGE_REGS = {
     "LINKEDIN":  "linkedin/registration.yaml",
     "META":      "meta/registration.yaml",
     "TWITTER":   "twitter/registration.yaml",
+    "DISCORD":   "discord/registration.yaml",
 }
 
 def read(rel):
@@ -73,6 +76,9 @@ for key, rel in REGS.items():
 
 for key, rel in CONFIGS.items():
     t = read(rel)
+    if key == "DISCORD":
+        add(f"PROV_{key}", first(r'^        shared_secret:\s*(\S+)', t, rel))
+        continue
     # anchored to the real (uncommented, 4-space-indented) keys
     add(f"PROV_{key}",   first(r'^    shared_secret:\s*(\S+)', t, rel))
     add(f"PICKLE_{key}", first(r'^    pickle_key:\s*(\S+)',    t, rel))
@@ -93,6 +99,7 @@ MXID_FILES = {
     "meta/config.yaml", "twitter/config.yaml", "gmessages/config.yaml",
     "linkedin/config.yaml", "whatsapp/config.yaml",
     "gmessages/registration.yaml", "synapse/gmessages-registration.yaml",
+    "discord/config.yaml", "discord/registration.yaml", "synapse/discord-registration.yaml",
 }
 
 def templatize(rel):

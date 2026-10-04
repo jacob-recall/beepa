@@ -148,7 +148,7 @@ def main():
         env = sandbox.prepare()
         args = sys.argv[1:]
         targets = {"--enrollment": "test_enroll.py", "--roster": "test_roster.py", "--recovery": "test_recovery.py",
-                   "--lifecycle": "test_lifecycle.py"}
+                   "--lifecycle": "test_lifecycle.py", "--discord": "test_discord.py"}
         target = targets.get(args[0] if args else "", "harness.py")
         if target != "harness.py":
             args = args[1:]

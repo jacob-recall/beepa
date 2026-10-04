@@ -30,7 +30,7 @@ AGENTS = {
     'master-gateway': ('master/gateway.py', 'master/logs/gateway', None),
 }
 RUNTIME_DIRS = (
-    'synapse', 'whatsapp', 'meta', 'gmessages', 'linkedin', 'twitter',
+    'synapse', 'whatsapp', 'meta', 'gmessages', 'linkedin', 'twitter', 'discord',
     '.beepa-update', '.beepa-config', '.beepa-venvs', 'master/synapse',
     'master/runtime', 'master/.beepa-config', 'imessage/bin', 'imessage/tmp',
 )

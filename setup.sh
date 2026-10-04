@@ -123,6 +123,8 @@ fi
 # --- 1. bring up the local stack (idempotent) ---
 if command -v docker >/dev/null 2>&1; then
   log "starting the local hub (docker compose: bridge + client)…"
+  python3 "${HERE}/install_config.py" --root "${HERE}" compose -- up -d --wait postgres
+  python3 "${HERE}/install_config.py" --root "${HERE}" compose -- exec -T postgres psql -v ON_ERROR_STOP=1 -U matrix -d synapse -f /docker-entrypoint-initdb.d/02-discord.sql
   python3 "${HERE}/install_config.py" --root "${HERE}" compose -- up -d
   # Bind-mounted YAML changes are not a Compose service-definition change.
   # Explicitly restart only services whose effective configuration changed.

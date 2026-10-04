@@ -110,7 +110,8 @@ check("restamp: deterministic order",
 def make_sync(levels):
     """A /sync snapshot: one iMessage source space whose children carry the
     given per-room share_override levels."""
-    events = [{"type": "m.room.name", "content": {"name": "iMessage"}}]
+    events = [{"type": "m.room.name", "content": {"name": "iMessage"}},
+              {"type": "m.room.create", "content": {"type": "m.space"}}]
     for rid in levels:
         events.append({"type": "m.space.child", "state_key": rid,
                        "content": {"via": ["localhost"]}})

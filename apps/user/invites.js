@@ -150,7 +150,7 @@ function bridgeInvitesToJoin(inviteSection, botMxids, selfMxid, sourceSpaces, op
       // refused — buildConvos() selects a source's space by name prefix alone.
       const match = (typeof name === 'string')
         ? spaces.find(s => s && typeof s.spaceName === 'string' && s.spaceName
-            && name.startsWith(s.spaceName))
+            && (name.startsWith(s.spaceName) || (Array.isArray(s.childSpaceNames) && s.childSpaceNames.includes(name))))
         : undefined;
       if (!match || match.botMxid !== creator) { refusedNonBridge++; continue; }
     }

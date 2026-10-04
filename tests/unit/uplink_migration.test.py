@@ -56,7 +56,8 @@ MODEL_PATH_FRAG = "/account_data/" + consent.CONSENT_MODEL_TYPE
 def make_sync(room_ids, overrides=None):
     """A /sync snapshot: one iMessage source space with `room_ids` as children."""
     overrides = overrides or {}
-    events = [{"type": "m.room.name", "content": {"name": "iMessage"}}]
+    events = [{"type": "m.room.name", "content": {"name": "iMessage"}},
+              {"type": "m.room.create", "content": {"type": "m.space"}}]
     for rid in room_ids:
         events.append({"type": "m.space.child", "state_key": rid,
                        "content": {"via": ["localhost"]}})

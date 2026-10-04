@@ -138,3 +138,11 @@
 /* F7: the manager's optional send-at picker, inline under the suggest bar. */
 #proposal-schedule-pane { display: flex; gap: 8px; align-items: center; padding: 6px 10px; font-size: 12px; }
 #proposal-schedule-pane.hidden { display: none; }
+
+/* Direct-room composer: a send, not a suggestion */
+.proposal-mode { font-size: 11.5px; padding: 6px 16px 0; }
+#proposal-pane.direct #proposal-send { background: var(--color-accent); border-color: var(--color-accent); }
+#proposal-pane:not(.direct) #proposal-send { background: #7c5cd6; border-color: #7c5cd6; }
+#proposal-pane.direct .proposal-mode { color: var(--color-accent-700); }
+body.room-direct #room-messages .ghost.pending, body.room-direct #room-messages .ghost.seen { border-color: var(--color-accent); background: #e7f8f3; }
+body.room-direct #room-messages .ghost-bar, body.room-direct #room-messages .ghosts-cap { color: var(--color-accent-700); }

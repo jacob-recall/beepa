@@ -1486,7 +1486,12 @@ function renderBubble(ev) {
     meta.appendChild(av);
   }
   meta.appendChild(el('span', 'msg-sender', sent ? (MS.openRoomUser || 'Teammate') : senderName));
-  meta.appendChild(el('span', 'msg-role-time', (sent ? 'teammate' : 'other party') + ' · ' + shortTime(ts)));
+  const c0 = ev.content || {};
+  const role = !sent ? 'other party'
+    : (typeof c0['com.jkali.auto_sent_from_proposal'] === 'string') ? 'you, as ' + (MS.openRoomUser ? nameFor(MS.openRoomUser) : 'teammate')
+    : (typeof c0['com.jkali.from_schedule'] === 'string') ? 'scheduled'
+    : 'teammate';
+  meta.appendChild(el('span', 'msg-role-time', role + ' · ' + shortTime(ts)));
   row.appendChild(meta);
 
   let cls = 'msg';
@@ -1688,6 +1693,13 @@ function shareLevelLabel(content) {
   return level === 'direct' ? 'Send' : 'Propose';
 }
 
+// A room whose teammate set the level to DIRECT: what the manager writes here
+// is auto-sent by the teammate's own uplink (behind D2's twelve gates) with
+// no review click, so the bar is presented as what it is — a send as the
+// teammate — rather than a suggestion. The write is still the one
+// com.jkali.proposal event; the send happens on the teammate's machine.
+function isDirectRoom(rec) { return shareLevelLabel(rec && rec.shareLevelContent) === 'Send'; }
+
 function setupProposalComposer(rec) {
   const pane = $('proposal-pane');
   if (!pane) return;
@@ -1695,8 +1707,21 @@ function setupProposalComposer(rec) {
   proposalStatus('');
   const input = $('proposal-input');
   if (input) input.value = '';
+  const who = nameFor((rec && rec.userLabel) || '') || 'the teammate';
+  const direct = isDirectRoom(rec);
+  pane.classList.toggle('direct', direct);
+  document.body.classList.toggle('room-direct', direct);
   const send = $('proposal-send');
-  if (send) send.textContent = shareLevelLabel(rec && rec.shareLevelContent);
+  if (send) send.textContent = direct ? 'Send as ' + who : 'Suggest to ' + who;
+  if (input) input.placeholder = direct ? 'Message as ' + who + '…' : 'Suggest a reply for ' + who + '…';
+  const clock = $('proposal-schedule');
+  if (clock) { clock.title = direct ? 'Send at a time (fires as ' + who + ')' : 'Hand off for a time (' + who + ' confirms)'; clock.setAttribute('aria-label', clock.title); }
+  const mode = $('proposal-mode');
+  if (mode) {
+    mode.textContent = direct
+      ? 'Direct: this goes out as ' + who + ' within seconds, through ' + who + '’s own account, without review. Enter sends; ◴ sends at a time.'
+      : 'Suggest: ' + who + ' sees this as a draft and decides whether to send it. ◴ hands it off for a time.';
+  }
   if (!ctx) { pane.classList.add('hidden'); return; }
   pane.classList.remove('hidden');
 }
@@ -1775,22 +1800,35 @@ function renderSuggestionStack() {
   const props = MS.proposalsByRoom.get(ctx.targetRoom) || [];
   if (!props.length) return;
   const msgs = [...MS.roomEvents.values()].map(ev => ({ type: ev.type, ts: mirrorTs(ev), content: ev.content }));
-  const states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse(); // oldest at top
+  const direct = isDirectRoom(rec);
+  let states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse(); // oldest at top
+  // In a Direct room the sent message itself is in the thread (auto_sent
+  // provenance on the bubble), so a 'sent'/'auto' ghost would be a duplicate.
+  if (direct) states = states.filter(s => s.state !== 'auto' && s.state !== 'sent');
   const who = nameFor(ctx.label || '') || 'teammate';
+  if (!states.length) return;
   const wrap = el('div', 'ghosts');
   const pendingN = states.filter(s => s.state === 'pending' || s.state === 'seen').length;
   const cap = el('div', 'ghosts-cap');
-  cap.appendChild(el('span', '', 'Your suggestions · ' + (pendingN ? pendingN + ' pending' : 'none pending')));
+  cap.appendChild(el('span', '', direct ? 'Sending as ' + who + ' · ' + (pendingN ? pendingN + ' in flight' : 'nothing in flight')
+    : 'Your suggestions · ' + (pendingN ? pendingN + ' pending' : 'none pending')));
   wrap.appendChild(cap);
   for (const s of states.slice(-8)) {
     const g = el('div', 'ghost ' + s.state);
     g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
     const bar = el('div', 'ghost-bar');
-    const label = s.sending ? 'sending…' : { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
-      retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'pending · not seen yet' }[s.state];
+    // Direct rooms: a pending ghost is "in flight" to the teammate's uplink;
+    // one that stays pending past ~2 minutes was refused by a gate (superseded,
+    // cap, suspended…) and is now an ordinary draft for the teammate — say so.
+    const stale = direct && !s.sending && (s.state === 'pending' || s.state === 'seen') && !s.sendAt && (Date.now() - s.ts > 120000);
+    const label = s.sending ? (direct ? 'sending as ' + who + '…' : 'sending…')
+      : stale ? 'not sent automatically — now a draft for ' + who + ' (' + shortTime(s.ts) + ')'
+      : direct && (s.state === 'pending' || s.state === 'seen') ? (s.sendAt ? 'scheduled · sends as ' + who + ' at ' + shortTime(s.sendAt) : 'in flight as ' + who + '…')
+      : { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
+          retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'handed off to ' + who + ' · pending' }[s.state];
     bar.appendChild(el('span', 'ghost-st', label));
-    if (s.sendAt && (s.state === 'pending' || s.state === 'seen')) {
-      bar.appendChild(el('span', 'ghost-st', '· timed for ' + shortTime(s.sendAt)));
+    if (!direct && s.sendAt && (s.state === 'pending' || s.state === 'seen')) {
+      bar.appendChild(el('span', 'ghost-st', '· for ' + shortTime(s.sendAt) + ' (' + who + ' confirms)'));
     }
     if (s.state === 'pending' || s.state === 'seen') {
       const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';

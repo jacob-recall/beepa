@@ -279,3 +279,17 @@ exercises `groupByProfile()`. See `tests/CLAUDE.md`.
   room header's read line adds "mirror lag" from each mirrored message's
   `com.jkali.hops` stamp (`hopLagMs`). Display only; nothing here is trusted
   for any decision.
+- **Direct-room composer (2026-10-03).** When the open mirror's
+  `com.jkali.share_level` is `direct`, the bar reads "Send as <teammate>",
+  the mode line says the message goes out through the teammate's own account
+  without review, and pending ghosts read "in flight"; one still pending after
+  two minutes is labelled "not sent automatically — now a draft for
+  <teammate>" (a D2 gate refused it). `auto`/`sent` ghosts are hidden there
+  because the real bubble is in the thread, captioned "you, as <teammate>"
+  (from `com.jkali.auto_sent_from_proposal`) or "scheduled" (from
+  `com.jkali.from_schedule`). In a share room the bar reads "Suggest to
+  <teammate>" and a timed one is a hand-off the teammate confirms. **The write
+  is unchanged**: still the single `com.jkali.proposal` event into the
+  allowlisted proposals room; the send happens on the teammate's machine
+  behind D2's twelve gates. `isDirectRoom()` is `shareLevelLabel()` and
+  under-promises the same way.

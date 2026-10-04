@@ -29,13 +29,19 @@ import { S } from '../../shared/state.js';
 import {
   localpart, spaceLabelFor, invitesToJoin, acceptedSpaces, verifiedChildIds, ROOM_SHAPE_RE,
 } from './invites.js';
-import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers } from './hidden.js';
+import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers,
+  parseNames, dumpNames, rename, displayName, sharingUsers } from './hidden.js';
 import { masterTransport } from './transport.js';
 import { PLATFORM_ICON, PLATFORM_LABEL } from '../../shared/model/source_catalog.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../../shared/model/message_timestamps.js';
+// shared/model/attention.js is a zero-import leaf (no shared/ui/* import
+// chain) — the one allowed Triage Rail import here. See apps/master/CLAUDE.md.
+import { initials, indicatorsFor, pendingDrafts, clusterFeed } from '../../shared/model/attention.js';
 
 // Per-browser hidden-teammate labels (localStorage). Convenience only.
 const HIDDEN_KEY = 'beepa_hidden_teammates';
+// Per-browser display names for teammate labels (localStorage). Convenience only.
+const NAMES_KEY = 'beepa_teammate_names';
 
 // The MASTER homeserver base (same origin the transport is pointed at below).
 // Authenticated media (Synapse default) cannot be fetched by a bare <img src>
@@ -87,6 +93,7 @@ configureMatrixBase({ csBase: MASTER_BASE, serverName: MASTER_TRANSPORT.serverNa
 // user-hub/bridge concepts that do not apply here) ----
 const MS = {
   rooms: {},           // roomId -> {id, name, isSpace, children, sourceId, lastBody, lastTs, userLabel}
+  since: null,         // /sync next_batch; incremental refresh when set (see syncOnce)
   byUser: new Map(),   // teammate label -> [{id, title, preview, lastTs, sourceId, userLabel}]
   feed: [],            // flattened rows across all teammates, recency-sorted
   proposalsByUser: new Map(),  // teammate label -> their proposals room id (write target)
@@ -107,8 +114,9 @@ const MS = {
   tailRunning: false,
   tailSince: null,
   roomSeen: new Set(), // event IDs shared by history and live sync, reset per open
-  sentProposals: new Set(), // proposal IDs acknowledged by mirrored outgoing events
   roomEvents: new Map(), // recent raw events for reversible native-echo grouping
+  proposalsByRoom: new Map(), // target_room -> that teammate's proposals (roomProposals), filled by loadProposalsIndex()
+  expandedClusters: new Set(), // profile ids expanded in the feed (cluster-caret toggle)
   roomRows: new Map(),
   pollTimer: null,
   // Join backpressure: room ids whose /join returned a hard (non-429 4xx)
@@ -119,6 +127,7 @@ const MS = {
   // sidebar, so a verification failure is visible instead of silent data loss).
   skippedUnverified: { spaces: 0, children: 0 },
   hidden: new Set(),   // teammate labels this browser omits from lists
+  names: new Map(),    // teammate label -> display name this browser shows (convenience)
 };
 
 let roomEpoch = 0;
@@ -134,12 +143,18 @@ setOnUnauthorized(forgetSession);
 // mirror-room-specific state/content fields §8.2 defines instead of bridge
 // concepts (SOURCES/mgmt rooms) that do not exist on the master.
 // ===========================================================================
-async function fetchSnapshot() {
+// INCREMENTAL by default: a full initial sync over ~1000 mirror rooms costs the
+// homeserver ~20s and ~12MB, so it happens once per browser (then is cached in
+// IndexedDB, see snapshotCache*) and every later call passes `since` and gets
+// only the delta. parseSnapshot merges that delta into the existing MS.rooms.
+async function fetchSnapshot(since) {
   const filter = encodeURIComponent(JSON.stringify({
     room: { timeline: { limit: 5, not_types: [CORRECTION_TYPE] }, state: { lazy_load_members: true } },
     presence: { types: [] }, account_data: { types: [] },
   }));
-  return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
+  const q = '/_matrix/client/v3/sync?timeout=0&filter=' + filter
+    + (typeof since === 'string' && since ? '&since=' + encodeURIComponent(since) : '');
+  return await api('GET', q);
 }
 
 // CV-R4-equivalent content whitelist (mirrors shared/ui/render.js's
@@ -209,6 +224,26 @@ async function loadMediaInto(bodyNode, resolved) {
   } catch (e) { /* keep the static label on any error */ }
 }
 
+// Cosmetic sender avatar on a received bubble — fetched the same authenticated
+// way as media (loadMediaInto), bounded cache of object URLs by master mxc.
+const avatarBlobs = new Map();   // master mxc -> object URL (bounded)
+async function loadAvatarInto(node, mxc) {
+  try {
+    let obj = avatarBlobs.get(mxc);
+    if (!obj) {
+      const url = mxcDownloadUrl(mxc);
+      if (!url) return;
+      const res = await fetch(url, { headers: S.token ? { Authorization: 'Bearer ' + S.token } : {} });
+      if (!res.ok) return;
+      obj = URL.createObjectURL(await res.blob());
+      if (avatarBlobs.size > 200) avatarBlobs.clear();
+      avatarBlobs.set(mxc, obj);
+    }
+    const img = el('img', 'avatar-img'); img.src = obj; img.alt = '';
+    node.replaceChildren(img);
+  } catch (e) { /* initials stay */ }
+}
+
 // PLAN §8.2/§11: sort/display by com.jkali.origin_ts (the ORIGINAL message
 // time the uplink stamped), not origin_server_ts — a normal client cannot
 // backdate server timestamps, so historical backfill posted in one burst
@@ -225,94 +260,205 @@ function displayNameForMxid(mxid) {
   return sanitizeLine(localpart(mxid) || (typeof mxid === 'string' ? mxid : ''));
 }
 
-function parseSnapshot(data) {
-  const rooms = {};
-  const join = (data.rooms && data.rooms.join) || {};
-  for (const rid of Object.keys(join)) {
-    const r = join[rid];
-    const info = { id: rid, name: null, isSpace: false, children: [], sourceId: null,
-                   lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
-                   profileId: null, profileDisplayName: null, createSender: null,
-                   isContacts: false, contacts: [], shareLevelContent: null };
-    // State from BOTH the `state` block and `timeline` (a newer space's
-    // create/name/child events can still be in the timeline window).
-    const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
-    const seenChild = new Set();
-    for (const e of stateEvents) {
-      if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
-      if (e.type === 'm.room.create' && e.content && e.content.type === 'm.space') info.isSpace = true;
-      // The create event's SERVER-STAMPED sender is this room's identity: the
-      // account that created it. It is the single source both the auto-join
-      // gate and the render gate bind a teammate label to (./invites.js).
-      // A client cannot forge it, and it is the one identity field Matrix's
-      // stripped invite state also carries — so the same predicate works
-      // before and after joining.
-      if (e.type === 'm.room.create' && e.state_key === '' && info.createSender === null
-          && typeof e.sender === 'string') {
-        info.createSender = e.sender;
-      }
-      // The uplink stamps the teammate's REAL local room id into the mirror
-      // room's create content (creation_content.com.jkali.mirror_of). It is the
-      // target_room a proposal must carry so the teammate knows which of their
-      // own conversations the suggestion is for. Read-only value (server state).
-      if (e.type === 'm.room.create' && e.content && typeof e.content['com.jkali.mirror_of'] === 'string') {
-        info.mirrorOf = e.content['com.jkali.mirror_of'];
-      }
-      // A room marked com.jkali.proposals is this teammate's dedicated proposal
-      // room — the ONLY room this app ever writes into, and only a
-      // com.jkali.proposal event (see submitProposal). Never a mirror room.
-      if (e.type === 'com.jkali.proposals' && e.state_key === '') info.isProposals = true;
-      // A room marked com.jkali.contacts is this teammate's dedicated shared
-      // address-book room — read-only here (never written to). Same discovery
-      // shape as the proposals marker above.
-      if (e.type === CONTACTS_MARKER && e.state_key === '') info.isContacts = true;
-      // Each shared contact handle rides as a com.jkali.contact STATE event
-      // (state_key = sha1(source|network_id)). Collected raw from room state
-      // only (never message content) and sanitized at the render call site.
-      if (e.type === CONTACT_STATE_TYPE && typeof e.state_key === 'string' && e.state_key
-          && e.content && typeof e.content === 'object') {
-        info.contacts.push(e.content);
-      }
-      // §8.2: the uplink tags each mirror room's platform at creation as a
-      // room STATE event (not per-account_data, so it is visible to @manager
-      // — a different account than the room's creator) so the master app can
-      // show the platform badge.
-      if (e.type === 'com.jkali.source' && e.state_key === '' && e.content && typeof e.content.source === 'string') {
-        info.sourceId = e.content.source;
-      }
-      // agents/uplink/uplink.py's create_mirror stamps this state event ONLY
-      // when the mirror is a member of a SHARED contact profile (§Phase 5
-      // contacts-core report): {id, displayName}. Grouping key for "one person,
-      // many platforms" below — never mutated here, read-only room state.
-      if (e.type === 'com.jkali.profile' && e.state_key === '' && e.content
-          && typeof e.content.id === 'string' && e.content.id) {
-        info.profileId = sanitizeLine(e.content.id);
-        info.profileDisplayName = typeof e.content.displayName === 'string'
-          ? sanitizeLine(e.content.displayName) : null;
-      }
-      // D2b (direct-share-level plan): the uplink stamps/re-stamps this state
-      // event on a mirror room with the teammate's per-conversation level
-      // ('share' | 'direct'). Read-only, raw content kept as-is (including any
-      // junk) — shareLevelLabel() below is the sole place that validates it,
-      // so there is exactly one under-promise-only decision point.
-      if (e.type === 'com.jkali.share_level' && e.state_key === '') {
-        info.shareLevelContent = (e.content && typeof e.content === 'object') ? e.content : null;
-      }
-      if (e.type === 'm.space.child' && e.state_key && e.content && Object.keys(e.content).length) {
-        if (!seenChild.has(e.state_key)) { seenChild.add(e.state_key); info.children.push(e.state_key); }
-      }
+function freshRoomInfo(rid) {
+  return { id: rid, name: null, isSpace: false, children: [], childSet: {}, sourceId: null,
+           lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
+           profileId: null, profileDisplayName: null, createSender: null,
+           isContacts: false, contacts: [], contactsByKey: {}, shareLevelContent: null,
+           readState: null, avatarByEvent: null, timestampCorrections: new Map() };
+}
+
+// Apply one /sync room section (full OR incremental delta) onto an info
+// record. Every field is "latest state wins", so the same function serves the
+// initial full sync and every later delta. State comes from BOTH the `state`
+// block and `timeline` (a newer space's create/name/child events can still be
+// in the timeline window; in a delta, all new state rides in the timeline).
+function applyRoom(info, r) {
+  const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
+  for (const e of stateEvents) {
+    if (!e || typeof e.type !== 'string') continue;
+    if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
+    if (e.type === 'm.room.create' && e.content && e.content.type === 'm.space') info.isSpace = true;
+    // The create event's SERVER-STAMPED sender is this room's identity: the
+    // account that created it. It is the single source both the auto-join
+    // gate and the render gate bind a teammate label to (./invites.js).
+    if (e.type === 'm.room.create' && e.state_key === '' && info.createSender === null
+        && typeof e.sender === 'string') {
+      info.createSender = e.sender;
     }
-    info.timestampCorrections = timestampCorrections(stateEvents, info.createSender);
-    const tl = (r.timeline && r.timeline.events) || [];
-    for (const ev of tl) {
-      const resolved = resolveMirrorContent(ev);
-      if (!resolved) continue;
-      const ts = mirrorTs(ev, info.timestampCorrections);
-      if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; }
+    // The uplink stamps the teammate's REAL local room id into the mirror
+    // room's create content (creation_content.com.jkali.mirror_of).
+    if (e.type === 'm.room.create' && e.content && typeof e.content['com.jkali.mirror_of'] === 'string') {
+      info.mirrorOf = e.content['com.jkali.mirror_of'];
     }
-    rooms[rid] = info;
+    // com.jkali.proposals marks the teammate's dedicated proposal room — the
+    // ONLY room this app ever writes into (submitProposal). Never a mirror.
+    if (e.type === 'com.jkali.proposals' && e.state_key === '') info.isProposals = true;
+    // com.jkali.contacts marks the shared address-book room (read-only here).
+    if (e.type === CONTACTS_MARKER && e.state_key === '') info.isContacts = true;
+    // One com.jkali.contact STATE event per shared handle (state_key =
+    // sha1(source|network_id)); latest content per key wins, tombstones included.
+    if (e.type === CONTACT_STATE_TYPE && typeof e.state_key === 'string' && e.state_key
+        && e.content && typeof e.content === 'object') {
+      info.contactsByKey[e.state_key] = e.content;
+    }
+    // §8.2: platform tag, stamped as room STATE so @manager can read it.
+    if (e.type === 'com.jkali.source' && e.state_key === '' && e.content && typeof e.content.source === 'string') {
+      info.sourceId = e.content.source;
+    }
+    // com.jkali.profile: stamped only on members of a SHARED contact profile.
+    if (e.type === 'com.jkali.profile' && e.state_key === '' && e.content
+        && typeof e.content.id === 'string' && e.content.id) {
+      info.profileId = sanitizeLine(e.content.id);
+      info.profileDisplayName = typeof e.content.displayName === 'string'
+        ? sanitizeLine(e.content.displayName) : null;
+    }
+    // D2b: per-conversation level stamp; shareLevelLabel() validates it.
+    if (e.type === 'com.jkali.share_level' && e.state_key === '') {
+      info.shareLevelContent = (e.content && typeof e.content === 'object') ? e.content : null;
+    }
+    // Uplink-owned read state ({teammate_read_ts, remote_read_ts}); read-only.
+    if (e.type === 'com.jkali.read_state' && e.state_key === '' && e.content && typeof e.content === 'object') {
+      info.readState = { teammate_read_ts: Number(e.content.teammate_read_ts) || 0,
+                         remote_read_ts: Number(e.content.remote_read_ts) || 0 };
+    }
+    // m.space.child: non-empty content links, empty content unlinks (revocation).
+    if (e.type === 'm.space.child' && e.state_key) {
+      if (e.content && Object.keys(e.content).length) info.childSet[e.state_key] = true;
+      else delete info.childSet[e.state_key];
+    }
   }
+  info.children = Object.keys(info.childSet);
+  info.contacts = Object.values(info.contactsByKey);
+  const corrections = timestampCorrections(stateEvents, info.createSender);
+  if (corrections.size) {
+    if (!(info.timestampCorrections instanceof Map)) info.timestampCorrections = new Map();
+    for (const [id, ts] of corrections) info.timestampCorrections.set(id, ts);
+  }
+  const tl = (r.timeline && r.timeline.events) || [];
+  for (const ev of tl) {
+    const resolved = resolveMirrorContent(ev);
+    if (!resolved) continue;
+    const ts = mirrorTs(ev, info.timestampCorrections);
+    if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; }
+  }
+  return info;
+}
+
+// Merge one /sync payload into `base` (the previous MS.rooms, or {} for a full
+// sync) and return the new rooms map. Joined rooms are applied, left rooms
+// are dropped. Exported for tests/unit/master_snapshot_merge.test.js.
+function parseSnapshot(data, base) {
+  const rooms = Object.assign({}, base || {});
+  const join = (data && data.rooms && data.rooms.join) || {};
+  for (const rid of Object.keys(join)) {
+    const info = rooms[rid] || freshRoomInfo(rid);
+    rooms[rid] = applyRoom(info, join[rid]);
+  }
+  const left = (data && data.rooms && data.rooms.leave) || {};
+  for (const rid of Object.keys(left)) delete rooms[rid];
   return rooms;
+}
+
+// ---- snapshot cache (IndexedDB): the last sync token + rooms map, so a page
+// refresh resumes with one small incremental sync instead of a ~20s full one.
+// Read-side cache only; dropped whenever the server rejects the token.
+const SNAPSHOT_IDB_NAME = 'beepa-master-snapshot';
+const SNAPSHOT_IDB_STORE = 'kv';
+function openSnapshotDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') { reject(new Error('indexedDB unavailable')); return; }
+    const req = indexedDB.open(SNAPSHOT_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SNAPSHOT_IDB_STORE)) db.createObjectStore(SNAPSHOT_IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function serializeRooms(rooms) {
+  const out = {};
+  for (const [rid, info] of Object.entries(rooms)) {
+    const rec = Object.assign({}, info, {
+      timestampCorrections: info.timestampCorrections instanceof Map ? [...info.timestampCorrections] : [],
+    });
+    delete rec.userLabel;        // re-derived by buildByUser from createSender
+    out[rid] = rec;
+  }
+  return out;
+}
+function deserializeRooms(raw) {
+  const out = {};
+  for (const [rid, info] of Object.entries(raw || {})) {
+    if (!ROOMID_RE.test(rid) || !info || typeof info !== 'object') continue;
+    const rec = Object.assign(freshRoomInfo(rid), info);
+    rec.timestampCorrections = new Map(Array.isArray(info.timestampCorrections) ? info.timestampCorrections : []);
+    rec.childSet = (info.childSet && typeof info.childSet === 'object') ? info.childSet : {};
+    rec.children = Object.keys(rec.childSet);
+    rec.contactsByKey = (info.contactsByKey && typeof info.contactsByKey === 'object') ? info.contactsByKey : {};
+    rec.contacts = Object.values(rec.contactsByKey);
+    delete rec.userLabel;
+    out[rid] = rec;
+  }
+  return out;
+}
+async function snapshotCacheLoad() {
+  try {
+    const db = await openSnapshotDb();
+    const row = await new Promise((resolve, reject) => {
+      const tx = db.transaction(SNAPSHOT_IDB_STORE, 'readonly');
+      const req = tx.objectStore(SNAPSHOT_IDB_STORE).get('snapshot');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    if (!row || typeof row.since !== 'string' || !row.since || row.user !== S.userId) return null;
+    return { since: row.since, rooms: deserializeRooms(row.rooms) };
+  } catch (e) { return null; }
+}
+async function snapshotCacheSave() {
+  if (!MS.since) return;
+  try {
+    const db = await openSnapshotDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(SNAPSHOT_IDB_STORE, 'readwrite');
+      tx.objectStore(SNAPSHOT_IDB_STORE).put({ since: MS.since, user: S.userId, rooms: serializeRooms(MS.rooms), savedAt: Date.now() }, 'snapshot');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch (e) { /* cache only */ }
+}
+async function snapshotCacheClear() {
+  try {
+    const db = await openSnapshotDb();
+    await new Promise((resolve) => {
+      const tx = db.transaction(SNAPSHOT_IDB_STORE, 'readwrite');
+      tx.objectStore(SNAPSHOT_IDB_STORE).delete('snapshot');
+      tx.oncomplete = () => resolve(); tx.onerror = () => resolve();
+    });
+    db.close();
+  } catch (e) { /* cache only */ }
+}
+
+// One sync step: incremental when MS.since is set, else full. A rejected
+// token (4xx) drops the cache and falls back to a full sync once.
+async function syncOnce() {
+  let data;
+  try {
+    data = await fetchSnapshot(MS.since);
+  } catch (e) {
+    const code = e && typeof e.status === 'number' ? e.status : 0;
+    if (MS.since && code >= 400 && code < 500) {
+      MS.since = null; MS.rooms = {};
+      await snapshotCacheClear();
+      data = await fetchSnapshot(null);
+    } else throw e;
+  }
+  MS.rooms = parseSnapshot(data, MS.since ? MS.rooms : {});
+  MS.since = typeof data.next_batch === 'string' ? data.next_batch : MS.since;
+  return data;
 }
 
 // Teammate spaces are named "space:<localpart>" (master/provision.sh) — but the
@@ -407,6 +553,10 @@ function buildByUser(rooms) {
         userLabel: label,
         profileId: r.profileId || null,
         profileDisplayName: r.profileDisplayName || null,
+        mirrorOf: r.mirrorOf || null,
+        unread: (r.readState && r.readState.teammate_read_ts < r.lastTs) ? 1 : 0,
+        readState: r.readState,
+        drafts: [],  // filled in refreshAll once loadProposalsIndex() has run
       });
     }
     byUser.set(label, convos);
@@ -459,9 +609,8 @@ function renderUnverifiedNote() {
 async function joinPendingInvites() {
   let data = null;
   for (let pass = 0; pass < 3; pass++) {
-    data = await fetchSnapshot();
-    const rooms = parseSnapshot(data);
-    const vch = verifiedChildIds(acceptedSpaces(rooms));
+    data = await syncOnce();
+    const vch = verifiedChildIds(acceptedSpaces(MS.rooms));
     const ids = invitesToJoin((data.rooms && data.rooms.invite) || {}, vch, {})
       .filter(id => !MS.joinFailed.has(id) && ROOMID_RE.test(id));
     let joined = 0;
@@ -483,16 +632,27 @@ async function joinPendingInvites() {
 }
 
 async function refreshAll() {
-  const data = await joinPendingInvites();
-  const rooms = parseSnapshot(data);
-  MS.rooms = rooms;
+  await joinPendingInvites();          // advances MS.since / MS.rooms via syncOnce
+  const rooms = MS.rooms;
   MS.byUser = buildByUser(rooms);
+  snapshotCacheSave().catch(() => {});  // sets MS.proposalsByUser/proposalsRoomSet as a side effect
+  // Load every teammate's proposals once per refresh, BEFORE building rows, so
+  // a pending draft can show on the right row (Triage Rail parity with the
+  // teammate app's rows.js, which reads the same pendingDrafts(c.drafts, ...)).
+  await loadProposalsIndex();
+  for (const convos of MS.byUser.values()) {
+    for (const c of convos) {
+      c.drafts = (MS.proposalsByRoom.get(c.mirrorOf) || [])
+        .map(p => ({ eventId: p.eventId, body: p.body, ts: p.ts }));
+    }
+  }
   MS.feed = [].concat(...[...MS.byUser.values()]).sort((a, b) => b.lastTs - a.lastTs);
   // Fold this refresh into the persistent contacts index. Fire-and-forget:
   // it is O(contacts) over data already in memory (no extra /sync), and its
   // own try/catch means a failure here never affects rendering below.
   persistContactsIndex().catch(() => {});
   renderUnverifiedNote();
+  renderListTitle();
   // The open room can disappear mid-session (the teammate un-shared it, or it
   // failed re-verification). Close the proposal path rather than leaving a
   // composer pointed at a room that is no longer part of the verified set.
@@ -502,7 +662,6 @@ async function refreshAll() {
     roomStatus('This conversation is no longer shared.');
   }
   if (MS.activeView === 'recent') renderRecent();
-  else if (MS.activeView === 'search') renderSearch();
   else if (MS.activeView === 'contacts') renderContacts();
   else if (MS.activeView === 'teammates') renderTeammatesList();
   else if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0) {
@@ -510,6 +669,7 @@ async function refreshAll() {
     if (MS.hidden.has(label)) navTo('recent');
     else renderTeammate(label);
   }
+  renderTeammateRail();
 }
 
 // ===========================================================================
@@ -584,92 +744,191 @@ function buildUserPlatformsRow(label) {
   return row;
 }
 
+// How this browser shows a verified teammate label (per-browser rename; the
+// label itself stays the identity key everywhere).
+function nameFor(label) { return sanitizeLine(displayName(MS.names, label)); }
+function loadNames() {
+  try { return parseNames(localStorage.getItem(NAMES_KEY)); } catch (e) { return new Map(); }
+}
+function saveNames() {
+  try { localStorage.setItem(NAMES_KEY, dumpNames(MS.names)); } catch (e) {}
+}
+// Compact "whose account" marker for cross-teammate lists: an initials chip
+// with the full name in the tooltip, instead of a text badge on every row.
+function fromChip(label) {
+  const chip = el('span', 'from-chip', initials(nameFor(label)));
+  chip.title = 'From ' + nameFor(label) + '’s account';
+  chip.setAttribute('aria-label', 'From ' + nameFor(label));
+  return chip;
+}
+
+// Whether the current list view is a single teammate's own section — the
+// teammate badge is redundant there (every row is already theirs) but needed
+// in Recent/Search where rows span everyone.
+function inSingleTeammateView() {
+  return typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0;
+}
+
+// 4px left stripe, one segment per active indicator — same shape/classes as
+// the teammate app's shared/ui/rows.js buildStripe (CSS lives in
+// shared/style/beepa.css's Triage Rail rows block, reused here by hand per
+// apps/master/CLAUDE.md: this app cannot import rows.js itself).
+function buildStripe(flags) {
+  const s = el('div', 'stripe');
+  for (const f of flags) s.appendChild(el('i', 'seg ' + f));
+  return s;
+}
+// Trailing column: relative time + unread/draft count pills.
+function buildSide(rec, flags, unreadCount, draftCount) {
+  const side = el('div', 'side');
+  if (rec.lastTs) side.appendChild(el('span', 'when', relTime(rec.lastTs)));
+  if (flags.includes('unread')) side.appendChild(el('span', 'pill unread', String(unreadCount)));
+  if (flags.includes('draft')) side.appendChild(el('span', 'pill draft', String(draftCount)));
+  return side;
+}
+
 // One row = one mirror room, whichever list it appears in (Recent / a
-// teammate's section / Search results). Shows the conversation name, the
-// preview, whose account it is (userLabel), and the platform badge — the
-// "each row shows whose account + which platform" requirement (§6.4).
+// teammate's section / Search results). Triage Rail anatomy: stripe · avatar
+// (+ platform badge) · title/preview · side (when + pills) — mirrors
+// shared/ui/rows.js's buildFeedRow by hand (see apps/master/CLAUDE.md on why
+// this file cannot import rows.js).
 function buildFeedRow(c) {
+  const pend = pendingDrafts(c.drafts, c.lastTs);
+  const flags = indicatorsFor({ unread: !!c.unread, draft: pend.length > 0 });
   const row = el('div', 'convo');
   row.setAttribute('role', 'button');
   row.tabIndex = 0;
-  row.appendChild(el('div', 'avatar', (c.title || '?').slice(0, 1).toUpperCase()));
+  row.appendChild(buildStripe(flags));
+  const avatar = el('div', 'avatar', (c.title || '?').slice(0, 1).toUpperCase());
+  const plat = buildPlatBadge(c.sourceId);
+  plat.classList.add('avatar-plat');
+  avatar.appendChild(plat);
+  row.appendChild(avatar);
   const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', c.title));
-  meta.appendChild(el('div', 'preview', c.preview));
+  const title = el('div', 'title', c.title);
+  if (!inSingleTeammateView() && c.userLabel) title.appendChild(fromChip(c.userLabel));
+  meta.appendChild(title);
+  meta.appendChild(el('div', 'preview' + (pend.length ? ' draft' : ''),
+    pend.length ? 'My draft · ' + sanitizeLine(pend[0].body || '') : c.preview));
   row.appendChild(meta);
-  if (c.lastTs) row.appendChild(el('span', 'when', relTime(c.lastTs)));
-  row.appendChild(el('span', 'badge', c.userLabel || ''));
-  row.appendChild(buildPlatBadge(c.sourceId));
-  row.appendChild(el('span', 'convo-open', 'Open'));  // visual affordance only; the whole row is already clickable/keyboard-activatable below
+  row.appendChild(buildSide(c, flags, c.unread || 0, pend.length));
   const open = () => { openRoom(c.id).catch(() => {}); };
   row.addEventListener('click', open);
   row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   return row;
 }
 
-// Group a flat conversation list into "one person, many platforms" clusters:
-// every convo carrying the SAME com.jkali.profile id (stamped by the uplink
-// only on members of a SHARED contact profile — see parseSnapshot above)
-// collapses under one header; everything else stays a standalone row, exactly
-// as before. Pure grouping over already-fetched data — no new reads, no
-// mutation. Order preserved by most-recent activity, same as the flat feed.
-function groupByProfile(convos) {
-  const order = [];
-  const groups = new Map(); // profileId -> group item (also pushed into order once)
-  for (const c of convos) {
-    if (c.profileId) {
-      let g = groups.get(c.profileId);
-      if (!g) {
-        g = { kind: 'profile', profileId: c.profileId, displayName: c.profileId, members: [], lastTs: 0 };
-        groups.set(c.profileId, g);
-        order.push(g);
-      }
-      g.members.push(c);
-      if (c.profileDisplayName) g.displayName = c.profileDisplayName; // prefer a real name over the raw id
-      if ((c.lastTs || 0) > g.lastTs) g.lastTs = c.lastTs || 0;
-    } else {
-      order.push({ kind: 'single', convo: c, lastTs: c.lastTs || 0 });
-    }
+// roomId -> {id, displayName} for shared/model/attention.js's clusterFeed —
+// built fresh from already-fetched convo records (com.jkali.profile, read in
+// parseSnapshot), never a new read.
+function roomProfileFor(convos) {
+  const m = new Map();
+  for (const c of convos) if (c.profileId) m.set(c.id, { id: c.profileId, displayName: c.profileDisplayName || c.profileId });
+  return m;
+}
+
+// Every distinct platform known for one (teammate, person) — the union of
+// their SHARED mirror rooms (already visible, `memberSources`) and their
+// shared contact handles (MS.contacts, deduped by source) which may include a
+// platform with no mirror room at all, i.e. known but not shared to a
+// conversation. Used only to surface that gap; never fabricates a room.
+function personKnownPlatforms(label, profileId, memberSources) {
+  const fromContacts = MS.contacts
+    .filter(ct => ct.label === label && ct.person_id === profileId)
+    .map(ct => ct.source);
+  return computePlatforms(memberSources.concat(fromContacts));
+}
+
+// Collapsed "one person, many platforms" row (Task 3's buildClusterRow,
+// re-implemented locally — same reasoning as buildFeedRow above). The caret
+// toggles MS.expandedClusters; buildSubRow renders each member beneath when
+// expanded (renderRecent/renderTeammate below).
+function buildClusterRow(item) {
+  const newest = item.members[0];
+  const label = newest.userLabel;
+  const memberSources = [...new Set(item.members.map(m => m.sourceId).filter(Boolean))];
+  const flags = indicatorsFor({ unread: item.unread > 0, draft: item.draft > 0 });
+  const row = el('div', 'convo cluster');
+  row.appendChild(buildStripe(flags));
+  const avatar = el('div', 'avatar', (item.displayName || newest.title || '?').slice(0, 1).toUpperCase());
+  for (const src of memberSources) {
+    const b = buildPlatBadge(src);
+    b.classList.add('avatar-plat');
+    avatar.appendChild(b);
   }
-  for (const item of order) {
-    if (item.kind === 'profile') item.members.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+  row.appendChild(avatar);
+  const meta = el('div', 'meta');
+  const title = el('div', 'title', sanitizeLine(item.displayName || newest.title || ''));
+  if (!inSingleTeammateView() && label) title.appendChild(fromChip(label));
+  const open = MS.expandedClusters.has(item.profileId);
+  const known = personKnownPlatforms(label, item.profileId, memberSources);
+  const hiddenSources = known.filter(s => !memberSources.includes(s));
+  const caretText = hiddenSources.length
+    ? '▸ ' + memberSources.length + ' of ' + known.length
+    : (open ? '▾ ' : '▸ ') + item.members.length;
+  const caret = el('button', 'cluster-caret', caretText);
+  caret.type = 'button';
+  caret.title = open ? 'Collapse platforms' : 'Show platforms';
+  caret.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (open) MS.expandedClusters.delete(item.profileId); else MS.expandedClusters.add(item.profileId);
+    rerenderActiveList();
+  });
+  title.appendChild(caret);
+  meta.appendChild(title);
+  const pend = pendingDrafts(newest.drafts, newest.lastTs);
+  let previewText = pend.length ? 'My draft · ' + sanitizeLine(pend[0].body || '') : sanitizeLine(newest.preview || '');
+  if (hiddenSources.length) previewText += ' · ' + hiddenSources.map(s => platformLabel(s) || s).join(', ') + ' not shared';
+  meta.appendChild(el('div', 'preview' + (pend.length ? ' draft' : ''), previewText));
+  row.appendChild(meta);
+  row.appendChild(buildSide(newest, flags, item.unread, item.draft));
+  const openRow = () => { openRoom(newest.id).catch(() => {}); };
+  row.addEventListener('click', openRow);
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openRow(); } });
+  return row;
+}
+// Member sub-row under an expanded cluster: this one platform's own row.
+function buildSubRow(c) {
+  const row = buildFeedRow(c);
+  row.className += ' sub';
+  return row;
+}
+
+// Re-render whichever list view is currently open (used by the cluster caret
+// toggle, which changes MS.expandedClusters but not MS.activeView).
+function rerenderActiveList() {
+  if (MS.activeView === 'recent') renderRecent();
+  else if (inSingleTeammateView()) renderTeammate(MS.activeView.slice('teammate:'.length));
+}
+
+// Renders one list item, clustered or not, plus its expanded sub-rows — the
+// shared entry point both renderRecent and renderTeammate use below.
+function appendListItem(list, item) {
+  if (item.kind === 'single') { list.appendChild(buildFeedRow(item.rec)); return; }
+  list.appendChild(buildClusterRow(item));
+  if (MS.expandedClusters.has(item.profileId)) {
+    for (const m of item.members) list.appendChild(buildSubRow(m));
   }
-  order.sort((a, b) => b.lastTs - a.lastTs);
-  return order;
 }
 
-// A profile header shown ONCE per person, with their per-platform threads
-// nested beneath — each still built by buildFeedRow, so it keeps its own
-// source badge, teammate badge, preview and click-to-open behavior unchanged.
-// Reuses the shared row renderer; adds no new interaction (click still opens
-// the individual mirror room, same as a standalone row).
-function buildProfileGroup(g) {
-  const wrap = el('div', 'profile-group');
-  const header = el('div', 'profile-header');
-  header.appendChild(el('span', 'profile-avatar', (g.displayName || '?').slice(0, 1).toUpperCase()));
-  header.appendChild(el('span', 'profile-name', g.displayName));
-  header.appendChild(el('span', 'profile-count',
-    g.members.length + ' thread' + (g.members.length === 1 ? '' : 's')));
-  wrap.appendChild(header);
-  const members = el('div', 'profile-members');
-  for (const c of g.members) members.appendChild(buildFeedRow(c));
-  wrap.appendChild(members);
-  return wrap;
+// #search-input is a pure client-side filter over the in-memory rows of the
+// CURRENT list (Recent or one teammate); it never builds a URL, sends a
+// command, or navigates. Matches title, preview, and (in Recent) whose account.
+function listQuery() { return (($('search-input') && $('search-input').value) || '').trim().toLowerCase(); }
+function matchesQuery(c, q, withOwner) {
+  if (!q) return true;
+  return (c.title || '').toLowerCase().includes(q) || (c.preview || '').toLowerCase().includes(q)
+    || (withOwner && (nameFor(c.userLabel) + ' ' + (c.userLabel || '')).toLowerCase().includes(q));
 }
-
-// Renders one list item, grouped or not — the shared entry point both
-// renderRecent and renderTeammate use below.
-function buildListItem(item) {
-  return item.kind === 'profile' ? buildProfileGroup(item) : buildFeedRow(item.convo);
-}
-
 function renderRecent() {
   const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
-  const feed = visibleFeed(MS.feed, MS.hidden);
-  if (!feed.length) { list.appendChild(elEmpty('No shared conversations yet.')); return; }
-  for (const item of groupByProfile(feed.slice(0, 200))) list.appendChild(buildListItem(item));
+  const q = listQuery();
+  const feed = visibleFeed(MS.feed, MS.hidden).filter(c => matchesQuery(c, q, true));
+  if (!feed.length) { list.appendChild(elEmpty(q ? 'No conversations match "' + q + '".' : 'No shared conversations yet.')); return; }
+  const capped = feed.slice(0, 200);
+  for (const item of clusterFeed(capped, roomProfileFor(capped))) appendListItem(list, item);
 }
 
 // Sidebar teammate rows (mockup 1f left rail): initials avatar + name + a
@@ -695,14 +954,38 @@ function renderTeammatesList() {
   }
 }
 
+// Icon-rail teammate switcher (#nav-teammates-rail): one initials chip per
+// visible teammate, with a pending-suggestion count pill, mirroring the
+// sidebar list's own entries. Called at the end of refreshAll/navTo — purely
+// presentational over already-fetched MS state.
+function renderTeammateRail() {
+  const rail = $('nav-teammates-rail');
+  if (!rail) return;
+  rail.replaceChildren();
+  // Only teammates with something shared right now; zero-shared and hidden
+  // ones stay reachable from the Teammates list (nav-teammates).
+  for (const [label, convos] of sharingUsers(MS.byUser, MS.hidden)) {
+    const btn = el('button', 'navitem nav-icon teammate-rail-btn');
+    btn.type = 'button';
+    btn.title = nameFor(label);
+    btn.setAttribute('aria-label', nameFor(label));
+    btn.appendChild(el('span', 'avatar avatar-sm', initials(nameFor(label))));
+    const pending = convos.reduce((sum, c) => sum + pendingDrafts(c.drafts, c.lastTs).length, 0);
+    if (pending) btn.appendChild(el('span', 'n', String(pending)));
+    btn.classList.toggle('active', MS.activeView === 'teammate:' + label);
+    btn.addEventListener('click', () => navTo('teammate:' + label));
+    rail.appendChild(btn);
+  }
+}
+
 // Same .convo schema as feed/contact rows: avatar, title+preview, platform
 // badges, trailing kebab (Hide/Show + Delete). Click opens that teammate's
 // conversations; kebab actions do not navigate.
 function buildTeammateRow(label, convos, isHiddenRow) {
   const row = el('div', 'convo' + (isHiddenRow ? ' teammate-hidden' : ''));
-  row.appendChild(el('div', 'avatar', initials(label)));
+  row.appendChild(el('div', 'avatar', initials(nameFor(label))));
   const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', sanitizeLine(label)));
+  meta.appendChild(el('div', 'title', nameFor(label) + (nameFor(label) !== label ? ' · ' + sanitizeLine(label) : '')));
   const n = convos.length;
   meta.appendChild(el('div', 'preview',
     n ? (n + ' conversation' + (n === 1 ? '' : 's')) : 'nothing shared yet'));
@@ -756,7 +1039,7 @@ function buildTeammateKebab(label, isHiddenRow) {
     closeTeammateKebabs();
     confirmDeleteTeammate(label).then((ok) => {
       if (ok) deleteTeammate(label).catch((err) => {
-        window.alert('Could not delete: ' + String((err && err.message) || err));
+        listStatus('Could not delete: ' + String((err && err.message) || err), true);
       });
     });
   });
@@ -792,7 +1075,7 @@ function confirmDeleteTeammate(label) {
     const dlg = el('div', 'dialog');
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.appendChild(el('div', 'dialog-title', 'Delete ' + sanitizeLine(label) + '?'));
+    dlg.appendChild(el('div', 'dialog-title', 'Delete ' + nameFor(label) + (nameFor(label) !== label ? ' (' + sanitizeLine(label) + ')' : '') + '?'));
     dlg.appendChild(el('p', 'dialog-body',
       'This deactivates their master account and removes them from this console. You cannot re-add the same username.'));
     const actions = el('div', 'dialog-actions');
@@ -820,19 +1103,43 @@ function confirmDeleteTeammate(label) {
   });
 }
 
+// Inline status line under the list title (never window.alert).
+function listStatus(text, isError) {
+  const s = $('list-status');
+  if (!s) return;
+  s.textContent = text || '';
+  s.classList.toggle('hidden', !text);
+  s.classList.toggle('error', !!isError);
+}
 async function deleteTeammate(label) {
+  listStatus('Deleting ' + nameFor(label) + '…');
   const res = await fetch(ENROLL_BASE + '/admin/delete-teammate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (S.token || '') },
     body: JSON.stringify({ username: label }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + res.status));
+  if (!res.ok) {
+    const msg = (data && data.error) ? String(data.error) : ('HTTP ' + res.status);
+    // A space the enrollment service never provisioned (a legacy or hand-made
+    // account) cannot be deactivated from here; hiding it in this browser is
+    // the honest fallback, and says so.
+    if (res.status === 400 && /unknown or unprovisioned|reserved/.test(msg)) {
+      MS.hidden = hide(MS.hidden, label); saveHidden();
+      if (MS.activeView === 'teammate:' + label) navTo('recent');
+      applyHidden();
+      listStatus('“' + nameFor(label) + '” is not managed by the enrollment service, so it was hidden in this browser instead (Teammates › Hidden to show it again).', true);
+      return;
+    }
+    throw new Error(msg);
+  }
   MS.hidden = unhide(MS.hidden, label);
   saveHidden();
-  if (MS.activeView === 'teammate:' + label) navTo('teammates');
+  if (MS.activeView === 'teammate:' + label) navTo('recent');
   try { await refreshAll(); } catch (e) { /* list may already be empty */ }
   if (MS.activeView === 'teammates') renderTeammatesList();
+  renderTeammateRail(); renderListTitle();
+  listStatus('Deleted ' + nameFor(label) + '.');
 }
 
 function loadHidden() {
@@ -850,9 +1157,10 @@ function applyHidden() {
     return;
   }
   if (MS.activeView === 'recent') renderRecent();
-  else if (MS.activeView === 'search') renderSearch();
   else if (MS.activeView === 'contacts') renderContacts();
   else if (MS.activeView === 'teammates') renderTeammatesList();
+  renderListTitle();
+  renderTeammateRail();
 }
 function hideTeammate(label) {
   MS.hidden = hide(MS.hidden, label);
@@ -863,44 +1171,104 @@ function showTeammate(label) {
   applyHidden();
 }
 
-// Up to two initials from a teammate label, for the round avatar chip.
-function initials(label) {
-  const parts = String(label || '').trim().split(/\s+/).filter(Boolean);
-  if (!parts.length) return '?';
-  const first = parts[0][0] || '';
-  const second = parts.length > 1 ? (parts[parts.length - 1][0] || '') : '';
-  return (first + second).toUpperCase();
-}
-
 function renderTeammate(label) {
-  const convos = (MS.byUser.get(label) || []).slice().sort((a, b) => b.lastTs - a.lastTs);
+  const q = listQuery();
+  const convos = (MS.byUser.get(label) || []).slice().sort((a, b) => b.lastTs - a.lastTs)
+    .filter(c => matchesQuery(c, q, false));
   const list = $('list-body');
   if (!list) return;
   list.replaceChildren();
-  // At-a-glance "shared platforms" summary for this teammate, above their
-  // conversation list — additive: the existing empty-state/list rendering
-  // below is unchanged either way.
-  const summary = el('div', 'user-platforms-summary');
-  summary.appendChild(el('span', 'user-platforms-caption', 'Shared platforms:'));
-  summary.appendChild(buildUserPlatformsRow(label));
-  list.appendChild(summary);
-  if (!convos.length) { list.appendChild(elEmpty('Nothing shared yet.')); return; }
-  for (const item of groupByProfile(convos)) list.appendChild(buildListItem(item));
+  if (!convos.length) { list.appendChild(elEmpty(q ? 'No conversations match "' + q + '".' : 'Nothing shared yet.')); return; }
+  for (const item of clusterFeed(convos, roomProfileFor(convos))) appendListItem(list, item);
 }
 
-// #search-input is a pure client-side filter over the in-memory flattened
-// feed; it never builds a URL, sends a command, or navigates.
-function renderSearch() {
-  const q = (($('search-input') && $('search-input').value) || '').trim().toLowerCase();
-  const out = $('list-body');
-  if (!out) return;
-  out.replaceChildren();
-  if (!q) { out.appendChild(elEmpty('Type to search across every teammate.')); return; }
-  const rows = visibleFeed(MS.feed, MS.hidden).filter(c =>
-    c.title.toLowerCase().includes(q) || (c.preview || '').toLowerCase().includes(q)
-      || (c.userLabel || '').toLowerCase().includes(q));
-  if (!rows.length) { out.appendChild(elEmpty('No conversations match "' + q + '".')); return; }
-  for (const c of rows) out.appendChild(buildFeedRow(c));
+// The list-pane title: who you are looking at. Recent = everyone; a teammate
+// view = their avatar, display name, shared count + platforms, and a kebab
+// with Rename (per-browser name), Hide and Delete — the same actions the
+// Teammates list offers, reached from where you already are.
+function renderListTitle() {
+  const host = $('list-title');
+  if (!host) return;
+  host.replaceChildren();
+  const view = MS.activeView;
+  const search = $('search-input');
+  if (view === 'recent') {
+    host.appendChild(el('span', 'list-title-name', 'All shared conversations'));
+    const n = visibleFeed(MS.feed, MS.hidden).length;
+    host.appendChild(el('span', 'list-title-sub muted', n + ' conversation' + (n === 1 ? '' : 's') + ' · ' + sharingUsers(MS.byUser, MS.hidden).length + ' sharing'));
+    if (search) search.placeholder = 'Search everyone’s shared chats';
+    return;
+  }
+  if (!inSingleTeammateView()) { host.appendChild(el('span', 'list-title-name', view === 'contacts' ? 'Contacts' : view === 'teammates' ? 'Teammates' : '')); return; }
+  const label = view.slice('teammate:'.length);
+  const convos = MS.byUser.get(label) || [];
+  host.appendChild(el('span', 'avatar avatar-sm', initials(nameFor(label))));
+  const who = el('div', 'list-title-who');
+  const nameEl = el('span', 'list-title-name', nameFor(label));
+  who.appendChild(nameEl);
+  const sub = el('span', 'list-title-sub muted');
+  sub.appendChild(document.createTextNode(convos.length + ' shared' + (nameFor(label) !== label ? ' · ' + sanitizeLine(label) : '') + ' '));
+  sub.appendChild(buildUserPlatformsRow(label));
+  who.appendChild(sub);
+  host.appendChild(who);
+  host.appendChild(buildTitleKebab(label, nameEl));
+  if (search) search.placeholder = 'Search ' + nameFor(label) + '’s shared chats';
+}
+
+// Rename is inline: the name span becomes an input; Enter saves (per-browser,
+// never sent anywhere), Escape cancels, empty resets to the verified label.
+function startRename(label, nameEl) {
+  const input = el('input', 'list-title-rename');
+  input.value = nameFor(label);
+  input.setAttribute('aria-label', 'Display name for ' + label);
+  const finish = (save) => {
+    if (save) { MS.names = rename(MS.names, label, input.value); saveNames(); }
+    renderListTitle(); renderTeammateRail(); rerenderActiveList();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  nameEl.replaceWith(input);
+  input.focus(); input.select();
+}
+function buildTitleKebab(label, nameEl) {
+  const holder = el('span', 'share-controls');
+  const kebab = el('button', 'share-kebab', '\u22EE');
+  kebab.type = 'button'; kebab.title = 'More';
+  kebab.setAttribute('aria-label', 'Actions for ' + nameFor(label));
+  kebab.setAttribute('aria-haspopup', 'menu');
+  const menu = el('div', 'share-menu hidden');
+  menu.setAttribute('role', 'menu');
+  const mk = (text, cls, fn) => {
+    const b = el('button', 'share-menu-link' + (cls ? ' ' + cls : ''), text);
+    b.type = 'button'; b.setAttribute('role', 'menuitem');
+    b.addEventListener('click', (e) => { e.stopPropagation(); closeTeammateKebabs(); fn(); });
+    menu.appendChild(b);
+  };
+  mk('Rename…', '', () => startRename(label, nameEl));
+  mk('Hide', '', () => hideTeammate(label));
+  mk('Delete', 'teammate-delete', () => {
+    confirmDeleteTeammate(label).then((ok) => {
+      if (ok) deleteTeammate(label).catch((err) => { listStatus('Could not delete: ' + String((err && err.message) || err), true); });
+    });
+  });
+  const stop = (e) => e.stopPropagation();
+  kebab.addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const open = !menu.classList.contains('hidden');
+    closeTeammateKebabs();
+    if (!open) menu.classList.remove('hidden');
+  });
+  menu.addEventListener('click', stop); menu.addEventListener('keydown', stop);
+  holder.appendChild(kebab); holder.appendChild(menu);
+  holder.addEventListener('click', stop);
+  if (!window.__teammateKebabCloser) {
+    window.__teammateKebabCloser = true;
+    document.addEventListener('click', closeTeammateKebabs);
+  }
+  return holder;
 }
 
 // ===========================================================================
@@ -919,6 +1287,23 @@ function shortTime(ts) {
   if (typeof ts !== 'number' || !isFinite(ts) || !ts) return '';
   try { return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
   catch (e) { return ''; }
+}
+
+// Two read-state lines under the room header, from the uplink's read-only
+// com.jkali.read_state stamp (parseSnapshot). Fail closed: an unknown read
+// state (room has never carried the stamp) says so instead of guessing.
+function renderRoomReadLine(rec) {
+  const line = $('room-read');
+  if (!line) return;
+  if (!rec || !rec.readState) { line.textContent = 'Read state unknown'; return; }
+  const { remote_read_ts, teammate_read_ts } = rec.readState;
+  const teammateLabel = rec.userLabel ? nameFor(rec.userLabel) : 'Teammate';
+  const parts = [];
+  if (remote_read_ts >= rec.lastTs && rec.lastTs > 0) parts.push('Other party read the latest message');
+  parts.push(teammate_read_ts >= rec.lastTs && rec.lastTs > 0
+    ? teammateLabel + ' has read everything'
+    : teammateLabel + ' has unread messages');
+  line.textContent = parts.join(' · ');
 }
 
 // Alignment/attribution comes from the trusted com.jkali.from_me flag the
@@ -1009,12 +1394,6 @@ function renderBubble(ev) {
   if (typeof eventId !== 'string' || !eventId || MS.roomSeen.has(eventId)) return;
   MS.roomSeen.add(eventId);
   const sent = !!(ev.content && ev.content['com.jkali.from_me'] === true);
-  const proposalId = sent && ev.content['com.jkali.auto_sent_from_proposal'];
-  if (typeof proposalId === 'string' && proposalId) {
-    MS.sentProposals.add(proposalId);
-    const suggestion = box.querySelector('.msg-row.suggested');
-    if (suggestion && suggestion.dataset.proposalId === proposalId) suggestion.remove();
-  }
   // Who to show on a received bubble: the uplink stamps the ORIGIN sender's
   // display name (resolved from the teammate-local room's member state) as
   // com.jkali.origin_sender. The raw ev.sender is always the teammate's own
@@ -1034,6 +1413,16 @@ function renderBubble(ev) {
   const miniBadge = buildPlatBadge(MS.openRoomSourceId);
   miniBadge.className += ' msg-badge-mini';
   meta.appendChild(miniBadge);
+  if (!sent) {
+    // Cosmetic only (F3 partial): the uplink's com.jkali.origin_avatar is a
+    // bridge-sourced display picture, re-fetched as authenticated bytes below
+    // (loadAvatarInto) — never trusted for identity, which stays the from_me
+    // flag/power-level guarantee this file's header describes.
+    const av = el('span', 'avatar avatar-sm', initials(senderName));
+    const mxc = ev.content && ev.content['com.jkali.origin_avatar'];
+    if (typeof mxc === 'string' && MXC_RE.test(mxc)) loadAvatarInto(av, mxc);
+    meta.appendChild(av);
+  }
   meta.appendChild(el('span', 'msg-sender', sent ? (MS.openRoomUser || 'Teammate') : senderName));
   meta.appendChild(el('span', 'msg-role-time', (sent ? 'teammate' : 'other party') + ' · ' + shortTime(ts)));
   row.appendChild(meta);
@@ -1078,7 +1467,6 @@ async function openRoom(roomId) {
   const current = () => epoch === roomEpoch && S.token === session && MS.openRoomId === roomId;
   MS.openRoomId = roomId;
   MS.roomSeen.clear();
-  MS.sentProposals.clear();
   MS.roomEvents.clear();
   MS.roomRows.clear();
   const rec = MS.rooms[roomId];
@@ -1099,13 +1487,14 @@ async function openRoom(roomId) {
   setupProposalComposer(rec);
   $('room-title').textContent = sanitizeLine(rec.name || roomId);
   const owner = $('room-owner');
-  if (rec.userLabel) { owner.textContent = 'shared by ' + rec.userLabel; owner.classList.remove('hidden'); }
+  if (rec.userLabel) { owner.textContent = 'shared by ' + nameFor(rec.userLabel); owner.classList.remove('hidden'); }
   else { owner.textContent = ''; owner.classList.add('hidden'); }
   const badge = $('room-badge');
   const b = buildPlatBadge(rec.sourceId);
   badge.className = b.className;
   badge.textContent = b.textContent;
   $('room-source-label').textContent = platformLabel(rec.sourceId);
+  renderRoomReadLine(rec);
   const box = $('room-messages');
   if (box) box.replaceChildren();
   roomStatus('');
@@ -1126,8 +1515,7 @@ async function openRoom(roomId) {
     if (current()) roomStatus('Could not load messages: ' + String(e.message || e));
   }
   if (!current()) return;
-  await loadSuggestionOverlay();
-  if (!current()) return;
+  renderSuggestionStack();
   if (box) box.scrollTop = box.scrollHeight;
   startTail(roomId);
 }
@@ -1168,17 +1556,15 @@ async function startTail(roomId) {
           for (const [id, ts] of corrections) rec.timestampCorrections.set(id, ts);
           const existing = [...MS.roomEvents.values()];
           const box = $('room-messages');
-          const suggestion = box?.querySelector('.msg-row.suggested');
           box?.replaceChildren();
           MS.roomSeen.clear(); MS.roomRows.clear(); MS.lastDayKey = null;
           for (const ev of existing.sort((a, b) => mirrorTs(a) - mirrorTs(b))) renderBubble(ev);
-          if (suggestion) box.appendChild(suggestion);
         }
         for (const ev of room.timeline.events.slice().sort((a, b) => mirrorTs(a) - mirrorTs(b))) {
           renderBubble(ev);
         }
         reconcileNativeEchoes();
-        pinSuggestion();
+        renderSuggestionStack();
         const box = $('room-messages');
         if (box) box.scrollTop = box.scrollHeight;
       }
@@ -1261,12 +1647,10 @@ function proposalStatus(text, isError) {
   s.classList.toggle('error', !!isError);
 }
 
-// Latest room-targeted proposal for one target_room. Pure. The teammate inbox
-// already keeps only the newest pending draft per room (pendingForRoom); this
-// overlay does the same so the manager sees one editable bubble, not a stack.
-function latestRoomProposal(events, targetRoom) {
-  if (!Array.isArray(events) || typeof targetRoom !== 'string' || !targetRoom) return null;
-  let best = null;
+// All room-targeted proposals for one target_room, newest first. Pure.
+function roomProposals(events, targetRoom) {
+  if (!Array.isArray(events) || typeof targetRoom !== 'string' || !targetRoom) return [];
+  const out = [];
   for (const e of events) {
     if (!e || e.type !== 'com.jkali.proposal' || !e.content) continue;
     if (e.content.target_room !== targetRoom) continue;
@@ -1274,89 +1658,81 @@ function latestRoomProposal(events, targetRoom) {
     if (!body) continue;
     const ts = typeof e.content.origin_ts === 'number' ? e.content.origin_ts
       : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
-    if (!best || ts > best.ts) best = { body, eventId: e.event_id, ts };
+    out.push({ body, eventId: e.event_id, ts });
   }
-  return best;
+  return out.sort((a, b) => b.ts - a.ts);
+}
+// Kept for callers that only want the newest (tests/unit/master_timeline.test.js).
+function latestRoomProposal(events, targetRoom) { return roomProposals(events, targetRoom)[0] || null; }
+
+// Pure state per suggestion. `messages` are {type, ts, content} (ts = mirrorTs).
+// F12: `com.jkali.from_proposal`/`com.jkali.auto_sent_from_proposal` are trusted
+// ONLY on messages whose content carries `com.jkali.from_me === true` — that
+// flag is itself trustworthy only because master-side power levels (§8.3) mean
+// only the teammate's own uplink account can ever post into their mirror room
+// (see renderBubble / apps/master/CLAUDE.md). A message from anyone else in the
+// room — the remote correspondent — can forge those keys, so they must never
+// decide 'sent'/'auto' off a non-from_me message.
+function suggestionStates(proposals, messages, readState, now) {
+  const msgs = (Array.isArray(messages) ? messages : []).filter(m => m && m.type === 'm.room.message');
+  const own = msgs.filter(m => m.content && m.content['com.jkali.from_me'] === true);
+  const readTs = readState && typeof readState.teammate_read_ts === 'number' ? readState.teammate_read_ts : 0;
+  return (Array.isArray(proposals) ? proposals : []).map(p => {
+    let state = 'pending';
+    if (own.some(m => m.content['com.jkali.from_proposal'] === p.eventId)) state = 'sent';
+    else if (own.some(m => m.content['com.jkali.auto_sent_from_proposal'] === p.eventId)) state = 'auto';
+    else if (msgs.some(m => typeof m.ts === 'number' && m.ts > p.ts)) state = 'retired';
+    else if (readTs >= p.ts && p.ts > 0) state = 'seen';
+    return Object.assign({}, p, { state });
+  });
 }
 
-function pinSuggestion() {
-  const box = $('room-messages');
-  const row = box && box.querySelector('.msg-row.suggested');
-  if (row && row !== box.lastElementChild) box.appendChild(row);
-}
-
-function showSuggestion(body, proposalId) {
-  const box = $('room-messages');
-  if (!box) return;
-  if (proposalId && MS.sentProposals.has(proposalId)) return;
-  const text = sanitize(body);
-  if (!text) return;
-  let row = box.querySelector('.msg-row.suggested');
-  if (!row) {
-    row = el('div', 'msg-row sent suggested');
-    const meta = el('div', 'msg-meta');
-    meta.appendChild(el('span', 'msg-role-time', 'suggested'));
-    row.appendChild(meta);
-    const bubble = el('div', 'msg');
-    bubble.appendChild(el('div', 'body'));
-    row.appendChild(bubble);
-    row.addEventListener('dblclick', startSuggestionEdit);
-    box.appendChild(row);
-  }
-  const bodyNode = row.querySelector('.body');
-  row.dataset.proposalId = proposalId || '';
-  if (bodyNode && bodyNode.getAttribute('contenteditable') !== 'true') bodyNode.textContent = text;
-  pinSuggestion();
-  box.scrollTop = box.scrollHeight;
-}
-
-function startSuggestionEdit(e) {
-  const bodyNode = e.currentTarget.querySelector('.body');
-  if (!bodyNode || bodyNode.getAttribute('contenteditable') === 'true') return;
-  const saved = bodyNode.textContent || '';
-  bodyNode.setAttribute('contenteditable', 'true');
-  bodyNode.focus();
-  const range = document.createRange();
-  range.selectNodeContents(bodyNode);
-  const sel = window.getSelection();
-  if (sel) { sel.removeAllRanges(); sel.addRange(range); }
-  let done = false;
-  const stop = () => {
-    if (done) return;
-    done = true;
-    bodyNode.removeAttribute('contenteditable');
-    bodyNode.removeEventListener('blur', onBlur);
-    bodyNode.removeEventListener('keydown', onKey);
-  };
-  const onBlur = () => {
-    if (done) return;
-    const next = sanitize(bodyNode.textContent || '').trim();
-    stop();
-    if (!next) { bodyNode.textContent = saved; return; }
-    if (next === saved) return;
-    submitProposal({ body: next }).catch(() => { bodyNode.textContent = saved; });
-  };
-  const onKey = (ev) => {
-    if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); bodyNode.blur(); }
-    if (ev.key === 'Escape') { ev.preventDefault(); bodyNode.textContent = saved; stop(); }
-  };
-  bodyNode.addEventListener('blur', onBlur);
-  bodyNode.addEventListener('keydown', onKey);
-}
-
-async function loadSuggestionOverlay() {
+// ---- Suggestion stack (replaces the single-bubble overlay). All proposals
+// for the OPEN room's target, newest at the bottom, each carrying its own
+// sent/auto/retired/seen/pending state — never a hidden single bubble. ----
+function renderSuggestionStack() {
+  const host = $('proposal-stack');
   const ctx = MS.openProposalCtx;
-  const epoch = roomEpoch;
-  const session = S.token;
-  if (!ctx || !ctx.proposalsRoomId || !ctx.targetRoom || !ctx.mirrorRoomId) return;
-  if (!ROOMID_RE.test(ctx.proposalsRoomId) || !MS.proposalsRoomSet.has(ctx.proposalsRoomId)) return;
-  try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(ctx.proposalsRoomId) + '/messages?dir=b&limit=100';
-    const data = await api('GET', q);
-    if (roomEpoch !== epoch || S.token !== session || MS.openProposalCtx !== ctx) return;
-    const latest = latestRoomProposal(Array.isArray(data.chunk) ? data.chunk : [], ctx.targetRoom);
-    if (latest) showSuggestion(latest.body, latest.eventId);
-  } catch (e) { /* overlay is optional; the write path still works */ }
+  if (!host || !ctx) return;
+  host.replaceChildren();
+  if (!ctx.targetRoom) return;
+  const rec = MS.rooms[ctx.mirrorRoomId];
+  const props = MS.proposalsByRoom.get(ctx.targetRoom) || [];
+  const msgs = [...MS.roomEvents.values()].map(ev => ({ type: ev.type, ts: mirrorTs(ev), content: ev.content }));
+  const states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse(); // oldest at top
+  for (const s of states.slice(-6)) {
+    const card = el('div', 'sug ' + s.state);
+    const cap = el('div', 'sug-cap');
+    const label = { sent: '✓ Sent by ' + (ctx.label || 'teammate'), auto: '⚡ Sent as ' + (ctx.label || 'teammate') + ' automatically',
+      retired: 'Retired · the thread moved on', seen: 'Seen by ' + (ctx.label || 'teammate') + ' · not sent', pending: 'Pending · not yet seen' }[s.state];
+    cap.appendChild(el('span', '', label + ' · ' + shortTime(s.ts)));
+    if (s.state === 'pending' || s.state === 'seen') {
+      const edit = el('button', 'sug-link', 'Edit'); edit.type = 'button';
+      edit.addEventListener('click', () => { const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
+      cap.appendChild(edit);
+    }
+    card.appendChild(cap);
+    card.appendChild(el('div', 'sug-text', sanitize(s.body)));
+    host.appendChild(card);
+  }
+  host.scrollTop = host.scrollHeight;
+}
+
+// Loads every teammate's proposals-room history once per refresh and indexes
+// it by target_room, so rows can show pending drafts and the open room's
+// suggestion stack never needs its own separate /messages read (see openRoom).
+async function loadProposalsIndex() {
+  const byRoom = new Map();
+  for (const [label, prid] of MS.proposalsByUser) {
+    if (!ROOMID_RE.test(prid) || !MS.proposalsRoomSet.has(prid)) continue;
+    try {
+      const data = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(prid) + '/messages?dir=b&limit=100');
+      const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+      const targets = new Set(chunk.map(e => e && e.content && e.content.target_room).filter(t => typeof t === 'string'));
+      for (const t of targets) byRoom.set(t, roomProposals(chunk, t));
+    } catch (e) { /* keep whatever we had for this teammate */ }
+  }
+  MS.proposalsByRoom = byRoom;
 }
 
 // Pure builder for a PERSON-targeted proposal's content (extracted so a unit
@@ -1475,7 +1851,12 @@ async function submitProposal(opts) {
     if (MS.openProposalCtx !== ctx) return;
     if (input) input.value = '';
     proposalStatus('');
-    showSuggestion(body, result && result.event_id);
+    // Optimistic update: push the new proposal onto this target's index so the
+    // stack shows it as pending immediately, without waiting for the next
+    // loadProposalsIndex() pass.
+    const list = MS.proposalsByRoom.get(target) || [];
+    MS.proposalsByRoom.set(target, [{ body, eventId: result && result.event_id, ts: content.origin_ts }, ...list]);
+    renderSuggestionStack();
   } catch (e) {
     proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
   }
@@ -1486,7 +1867,7 @@ async function submitProposal(opts) {
 // teammate's shared address book (com.jkali.contact state, collected in
 // buildByUser). GROUPED BY person_id: a handle and that person's mirror rooms
 // (already tagged com.jkali.profile == the same person_id) fold under one
-// header, exactly as groupByProfile clusters the conversation feed. A handle
+// header, exactly as clusterFeed clusters the conversation feed. A handle
 // with a null person_id lists ungrouped. Selecting a handle opens the
 // person-targeted composer, whose only write is submitProposal's identifier
 // branch above — still a com.jkali.proposal, never a message.
@@ -1546,7 +1927,7 @@ function buildContactRow(ct) {
   meta.appendChild(el('div', 'title', sanitizeLine(name)));
   meta.appendChild(el('div', 'preview', sanitizeLine(ct.network_id)));
   row.appendChild(meta);
-  row.appendChild(el('span', 'badge', ct.label || ''));
+  if (ct.label) row.appendChild(fromChip(ct.label));
   row.appendChild(buildPlatBadge(ct.source));
   const open = () => selectContact(ct);
   row.addEventListener('click', open);
@@ -1857,16 +2238,12 @@ function navTo(key) {
   showContactsSearch(key === 'contacts');
   MS.activeView = key;
   setActiveNav(key);
+  if (key === 'search') { navTo('recent'); return; }   // search now lives in the main views
   if (key === 'recent') {
-    showWorkspace(true);
-    showListSearch(false);
-    setDetailMode('empty');
-    renderRecent();
-  } else if (key === 'search') {
     showWorkspace(true);
     showListSearch(true);
     setDetailMode('empty');
-    renderSearch();
+    renderRecent();
   } else if (key === 'contacts') {
     showWorkspace(true);
     showListSearch(false);
@@ -1883,10 +2260,12 @@ function navTo(key) {
     resetAddTeammate();
   } else if (key.indexOf('teammate:') === 0) {
     showWorkspace(true);
-    showListSearch(false);
+    showListSearch(true);
     setDetailMode('empty');
     renderTeammate(key.slice('teammate:'.length));
   }
+  renderListTitle();
+  renderTeammateRail();
 }
 
 // ---- add / link a teammate (manager-only; see ENROLL_BASE above) ----
@@ -1965,8 +2344,23 @@ async function enterApp() {
   $('view-signin').classList.add('hidden');
   $('shell').classList.remove('hidden');
   MS.hidden = loadHidden();
-  try { await refreshAll(); } catch (e) { /* stays empty on error */ }
-  navTo('recent');
+  MS.names = loadNames();
+  // Paint from the cached snapshot at once (if this browser has one), then
+  // catch up with one incremental sync; a cold browser does the full sync.
+  const cached = await snapshotCacheLoad();
+  if (cached) {
+    MS.since = cached.since; MS.rooms = cached.rooms;
+    MS.byUser = buildByUser(MS.rooms);
+    MS.feed = [].concat(...[...MS.byUser.values()]).sort((a, b) => b.lastTs - a.lastTs);
+    navTo('recent');
+  } else {
+    navTo('recent');
+    listStatus('Loading shared conversations… (the first load builds a local cache)');
+  }
+  try { await refreshAll(); } catch (e) { listStatus('Could not refresh: ' + String((e && e.message) || e), true); return; }
+  listStatus('');
+  if (MS.activeView === 'recent') renderRecent();
+  renderListTitle(); renderTeammateRail();
   if (MS.pollTimer) clearInterval(MS.pollTimer);
   // Periodic re-snapshot for freshness (no in-place live merge needed for a
   // manager-facing recent/grouped list — a simple poll is enough here).
@@ -1979,7 +2373,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups };
+export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {
@@ -1999,8 +2393,6 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
 
   $('nav-recent').dataset.navkey = 'recent';
   $('nav-recent').addEventListener('click', () => navTo('recent'));
-  $('nav-search').dataset.navkey = 'search';
-  $('nav-search').addEventListener('click', () => navTo('search'));
   const navContacts = $('nav-contacts');
   if (navContacts) {
     navContacts.dataset.navkey = 'contacts';
@@ -2046,7 +2438,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
       navigator.clipboard.writeText(text).catch(() => {});
     }
   });
-  $('search-input').addEventListener('input', renderSearch);
+  $('search-input').addEventListener('input', rerenderActiveList);
   const contactsSearch = $('contacts-search');
   if (contactsSearch) contactsSearch.addEventListener('input', renderContacts);
   // Export/backup only — reads the persisted index (or falls back to the

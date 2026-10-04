@@ -25,6 +25,10 @@ export const S = {
   convoRunning: false, convoSince: null,
   selfMxids: new Set(),
   timestampCorrections: new Map(),
+  feedFilter: 'all',                 // 'all' | 'needs' | 'drafts' (Triage Rail chips)
+  expandedClusters: new Set(),       // profile ids whose sub-rows are open
+  roomProfile: new Map(),            // roomId -> {id, displayName}; written by apps/user/consent.js
+  convoRemoteReadTs: 0,              // other-party read ts for the OPEN room (caption only)
 };
 export const convosBySource = {};
 export const runtime = {
@@ -34,6 +38,7 @@ export const runtime = {
   instagram: { mgmtRoomId: null, connected: false },
   linkedin: { mgmtRoomId: null, connected: false },
   twitter: { mgmtRoomId: null, connected: false },
+  discord: { mgmtRoomId: null, connected: false },
 };
 export const feedModel = new Map();
 export const feedManualHidden = new Set();

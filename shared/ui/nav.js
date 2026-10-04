@@ -12,13 +12,8 @@ import { S, runtime, convosBySource, feedModel } from '../state.js';
 let sharingViewHook = null;
 function setSharingViewHook(fn) { sharingViewHook = typeof fn === 'function' ? fn : null; }
 
-let proposalsViewHook = null;
-function setProposalsViewHook(fn) { proposalsViewHook = typeof fn === 'function' ? fn : null; }
-
 let contactsViewHook = null;
 function setContactsViewHook(fn) { contactsViewHook = typeof fn === 'function' ? fn : null; }
-
-let listMode = 'chats'; // 'chats' | 'proposals' — conversation-layer toggle on Home
 
 const LIST_SEARCH = {
   home: 'home-search',
@@ -31,6 +26,7 @@ for (const s of SOURCES) {
 const PILL_BY_SOURCE = {
   whatsapp: 'wa-status', imessage: 'imsg-status', gmessages: 'gmsg-status',
   instagram: 'ig-status', linkedin: 'li-status', twitter: 'tw-status',
+  discord: 'discord-status',
 };
 
 function platformLogoBadge(sourceId) {
@@ -98,30 +94,8 @@ function platformRailClick(sourceId) {
   else openPlatformConnect(sourceId);
 }
 
-function showListMode(show) {
-  const lm = $('list-mode');
-  if (lm) lm.classList.toggle('hidden', !show);
-}
-
-function setListMode(mode) {
-  listMode = mode === 'proposals' ? 'proposals' : 'chats';
-  const chatsBtn = $('list-mode-chats');
-  const propBtn = $('list-mode-proposals');
-  if (chatsBtn) chatsBtn.classList.toggle('active', listMode === 'chats');
-  if (propBtn) propBtn.classList.toggle('active', listMode === 'proposals');
-  renderHomeLayer();
-}
-
 function renderHomeLayer() {
-  if (listMode === 'proposals') {
-    showListSearch(null);
-    showListMode(true);
-    setDetailMode('empty');
-    if (proposalsViewHook) proposalsViewHook();
-    return;
-  }
   showListSearch('home');
-  showListMode(true);
   setDetailMode(S.openRoomId ? 'chat' : 'empty');
   renderHome();
   const convoPane = $('msgr-convo');
@@ -285,13 +259,11 @@ async function navTo(key) {
   if (key === 'all') return;
 
   if (key === 'home') {
-    listMode = 'chats';
     setWorkspaceLayout(true);
-    setListMode('chats');
+    renderHomeLayer();
   } else if (key.indexOf('source:') === 0) {
     const sourceId = key.slice(7);
     setWorkspaceLayout(true);
-    showListMode(false);
     showListSearch(key);
     if (!sourceConnected(sourceId)) {
       setDetailMode('empty');
@@ -303,25 +275,11 @@ async function navTo(key) {
     await loadSourceList(sourceId);
   } else if (key === 'people') {
     setWorkspaceLayout(true);
-    showListMode(false);
     showListSearch('people');
     setDetailMode('empty');
     try { await refreshConvos(); } catch (e) {}
     if (contactsViewHook) contactsViewHook();
     else renderPeople();
-  }
-}
-
-function wireListMode() {
-  const chatsBtn = $('list-mode-chats');
-  const propBtn = $('list-mode-proposals');
-  if (chatsBtn && !chatsBtn.dataset.wired) {
-    chatsBtn.dataset.wired = '1';
-    chatsBtn.addEventListener('click', () => setListMode('chats'));
-  }
-  if (propBtn && !propBtn.dataset.wired) {
-    propBtn.dataset.wired = '1';
-    propBtn.addEventListener('click', () => setListMode('proposals'));
   }
 }
 
@@ -387,7 +345,6 @@ function refreshPlatformRail() {
 function buildNav() {
   buildPlatformRail();
   buildPlatformList();
-  wireListMode();
   wireSettingsMenu();
   wireTool('nav-home', 'home');
   wireTool('nav-people', 'people');
@@ -402,7 +359,7 @@ function wireTool(id, key) {
 
 export {
   showAuth, setActiveNav, showSection, navTo, buildNav, wireTool,
-  setSharingViewHook, setProposalsViewHook, setContactsViewHook,
-  setDetailMode, showListSearch, setListMode, renderHomeLayer, closeSettingsPopover,
+  setSharingViewHook, setContactsViewHook,
+  setDetailMode, showListSearch, renderHomeLayer, closeSettingsPopover,
   refreshPlatformRail, openPlatformConnect,
 };

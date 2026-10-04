@@ -12,6 +12,12 @@
 .rail-brand { width: 36px; height: 36px; line-height: 36px; text-align: center; font-weight: 700; font-size: 15px; margin-bottom: 8px; flex: none; }
 #nav-primary { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
 .nav-icon { width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: 10px; font-size: 20px; }
+#nav-teammates-rail.nav-platforms { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; max-height: 40vh; overflow-y: auto; }
+.teammate-rail-btn { position: relative; }
+.teammate-rail-btn .n { position: absolute; top: 2px; right: 2px; min-width: 14px; height: 14px; border-radius: 7px; background: #7c5cd6; color: #fff; font-size: 9px; display: grid; place-items: center; padding: 0 3px; }
+.avatar-sm { width: 24px; height: 24px; font-size: 10px; border-radius: 50%; display: inline-grid; place-items: center; background: var(--color-neutral-300); color: var(--color-neutral-700); overflow: hidden; }
+.avatar-img { width: 100%; height: 100%; object-fit: cover; }
+#proposal-stack { display: grid; gap: 6px; padding: 8px 16px 0; max-height: 40vh; overflow-y: auto; }
 .sidebar-live { padding: 4px 0; font-size: 0; }
 .sidebar-live .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
 
@@ -39,8 +45,18 @@
 #msgr-convo { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
 #detail-room { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 #detail-room.hidden { display: none !important; }
-#room-head { display: flex; align-items: center; gap: 12px; padding: 10px 16px; flex: 0 0 auto; }
+/* Conversation header (Triage Rail parity with apps/user #convo-head):
+   back · heading(title row / sub row / read row) · spacer · live pill */
+#room-head { display: flex; align-items: center; gap: 12px; padding: 8px 16px; min-height: 58px; flex: 0 0 auto; }
 #room-back { width: 32px; height: 32px; flex: none; }
+#room-heading { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; line-height: 1.25; }
+.room-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+#room-title { flex: 0 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#room-owner { flex: none; }
+.room-sub-row { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.room-sub-row:empty, #room-read:empty { display: none; }
+#room-head .spacer { flex: 0 0 8px; }
+#room-head .live-indicator-room { flex: none; white-space: nowrap; }
 #room-messages { flex: 1; min-height: 0; overflow-y: auto; }
 .message-copies { max-width: 100%; margin-top: 4px; color: var(--color-muted); font-size: 12px; }
 .message-copies > summary { cursor: pointer; }
@@ -97,3 +113,20 @@
   #msgr-convo.no-selection { display: none; }
   .settings-popover { left: 8px; right: 8px; min-width: 0; }
 }
+
+/* list-pane title (who you are looking at) + inline rename */
+.list-title { display: flex; align-items: center; gap: 10px; min-height: 32px; }
+.list-title:empty { display: none; }
+.list-title .avatar-sm { width: 30px; height: 30px; font-size: 11px; flex: none; }
+.list-title-who { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; line-height: 1.25; }
+.list-title-name { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-title-sub { font-size: 11.5px; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.list-title-sub .user-platforms-row { padding: 0; margin: 0; flex-basis: auto; }
+.list-title-sub .plat-badge { width: 14px; height: 14px; }
+.list-title-rename { font: 600 15px var(--font-body); padding: 2px 6px; border-radius: 6px; width: 100%; max-width: 240px; }
+.list-title .share-controls { margin-left: auto; }
+/* compact "whose account" chip on cross-teammate rows */
+.from-chip { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; font: 600 9px var(--font-body); background: var(--color-neutral-300); color: var(--color-neutral-700); flex: none; }
+
+#list-status { font-size: 12px; padding: 0 2px; }
+#list-status.error { color: #ea0038; }

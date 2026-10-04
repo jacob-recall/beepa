@@ -160,6 +160,13 @@ DIRECT_SEND_ACK_TYPE = "com.jkali.direct_send_ack"
 SHARE_LEVEL_TYPE = "com.jkali.share_level"
 DIRECT_SEND_BODY_MAX = 8000                 # D2.2 send-grade clamp (= sendConvoMessage's)
 DIRECT_SEND_FRESH_MS = 10 * 60 * 1000       # D2.3 replay bound: 10 minutes
+SUPERSEDED_SCAN_LIMIT = 10                  # D2-12: newest local messages to inspect
+READ_STATE_TYPE = "com.jkali.read_state"    # mirror-room state the uplink owns (read state)
+ORIGIN_AVATAR_KEY = "com.jkali.origin_avatar"
+FROM_PROPOSAL_KEY = "com.jkali.from_proposal"
+# Bridge bot mxids from the shared catalog (already imported above) — a bot's
+# own read receipt is never a person reading.
+SOURCE_BOT_MXIDS = frozenset(s["botMxid"] for s in SOURCES if s.get("botMxid"))
 DIRECT_SEND_ROOM_HOURLY = 20                # D2.6 default per-room rolling cap
 DIRECT_SEND_WINDOW_S = 3600                 # D2.6 rolling window
 # D2.2 send-grade sanitization: the SAME character classes as
@@ -401,6 +408,35 @@ def sanitize_send_body(body):
     if stripped.startswith("!"):
         return None
     return clean
+
+
+def read_state_from_room(room, self_ids, bot_ids):
+    """Teammate + other-party read timestamps from one LOCAL /sync room section.
+
+    teammate_read_ts: newest m.read receipt from the teammate's own account or
+    one of their attested bridge ghosts. remote_read_ts: newest receipt from
+    anyone else except a bridge bot. Pure; missing/malformed => 0.
+    """
+    out = {"teammate_read_ts": 0, "remote_read_ts": 0}
+    if not isinstance(room, dict):
+        return out
+    for e in ((room.get("ephemeral") or {}).get("events") or []):
+        if not isinstance(e, dict) or e.get("type") != "m.receipt" or not isinstance(e.get("content"), dict):
+            continue
+        for per_event in e["content"].values():
+            reads = per_event.get("m.read") if isinstance(per_event, dict) else None
+            if not isinstance(reads, dict):
+                continue
+            for user, info in reads.items():
+                ts = info.get("ts") if isinstance(info, dict) else None
+                if not isinstance(ts, int) or isinstance(ts, bool):
+                    continue
+                if user in bot_ids:
+                    continue
+                key = "teammate_read_ts" if user in self_ids else "remote_read_ts"
+                if ts > out[key]:
+                    out[key] = ts
+    return out
 
 
 class MasterUnreachable(Exception):
@@ -775,17 +811,19 @@ class Uplink(durable_sync.DurableSync):
         roots, edges = {}, {}
         for rid, room in join.items():
             states = list((room.get("state") or {}).get("events") or []) + list((room.get("timeline") or {}).get("events") or [])
-            name, children = None, {}
+            name, children, is_space = None, {}, False
             for event in states:
                 if not isinstance(event, dict):
                     continue
                 if event.get("type") == "m.room.name":
                     name = (event.get("content") or {}).get("name")
+                elif event.get("type") == "m.room.create":
+                    is_space = (event.get("content") or {}).get("type") == "m.space"
                 elif event.get("type") == "m.space.child":
                     # A later empty state event removes the earlier edge.
                     children[event.get("state_key")] = bool((event.get("content") or {}).get("via"))
             edges[rid] = [child for child, active in children.items() if active and child in join]
-            if isinstance(name, str):
+            if is_space and isinstance(name, str):
                 for label, sid in SOURCE_LABEL_TO_ID.items():
                     if (name == label if label == "X" else name.startswith(label)):
                         roots[rid] = sid
@@ -1288,15 +1326,38 @@ class Uplink(durable_sync.DurableSync):
             todo.discard(eid)
         return posted
 
-    def _display_name(self, local_room_id, sender):
-        """Best-effort origin sender display name from local room member state."""
+    def _member_profile(self, local_room_id, sender):
+        """(displayname, avatar_url) from local member state; (sender, None) on failure."""
         try:
             res = self.local("GET", "/_matrix/client/v3/rooms/"
                              + urllib.parse.quote(local_room_id, safe="")
                              + "/state/m.room.member/" + urllib.parse.quote(sender, safe=""))
-            return res.get("displayname") or sender
+            name = res.get("displayname") or sender
+            avatar = res.get("avatar_url")
+            return name, (avatar if isinstance(avatar, str) and MXC_RE.match(avatar) else None)
         except urllib.error.HTTPError:
-            return sender
+            return sender, None
+
+    def _display_name(self, local_room_id, sender):
+        """Best-effort origin sender display name from local room member state."""
+        return self._member_profile(local_room_id, sender)[0]
+
+    def _master_avatar_for(self, local_mxc, local_room_id):
+        """Re-upload an avatar once per local mxc (meta-cached) -> master mxc or None.
+
+        F13b: failures are cached too (sentinel "-"), so an unfetchable or
+        oversized avatar costs ONE attempt per mxc, not one per message. A new
+        avatar is a new mxc and therefore a new key.
+        """
+        key = "avatar:" + local_mxc
+        cached = self.meta_get(key)
+        if cached == "-":
+            return None
+        if cached:
+            return cached
+        new_uri = self._reupload_media({"url": local_mxc, "msgtype": "m.image"}, local_room_id)
+        self.meta_set(key, new_uri or "-")
+        return new_uri
 
     # -- media re-upload (v1.5) ---------------------------------------------
     @staticmethod
@@ -1415,9 +1476,25 @@ class Uplink(durable_sync.DurableSync):
                                 or sender in self.self_mxids
                                 or (source == "imessage" and sender == getattr(self.cfg, "imessage_bot", None)
                                     and content.get(FROM_ME_KEY) is True))
+        # F12: provenance stamps are OURS. A remote party / bridge can put these
+        # keys in their own content; strip anything we did not stamp ourselves,
+        # and keep the teammate-authored ones only on a message the from_me gate
+        # owns.
+        content.pop(ORIGIN_AVATAR_KEY, None)
+        if content.get(FROM_ME_KEY) is not True:
+            content.pop(FROM_PROPOSAL_KEY, None)
+            content.pop(AUTO_SENT_FROM_PROPOSAL_KEY, None)
         stamp_timestamp(content, ev)
         content[SOURCE_KEY] = source or "unknown"
-        content[ORIGIN_SENDER_KEY] = self._display_name(local_room_id, sender)
+        name, avatar = self._member_profile(local_room_id, sender)
+        content[ORIGIN_SENDER_KEY] = name
+        # F13d: this _reupload_media call MUST stay before the media block below —
+        # that block resets _media_retryable on entry, so the media_retry insert
+        # reads the media call's flag, not this one's. Do not reorder.
+        if avatar:
+            master_avatar = self._master_avatar_for(avatar, local_room_id)
+            if master_avatar:
+                content[ORIGIN_AVATAR_KEY] = master_avatar
         # Media (v1.5): re-upload the blob from LOCAL to the MASTER media store and
         # post the NEW master mxc + preserved info/filename metadata. On ANY failure
         # (bad/encrypted mxc, over UPLINK_MEDIA_MAX, download/upload error) fall back
@@ -1738,6 +1815,37 @@ class Uplink(durable_sync.DurableSync):
         except Exception:                          # noqa: BLE001 — fail closed
             return "private"
 
+    def room_quiet_since(self, local_room_id, since_ts):
+        """D2-12: True iff NO m.room.message in the target room is newer than
+        since_ts. The daemon-side twin of the app's draft-retirement rule: a
+        proposal the conversation has moved past is never auto-sent (that is
+        the double text). FAIL CLOSED — any read error, bad id or junk => False.
+
+        An EMPTY page reads as quiet (a new room); a non-list chunk or any
+        error reads as NOT quiet. Reduces the double text to the one-round-trip
+        window between this read and the PUT; it cannot eliminate it.
+        """
+        if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
+            return False
+        if not isinstance(since_ts, int) or isinstance(since_ts, bool):
+            return False
+        try:
+            data = self.local("GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(local_room_id, safe="")
+                              + "/messages", query={"dir": "b", "limit": str(SUPERSEDED_SCAN_LIMIT),
+                                                    "filter": json.dumps({"types": ["m.room.message"]})})
+        except Exception:                          # noqa: BLE001 — fail closed
+            return False
+        chunk = data.get("chunk") if isinstance(data, dict) else None
+        if not isinstance(chunk, list):
+            return False
+        for e in chunk:
+            if not isinstance(e, dict) or e.get("type") != "m.room.message":
+                continue
+            ts = e.get("origin_server_ts")
+            if isinstance(ts, int) and not isinstance(ts, bool) and ts > since_ts:
+                return False
+        return True
+
     def direct_send_under_cap(self, room_hash, now=None):
         """D2-6: is this room under the rolling per-hour auto-send cap?
 
@@ -1826,6 +1934,16 @@ class Uplink(durable_sync.DurableSync):
         # D2-6: persisted rolling per-room cap.
         if not self.direct_send_under_cap(self._room_hash(target)):
             return None, "cap"
+        # D2-12: conversation quiet since the proposal was made. Any message
+        # from anyone (the teammate's own phone reply included) after the
+        # proposal supersedes it. F3: this is the only network read among the
+        # gates, so it runs LAST — a hostile master cannot amplify local reads
+        # past the cheap identity/consent/cap refusals. F5: compare against the
+        # proposal time CLAMPED TO NOW — D2-3 tolerates +60s of future-dating,
+        # and a future ots would otherwise hide real activity in that window
+        # from this gate.
+        if not self.room_quiet_since(target, min(ots, now_ms)):
+            return None, "superseded"
         return body, None
 
     def _auto_send(self, master_event_id, local_room_id, body):
@@ -2399,6 +2517,29 @@ class Uplink(durable_sync.DurableSync):
             conn.close()
 
     # -- main loop ----------------------------------------------------------
+    def _mirror_read_state(self, local_room_id, master_room_id, state):
+        """PUT com.jkali.read_state on the mirror when it changed (meta-cached).
+        A state event the uplink owns (PL 100 in its own mirror rooms) is the
+        honest carrier: receipts cannot be forwarded across homeservers. Write
+        failure is logged and retried on the next change; never raised."""
+        key = "read_state:" + local_room_id
+        payload = {"teammate_read_ts": int(state.get("teammate_read_ts") or 0),
+                   "remote_read_ts": int(state.get("remote_read_ts") or 0)}
+        sig = "%d:%d" % (payload["teammate_read_ts"], payload["remote_read_ts"])
+        if self.meta_get(key) == sig:
+            return
+        payload["updated_ts"] = int(time.time() * 1000)
+        try:
+            # F9: short timeout — this runs from local ingestion, which must never
+            # stall on a sleeping master.
+            self.master("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="")
+                        + "/state/" + READ_STATE_TYPE + "/", payload, timeout=15)
+            self.meta_set(key, sig)
+        except MasterUnreachable:
+            log.debug("read_state not mirrored (master unreachable)")
+        except Exception as e:                     # noqa: BLE001 — cosmetic state, never blocks delivery
+            log.debug("read_state not mirrored (%s)", type(e).__name__)
+
     def tail_once(self):
         """One /sync of the LOCAL hs; forward new events in shared mirror rooms."""
         since = self.meta_get("sync_since")
@@ -2429,6 +2570,17 @@ class Uplink(durable_sync.DurableSync):
             if self.mirror_status(local_room_id) == "revoking":
                 continue
             master_room_id = row[0]
+            try:
+                selfs = set(self.self_mxids) | {self.cfg.local_user}
+                rs = read_state_from_room(room, selfs, SOURCE_BOT_MXIDS)
+                # F9: the SAME per-write consent recheck every other master write
+                # performs, so an unshared room never leaks its read state.
+                if ((rs["teammate_read_ts"] or rs["remote_read_ts"])
+                        and self.active_link_for_dispatch()
+                        and self.archive_level(local_room_id) in ("share", "direct")):
+                    self._mirror_read_state(local_room_id, master_room_id, rs)
+            except Exception as e:                 # noqa: BLE001 — never affects event forwarding
+                log.debug("read_state skipped (%s)", type(e).__name__)
             timeline = room.get("timeline") or {}
             events = timeline.get("events") or []
             if timeline.get("limited"):

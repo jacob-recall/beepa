@@ -4,10 +4,14 @@
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { $, el, sanitizeLine, txn } from './el.js';
 import { setActiveNav, showSection, setDetailMode } from './nav.js';
-import { convoResolveContent, renderMessageEvent } from './render.js';
+import { convoResolveContent, renderMessageEvent, applyReadCaption } from './render.js';
 import { messageTimestamp, timestampCorrections } from '../model/message_timestamps.js';
 import { IMSG_BOT_MXID } from './sources.js';
 import { buildPlatBadge, setActiveConvoRow } from './rows.js';
+import { parseReadState } from './account-data.js';
+import { scheduleFeedRender } from './search.js';
+import { SOURCES } from '../model/source_catalog.js';
+import { feedRelTime } from '../model/message_preview.js';
 import { S, convoSeen, feedModel, runtime } from '../state.js';
 
 // Module-local per-conversation message cache (LRU by room, module-local like
@@ -81,6 +85,86 @@ function convoSetStatus(text) {
   s.classList.toggle('hidden', !text);
 }
 
+// Optional app hooks (apps/user registers them; shared never imports apps/):
+// convoHeaderHook(roomId, extraEl, subEl) decorates the header (read-only
+// chips); composerGhostHook(roomId) renders the manager-draft ghost.
+let convoHeaderHook = null;
+function setConvoHeaderHook(fn) { convoHeaderHook = typeof fn === 'function' ? fn : null; }
+let composerGhostHook = null;
+function setComposerGhostHook(fn) { composerGhostHook = typeof fn === 'function' ? fn : null; }
+
+function profileOf(roomId) {
+  const rp = S.roomProfile;
+  if (!rp) return null;
+  const p = typeof rp.get === 'function' ? rp.get(roomId) : rp[roomId];
+  return (p && typeof p.id === 'string' && p.id) ? p : null;
+}
+// Every feed record sharing this room's contact profile (newest first), or
+// just the room itself when it is unlinked. Rooms merge ONLY via S.roomProfile
+// (written from the stored contact profiles), never by name.
+function siblingRooms(roomId) {
+  const rec = feedModel.get(roomId);
+  if (!rec) return [];
+  const p = profileOf(roomId);
+  if (!p) return [rec];
+  const out = [];
+  for (const r of feedModel.values()) {
+    const q = profileOf(r.id);
+    if (q && q.id === p.id) out.push(r);
+  }
+  return out.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+}
+// Platform tabs under the header for a clustered person; hidden for one room.
+function renderConvoTabs(roomId) {
+  const host = $('convo-tabs');
+  if (!host) return;
+  const sibs = siblingRooms(roomId);
+  host.replaceChildren();
+  host.classList.toggle('hidden', sibs.length < 2);
+  if (sibs.length < 2) return;
+  for (const r of sibs) {
+    const tab = el('button', 'convo-tab' + (r.id === roomId ? ' on' : ''));
+    tab.type = 'button'; tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', r.id === roomId ? 'true' : 'false');
+    tab.appendChild(buildPlatBadge(r.sourceId));
+    const source = SOURCES.find(s => s.id === r.sourceId);
+    tab.appendChild(el('span', 'convo-tab-label', (source && source.label) || r.sourceId || ''));
+    if (r.unread) tab.appendChild(el('span', 'pill unread', String(r.unread)));
+    if (r.id !== roomId && r.lastTs) tab.appendChild(el('span', 'convo-tab-when', feedRelTime(r.lastTs)));
+    tab.addEventListener('click', () => { if (r.id !== roomId) openConvo(r.id); });
+    host.appendChild(tab);
+  }
+}
+
+// Read receipts are a per-viewer convenience (not authorization): '0' turns off
+// marking conversations read on the phone when opened here. Default on.
+function receiptsEnabled() {
+  try { return localStorage.getItem('beepa_send_receipts') !== '0'; } catch (e) { return true; }
+}
+// Advance BOTH the fully-read marker and the public read receipt to eventId.
+// Only for a validated, OPEN room; failure is logged nowhere and changes nothing.
+async function markRead(roomId, eventId) {
+  if (!receiptsEnabled()) return;
+  if (typeof eventId !== 'string' || !eventId.startsWith('$')) return;
+  if (!ROOMID_RE.test(roomId) || !S.joinedSet.has(roomId) || S.openRoomId !== roomId) return;
+  try {
+    await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/read_markers',
+      { 'm.fully_read': eventId, 'm.read': eventId });
+    const rec = feedModel.get(roomId);
+    if (rec && rec.unread) { rec.unread = 0; scheduleFeedRender(); }
+  } catch (e) { /* receipt failure never affects anything else */ }
+}
+function newestRenderedEventId() {
+  const box = $('convo-messages');
+  if (!box) return null;
+  for (let i = box.children.length - 1; i >= 0; i--) {
+    const id = box.children[i].dataset && box.children[i].dataset.eventId;
+    if (id) return id;
+  }
+  return null;
+}
+function selfIds() { return new Set([S.userId, ...(S.selfMxids || [])]); }
+
 // Open the native conversation view for a validated room (CV-6): the
 // ROOMID_RE ∩ S.joinedSet gate re-applied at open time. Loads recent history via
 // /messages, renders through the shared renderer, then starts the room-scoped
@@ -99,14 +183,26 @@ async function openConvo(roomId) {
   if (input) input.value = '';                      // never carry a draft into a different room
 
   const rec = feedModel.get(roomId);
+  S.convoRemoteReadTs = (rec && rec.remoteReadTs) || 0;
+  const p = profileOf(roomId);
   const titleEl = $('convo-title');
-  if (titleEl) titleEl.textContent = sanitizeLine((rec && rec.name) || roomId);
+  if (titleEl) titleEl.textContent = sanitizeLine((p && p.displayName) || (rec && rec.name) || roomId);
+  const sub = $('convo-sub');
+  if (sub) sub.textContent = '';
   const badge = $('convo-badge');
   if (badge) {
     const b = buildPlatBadge(rec && rec.sourceId); // derived from record sourceId only
     badge.className = b.className;
     badge.textContent = b.textContent;
   }
+  renderConvoTabs(roomId);
+  const extra = $('convo-head-extra');
+  if (extra) {
+    extra.replaceChildren();
+    if (convoHeaderHook) { try { convoHeaderHook(roomId, extra, sub); } catch (e) { /* app hook must not break open */ } }
+  }
+  if (input) input.placeholder = 'Reply on ' + ((SOURCES.find(s => s.id === (rec && rec.sourceId)) || {}).label || 'this platform') + '…';
+  if (composerGhostHook) { try { composerGhostHook(roomId); } catch (e) { /* app hook must not break open */ } }
   const box = $('convo-messages');
   if (box) box.replaceChildren();                   // #convo-messages holds ONLY bubbles (CV-R3)
   // Layout/nav only: reveal the Home messenger and open the right-hand chat pane.
@@ -142,6 +238,8 @@ async function openConvo(roomId) {
       // pass above already rendered, so this only paints what's new.
       for (const ev of chunk) renderMessageEvent(ev);
       if (box) box.scrollTop = box.scrollHeight;
+      applyReadCaption(S.convoRemoteReadTs);
+      markRead(roomId, newestRenderedEventId());
     }
   } catch (e) {
     if (current()) convoSetStatus('Could not load messages: ' + String(e.message || e));
@@ -166,7 +264,7 @@ async function startConvoWatch(roomId) {
   while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { rooms: [watchRoom], timeline: { limit: 20 }, state: { types: [] } },
+        room: { rooms: [watchRoom], timeline: { limit: 20 }, state: { types: [] }, ephemeral: { types: ['m.receipt'] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -197,6 +295,13 @@ async function startConvoWatch(roomId) {
         if (toCache.length) cacheAppend(watchRoom, toCache);  // keep the cache warm while the room is open
         const box = $('convo-messages');
         if (box) box.scrollTop = box.scrollHeight;
+        applyReadCaption(S.convoRemoteReadTs);
+        if (typeof document === 'undefined' || document.visibilityState !== 'hidden') markRead(watchRoom, newestRenderedEventId());
+        if (composerGhostHook) { try { composerGhostHook(watchRoom); } catch (e) { /* app hook must not break the tail */ } }
+      }
+      if (room && room.ephemeral && S.openRoomId === watchRoom) {
+        const rs = parseReadState(room, selfIds());
+        if (rs.remoteReadTs > S.convoRemoteReadTs) { S.convoRemoteReadTs = rs.remoteReadTs; applyReadCaption(rs.remoteReadTs); }
       }
     } catch (e) {
       if (!current()) return;
@@ -227,7 +332,7 @@ function stopConvoWatch() {
 // identical guard below. A passed target NEVER falls back to S.openRoomId, so an
 // invalid or management-room target is rejected here, never silently redirected
 // to whatever chat happens to be open. No second send path exists.
-async function sendConvoMessage(targetRoom, bodyOverride) {
+async function sendConvoMessage(targetRoom, bodyOverride, meta) {
   const input = $('convo-input');
   if (!input) return false;
   const hasTarget = (typeof targetRoom === 'string' && !!targetRoom);
@@ -248,11 +353,19 @@ async function sendConvoMessage(targetRoom, bodyOverride) {
       roomId === runtime.gmessages.mgmtRoomId ||
       roomId === runtime.instagram.mgmtRoomId ||
       roomId === runtime.linkedin.mgmtRoomId ||
-      roomId === runtime.twitter.mgmtRoomId) {
+      roomId === runtime.twitter.mgmtRoomId ||
+      roomId === runtime.discord.mgmtRoomId) {
     convoSetStatus('Cannot send a message here.');
     return false;
   }
   const body = text.slice(0, 8000);                 // clamp length
+  const content = { msgtype: 'm.text', body };
+  // Cosmetic provenance only (same role as the uplink's auto_sent_from_proposal
+  // stamp): lets the mirrored copy say "sent by teammate" against a suggestion.
+  // Shape-checked, never read by any guard here or in the uplink.
+  if (meta && typeof meta.fromProposal === 'string' && /^\$[A-Za-z0-9._~:+/=-]{1,255}$/.test(meta.fromProposal)) {
+    content['com.jkali.from_proposal'] = meta.fromProposal;
+  }
   const t = txn();                                  // fresh random transaction id
   if (fromComposer) input.value = '';               // clear only the composer we read from
   convoSetStatus('');
@@ -260,14 +373,14 @@ async function sendConvoMessage(targetRoom, bodyOverride) {
   // by 'txn:'+t (renderMessageEvent). No event_id yet -> keyed by txn only.
   renderMessageEvent({
     type: 'm.room.message', sender: S.userId,
-    content: { msgtype: 'm.text', body },
+    content,
     origin_server_ts: Date.now(), unsigned: { transaction_id: t },
   });
   const box = $('convo-messages');
   if (box) box.scrollTop = box.scrollHeight;
   try {
     await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
-      '/send/m.room.message/' + encodeURIComponent(t), { msgtype: 'm.text', body });
+      '/send/m.room.message/' + encodeURIComponent(t), content);
     if (fromComposer && afterSendHook) {
       try { afterSendHook(roomId, body); } catch (e) { /* app hook must not break send */ }
     }
@@ -291,4 +404,4 @@ function prefillComposer(text) {
   input.focus();
 }
 
-export { convoSetStatus, openConvo, startConvoWatch, stopConvoWatch, sendConvoMessage, prefillComposer, setAfterSendHook };
+export { convoSetStatus, openConvo, startConvoWatch, stopConvoWatch, sendConvoMessage, prefillComposer, setAfterSendHook, setConvoHeaderHook, setComposerGhostHook, siblingRooms, markRead, receiptsEnabled };

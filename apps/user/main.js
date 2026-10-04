@@ -16,6 +16,7 @@ import { buildNav, navTo, refreshPlatformRail, showAuth } from '../../shared/ui/
 import { setActiveConvoRow } from '../../shared/ui/rows.js';
 import { renderHome, renderSourceList, setFeedRenderHook } from '../../shared/ui/search.js';
 import { GMSG, IG, LI, SOURCES, TW, WA, clearQR, resolveImsgMgmt, resolveMgmt, sendCmd, sendStatusRefresh, startSync } from '../../shared/ui/sources.js';
+import { resetDiscordLogin } from '../../shared/ui/discord.js';
 import { S, convoNamePending, convoNames, convoSeen, feedManualHidden, feedModel, runtime } from '../../shared/state.js';
 
 // Register the transport's 401 handler (see shared/matrix/client.js).
@@ -26,6 +27,8 @@ function forgetSession() {
   S.token = null; S.userId = null;
   S.timestampCorrections?.clear();
   runtime.whatsapp.mgmtRoomId = null; runtime.imessage.mgmtRoomId = null; runtime.gmessages.mgmtRoomId = null; runtime.instagram.mgmtRoomId = null; runtime.linkedin.mgmtRoomId = null; runtime.twitter.mgmtRoomId = null;
+  runtime.discord.mgmtRoomId = null;
+  resetDiscordLogin();
   for (const k of Object.keys(runtime)) runtime[k].connected = false;
   S.syncRunning = false;
   S.feedRunning = false;                              // HF-2: stop the feed loop with the session
@@ -300,6 +303,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // HF-8: Home search is a pure client-side filter over the in-memory feed
   // model; it never builds a URL, sends a command, or navigates.
+  // Read receipts toggle (per-viewer convenience, read by shared/ui/chat.js receiptsEnabled()).
+  const rc = $('setting-receipts');
+  if (rc) {
+    try { rc.checked = localStorage.getItem('beepa_send_receipts') !== '0'; } catch (e) {}
+    rc.addEventListener('change', () => { try { localStorage.setItem('beepa_send_receipts', rc.checked ? '1' : '0'); } catch (e) {} });
+  }
   const homeSearch = $('home-search');
   if (homeSearch) homeSearch.addEventListener('input', renderHome);
   const sourceSearch = $('source-search');

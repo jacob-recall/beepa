@@ -6,7 +6,7 @@ model is unchanged by the reliability and deployment repairs.
 ## What it does
 
 Each teammate has a private local Matrix hub and bridges for WhatsApp,
-iMessage, Google Messages, Instagram, LinkedIn and X. The master receives
+iMessage, Google Messages, Instagram, LinkedIn, X and Discord DMs. The master receives
 copies of conversations that the teammate explicitly shares. The master can
 run on a mostly-on personal Mac, reached through a private Tailscale network.
 When either computer is offline, live access waits; retained source history
@@ -38,7 +38,10 @@ each conversation retains its own authority setting.
 
 Direct requires the configured manager identity, the expected proposal room,
 a current mapped conversation, a fresh proposal, a current Direct setting at
-dispatch, valid content/target, and available rate allowance. Identity changes
+dispatch, valid content/target, available rate allowance, and a conversation
+that has not moved on since the proposal was made — a later message in that
+conversation refuses the automatic send, so an already-answered suggestion
+does not become a second reply. Identity changes
 suspend automatic sending until the existing reconfirmation requirement is
 met. Historical catch-up does not turn stale proposals into fresh sends.
 Durable outcome and ambiguity records prevent blindly resending an uncertain

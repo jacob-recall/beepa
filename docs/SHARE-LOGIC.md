@@ -20,6 +20,14 @@ Each hop has a distinct owner and enforcement point:
 | 5 | **Manager membership** — the manager's account *joins* the space, the mirrors, and the proposals room | **Manager console** | Auto-accepting the uplink's invites — **this hop was broken; see below** | Invites pile up unaccepted → console renders nothing |
 | 6 | **Rendering** — rail + feed + per-teammate views | Manager console | `parseSnapshot`/`buildByUser`: only *joined* rooms that are children of a joined `space:*` space are listed | Hop 5 incomplete |
 
+Hop 4 carries one thing besides messages: **sharing a conversation also shares
+the teammate's read position in it** (F10). The uplink stamps
+`com.jkali.read_state` on the mirror — the newest read receipt from the
+teammate and from the other party — for `share` and `direct` rooms only, so
+the manager sees what the teammate has seen. It is written from the same
+ingestion pass as messages, behind the same consent recheck, and is retired
+(not erased) by revocation exactly like message content.
+
 The reverse (proposal) path piggybacks on the same membership: the manager can
 only write a suggestion into a teammate's Proposals room after joining it
 (hop 5), and the teammate's uplink pulls it down regardless of console state.

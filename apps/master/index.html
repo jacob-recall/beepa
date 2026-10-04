@@ -7,8 +7,8 @@
 <title>Beepa Console</title>
 <link rel="icon" type="image/svg+xml" href="../../shared/assets/motherload_master.svg">
 <link rel="stylesheet" href="../../shared/style/organic.css?v=wa4">
-<link rel="stylesheet" href="style.css?v=wa11">
-<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa11">
+<link rel="stylesheet" href="style.css?v=tr4">
+<link rel="stylesheet" href="../../shared/style/beepa.css?v=tr4">
 </head>
 <body>
 <section id="view-signin">
@@ -33,10 +33,10 @@
     <div id="brand" class="rail-brand" title="Beepa Console"><img class="brand-img" src="../../shared/assets/motherload_master.svg" alt="Beepa Console"></div>
     <nav id="nav-primary" aria-label="Main">
       <button id="nav-recent" class="navitem nav-icon" type="button" title="Feed" aria-label="Feed"><span class="ic">&#127968;</span></button>
-      <button id="nav-search" class="navitem nav-icon" type="button" title="Search" aria-label="Search"><span class="ic">&#128269;</span></button>
       <button id="nav-contacts" class="navitem nav-icon" type="button" title="Contacts" aria-label="Contacts"><span class="ic">&#128100;</span></button>
       <button id="nav-teammates" class="navitem nav-icon" type="button" title="Teammates" aria-label="Teammates"><span class="ic">&#128101;</span></button>
     </nav>
+    <nav id="nav-teammates-rail" class="nav-platforms" aria-label="Teammates"></nav>
     <div class="spacer"></div>
     <div class="live-indicator sidebar-live" title="Refreshing every 20s"><span class="live-dot"></span></div>
     <button id="nav-settings-toggle" class="navitem nav-icon" type="button" title="Settings" aria-label="Settings" aria-expanded="false"><span class="ic">&#9881;</span></button>
@@ -53,7 +53,9 @@
       <div id="workspace">
         <div id="list-pane">
           <div id="list-head">
-            <input id="search-input" class="list-search hidden" placeholder="Search everyone" spellcheck="false" autocomplete="off">
+            <div id="list-title" class="list-title"></div>
+            <div id="list-status" class="proposal-status hidden"></div>
+            <input id="search-input" class="list-search hidden" placeholder="Search shared chats" spellcheck="false" autocomplete="off">
             <input id="contacts-search" class="list-search hidden" placeholder="Search contacts" spellcheck="false" autocomplete="off">
             <button id="contacts-export" type="button" class="btn hidden" title="Download the contacts index as JSON">Export contacts</button>
           </div>
@@ -73,6 +75,7 @@
                   <span id="room-badge" class="plat-badge"></span>
                   <span id="room-source-label" class="muted"></span>
                 </div>
+                <div id="room-read" class="room-sub-row muted"></div>
               </div>
               <div class="spacer"></div>
               <div class="live-indicator live-indicator-room" title="Watching for new messages"><span class="live-dot"></span>Live</div>
@@ -80,6 +83,7 @@
             <div id="room-messages"></div>
             <div id="room-status" class="convo-status hidden"></div>
             <div id="proposal-pane" class="hidden">
+              <div id="proposal-stack"></div>
               <div id="proposal-compose">
                 <input id="proposal-input" placeholder="Message" spellcheck="true" autocomplete="off">
                 <button id="proposal-send" type="button" class="primary">Suggest a reply</button>
@@ -135,6 +139,6 @@
 </div>
 
 <script src="config.js"></script>
-<script type="module" src="main.js?v=wa11"></script>
+<script type="module" src="main.js?v=tr4"></script>
 </body>
 </html>

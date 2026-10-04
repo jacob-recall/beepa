@@ -140,7 +140,7 @@ what bounds the capability is the gate list under "Security invariants".
   against the live joined set. **Exception (D2):** for a `direct`-level
   conversation the daemon itself sends into `target_room` — see the next
   invariant, which is the complete list of what makes that safe.
-- **The `direct` auto-send is the one send path here, and all eleven gates
+- **The `direct` auto-send is the one send path here, and all twelve gates
   are load-bearing.** `_direct_send_gate()` runs them in order and returns
   the sanitized body only if every one passes; ANY failure falls back to the
   ordinary actionable inbox draft (never a silent drop), and the gate name is
@@ -190,9 +190,53 @@ what bounds the capability is the gate list under "Security invariants".
       AND suspends auto-send, writing
       `com.jkali.direct_send_suspended`; it resumes only when the teammate's
       `com.jkali.direct_send_ack` matches that exact four-field tuple.
+  12. **Superseded — the conversation has moved on.** `room_quiet_since()`
+      reads the newest `SUPERSEDED_SCAN_LIMIT` (10) `m.room.message` events in
+      the target room; ANY of them newer than the proposal refuses the send as
+      `superseded`. The comparison point is the proposal's `origin_server_ts`
+      **clamped to now** (`min(ots, now_ms)`, F5) — D2-3 tolerates +60s of
+      future-dating, and an unclamped future stamp would hide real activity in
+      that window. FAIL CLOSED: a bad room id, a non-list chunk or any read
+      error reads as NOT quiet; an EMPTY page reads as quiet (a new room).
+      This is the daemon-side twin of the app's draft-retirement rule — it is
+      what stops the double text where the teammate already answered. Two
+      honest limits: it **reduces, does not eliminate** the race (the TOCTOU
+      window between this read and the PUT remains, F7), and because a send
+      supersedes the proposals behind it, a manager burst self-limits to one
+      auto-send per room per batch (F4). It is the only gate that makes a
+      network read, so it runs LAST, after the cheap cap check (F3).
   The `com.jkali.auto_sent_from_proposal` field on the sent message is
   **cosmetic** (F14) — forgeable by anything holding the teammate token, and
   it must never feed the `from_me` gate or any other trust decision.
+- **What the uplink stamps on the master, and who may write it.**
+  Mirror-room STATE: `com.jkali.source` / `com.jkali.profile` /
+  `com.jkali.share_level` / `com.jkali.mirror_of`, plus
+  **`com.jkali.read_state`** (state_key `""`, content `{teammate_read_ts,
+  remote_read_ts, updated_ts}`) — the teammate's and the other party's newest
+  read receipts, which cannot cross homeservers as receipts. Written from
+  `tail_once`'s ingestion leg behind the SAME per-write checks as any other
+  master write (`active_link_for_dispatch()` AND `archive_level(room) in
+  ("share","direct")`, F9), meta-cached so an unchanged state costs no call,
+  on a 15s timeout, and `MasterUnreachable`/any error is swallowed — local
+  ingestion must never stall on a sleeping master. The uplink account is PL
+  100 in its own mirror rooms and the manager is PL 0, so the manager cannot
+  forge it. Like message content, revocation retires access, not the bytes
+  already there (F11). Sharing a conversation therefore also shares the
+  teammate's read position in it — the sharing UI copy and
+  `docs/SHARE-LOGIC.md` say so (F10).
+  Message CONTENT: `com.jkali.from_me` (the trust gate),
+  `com.jkali.origin_sender`, `com.jkali.source`, the timestamp fields, and the
+  cosmetic **`com.jkali.origin_avatar`** (a MASTER mxc for the sender's
+  avatar, re-uploaded once per local mxc and cached — *failures cached as
+  `"-"` too*, F13b, so an unfetchable or oversized avatar costs one attempt,
+  not one per message). **Provenance stamps are ours (F12):**
+  `_forward_message` unconditionally pops `com.jkali.origin_avatar` from
+  inbound content, and pops `com.jkali.from_proposal` /
+  `com.jkali.auto_sent_from_proposal` unless `from_me` is `True` — otherwise a
+  remote party or bridge could inject them into their own message. Both caches
+  live in `meta` (`avatar:%`, `read_state:%`) and are cleared by
+  `destination_binding` on a destination change (F13c), so a new master never
+  serves old-master mxcs or suppresses the first read-state PUT.
 - **Address-book contacts leave the machine only through
   `reconcile.plan_contact_mirror`, and only as a per-pass diff.** The
   planner is the consent gate for contact PII: a row is a push candidate
@@ -257,6 +301,8 @@ python3 tests/unit/consent_py.test.py
 python3 tests/unit/uplink_reconcile.test.py
 python3 tests/unit/uplink_direct_send.test.py    # D2 auto-send gates + schema
 python3 tests/unit/uplink_share_level.test.py    # D2b share-level stamping
+python3 tests/unit/uplink_superseded.test.py    # D2-12 superseded gate + inbound stamp stripping
+python3 tests/unit/uplink_read_state.test.py    # com.jkali.read_state mirroring
 python3 tests/unit/uplink_contact_overrides.test.py  # per-contact override gates
 
 # run the daemon against a real local + master pair (see master/CLAUDE.md

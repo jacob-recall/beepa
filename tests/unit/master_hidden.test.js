@@ -92,3 +92,22 @@ if (fail > 0) {
   for (const f of failures) console.error('  - ' + f);
   process.exitCode = 1;
 }
+
+// ---- per-browser teammate display names (convenience, never identity) ----
+import { parseNames, dumpNames, rename, displayName, sharingUsers } from '../../apps/master/hidden.js';
+{
+  const names = parseNames('{"david":"David K.","":"x","bob":"","eve":42}');
+  eq([...names], [['david', 'David K.']], 'parseNames: keeps only non-empty string names for non-empty labels');
+  eq([...parseNames('["david"]')], [], 'parseNames: an array is not a name map');
+  eq([...parseNames(null)], [], 'parseNames: null');
+  eq(displayName(names, 'david'), 'David K.', 'displayName: renamed');
+  eq(displayName(names, 'asha'), 'asha', 'displayName: falls back to the verified label');
+  eq(displayName(names, ''), '', 'displayName: empty label');
+  const r = rename(names, 'asha', '  Asha S  ');
+  eq(displayName(r, 'asha'), 'Asha S', 'rename: trims');
+  eq(displayName(rename(r, 'asha', ''), 'asha'), 'asha', 'rename: empty resets to the label');
+  eq(displayName(rename(r, 'asha', 'asha'), 'asha'), 'asha', 'rename: same as label stores nothing');
+  eq(JSON.parse(dumpNames(r)), { david: 'David K.', asha: 'Asha S' }, 'dumpNames round-trips');
+  const byUser = new Map([['david', [{ id: '!a' }]], ['asha', []], ['bob', [{ id: '!b' }]]]);
+  eq(sharingUsers(byUser, new Set(['bob'])).map(([l]) => l), ['david'], 'sharingUsers: drops zero-shared and hidden');
+}

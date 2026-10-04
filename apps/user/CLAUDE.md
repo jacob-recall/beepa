@@ -1,7 +1,7 @@
 # apps/user/ — the teammate app
 
 The full per-teammate hub: everything `shared/` provides, plus the sharing
-controls, consent panel, proposal inbox, and contact management that make
+controls, consent panel, manager-draft ghost (no inbox), and contact management that make
 this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
 §5, §12 phase 5, §2 v2). This is the only app with a composer / send path.
 
@@ -38,19 +38,33 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   toggle, and non-auto merge suggestions (`suggestions()` from
   `shared/model/contacts.js` — advisory only; a "Create contact" click is
   the only thing that ever turns a suggestion into a real link).
-- `proposals.js` — PLAN §2 v2 / §7. Reads the teammate's dedicated local
-  proposals room (created by the uplink, marked `com.jkali.proposals`) and
-  renders each `com.jkali.proposal` event as a clearly-flagged **DRAFT** card
-  in its own inbox region (`#proposals-list`) — **never** through
-  `renderMessageEvent`, so a proposal can never be mistaken for a real
-  message and the from_me anti-spoof gate is untouched. Actions: "Send to
-  conversation" (calls the guarded `sendConvoMessage(targetRoom, body)` with
-  an *explicit* target — never falls back to whatever's open), "Edit in
-  chat" / "Use in composer" (prefills the composer for the teammate to send
-  themselves), "Dismiss" (marks handled locally, never sends).
-- `main.js`'s `sendConvoMessage(targetRoom, bodyOverride)` call sites are the
+- `proposals.js` — PLAN §2 v2 / §7, Triage Rail form (2026-10-03). Reads the
+  teammate's dedicated local proposals room (created by the uplink, marked
+  `com.jkali.proposals`). There is **no inbox tab**: each room-targeted
+  `com.jkali.proposal` becomes an entry in that room's feed record `drafts`
+  (`attachDrafts`, pure), and the OPEN room's drafts render as a **ghost** in
+  `#convo-ghost` above the composer — **never** through `renderMessageEvent`,
+  so a draft can never be mistaken for a real message and the from_me
+  anti-spoof gate is untouched. A draft is PENDING only while
+  `draftPending(origin_ts, room.lastTs)` from `shared/model/attention.js`
+  holds (fail closed: unknown activity ⇒ not pending); any later message from
+  anyone retires it visibly (struck through, "Restore" for 24h). The chat list
+  shows the same state as a violet stripe/pill and a `Draft:` preview
+  (`shared/ui/rows.js`). Ghost actions: "Send as me" calls the guarded
+  `sendConvoMessage(targetRoom, shown, { fromProposal })` with an *explicit*
+  target and the **exact string shown** (`sanitize(body)`, F14 — never a
+  truncated preview of a longer send); "Edit" prefills the composer; "Dismiss"
+  marks handled locally. Person-targeted (new-chat) drafts render as a
+  pseudo-row at the top of the Home list and keep the detail pane + verbatim
+  confirm + gated `start-chat` leg. `parseProposal` takes
+  `min(origin_server_ts, content.origin_ts)` (F17: the manager controls
+  `origin_ts`; a far-future value must never pin a ghost as pending).
+  `com.jkali.from_proposal` is a cosmetic content stamp read only by the
+  manager console's suggestion stack (and only on from_me messages); no trust
+  logic anywhere reads it.
+- `main.js`'s `sendConvoMessage(targetRoom, bodyOverride, meta)` call sites are the
   **only** two ways a message leaves this app: typing + Send/Enter in the
-  open conversation, and approving a proposal. Both go through the same
+  open conversation, and "Send as me" on a ghost draft. Both go through the same
   guarded function in `shared/ui/chat.js`. **That is a statement about this
   app, not about the machine:** for a conversation the teammate has set to
   the `direct` level, `agents/uplink/` sends manager proposals into the
@@ -141,8 +155,9 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   control, and the control keeps rendering **last-known-good** state — never
   the requested state. A toggle that looks moved but never landed is a consent
   lie, and it was the reported bug in the contact-share affordance. This
-  applies to `buildTriStateSlider`'s handler, both global switches, the
-  per-contact controls, and the profile fan-out. A handler may still return
+  applies to `buildTriStateSlider`'s handler, the header share chip
+  (`headerChip`, Triage Rail), both global switches, the per-contact
+  controls, and the profile fan-out. A handler may still return
   `false` to mean "refused deliberately" (a declined confirm) — that is not a
   swallowed error, and the refusing surface says so itself.
 - **Every consent write is a MERGE over a FRESH read, and a failed read writes
@@ -187,8 +202,10 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   behind a confirm that enumerates EVERY affected conversation by name,
   carries the same risk copy as the single-conversation confirm, and states
   that only existing conversations are affected. Every write of `'direct'`
-  (single or bulk) still funnels through `writeShareOverride`/
-  `escalateToDirect` — the cycle itself never reaches it.
+  (single or bulk, including the header chip's adjacent "Direct…" button)
+  still funnels through `writeShareOverride`/`escalateToDirect` — the cycle
+  itself never reaches it. The header chip toggles Private ↔ Shared only;
+  Direct → Private via the chip is a de-escalation and needs no confirm.
 
 ## How to run / test
 
@@ -211,7 +228,7 @@ docker compose up -d          # from repo root; see docker-compose.yml
 ```
 
 The **integration harness** (`tests/integration/harness.py`) is the real
-end-to-end coverage for this app's share controls + proposal inbox +
+end-to-end coverage for this app's share controls + manager drafts +
 contacts, since it drives the uplink against a real local + master
 homeserver pair and asserts on both sides — see `tests/CLAUDE.md`.
 

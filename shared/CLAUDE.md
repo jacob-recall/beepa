@@ -93,7 +93,7 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   table + command console, account-data-backed feed sync, and the
   connections/settings cards. Several expose an **app-injection hook**
   pattern (`setConvoRowDecorator`, `setSourceViewHook`, `setSharingViewHook`,
-  `setContactsViewHook`, `setProposalsViewHook`, `setOnUnauthorized`) so an
+  `setContactsViewHook`, `setConvoHeaderHook`, `setComposerGhostHook`, `setOnUnauthorized`) so an
   app can extend shared UI without `shared/` ever importing from `apps/`.
   Keep that direction one-way: never add an `import` from `shared/` into
   `apps/user/` or `apps/master/`.

@@ -1,24 +1,25 @@
-// Teammate proposal inbox. A room-targeted draft opens the real conversation
-// with the text already in the composer; the row has ✓ / ✕ so you can send or
-// reject without the full-pane editor. Enter on a focused row sends. Identifier
-// (new-chat) drafts still use the detail pane + confirm modal.
+// Teammate manager-drafts (Triage Rail). There is NO inbox: a room-targeted
+// draft renders as a GHOST in the open conversation's composer (#convo-ghost),
+// and the chat list carries a draft stripe/pill via each feed record's `drafts`.
+// A draft is PENDING only while draftPending(origin_ts, room.lastTs) holds
+// (shared/model/attention.js, fail closed) — any later message from anyone
+// retires it visibly (struck through, Restore). Person-targeted (new-chat)
+// drafts surface as a pseudo-row at the top of the Home list and keep the
+// detail pane + confirm modal + gated start-chat leg.
 
 import { ROOMID_RE, api } from '../../shared/matrix/client.js';
-import { $, el, sanitizeLine } from '../../shared/ui/el.js';
-import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook } from '../../shared/ui/chat.js';
+import { $, el, sanitize, sanitizeLine } from '../../shared/ui/el.js';
+import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook, setComposerGhostHook } from '../../shared/ui/chat.js';
 import { buildPlatBadge } from '../../shared/ui/rows.js';
 import { sendCmd, validHandle } from '../../shared/ui/sources.js';
 import { confirmModal } from '../../shared/ui/connections.js';
-import { setProposalsViewHook, setDetailMode } from '../../shared/ui/nav.js';
-import { feedRelTime } from '../../shared/ui/search.js';
+import { setDetailMode } from '../../shared/ui/nav.js';
+import { feedRelTime, scheduleFeedRender, setFeedRenderHook } from '../../shared/ui/search.js';
+import { pendingDrafts, retiredDrafts } from '../../shared/model/attention.js';
 import { S, feedModel } from '../../shared/state.js';
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
 let allProposals = [];     // everything parsed (pending + dismissed + non-actionable)
-let selectedId = null;     // eventId shown in the right pane, or null
-let showDismissed = false;
-let showSent = false;
-let kebabOpen = false;
 
 function loadHandled() {
   try { return new Set(JSON.parse(localStorage.getItem(HANDLED_KEY) || '[]')); }
@@ -53,8 +54,11 @@ function parseProposal(e) {
   const c = e.content;
   const body = c.body;
   if (typeof body !== 'string' || !body.trim()) return null;
-  const ts = typeof c.origin_ts === 'number' ? c.origin_ts
-      : (typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0);
+  // F17: the manager controls content.origin_ts; a far-future value must never
+  // keep a ghost pending, so never let it exceed the local server's stamp.
+  const serverTs = typeof e.origin_server_ts === 'number' ? e.origin_server_ts : 0;
+  const claimed = typeof c.origin_ts === 'number' ? c.origin_ts : 0;
+  const ts = (serverTs && claimed) ? Math.min(serverTs, claimed) : (serverTs || claimed);
   const template = c.template === true;
   const autoSent = c['com.jkali.auto_sent'] === true;
   const sentEventId = (autoSent && typeof c.sent_event_id === 'string' && c.sent_event_id) ? c.sent_event_id : null;
@@ -119,13 +123,6 @@ function rowGesture(p, gesture) {
     return { action: 'detail' };
   }
   return { action: 'none' };
-}
-
-function openWithDraft(roomId, body) {
-  openConvo(roomId);
-  queueMicrotask(() => {
-    if (S.openRoomId === roomId) prefillComposer(body);
-  });
 }
 
 // ---- proposals room discovery (cached; full /sync only on a real cache miss) --
@@ -224,7 +221,7 @@ async function sendProposal(p, body, err, btn) {
   await openConvo(p.targetRoom);
   const ok = await sendConvoMessage(p.targetRoom, text);
   if (btn) btn.disabled = false;
-  if (ok) { markHandled(p); afterHandled(p); return; }
+  if (ok) { markHandled(p); setDetailMode('empty'); afterHandled(); return; }
   setDetailError(err, 'Could not send — conversation unavailable.');
 }
 // Person-targeted send leg — approving a draft aimed at a contact identifier with
@@ -247,315 +244,193 @@ async function sendIdentifierProposal(p, text, err, btn) {
   try { await sendCmd('imessage', 'start-chat ' + handle + ' | ' + text); }
   finally { if (btn) btn.disabled = false; }
   markHandled(p);
-  afterHandled(p);
+  setDetailMode('empty');
+  afterHandled();
 }
 
-// After send/reject: drop the draft from the list. Stay in the open chat if
-// we just sent into one; identifier detail is the only pane we close.
-let focusListAfterHandle = false;
-function afterHandled(p) {
-  if (selectedId === p.eventId) {
-    selectedId = null;
-    if (p.kind === 'identifier') setDetailMode('empty');
+// ---- feed-record drafts (the ghost's data) -----------------------------------
+// PURE: write each room's unhandled, room-targeted, actionable proposals onto
+// its feed record as `drafts` (newest first) and clear rooms with none. Whether
+// a draft is PENDING or RETIRED is decided at render time by attention.js's
+// draftPending(draft.ts, rec.lastTs), so a phone reply that bumps lastTs
+// retires the ghost on the next render with no extra bookkeeping.
+function attachDrafts(proposals, handled, feed) {
+  const byRoom = new Map();
+  for (const p of (Array.isArray(proposals) ? proposals : [])) {
+    if (!p || p.kind !== 'room' || p.autoSent || p.ambiguous) continue;
+    if (handled && typeof handled.has === 'function' && handled.has(p.eventId)) continue;
+    if (!byRoom.has(p.targetRoom)) byRoom.set(p.targetRoom, []);
+    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template });
   }
-  updateCount(pendingList().length);
-  if (proposalsListShowing()) renderList();
-  if (focusListAfterHandle) {
-    focusListAfterHandle = false;
-    queueMicrotask(() => {
-      const btn = document.querySelector('.proposal-quick-yes');
-      const row = btn && btn.closest('.convo');
-      if (row) row.focus();
+  let rooms = 0;
+  for (const rec of feed.values()) {
+    const list = byRoom.get(rec.id);
+    rec.drafts = list ? list.sort((a, b) => b.ts - a.ts) : [];
+    if (rec.drafts.length) rooms++;
+  }
+  return rooms;
+}
+function identifierDrafts(proposals, handled) {
+  return (Array.isArray(proposals) ? proposals : [])
+    .filter(p => p && p.kind === 'identifier' && !p.autoSent && !p.ambiguous && !(handled && handled.has(p.eventId)))
+    .sort((a, b) => b.ts - a.ts);
+}
+
+// ---- ghost composer ----------------------------------------------------------
+let ghostIndex = 0;      // which pending draft the ghost shows (0 = newest)
+let ghostRoom = null;
+
+function renderGhost(roomId) {
+  const host = $('convo-ghost');
+  if (!host) return;
+  if (roomId !== ghostRoom) { ghostRoom = roomId; ghostIndex = 0; }
+  host.replaceChildren();
+  const rec = feedModel.get(roomId);
+  if (!rec) { host.classList.add('hidden'); return; }
+  const pending = pendingDrafts(rec.drafts, rec.lastTs);
+  const retired = retiredDrafts(rec.drafts, rec.lastTs, Date.now());
+  const ambiguous = allProposals.filter(p => p && p.kind === 'room' && p.ambiguous && p.targetRoom === roomId);
+  if (!pending.length && !retired.length && !ambiguous.length) { host.classList.add('hidden'); return; }
+  host.classList.remove('hidden');
+  for (const a of ambiguous.slice(0, 1)) {
+    const box = el('div', 'ghost ambiguous');
+    box.appendChild(el('div', 'ghost-cap', 'A suggestion may already have been sent here (' + feedRelTime(a.ts) + ' ago) — check above before replying'));
+    box.appendChild(el('div', 'ghost-text', sanitize(a.body)));
+    host.appendChild(box);
+  }
+  if (pending.length) {
+    if (ghostIndex >= pending.length) ghostIndex = 0;
+    const d = pending[ghostIndex];
+    // F14: display and send the SAME string. sanitize() keeps newlines, strips
+    // bidi/zero-width/control chars and clamps at 4000 — sanitizeLine would show
+    // 64 chars of a body that then sends at full length.
+    const shown = sanitize(d.body);
+    const box = el('div', 'ghost pending');
+    const cap = el('div', 'ghost-cap');
+    cap.appendChild(el('span', '', (d.template ? 'Template suggested' : 'Suggested by your manager') + ' · ' + feedRelTime(d.ts) + ' ago'));
+    if (pending.length > 1) {
+      const sw = el('button', 'ghost-switch', (ghostIndex + 1) + ' of ' + pending.length + ' ↕');
+      sw.type = 'button'; sw.title = 'Show the next suggestion';
+      sw.addEventListener('click', () => { ghostIndex = (ghostIndex + 1) % pending.length; renderGhost(roomId); });
+      cap.appendChild(sw);
+    } else cap.appendChild(el('span', 'muted', 'Retires if the thread moves on'));
+    box.appendChild(cap);
+    box.appendChild(el('div', 'ghost-text', shown));
+    const acts = el('div', 'ghost-acts');
+    const dismiss = el('button', 'ghost-btn', 'Dismiss'); dismiss.type = 'button';
+    dismiss.addEventListener('click', () => { markHandled({ eventId: d.eventId }); afterHandled(); });
+    const edit = el('button', 'ghost-btn', 'Edit'); edit.type = 'button';
+    edit.addEventListener('click', () => { prefillComposer(shown); markHandled({ eventId: d.eventId }); afterHandled(); });
+    const send = el('button', 'ghost-btn primary', 'Send as me'); send.type = 'button';
+    send.addEventListener('click', async () => {
+      send.disabled = true;
+      // Explicit target, the one guarded send path. `shown` is exactly what the
+      // teammate read above.
+      const ok = await sendConvoMessage(roomId, shown, { fromProposal: d.eventId });
+      send.disabled = false;
+      if (!ok) return;
+      markHandled({ eventId: d.eventId });
+      // F16: siblings are NOT marked handled — the sent message bumps lastTs and
+      // draftPending retires them visibly (struck through, Restore) on render.
+      afterHandled();
     });
+    acts.appendChild(dismiss); acts.appendChild(edit); acts.appendChild(send);
+    box.appendChild(acts);
+    host.appendChild(box);
+  }
+  for (const d of retired.slice(0, 2)) {
+    const box = el('div', 'ghost retired');
+    const cap = el('div', 'ghost-cap');
+    cap.appendChild(el('span', '', 'Manager suggested ' + feedRelTime(d.ts) + ' ago · the thread moved on'));
+    const restore = el('button', 'ghost-switch', 'Restore'); restore.type = 'button';
+    restore.addEventListener('click', () => { prefillComposer(sanitize(d.body)); markHandled({ eventId: d.eventId }); afterHandled(); });
+    cap.appendChild(restore);
+    box.appendChild(cap);
+    box.appendChild(el('div', 'ghost-text', sanitize(d.body)));
+    host.appendChild(box);
   }
 }
 
-// ---- list (left) -------------------------------------------------------------
-// A small numbered dot badge overlaid on the Proposals tab (not "(N)" text).
-function updateCount(n) {
-  const btn = $('list-mode-proposals');
-  if (!btn) return;
-  btn.replaceChildren();
-  btn.appendChild(document.createTextNode('Proposals'));
-  if (n > 0) btn.appendChild(el('span', 'proposal-count-dot', String(n)));
+function afterHandled() {
+  attachDrafts(allProposals, loadHandled(), feedModel);
+  scheduleFeedRender();
+  if (S.openRoomId) renderGhost(S.openRoomId);
+  renderIdentifierRows();
 }
 
-function buildRow(p, dismissed) {
-  const row = el('div', 'convo proposal-row' + (dismissed ? ' dismissed' : ''));
-  row.dataset.proposalId = p.eventId;
-  row.setAttribute('role', 'button');
-  row.tabIndex = 0;
-  if (selectedId === p.eventId) row.classList.add('active');
-  row.appendChild(buildPlatBadge(sourceOf(p)));
-  const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', targetName(p)));
-  meta.appendChild(el('div', 'preview', sanitizeLine(p.body).replace(/\s+/g, ' ').slice(0, 90)));
-  row.appendChild(meta);
-  if (p.ts) row.appendChild(el('span', 'when', feedRelTime(p.ts)));
-  row.appendChild(el('span', 'thread-badge', dismissed ? 'Dismissed' : 'Draft'));
-  const open = () => select(p, dismissed);
-  row.addEventListener('click', open);
-  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  if (!dismissed) attachQuickActions(row, p);
-  return row;
-}
-
-// Non-actionable: "sent directly" history from the uplink's auto-send outcome
-// record (F5). Never a quick-action row — clicking only opens the real
-// conversation, never re-sends.
-function buildHistoryRow(p) {
-  const row = el('div', 'convo proposal-row proposal-history');
-  row.setAttribute('role', 'button');
-  row.tabIndex = 0;
-  row.appendChild(buildPlatBadge(sourceOf(p)));
-  const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', targetName(p)));
-  meta.appendChild(el('div', 'preview', sanitizeLine(p.body).replace(/\s+/g, ' ').slice(0, 90)));
-  row.appendChild(meta);
-  if (p.ts) row.appendChild(el('span', 'when', feedRelTime(p.ts)));
-  row.appendChild(el('span', 'thread-badge sent-directly', 'Sent directly'));
-  const open = () => { if (p.kind === 'room') openConvo(p.targetRoom); };
-  row.addEventListener('click', open);
-  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  return row;
-}
-
-// Non-actionable as a one-click send (D2.9 post-dispatch ambiguous failure) —
-// distinct from both a pending draft and sent history: it may or may not
-// already be out. The only affordance is the manual path, opening the real
-// conversation so the teammate can check for themselves.
-function buildAmbiguousRow(p) {
-  const row = el('div', 'convo proposal-row proposal-ambiguous');
-  row.setAttribute('role', 'button');
-  row.tabIndex = 0;
-  row.appendChild(buildPlatBadge(sourceOf(p)));
-  const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', targetName(p)));
-  meta.appendChild(el('div', 'preview', 'May already have been sent — check the conversation'));
-  row.appendChild(meta);
-  if (p.ts) row.appendChild(el('span', 'when', feedRelTime(p.ts)));
-  row.appendChild(el('span', 'thread-badge ambiguous-badge', 'Check conversation'));
-  const open = () => { if (p.kind === 'room') openConvo(p.targetRoom); };
-  row.addEventListener('click', open);
-  row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-  return row;
-}
-
-function buildTopBar(pendingN, dismissedN, sentN) {
-  const bar = el('div', 'proposals-head');
-  const left = el('div', 'proposals-head-left');
-  left.appendChild(el('span', 'proposals-title', 'Proposals'));
-  left.appendChild(el('span', 'proposals-count', String(pendingN)));
-  bar.appendChild(left);
-
-  const kebab = el('button', 'proposal-kebab');
-  kebab.type = 'button';
-  kebab.textContent = '⋮';                       // vertical ellipsis (kebab)
-  kebab.title = 'More';
-  kebab.addEventListener('click', (e) => { e.stopPropagation(); kebabOpen = !kebabOpen; renderList(); });
-  bar.appendChild(kebab);
-
-  if (kebabOpen) {
-    const menu = el('div', 'proposal-kebab-menu');
-    const toggle = el('button', 'proposal-kebab-item');
-    toggle.type = 'button';
-    toggle.textContent = (showDismissed ? 'Hide dismissed' : 'Show dismissed')
-      + (dismissedN ? ' (' + dismissedN + ')' : '');
-    toggle.addEventListener('click', (e) => { e.stopPropagation(); showDismissed = !showDismissed; kebabOpen = false; renderList(); });
-    menu.appendChild(toggle);
-    const sentToggle = el('button', 'proposal-kebab-item');
-    sentToggle.type = 'button';
-    sentToggle.textContent = (showSent ? 'Hide sent' : 'Show sent')
-      + (sentN ? ' (' + sentN + ')' : '');
-    sentToggle.addEventListener('click', (e) => { e.stopPropagation(); showSent = !showSent; kebabOpen = false; renderList(); });
-    menu.appendChild(sentToggle);
-    bar.appendChild(menu);
-  }
-  return bar;
-}
-
-function renderList() {
+// ---- person-targeted drafts: a row at the top of the chat list -----------------
+// No inbox: a "start a new chat" suggestion has no room, so it surfaces as a
+// pseudo-row above the list (draft stripe) that opens the existing detail pane.
+function renderIdentifierRows() {
   const list = $('list-body');
   if (!list) return;
-  const pending = pendingList();
-  const dismissed = dismissedList();
-  const ambiguous = ambiguousList();
-  const sent = historyList();
-  list.replaceChildren();
-  list.appendChild(buildTopBar(pending.length, dismissed.length, sent.length));
-  updateCount(pending.length);
-
-  // Ambiguous rows need a manual look, so they always show, above pending —
-  // never folded away behind a toggle the way sent/dismissed are.
-  if (ambiguous.length) {
-    list.appendChild(el('div', 'proposals-divider muted', 'Needs a manual check'));
-    for (const p of ambiguous) list.appendChild(buildAmbiguousRow(p));
-  }
-
-  if (!pending.length && !ambiguous.length
-    && !(showDismissed && dismissed.length) && !(showSent && sent.length)) {
-    list.appendChild(el('p', 'list-empty', 'No proposals right now.'));
-    return;
-  }
-  for (const p of pending) list.appendChild(buildRow(p, false));
-  if (showDismissed && dismissed.length) {
-    list.appendChild(el('div', 'proposals-divider muted', 'Dismissed'));
-    for (const p of dismissed) list.appendChild(buildRow(p, true));
-  }
-  if (showSent && sent.length) {
-    list.appendChild(el('div', 'proposals-divider muted', 'Sent directly'));
-    for (const p of sent) list.appendChild(buildHistoryRow(p));
+  for (const old of list.querySelectorAll('.convo.identifier-draft')) old.remove();
+  if (S.activeNavKey !== 'home') return;
+  const rows = identifierDrafts(allProposals, loadHandled());
+  for (const p of rows.reverse()) {
+    const row = el('div', 'convo identifier-draft');
+    row.setAttribute('role', 'button'); row.tabIndex = 0;
+    const stripe = el('div', 'stripe'); stripe.appendChild(el('i', 'seg draft')); row.appendChild(stripe);
+    row.appendChild(buildPlatBadge(p.targetSource));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', 'New chat suggested: ' + sanitizeLine(p.targetDisplay || p.targetIdentifier)));
+    meta.appendChild(el('div', 'preview draft', 'Draft: ' + sanitizeLine(p.body)));
+    row.appendChild(meta);
+    const open = () => { setDetailMode('proposal'); renderDetail(p); };
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+    list.insertBefore(row, list.firstChild);
   }
 }
 
-// ---- detail (right, full) ----------------------------------------------------
-function select(p, dismissed) {
-  selectedId = p.eventId;
-  const g = rowGesture(p, 'click');
-  if (!dismissed && g.action === 'open') {
-    openWithDraft(p.targetRoom, g.prefill);
-  } else {
-    setDetailMode('proposal');
-    renderDetail(p, dismissed);
-  }
-  for (const r of document.querySelectorAll('.proposal-row')) {
-    r.classList.toggle('active', r.dataset.proposalId === p.eventId);
-  }
-}
-
-function renderDetail(p, dismissed) {
+// Detail pane for a person-targeted draft (unchanged send leg: confirm + sendCmd start-chat).
+function renderDetail(p) {
   const host = $('proposal-detail-body');
   if (!host) return;
   host.replaceChildren();
   const title = $('proposal-detail-title');
   if (title) title.textContent = targetName(p);
-
   const to = el('div', 'proposal-to');
   to.appendChild(buildPlatBadge(sourceOf(p)));
   to.appendChild(el('span', 'proposal-to-name', targetName(p)));
-  if (p.kind === 'identifier') to.appendChild(el('span', 'muted', ' — starts a NEW iMessage chat'));
+  to.appendChild(el('span', 'muted', ' — starts a NEW iMessage chat'));
   host.appendChild(to);
-  host.appendChild(el('p', 'muted proposal-note',
-    p.template ? 'Template suggestion — review before sending.' : 'Suggested by your manager — not sent yet.'));
-
-  // Full-height, inline-editable message so the whole draft is visible.
-  const ta = el('textarea', 'proposal-body-full');
-  ta.value = p.body;
-  host.appendChild(ta);
-
-  const err = el('div', 'proposal-card-error hidden');
-  host.appendChild(err);
-
+  host.appendChild(el('p', 'muted proposal-note', 'Suggested by your manager — not sent yet.'));
+  const ta = el('textarea', 'proposal-body-full'); ta.value = sanitize(p.body); host.appendChild(ta);
+  const err = el('div', 'proposal-card-error hidden'); host.appendChild(err);
   const actions = el('div', 'proposal-actions');
-  if (dismissed) {
-    const restore = el('button', 'proposal-btn primary', 'Restore');
-    restore.type = 'button';
-    restore.addEventListener('click', () => { unmarkHandled(p); select(p, false); renderList(); });
-    actions.appendChild(restore);
-  } else {
-    const sendBtn = el('button', 'proposal-btn proposal-send primary', 'Send');
-    sendBtn.type = 'button';
-    sendBtn.addEventListener('click', () => sendProposal(p, ta.value, err, sendBtn));
-    actions.appendChild(sendBtn);
-
-    if (p.kind === 'room') {
-      const openBtn = el('button', 'proposal-btn', 'Open conversation');
-      openBtn.type = 'button';
-      openBtn.addEventListener('click', () => openConvo(p.targetRoom));
-      actions.appendChild(openBtn);
-    }
-    const rejectBtn = el('button', 'proposal-btn proposal-dismiss', 'Reject');
-    rejectBtn.type = 'button';
-    rejectBtn.addEventListener('click', () => { markHandled(p); afterHandled(p); });
-    actions.appendChild(rejectBtn);
-  }
+  const sendBtn = el('button', 'proposal-btn proposal-send primary', 'Send'); sendBtn.type = 'button';
+  sendBtn.addEventListener('click', () => sendProposal(p, ta.value, err, sendBtn));
+  const rejectBtn = el('button', 'proposal-btn proposal-dismiss', 'Reject'); rejectBtn.type = 'button';
+  rejectBtn.addEventListener('click', () => { markHandled(p); setDetailMode('empty'); afterHandled(); });
+  actions.appendChild(sendBtn); actions.appendChild(rejectBtn);
   host.appendChild(actions);
-}
-
-function wireProposalBack() {
   const back = $('proposal-back');
-  if (back && !back.dataset.wired) {
-    back.dataset.wired = '1';
-    back.addEventListener('click', () => { selectedId = null; setDetailMode('empty'); renderList(); });
-  }
+  if (back && !back.dataset.wired) { back.dataset.wired = '1'; back.addEventListener('click', () => setDetailMode('empty')); }
 }
 
-// ---- entry + refresh ---------------------------------------------------------
-function renderProposalsView() {
-  wireProposalBack();
-  if (!selectedId) setDetailMode('empty');
-  renderList();                       // instant paint from memory (empty-by-default)
-  refresh().catch(() => {});          // background; never blocks first paint
-}
-
+// ---- refresh ----------------------------------------------------------------------
 async function refresh() {
   let proposals;
   try { proposals = await fetchProposals(); } catch (e) { return; }
   const sig = (arr) => arr.map((p) => p.eventId).sort().join(',');
-  if (sig(proposals) === sig(allProposals)) return;
+  if (sig(proposals) === sig(allProposals)) { if (S.openRoomId) renderGhost(S.openRoomId); return; }
   allProposals = proposals;
-  updateCount(pendingList().length);
-  // If the open draft vanished (sent/removed elsewhere), clear the right pane.
-  if (selectedId && !allProposals.some((p) => p.eventId === selectedId)) {
-    selectedId = null;
-    if (!S.openRoomId) setDetailMode('empty');
-  }
-  if (proposalsListShowing()) renderList();
+  afterHandled();
 }
-
 let pollTimer = null;
-function proposalsListShowing() {
-  const btn = $('list-mode-proposals');
-  return !!(btn && btn.classList.contains('active') && btn.offsetParent !== null);
-}
-function attachQuickActions(row, p) {
-  const wrap = el('span', 'proposal-quick');
-  const yes = el('button', 'proposal-quick-yes', '✓');
-  yes.type = 'button';
-  yes.title = 'Send';
-  yes.setAttribute('aria-label', 'Send suggestion');
-  const no = el('button', 'proposal-quick-no', '✕');
-  no.type = 'button';
-  no.title = 'Reject';
-  no.setAttribute('aria-label', 'Reject suggestion');
-  const stop = (e) => e.stopPropagation();
-  yes.addEventListener('click', (e) => {
-    stop(e);
-    focusListAfterHandle = true;
-    sendProposal(p, p.body, null, yes);
-  });
-  no.addEventListener('click', (e) => {
-    stop(e);
-    focusListAfterHandle = true;
-    markHandled(p);
-    afterHandled(p);
-  });
-  wrap.appendChild(yes);
-  wrap.appendChild(no);
-  wrap.addEventListener('click', stop);
-  row.appendChild(wrap);
-
-  row.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || e.target !== row) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    focusListAfterHandle = true;
-    sendProposal(p, p.body, null, null);
-  }, true);
-}
 
 function initProposalsUI() {
-  setProposalsViewHook(renderProposalsView);
+  setComposerGhostHook(renderGhost);
+  setFeedRenderHook(() => { renderIdentifierRows(); if (S.openRoomId) renderGhost(S.openRoomId); });
   setAfterSendHook((roomId) => {
-    const p = pendingForRoom(allProposals, loadHandled(), roomId);
-    if (!p) return;
-    markHandled(p);
-    afterHandled(p);
+    // A reply typed by the teammate retires every pending draft for the room.
+    const rec = feedModel.get(roomId);
+    for (const d of pendingDrafts((rec && rec.drafts) || [], (rec && rec.lastTs) || 0)) markHandled({ eventId: d.eventId });
+    afterHandled();
   });
-  if (!pollTimer) {
-    pollTimer = setInterval(() => { refresh().catch(() => {}); }, 10000);
-  }
+  if (!pollTimer) pollTimer = setInterval(() => { refresh().catch(() => {}); }, 10000);
   refresh().catch(() => {});
 }
 
-export { initProposalsUI, renderProposalsView, parseProposal, partitionProposals, pendingForRoom, rowGesture };
+export { initProposalsUI, parseProposal, partitionProposals, pendingForRoom, rowGesture, attachDrafts, identifierDrafts };

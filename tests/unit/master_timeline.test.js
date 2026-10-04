@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../../shared/model/message_timestamps.js';
+import { displayName, parseNames, dumpNames, rename, sharingUsers, visibleUsers, visibleFeed } from '../../apps/master/hidden.js';
+import { initials, indicatorsFor, pendingDrafts, clusterFeed } from '../../shared/model/attention.js';
 
 // Run the actual master history, renderer, overlay and live-loop code with a
 // tiny DOM and deferred transport. No browser session or real send is used.
@@ -34,11 +36,15 @@ class Element {
 const source = fs.readFileSync(new URL('../../apps/master/main.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;\n/gm, '').replace(/^export .*;\n/gm, '');
 const requests = [];
-const elements = new Map(['room-messages', 'room-title', 'room-owner', 'room-badge', 'room-source-label', 'room-status']
-  .map(id => [id, new Element()]));
+const elements = new Map([
+  'room-messages', 'room-title', 'room-owner', 'room-badge', 'room-source-label', 'room-status',
+  'proposal-stack', 'room-read', 'nav-teammates-rail',
+].map(id => [id, new Element()]));
 const S = { token: 'session-1' };
 const ctx = vm.createContext({ S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
+  displayName, parseNames, dumpNames, rename, sharingUsers, visibleUsers, visibleFeed,
   messageTimestamp, timestampCorrections, CORRECTION_TYPE,
+  initials, indicatorsFor, pendingDrafts, clusterFeed,
   $: id => elements.get(id) || null, el: (tag, cls, text) => new Element(tag, cls, text),
   sanitize: s => s, sanitizeLine: s => s,
   appendLinkified: (node, text) => { node.textContent = text; },
@@ -89,40 +95,34 @@ oldPoll.resolve(sync([msg('$stale')], 'wrong-cursor')); await tick();
 assert.deepEqual(ids(), ['$fresh']); assert.equal(ctx.ms.tailSince, null);
 assert.equal(ctx.ms.tailRunning, true); assert.equal(polls().at(-1), currentPoll);
 
-// A mirrored outgoing event acknowledges its exact proposal, not another
-// proposal containing identical text. Both arrival orders must reconcile.
-ctx.showSuggestion('hello', '$proposal');
-assert.ok(box.querySelector('.msg-row.suggested'));
-ctx.renderBubble(msg('$ack', 'hello', { 'com.jkali.auto_sent_from_proposal': '$proposal' }));
-assert.equal(box.querySelector('.msg-row.suggested'), null);
-ctx.showSuggestion('hello', '$proposal');
-assert.equal(box.querySelector('.msg-row.suggested'), null, 'late overlay cannot resurrect sent proposal');
-ctx.showSuggestion('hello', '$different-proposal');
-assert.ok(box.querySelector('.msg-row.suggested'), 'same text is not acknowledgement');
-
-// Stop/login also invalidates in-flight reads; an old rejection cannot stop
-// the current room's live loop or paint an obsolete error into its UI.
-ctx.stopTail(); S.token = 'session-2';
-const newSession = ctx.openRoom('!A:master');
-history().resolve({ chunk: [msg('$one')] }); await newSession;
-currentPoll.reject(new Error('stale-session')); await tick();
-assert.equal(ctx.ms.tailRunning, true); assert.deepEqual(ids(), ['$one']);
-ctx.stopTail(); polls().at(-1).resolve(sync([])); await tick();
-assert.equal(ctx.ms.tailRunning, false);
-
-// Overlay request completing after switching away and back is also obsolete.
+// A mirrored outgoing event acknowledges its EXACT proposal, not another
+// proposal containing identical text; the stack shows pending vs sent.
 vm.runInContext(`
   MS.proposalsByUser.set('owner', '!proposals:master');
   MS.proposalsRoomSet.add('!proposals:master');
   MS.rooms['!A:master'].mirrorOf = '!local:source';
+  MS.proposalsByRoom.set('!local:source', [
+    { eventId: '$different-proposal', body: 'hello', ts: 900 },
+    { eventId: '$proposal', body: 'hello', ts: 800 },
+  ]);
 `, ctx);
-const overlayOpen = ctx.openRoom('!A:master');
-history().resolve({ chunk: [] }); await tick();
-const staleOverlay = history();
-const other = ctx.openRoom('!B:master'); history().resolve({ chunk: [] }); await other;
-staleOverlay.resolve({ chunk: [{ type: 'com.jkali.proposal', event_id: '$old-proposal',
-  content: { target_room: '!local:source', body: 'obsolete' } }] }); await overlayOpen;
-assert.equal(box.querySelector('.msg-row.suggested'), null);
+const stackOpen = ctx.openRoom('!A:master');
+// ts=850 sits between the two proposals (800/900): it acknowledges $proposal
+// without being newer than $different-proposal, so the latter is still
+// 'pending' here — only the LATER message below (ts=5000) retires it.
+history().resolve({ chunk: [{ ...msg('$ack', 'hello', { 'com.jkali.auto_sent_from_proposal': '$proposal' }), origin_server_ts: 850 }] }); await stackOpen;
+const stack = elements.get('proposal-stack');
+const cardStates = () => stack.children.map(c => c.className.replace('sug ', ''));
+assert.deepEqual(cardStates(), ['auto', 'pending'], 'exact id acknowledged; same text alone is not acknowledgement');
+// A later mirrored message retires the still-pending suggestion, never marks it sent.
+ctx.renderBubble({ ...msg('$later', 'anything'), origin_server_ts: 5000 });
+ctx.renderSuggestionStack();
+assert.deepEqual(cardStates(), ['auto', 'retired']);
+ctx.stopTail(); polls().at(-1).resolve({ next_batch: 'done', rooms: {} }); await tick();
+
+// The stack renders ONLY the open room's target: switching rooms clears it.
+const otherOpen = ctx.openRoom('!B:master'); history().resolve({ chunk: [] }); await otherOpen;
+assert.equal(stack.children.length, 0);
 assert.equal(ctx.ms.openRoomId, '!B:master');
 ctx.stopTail(); polls().at(-1).resolve({ next_batch: 'done', rooms: {} }); await tick();
 

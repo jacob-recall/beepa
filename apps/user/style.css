@@ -97,14 +97,6 @@
 /* Bridge invites the auto-join gate refused or deferred (apps/user/main.js). */
 #autojoin-note { font-size: 12px; }
 
-.list-mode { display: flex; align-items: center; gap: 6px; }
-.list-mode-btn {
-  border: none; background: transparent; cursor: pointer; font: inherit;
-  padding: 6px 10px; border-radius: 8px; display: inline-flex; align-items: center; gap: 6px;
-}
-.list-mode-btn .ic { font-size: 16px; }
-.list-mode-named { font-size: 13px; font-weight: 600; }
-.list-mode-btn.active { background: var(--color-list-active); }
 
 #list-body { flex: 1; min-height: 0; overflow-y: auto; margin: 0; max-width: none; }
 
@@ -130,6 +122,18 @@
    settings hub — never let the "Select a conversation." placeholder hover over it. */
 #workspace.admin-only #convo-placeholder { display: none !important; }
 #convo-back { display: none; }
+/* Conversation header (Triage Rail): back · badge · who(title/sub) · spacer · chips · action */
+#convo-head { display: flex; align-items: center; gap: 12px; padding: 8px 16px; min-height: 58px; flex: 0 0 auto; }
+#convo-head .spacer { flex: 1 1 auto; }
+#convo-who { flex: 0 1 auto; display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+#convo-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#convo-sub { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#convo-sub:empty { display: none; }
+#convo-head-extra { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+#convo-head-extra:empty { display: none; }
+#convo-add-contact { flex: 0 0 auto; width: auto; margin: 0; white-space: nowrap; }
+#convo-tabs { display: flex; gap: 2px; padding: 0 12px; flex: 0 0 auto; overflow-x: auto; }
+#convo-tabs.hidden { display: none !important; }
 
 .detail-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .detail-panel.hidden { display: none !important; }
@@ -173,55 +177,36 @@
   .settings-popover { left: 8px; right: 8px; bottom: 8px; min-width: 0; }
 }
 
-/* ---- Proposals: Slack-threads-style inbox ---- */
-.proposal-thread { border-bottom: 1px solid rgba(127,127,127,0.12); }
-.proposal-row { cursor: pointer; align-items: center; }
-.proposal-row .plat-badge { flex: 0 0 auto; margin-right: 6px; }
-.proposal-chevron { flex: 0 0 auto; margin-left: 8px; color: #8a8f98; transition: transform .12s ease; }
-.proposal-chevron.expanded { transform: rotate(90deg); }
-.proposal-panel { padding: 6px 14px 14px; background: rgba(127,127,127,0.05); }
+/* ---- Manager drafts: person-targeted detail pane (room drafts render as the
+   composer ghost below) ---- */
 .proposal-note { margin: 0 0 8px; font-size: 12px; }
-.proposal-body { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; padding: 8px; border: 1px solid rgba(127,127,127,0.3); border-radius: 8px; }
 .proposal-card-error { color: #c0392b; margin: 6px 0 0; font-size: 13px; }
 .proposal-card-error.hidden { display: none; }
 .proposal-actions { display: flex; gap: 8px; margin-top: 8px; }
 .proposal-btn { padding: 6px 14px; border-radius: 8px; border: 1px solid rgba(127,127,127,0.3); background: transparent; cursor: pointer; font: inherit; }
 .proposal-btn.primary { background: #2f6df6; color: #fff; border-color: #2f6df6; }
 .proposal-btn.proposal-dismiss { color: #8a8f98; }
-
-/* ---- Proposals: list top bar (count + kebab) + full-height detail ---- */
-.proposals-head { display: flex; align-items: center; justify-content: space-between; position: relative; padding: 10px 12px; border-bottom: 1px solid rgba(127,127,127,0.14); }
-.proposals-head-left { display: flex; align-items: center; gap: 8px; }
-.proposals-title { font-weight: 600; }
-.proposals-count { min-width: 20px; text-align: center; padding: 1px 7px; border-radius: 10px; background: #2f6df6; color: #fff; font-size: 12px; }
-.proposal-kebab { border: 0; background: transparent; font-size: 20px; line-height: 1; cursor: pointer; color: #8a8f98; padding: 2px 8px; border-radius: 6px; }
-.proposal-kebab:hover { background: rgba(127,127,127,0.12); }
-.proposal-kebab-menu { position: absolute; right: 10px; top: 40px; z-index: 20; background: var(--panel, #fff); border: 1px solid rgba(127,127,127,0.25); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.18); overflow: hidden; }
-.proposal-kebab-item { display: block; width: 100%; text-align: left; padding: 8px 14px; border: 0; background: transparent; cursor: pointer; font: inherit; white-space: nowrap; }
-.proposal-kebab-item:hover { background: rgba(127,127,127,0.12); }
-.proposals-divider { padding: 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-.proposal-row.dismissed { opacity: .6; }
-.proposal-row.proposal-history { opacity: .75; cursor: default; }
-.proposal-row.proposal-ambiguous { background: rgba(234, 179, 8, 0.08); }
-.thread-badge.sent-directly { background: var(--color-neutral-200); color: var(--color-muted); }
-.thread-badge.ambiguous-badge { background: rgba(234, 179, 8, 0.25); color: #7a5b00; }
 #proposal-detail-body { display: flex; flex-direction: column; height: 100%; padding: 14px 16px; box-sizing: border-box; }
 .proposal-to { display: flex; align-items: center; gap: 6px; }
 .proposal-to-name { font-weight: 600; }
 .proposal-body-full { flex: 1; min-height: 160px; width: 100%; box-sizing: border-box; resize: none; font: inherit; padding: 12px; margin: 8px 0; border: 1px solid rgba(127,127,127,0.3); border-radius: 10px; }
 
-/* Proposals tab: small numbered dot badge (not "(N)" text) */
-#list-mode-proposals { position: relative; overflow: visible; }
-.proposal-count-dot { position: absolute; top: -5px; right: -7px; min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: #e02424; color: #fff; font-size: 10px; line-height: 16px; font-weight: 600; text-align: center; pointer-events: none; }
-
-.proposal-quick { display: inline-flex; flex: 0 0 auto; gap: 0; align-items: center; }
-.proposal-quick-yes, .proposal-quick-no {
-  border: 0; background: transparent; cursor: pointer;
-  width: 28px; height: 28px; padding: 0; border-radius: 50%;
-  font-size: 15px; line-height: 28px; color: var(--color-muted);
-}
-.proposal-quick-yes:hover { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
-.proposal-quick-no:hover { color: #c0392b; background: rgba(192, 57, 43, 0.12); }
+/* ---- Ghost draft in the composer (apps/user/proposals.js renderGhost) ---- */
+#convo-ghost { flex: 0 0 auto; padding: 8px 14px 0; display: grid; gap: 6px; background: var(--color-neutral-200); }
+#convo-ghost.hidden { display: none !important; }
+.ghost { border: 1px dashed #7c5cd6; background: #ece6fa; border-radius: 10px; padding: 8px 12px; display: grid; gap: 6px; }
+.ghost-cap { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: #7c5cd6; }
+.ghost-text { font-size: 13px; color: var(--color-text); opacity: .75; white-space: pre-wrap; max-height: 30vh; overflow-y: auto; }
+.ghost-acts { display: flex; gap: 8px; justify-content: flex-end; }
+.ghost-btn { height: 28px; padding: 0 12px; border-radius: 7px; font-size: 12.5px; }
+.ghost-btn.primary { background: #7c5cd6; border-color: #7c5cd6; color: #fff; }
+.ghost-switch { border: 0; background: transparent; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; padding: 0; }
+.ghost.retired { border-style: solid; border-color: var(--color-divider); background: var(--color-surface); }
+.ghost.retired .ghost-cap { color: var(--color-muted); }
+.ghost.retired .ghost-text { text-decoration: line-through; opacity: .5; }
+.ghost.ambiguous { border-color: #c9810a; background: #fbeed3; }
+.ghost.ambiguous .ghost-cap { color: #8a5a00; }
+.convo.identifier-draft .plat-badge { width: 22px; height: 22px; }
 
 /* ── per-contact share overrides (per-contact-share plan, C3) ───────────────
    F8: a failed consent write is SURFACED, never swallowed — .share-slider-error

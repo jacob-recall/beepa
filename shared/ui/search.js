@@ -4,7 +4,8 @@ import { feedRelTime } from '../model/message_preview.js';
 
 import { feedIsHidden, refreshConvos } from './account-data.js';
 import { $, el, sanitizeLine } from './el.js';
-import { buildConvoRow, buildFeedRow, elEmpty } from './rows.js';
+import { buildConvoRow, buildFeedRow, buildClusterRow, buildSubRow, rowFlags, elEmpty } from './rows.js';
+import { clusterFeed, applyFilter, indicatorsFor } from '../model/attention.js';
 import { SOURCES } from '../model/source_catalog.js';
 import { S, convosBySource, feedModel } from '../state.js';
 
@@ -15,65 +16,98 @@ import { S, convosBySource, feedModel } from '../state.js';
 let sourceViewHook = null;
 function setSourceViewHook(fn) { sourceViewHook = typeof fn === 'function' ? fn : null; }
 
-let feedRenderHook = null;
-function setFeedRenderHook(fn) { feedRenderHook = typeof fn === 'function' ? fn : null; }
+const feedRenderHooks = [];
+function setFeedRenderHook(fn) { if (typeof fn === 'function') feedRenderHooks.push(fn); }
+function runFeedRenderHooks() { for (const fn of feedRenderHooks) { try { fn(); } catch (e) { /* one app hook must not break the list */ } } }
 
 // HF-5: coalesce renders — one timer per batch so a burst = one re-render.
 function scheduleFeedRender() {
   if (S.feedRenderScheduled) return;
   S.feedRenderScheduled = true;
-  setTimeout(() => { S.feedRenderScheduled = false; renderHome(); }, 0);
+  setTimeout(() => {
+    S.feedRenderScheduled = false;
+    if (S.sourceViewId && S.activeNavKey === 'source:' + S.sourceViewId) {
+      renderSourceList();
+      runFeedRenderHooks();
+    } else {
+      renderHome();
+    }
+  }, 0);
 }
 
-// HF-8: render the merged feed sorted by recency, capped at ~200 rows. The
-// #home-search box is a pure client-side filter over the full in-memory model
-// (sanitized name + preview); it never builds a URL, sends a command, or
-// navigates. Clearing restores the full recency-sorted list.
+function itemFlags(it) {
+  return it.kind === 'single' ? rowFlags(it.rec) : indicatorsFor({ unread: it.unread, draft: it.draft });
+}
+// HF-8: render the merged feed sorted by recency, capped at ~200 items, with
+// Triage Rail clustering (one row per contact profile, via S.roomProfile) and
+// the Needs you / All / Drafts filter (S.feedFilter). #home-search is a pure
+// client-side filter over the in-memory model; it never builds a URL, sends a
+// command, or navigates.
 function renderHome() {
   const list = $('list-body');
   if (!list) return;
-  // #list-body is shared by Home, the per-source lists, and People. Feed-model
-  // updates (live /sync + the periodic re-seed) call this on their own cadence,
-  // so guard against clobbering a non-Home view the user is currently looking at.
+  // #list-body is shared by Home, the per-source lists, and People. Guard
+  // against clobbering a non-Home view the user is currently looking at.
   const k = S.activeNavKey;
   if (k && (k.indexOf('source:') === 0 || k === 'people' || k === 'settings')) return;
-  ensureHomeHiddenToggle();                           // HF-9: "Show hidden" chip above the list
+  ensureHomeFilters();
   const q = (($('home-search') && $('home-search').value) || '').trim().toLowerCase();
   const all = [...feedModel.values()].sort((a, b) => b.lastTs - a.lastTs);
   // HF-9: hidden rooms (low-priority/muted/manual) stay in feedModel but are
-  // excluded from the default list; the toggle reveals them (with Unhide).
+  // excluded from the default list; the chip reveals them.
   const visible = S.feedShowHidden ? all : all.filter(r => !feedIsHidden(r.id));
-  const rows = (q
+  const matched = q
     ? visible.filter(r => sanitizeLine(r.name).toLowerCase().includes(q) ||
                           sanitizeLine(r.lastBody || '').toLowerCase().includes(q))
-    : visible).slice(0, 200);
+    : visible;
+  const items = applyFilter(clusterFeed(matched, S.roomProfile), S.feedFilter, itemFlags).slice(0, 200);
   list.replaceChildren();
-  if (!rows.length) {
-    list.appendChild(elEmpty(q ? 'No conversations match your search.' : 'No conversations yet.'));
+  if (!items.length) {
+    list.appendChild(elEmpty(q ? 'No conversations match your search.'
+      : (S.feedFilter === 'drafts' ? 'No suggestions waiting.' : 'No conversations yet.')));
+    runFeedRenderHooks();
     return;
   }
-  for (const r of rows) list.appendChild(buildFeedRow(r));
-  if (feedRenderHook) feedRenderHook();
+  for (const it of items) {
+    if (it.kind === 'single') { list.appendChild(buildFeedRow(it.rec)); continue; }
+    list.appendChild(buildClusterRow(it));
+    if (S.expandedClusters.has(it.profileId)) for (const m of it.members) list.appendChild(buildSubRow(m));
+  }
+  runFeedRenderHooks();
 }
 
-// HF-9: a small "Show hidden" toggle chip inserted once, just above the Home
-// list (built with el()/textContent; no HTML strings). Toggles S.feedShowHidden
-// and re-renders so hidden (low-priority/muted/manual) rooms appear with an
-// Unhide action. Pure client-side state; sends no command and builds no URL.
-function ensureHomeHiddenToggle() {
+// Chips above the Home list: Needs you / All / Drafts + Show hidden. Built once
+// with el()/textContent; pure client-side state (S.feedFilter, S.feedShowHidden).
+const FILTERS = [['needs', 'Needs you'], ['all', 'All'], ['drafts', 'Drafts']];
+function ensureHomeFilters() {
   const list = $('list-body');
   if (!list || !list.parentNode) return;
-  let chip = $('home-hidden-toggle');
-  if (!chip) {
-    chip = el('button', 'feed-showhidden');
-    chip.id = 'home-hidden-toggle';
-    chip.type = 'button';
-    chip.addEventListener('click', () => { S.feedShowHidden = !S.feedShowHidden; renderHome(); });
-    list.parentNode.insertBefore(chip, list);
+  let bar = $('home-filters');
+  if (!bar) {
+    bar = el('div', 'home-filters');
+    bar.id = 'home-filters';
+    for (const [key, label] of FILTERS) {
+      const chip = el('button', 'chip', label);
+      chip.type = 'button'; chip.dataset.filter = key;
+      chip.addEventListener('click', () => { S.feedFilter = key; renderHome(); });
+      bar.appendChild(chip);
+    }
+    const hidden = el('button', 'chip chip-hidden');
+    hidden.type = 'button'; hidden.id = 'home-hidden-toggle';
+    hidden.addEventListener('click', () => { S.feedShowHidden = !S.feedShowHidden; renderHome(); });
+    bar.appendChild(hidden);
+    list.parentNode.insertBefore(bar, list);
   }
-  chip.setAttribute('aria-pressed', S.feedShowHidden ? 'true' : 'false');
-  chip.classList.toggle('active', S.feedShowHidden);
-  chip.textContent = S.feedShowHidden ? 'Hide hidden' : 'Show hidden';
+  let needs = 0, drafts = 0;
+  for (const r of feedModel.values()) { const f = rowFlags(r); if (f.length) needs++; if (f.includes('draft')) drafts++; }
+  for (const chip of bar.querySelectorAll('.chip[data-filter]')) {
+    const key = chip.dataset.filter;
+    chip.classList.toggle('on', S.feedFilter === key);
+    chip.setAttribute('aria-pressed', S.feedFilter === key ? 'true' : 'false');
+    chip.textContent = key === 'needs' ? 'Needs you · ' + needs : key === 'drafts' ? 'Drafts · ' + drafts : 'All';
+  }
+  const hidden = $('home-hidden-toggle');
+  if (hidden) { hidden.textContent = S.feedShowHidden ? 'Hide hidden' : 'Show hidden'; hidden.classList.toggle('on', S.feedShowHidden); }
 }
 
 async function loadSourceList(sourceId) {
@@ -81,7 +115,6 @@ async function loadSourceList(sourceId) {
   const list = $('list-body');
   if (!list) return;
   S.sourceViewId = sourceId;
-  if (sourceViewHook) sourceViewHook(sourceId);
   const search = $('source-search');
   if (search) {
     search.value = '';
@@ -102,7 +135,7 @@ async function loadSourceList(sourceId) {
     }
   }
   renderSourceList();
-  if (feedRenderHook) feedRenderHook();
+  runFeedRenderHooks();
 }
 
 // #source-search is a pure client-side filter over the loaded per-source list,
@@ -110,6 +143,7 @@ async function loadSourceList(sourceId) {
 function renderSourceList() {
   const list = $('list-body');
   if (!list || !S.sourceViewId) return;
+  if (sourceViewHook) sourceViewHook(S.sourceViewId);
   const source = SOURCES.find(s => s.id === S.sourceViewId);
   // Sort most-recent-first (by last-activity ts); ties/no-message rooms fall to
   // the bottom. A copy — never reorder the shared convosBySource array in place.
@@ -158,4 +192,4 @@ function renderPeople() {
   renderDirectory();
 }
 
-export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeHiddenToggle, loadSourceList, renderSourceList, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook, setFeedRenderHook };
+export { scheduleFeedRender, feedRelTime, renderHome, ensureHomeFilters, loadSourceList, renderSourceList, renderDirectory, renderPeople, appendDirectoryRows, setSourceViewHook, setFeedRenderHook };

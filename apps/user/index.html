@@ -6,10 +6,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa</title>
 <link rel="icon" type="image/svg+xml" href="../../shared/assets/motherload.svg">
-<link rel="stylesheet" href="../../shared/style/organic.css?v=wa10">
-<link rel="stylesheet" href="style.css?v=wa10">
-<link rel="stylesheet" href="../../shared/style/beepa.css?v=wa10">
-<link rel="stylesheet" href="settings.css?v=wa10">
+<link rel="stylesheet" href="../../shared/style/organic.css?v=tr2">
+<link rel="stylesheet" href="style.css?v=tr2">
+<link rel="stylesheet" href="../../shared/style/beepa.css?v=tr2">
+<link rel="stylesheet" href="settings.css?v=tr2">
 </head>
 <body>
 <div id="signout-note-wrap" class="hidden">
@@ -52,10 +52,6 @@
       <div id="workspace">
         <div id="list-pane">
           <div id="list-head">
-            <div id="list-mode" class="list-mode">
-              <button id="list-mode-chats" class="list-mode-btn" type="button" title="Chats" aria-label="Chats"><span class="ic">&#128172;</span></button>
-              <button id="list-mode-proposals" class="list-mode-btn list-mode-named" type="button">Proposals</button>
-            </div>
             <input id="home-search" class="list-search" placeholder="Search conversations" spellcheck="false" autocomplete="off">
             <input id="source-search" class="list-search hidden" placeholder="Search" spellcheck="false" autocomplete="off">
             <input id="people-search" class="list-search hidden" placeholder="Search people and conversations" spellcheck="false" autocomplete="off">
@@ -73,11 +69,17 @@
             <header id="convo-head">
               <button id="convo-back" type="button" title="Back to list">&#8592;</button>
               <span id="convo-badge" class="plat-badge"></span>
-              <span id="convo-title"></span>
+              <div id="convo-who">
+                <span id="convo-title"></span>
+                <span id="convo-sub" class="muted"></span>
+              </div>
               <span class="spacer"></span>
+              <span id="convo-head-extra"></span>
               <button id="convo-add-contact" type="button" title="Add to contact">Add to contact</button>
             </header>
+            <div id="convo-tabs" class="hidden" role="tablist"></div>
             <div id="convo-messages"></div>
+            <div id="convo-ghost" class="hidden"></div>
             <div id="convo-compose">
               <input id="convo-input" placeholder="Message" spellcheck="true" autocomplete="off">
               <button id="convo-send" type="button" class="primary">Send</button>
@@ -119,7 +121,7 @@
                 <div id="bridge-cards" class="settings-list"></div>
               </section>
               <section id="settings-section-sharing" class="settings-pane hidden">
-                <p class="settings-lead">Control what your manager can see.</p>
+                <p class="settings-lead">Control what your manager can see. Sharing a conversation also shares your read position in it.</p>
                 <div id="share-reconfirm" class="settings-block"></div>
                 <div id="share-global" class="settings-block"></div>
                 <div id="share-sources" class="settings-block"></div>
@@ -129,6 +131,7 @@
               </section>
               <section id="settings-section-advanced" class="settings-pane hidden">
                 <p class="settings-lead">Bridge commands and debug output.</p>
+                <label class="settings-check"><input id="setting-receipts" type="checkbox" checked> Mark conversations read on your phone when you open them here</label>
                 <div id="settings-source-tabs" class="settings-src-tabs"></div>
                 <div id="command-groups" class="settings-list"></div>
                 <div id="console-card" class="settings-console">
@@ -159,6 +162,6 @@
   </div>
 </div>
 
-<script type="module" src="main.js?v=wa10"></script>
+<script type="module" src="main.js?v=tr2"></script>
 </body>
 </html>

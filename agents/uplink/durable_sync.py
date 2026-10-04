@@ -288,7 +288,8 @@ class DurableSync:
                           'proposal_pending', 'media_retry'):
                 self.db.execute('DELETE FROM ' + table)
             self.db.execute("DELETE FROM meta WHERE k IN ('master_contacts_room','master_proposals_room',"
-                            "'proposal_sync_since','sync_since') OR k LIKE 'mname:%' OR k LIKE 'last_event:%'")
+                            "'proposal_sync_since','sync_since') OR k LIKE 'mname:%' OR k LIKE 'last_event:%' "
+                            "OR k LIKE 'avatar:%' OR k LIKE 'read_state:%'")
             self.db.commit()
             self._last_reconcile = float("-inf")
             log.warning('archive destination changed; rebuilding current shares; Direct ledgers retained')

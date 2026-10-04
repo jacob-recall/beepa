@@ -24,7 +24,8 @@ import { loadContactPages } from './contact-pages.js';
 import { api } from '../../shared/matrix/client.js';
 import { $, el, sanitizeLine } from '../../shared/ui/el.js';
 import { setConvoRowDecorator } from '../../shared/ui/rows.js';
-import { setSourceViewHook } from '../../shared/ui/search.js';
+import { setConvoHeaderHook, siblingRooms } from '../../shared/ui/chat.js';
+import { setSourceViewHook, scheduleFeedRender } from '../../shared/ui/search.js';
 import { setSharingViewHook } from '../../shared/ui/nav.js';
 import { SOURCES, validHandle } from '../../shared/ui/sources.js';
 import { S, convosBySource, feedModel } from '../../shared/state.js';
@@ -241,7 +242,13 @@ async function loadConsentState() {
     for (const k of Object.keys(map)) overrides.set(k, map[k]);
     migratedRoomIds = migratedRoomIdsFromSync(syncData, new Set(overrides.keys()));
   } catch (e) { /* keep previous cache */ }
-  try { profileMap = roomProfileMap(await readProfiles()); } catch (e) { /* keep previous cache */ }
+  try {
+    profileMap = roomProfileMap(await readProfiles());
+    // Triage Rail clustering key (shared/model/attention.js clusterFeed): the
+    // room -> contact-profile map, read from the SAME stored profiles the
+    // resolver consumes. Presentation only — grouping never shares a room.
+    S.roomProfile = new Map(Object.entries(profileMap).map(([rid, p]) => [rid, { id: p.id, displayName: p.displayName }]));
+  } catch (e) { /* keep previous cache */ }
   // F3: the three states are distinct on purpose — an unreadable overrides map
   // DISABLES the per-contact controls rather than rendering an empty one.
   try {
@@ -550,6 +557,86 @@ function buildSourcePolicySlider(source) {
       renderConsentSummary();
     },
   });
+}
+
+// Registered via setConvoHeaderHook (chat.js): the header share CONTROL for
+// the open conversation. One click on the chip toggles Private <-> Shared
+// through writeShareOverride — the SAME write primitive the row kebab uses.
+// 'direct' is NEVER a cycle position (apps/user/CLAUDE.md): it has its own
+// adjacent button that goes through escalateToDirect()'s confirm; turning
+// Direct off goes back to 'share' with no confirm (de-escalation, as in
+// buildDirectRow). F8 CONSENT-WRITE INVARIANT: a failed write is SURFACED next
+// to the chip and the chip keeps showing the last SAVED level, never the
+// requested one. The sub-line counts "N of M conversations shared" across the
+// person's platforms (siblingRooms). Legacy (non-explicit) model: read-only.
+function headerChip(roomId, host, sub) {
+  if (!host) return;
+  const convo = allConvos().find(c => c.id === roomId) || { id: roomId, title: roomId };
+  const err = el('span', 'share-chip-error hidden');
+  function levelOf(id) { return effectiveLevel(overrides.get(id)); }
+  function label(level) { return level === 'direct' ? 'Direct' : level === 'share' ? 'Shared' : 'Private'; }
+  function showErr(message) {
+    err.textContent = 'Not saved — ' + sanitizeLine(message || 'try again') + '. Showing your last saved setting.';
+    err.classList.remove('hidden');
+  }
+  function render() {
+    host.replaceChildren();
+    const level = levelOf(roomId);
+    if (!explicitModel()) {
+      host.appendChild(el('span', 'share-badge' + (level === 'private' ? '' : ' shared'), label(level)));
+    } else {
+      const chip = el('button', 'share-badge share-chip-btn' + (level === 'private' ? '' : ' shared'), label(level));
+      chip.type = 'button';
+      chip.title = level === 'private' ? 'Private — click to share this conversation with your manager'
+        : 'Shared with your manager — click to make it private';
+      chip.setAttribute('aria-pressed', level === 'private' ? 'false' : 'true');
+      chip.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        err.classList.add('hidden');
+        chip.disabled = true;
+        const next = level === 'private' ? 'share' : 'private';   // Direct -> Private is a de-escalation, no confirm
+        try {
+          await writeShareOverride(convo.id, next);
+          overrides.set(convo.id, next);
+        } catch (e2) { showErr(e2 && e2.message); chip.disabled = false; return; }
+        after();
+      });
+      host.appendChild(chip);
+      if (level !== 'private') {
+        const direct = el('button', 'share-badge share-chip-btn share-chip-direct' + (level === 'direct' ? ' on' : ''),
+          level === 'direct' ? 'Direct ✓' : 'Direct…');
+        direct.type = 'button';
+        direct.title = level === 'direct'
+          ? 'Auto-send is on: your manager’s messages go out as you without review. Click to turn it off.'
+          : 'Turn on auto-send for this conversation (asks you to confirm)';
+        direct.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          err.classList.add('hidden');
+          direct.disabled = true;
+          try {
+            if (level === 'direct') { await writeShareOverride(convo.id, 'share'); overrides.set(convo.id, 'share'); }
+            else if (!(await escalateToDirect(convo))) { direct.disabled = false; return; }   // declined confirm: refused, not an error
+          } catch (e2) { showErr(e2 && e2.message); direct.disabled = false; return; }
+          after();
+        });
+        host.appendChild(direct);
+      }
+    }
+    host.appendChild(err);
+    if (sub) {
+      const sibs = siblingRooms(roomId);
+      if (sibs.length > 1) {
+        const shared = sibs.filter(r => levelOf(r.id) !== 'private').length;
+        sub.textContent = shared + ' of ' + sibs.length + ' conversations shared';
+      } else sub.textContent = '';
+    }
+  }
+  function after() {
+    render();
+    scheduleFeedRender();            // row badges / kebab state re-derive from `overrides`
+    try { renderConsentSummary(); } catch (e) { /* summary panel is optional */ }
+  }
+  render();
 }
 
 // Registered via setConvoRowDecorator (rows.js): kebab with sliding share control.
@@ -1567,6 +1654,7 @@ function renderSharingView() {
 // ---- entry point (call once from apps/user/main.js after sign-in) ----
 async function initConsentUI() {
   setConvoRowDecorator(decorateRow);
+  setConvoHeaderHook(headerChip);
   setSourceViewHook(mountSourceSwitch);
   setSharingViewHook(renderSharingView);
   await loadConsentState();

@@ -11,7 +11,12 @@ const ctx = vm.createContext({ S, ROOMID_RE: /^!/, convoSeen: new Set(), feedMod
   messageTimestamp, timestampCorrections, IMSG_BOT_MXID: '@imessagebot:local',
   $: () => null, sanitizeLine: s => s, setActiveNav() {}, showSection() {}, setDetailMode() {},
   setActiveConvoRow() {}, renderMessageEvent: e => rendered.push(e.event_id), convoResolveContent: () => true,
-  setTimeout, api: (_method, path) => new Promise((resolve, reject) => requests.push({path, resolve, reject})) });
+  setTimeout, api: (_method, path) => new Promise((resolve, reject) => requests.push({path, resolve, reject})),
+  // Triage Rail additions (read state, tabs, hooks) — inert stubs for this watch-lifecycle test.
+  applyReadCaption() {}, parseReadState: () => ({ unread: 0, remoteReadTs: 0 }), scheduleFeedRender() {},
+  buildPlatBadge: () => ({ className: '', textContent: '', classList: { add() {} } }), SOURCES: [], feedRelTime: () => '',
+  el: () => ({ appendChild() {}, classList: { add() {}, toggle() {} }, dataset: {}, setAttribute() {}, addEventListener() {} }),
+  document: { visibilityState: 'visible' } });
 vm.runInContext(source, ctx);
 const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
 const history = id => requests.find(r => r.path.includes('/rooms/' + encodeURIComponent(id) + '/messages'));

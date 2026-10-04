@@ -85,7 +85,8 @@ lives where, security invariants, and how to run/test each piece:
   models. Both apps below import from here; `shared/` never imports from
   either app.
 - `apps/user/CLAUDE.md` — the teammate app: share controls, the consent
-  summary panel, the contacts UI, and the proposal inbox, all built on
+  summary panel, the contacts UI, and the manager-draft ghost (a suggestion
+  shown in the composer, retired when the thread moves on), all built on
   `shared/`. `sendConvoMessage` (in `shared/ui/chat.js`) is the only path
   by which this APP sends into a conversation; the only other message writes
   are `sendCmd`/`sendSecretToMgmt` into verified bridge-management rooms.
@@ -100,7 +101,7 @@ lives where, security invariants, and how to run/test each piece:
   proposals down into a dedicated local room, tracks watermark + event-map
   for exactly-once delivery. Outbound-only in both directions, and it sends
   into a conversation in exactly one case: a `direct`-level conversation
-  auto-sends manager proposals behind D2's eleven gates. Its `consent.py` is
+  auto-sends manager proposals behind D2's twelve gates. Its `consent.py` is
   a byte-parity Python port of `shared/model/consent.js` — the two must
   never drift.
 - `agents/contacts/CLAUDE.md` — the teammate's durable address-book store
@@ -125,13 +126,13 @@ the uplink mirrors, as an ordinary outbound Matrix client, into per-teammate
 rooms on the always-on master homeserver. The master is a **copy** and never
 holds a teammate credential; the manager reads it through `apps/master/`,
 which cannot send, and may only leave a proposal. For a `share` conversation
-that proposal waits in the teammate's inbox until they send it themselves
+that proposal waits as a ghost draft in the teammate's composer until they send it themselves
 (`apps/user/`, via the same guarded local send path). For a `direct`
 conversation — an explicit, separately-confirmed opt-in per conversation —
 the teammate's own uplink sends it into the conversation with no review
 click, which makes the manager identity a bounded remote send capability on
 that teammate's real accounts for those conversations; what bounds it is
-D2's eleven gates in `agents/uplink/`.
+D2's twelve gates in `agents/uplink/`.
 
 **Security model, in one line per layer:** render whitelist + anti-spoof
 from_me gate (shared UI) → explicit per-conversation consent resolver as the
@@ -139,10 +140,10 @@ authorization boundary, enforced identically in JS and Python (shared model
 + uplink) → mirror-room power levels pinning the manager to read-only, set
 at room creation (uplink) → no composer / no send code at all in the master
 app (build-time separation) → the one deliberate send path, the uplink's
-`direct` auto-send, bounded by D2's eleven teammate-side gates (manager
+`direct` auto-send, bounded by D2's twelve teammate-side gates (manager
 sender verification, send-grade sanitization, freshness, mirrored-target
-membership, a fresh consent point-read, a persisted rate cap,
-intent-before-dispatch, one non-actionable inbox record either way, a
-pre/post-dispatch failure split, a hash-only audit, and master-identity
-binding that suspends on rebinding) → secrets and state files at 600, master
-stack isolated from the live `matrix-wa` hub on separate ports and volumes.
+membership, a fresh consent point-read, a persisted rate cap, a conversation
+that has not moved on since the proposal, intent-before-dispatch, one
+non-actionable inbox record either way, a pre/post-dispatch failure split, a
+hash-only audit, and master-identity binding that suspends on rebinding) →
+secrets and state files at 600, master stack isolated from the live `matrix-wa` hub on separate ports and volumes.

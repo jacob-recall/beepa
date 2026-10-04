@@ -1,4 +1,5 @@
 import { feedPreviewFromEvent } from '../model/message_preview.js';
+import { sourceRoomIds } from '../model/source_rooms.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../model/message_timestamps.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
@@ -6,10 +7,10 @@ import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../mode
 import { ROOMID_RE, api } from '../matrix/client.js';
 import { logConsole, updateImsgCard } from './connections.js';
 import { sanitizeLine } from './el.js';
-import { renderMessageEvent } from './render.js';
+import { renderMessageEvent, applyReadCaption } from './render.js';
 import { scheduleFeedRender } from './search.js';
 import { SOURCES, IMSG_BOT_MXID, handleMgmtEvent, reactToBotReply, sendCmd, startSync } from './sources.js';
-import { S, convosBySource, feedManualHidden, feedModel } from '../state.js';
+import { S, runtime, convosBySource, feedManualHidden, feedModel } from '../state.js';
 
 const MXID_RE = /^@[^:]+:localhost$/;      // shape gate for account_data-listed mxids
 const SELF_MIN_ROOMS = 5;                  // heuristic threshold: min distinct rooms to claim a self-ghost
@@ -27,7 +28,7 @@ async function fetchSnapshot() {
     // source-view load too, via refreshConvos). The last real message is
     // normally within the last few events, and bridge-side message backfill —
     // not a bigger window — is what fills empty rooms for correct ordering.
-    room: { timeline: { limit: 6, not_types: [CORRECTION_TYPE] }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] } },
+    room: { timeline: { limit: 6, not_types: [CORRECTION_TYPE] }, state: { lazy_load_members: true }, account_data: { types: ['m.tag'] }, ephemeral: { types: ['m.receipt'] } },
     presence: { types: [] }, account_data: { types: [] },
   }));
   return await api('GET', '/_matrix/client/v3/sync?timeout=0&filter=' + filter);
@@ -46,14 +47,15 @@ function parseSnapshot(data) {
     const corrections = timestampCorrections(stateEvents, IMSG_BOT_MXID);
     if (!S.timestampCorrections) S.timestampCorrections = new Map();
     S.timestampCorrections.set(rid, corrections);
-    const seenChild = new Set();
+    const children = new Map();
     for (const e of stateEvents) {
       if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
       if (e.type === 'm.room.create' && e.content && e.content.type === 'm.space') info.isSpace = true;
-      if (e.type === 'm.space.child' && e.state_key && e.content && Object.keys(e.content).length) {
-        if (!seenChild.has(e.state_key)) { seenChild.add(e.state_key); info.children.push(e.state_key); }
+      if (e.type === 'm.space.child' && e.state_key) {
+        children.set(e.state_key, Array.isArray(e.content?.via) && e.content.via.length > 0);
       }
     }
+    info.children = [...children].filter(([, active]) => active).map(([roomId]) => roomId);
     const tl = (r.timeline && r.timeline.events) || [];
     for (let i = tl.length - 1; i >= 0; i--) {
       const e = tl[i];
@@ -71,10 +73,9 @@ function buildConvos(source, rooms) {
   // Match by name prefix: mautrix names its space "WhatsApp (+1...)", iMessage is exact.
   // (Purely which space feeds the tab; D-5's joined-rooms intersection below still
   // governs what is listed/navigable, so this is functional, not a security control.)
-  const space = Object.values(rooms).find(r => r.isSpace && typeof r.name === 'string' && r.name.startsWith(source.spaceName));
   const convos = [];
-  if (!space) return convos;
-  for (const childId of space.children) {
+  const excluded = new Set(Object.values(runtime).map(value => value.mgmtRoomId).filter(Boolean));
+  for (const childId of sourceRoomIds(source, rooms, excluded)) {
     if (!rooms[childId]) continue;                 // not in joined set -> excluded
     if (!ROOMID_RE.test(childId)) continue;        // malformed id -> excluded
     const r = rooms[childId];
@@ -126,6 +127,38 @@ function feedLastPreview(room, corrections) {
     if (p && (!best || p.ts > best.ts)) best = p;
   }
   return best;
+}
+
+// Read state from one /sync room section. `unread` is the SERVER's
+// notification_count (never a local count); `remoteReadTs` is the newest
+// m.receipt timestamp from a sender that is NOT us, NOT one of our own bridge
+// ghosts and NOT a bridge bot — i.e. the other party actually read. Missing or
+// malformed => 0 (no caption, no badge). Pure; no DOM.
+function parseReadState(room, selfIds) {
+  const out = { unread: 0, remoteReadTs: 0 };
+  if (!room || typeof room !== 'object') return out;
+  const n = room.unread_notifications && room.unread_notifications.notification_count;
+  if (typeof n === 'number' && isFinite(n) && n > 0) out.unread = n;
+  const bots = new Set(SOURCES.map(s => s.botMxid).filter(Boolean));
+  const evs = (room.ephemeral && Array.isArray(room.ephemeral.events)) ? room.ephemeral.events : [];
+  for (const e of evs) {
+    if (!e || e.type !== 'm.receipt' || !e.content || typeof e.content !== 'object') continue;
+    for (const perEvent of Object.values(e.content)) {
+      const reads = perEvent && perEvent['m.read'];
+      if (!reads || typeof reads !== 'object') continue;
+      for (const [user, info] of Object.entries(reads)) {
+        if (selfIds.has(user) || bots.has(user)) continue;
+        const ts = info && info.ts;
+        if (typeof ts === 'number' && isFinite(ts) && ts > out.remoteReadTs) out.remoteReadTs = ts;
+      }
+    }
+  }
+  return out;
+}
+function selfIdSet() {
+  const s = new Set(S.selfMxids || []);
+  if (S.userId) s.add(S.userId);
+  return s;
 }
 
 // ---- Self-identity detection (self-align) — build path. COSMETIC ONLY:
@@ -225,6 +258,7 @@ async function seedFeed() {
   }
   S.feedLowPriority = low;
   await feedRefreshMuted();                          // HF-9: refresh muted push-rule set
+  await refreshSelfMxids(join);                        // self-align FIRST: parseReadState below needs the self set
   const seen = new Set();
   for (const s of SOURCES) {
     if (s.kind === 'all') continue;
@@ -233,14 +267,19 @@ async function seedFeed() {
       seen.add(c.id);
       const corrections = S.timestampCorrections?.get(c.id);
       const p = feedLastPreview(join[c.id], corrections);
+      const rs = parseReadState(join[c.id], selfIdSet());
       const existing = feedModel.get(c.id);
       if (existing) {
         existing.name = c.title;                    // refresh name; keep original attribution
         if (p && (p.ts > existing.lastTs || corrections?.size)) { existing.lastBody = p.body; existing.lastTs = p.ts; }
+        existing.unread = rs.unread;
+        if (rs.remoteReadTs > (existing.remoteReadTs || 0)) existing.remoteReadTs = rs.remoteReadTs;
+        if (!Array.isArray(existing.drafts)) existing.drafts = [];
       } else {
         feedModel.set(c.id, {
           id: c.id, name: c.title,                  // c.title already sanitizeLine'd by buildConvos
           lastBody: p ? p.body : '', lastTs: p ? p.ts : 0, sourceId: s.id,
+          unread: rs.unread, remoteReadTs: rs.remoteReadTs, drafts: [],
         });
       }
     }
@@ -248,7 +287,7 @@ async function seedFeed() {
   for (const rid of [...feedModel.keys()]) {         // drop rooms no longer validated
     if (!seen.has(rid)) feedModel.delete(rid);
   }
-  await refreshSelfMxids(join);                        // self-align: rebuild self identities (alignment only)
+  scheduleFeedRender();
 }
 
 // HF-9: derive the muted-room set from the user's own push rules. A global
@@ -324,6 +363,13 @@ function feedIngest(data) {
   let changed = false, sawUnknown = false;
   for (const rid of Object.keys(join)) {
     if (!feedModel.has(rid)) { sawUnknown = true; continue; }  // HF-3: ignore unknown room ids
+    const rec0 = feedModel.get(rid);
+    const rs = parseReadState(join[rid], selfIdSet());
+    if (join[rid] && join[rid].unread_notifications && rs.unread !== rec0.unread) { rec0.unread = rs.unread; changed = true; }
+    if (rs.remoteReadTs > (rec0.remoteReadTs || 0)) {
+      rec0.remoteReadTs = rs.remoteReadTs; changed = true;
+      if (S.openRoomId === rid) { S.convoRemoteReadTs = rs.remoteReadTs; applyReadCaption(rs.remoteReadTs); }
+    }
     if ((join[rid]?.timeline?.events || []).some(e => e.type === CORRECTION_TYPE)) scheduleFeedRevalidate();
     const p = feedLastPreview(join[rid], S.timestampCorrections?.get(rid));
     if (!p) continue;
@@ -345,7 +391,7 @@ async function startFeedSync() {
   while (S.feedRunning && S.token) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { timeline: { limit: 6 }, state: { types: [] } },
+        room: { timeline: { limit: 6 }, state: { types: [] }, ephemeral: { types: ['m.receipt'] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -377,4 +423,4 @@ async function startFeedRefresh() {
   }
 }
 
-export { MXID_RE, SELF_MIN_ROOMS, fetchSnapshot, parseSnapshot, buildConvos, refreshConvos, feedPreviewFromEvent, feedLastPreview, fetchSelfIdentityAccountData, deriveSelfMxidsHeuristic, refreshSelfMxids, seedFeed, feedRefreshMuted, feedIsHidden, feedHideRoom, feedUnhideRoom, scheduleFeedRevalidate, feedIngest, startFeedSync, startFeedRefresh };
+export { MXID_RE, SELF_MIN_ROOMS, fetchSnapshot, parseSnapshot, parseReadState, buildConvos, refreshConvos, feedPreviewFromEvent, feedLastPreview, fetchSelfIdentityAccountData, deriveSelfMxidsHeuristic, refreshSelfMxids, seedFeed, feedRefreshMuted, feedIsHidden, feedHideRoom, feedUnhideRoom, scheduleFeedRevalidate, feedIngest, startFeedSync, startFeedRefresh };

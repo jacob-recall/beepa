@@ -175,6 +175,12 @@ def make_uplink(path=None, mirrors=((CONV, "!m1:master"),), levels=None, cap=20,
 
     u.local = local
     u.master = master
+    # D2-12 (superseded) is the last gate and the only one that reads the local
+    # timeline. These fixtures model the D2-1..D2-11 gates and their transport
+    # stub has no /messages route, so it would fail closed and short-circuit
+    # every send case here. Pin it to "quiet" so this file keeps testing the
+    # gates it is about; D2-12 itself is covered by uplink_superseded.test.py.
+    u.room_quiet_since = lambda room, ts: True
     return u
 
 

@@ -29,8 +29,13 @@ contacts) — and, as of V2, the single place the manager can write a
 
 `main.js`'s header explains this in detail; the short version: it imports
 only `shared/matrix/client.js` (transport, no send side-effects of its own),
-`shared/ui/el.js` (DOM helpers, no transitive imports), and `shared/state.js`
-(the plain `S` session slot). It deliberately does **not** import
+`shared/ui/el.js` (DOM helpers, no transitive imports), `shared/state.js`
+(the plain `S` session slot), and — since the Triage Rail task — one more
+leaf: `shared/model/attention.js` (`initials`, `indicatorsFor`,
+`pendingDrafts`, `clusterFeed`). That file is a genuine zero-import leaf —
+`grep -n "import" shared/model/attention.js` returns nothing — so pulling it
+in adds no `shared/ui` code, and no send path, to this app's bundle. It
+deliberately does **not** import
 `shared/ui/render.js`, `rows.js`, `nav.js`, `chat.js`, `search.js`,
 `sources.js`, or `connections.js` — every one of those is import-chained
 into `shared/ui/chat.js`'s `sendConvoMessage` and/or `shared/ui/sources.js`'s
@@ -56,9 +61,27 @@ whitelist, recency sort, a tailing long-poll) locally instead:
   tail owns an epoch and session token; obsolete history, overlay and sync
   responses must not render or advance another tail's cursor, even when the
   same room is reopened. Do not replace these checks with just a room-ID test.
-- A mirrored outgoing `com.jkali.auto_sent_from_proposal` acknowledges that
-  exact proposal ID and removes its suggestion overlay. Equal text alone is
-  not acknowledgement and must not hide a different proposal.
+- **The suggestion stack (`#proposal-stack`, `renderSuggestionStack()`)
+  replaced the old single-bubble overlay.** Every proposal for the open
+  room's target renders its own card, each independently labeled
+  sent/auto/retired/seen/pending by `suggestionStates()` — never a single
+  hidden/shown bubble. A mirrored outgoing `com.jkali.auto_sent_from_proposal`
+  or `com.jkali.from_proposal` acknowledges that EXACT proposal ID; equal
+  text alone is not acknowledgement and must not mark a different proposal
+  sent. **F12 (security review, 2026-10-03):** both of those keys are
+  cosmetic, uplink-stamped content fields a remote party could in principle
+  forge, so `suggestionStates()` only trusts them on a message whose content
+  also carries `com.jkali.from_me === true` — the one flag `renderBubble`
+  already treats as trustworthy here, because master-side power levels pin
+  only the teammate's own uplink account as the poster in their mirror room
+  (see above). Never read `from_proposal`/`auto_sent_from_proposal` off a
+  message without that same from_me check.
+- **`com.jkali.read_state`** (state_key `''`, `{teammate_read_ts,
+  remote_read_ts, updated_ts}`) is a read-only state event the uplink writes
+  per mirror room; `parseSnapshot()` reads it into `rec.readState` and
+  nothing here ever writes it. It drives the row unread dot, the header's
+  two read lines (`renderRoomReadLine`), and `suggestionStates()`'s `seen`
+  case — never an authorization decision.
 - `nativeEchoGroups()` groups a complete matching iMessage copy of a marked
   proposal send (whole text, or consecutive newline components within 60s)
   into an expandable disclosure. All underlying events remain readable;
@@ -223,3 +246,20 @@ exercises `groupByProfile()`. See `tests/CLAUDE.md`.
    `parseSnapshot()` only from `state`/`timeline` state events — never
    trust a value from the mirrored message content itself for anything
    that affects grouping, badges, or the proposal target.
+
+## Triage Rail console additions (2026-10-03, second pass)
+
+- **Rail shows only teammates with something shared** (`sharingUsers` in
+  `hidden.js`); hidden and zero-shared teammates stay reachable from the
+  Teammates list. Convenience filtering, never authorization.
+- **Per-browser display names** for teammate labels (`beepa_teammate_names`
+  in `localStorage`, parsed/filtered by `hidden.js`'s `parseNames`/`rename`/
+  `displayName`). The VERIFIED label (space creator's localpart) remains the
+  identity key for every gate and every write target; a name only changes
+  what this browser prints. Rename/Hide/Delete live in the list-pane title
+  kebab (`renderListTitle`/`buildTitleKebab`) as well as the Teammates list.
+- **Search is in-place**: `#search-input` filters the current Recent or
+  teammate list (title, preview, and in Recent whose account); the separate
+  Search nav is gone (`navTo('search')` redirects to Recent).
+- **From-chip**: cross-teammate rows mark whose account a row belongs to with
+  an initials chip (`fromChip`, tooltip = full name) instead of a text badge.

@@ -34,7 +34,7 @@ const avatar = row.children.find(c => c.className.startsWith('avatar'));
 assert.equal(avatar.textContent, 'MR');
 assert.equal(avatar.children.filter(c => c.className.includes('plat-badge')).length, 1);
 const meta = row.children.find(c => c.className === 'meta');
-assert.equal(meta.children[1].textContent, 'Draft: Totally, Thursday works');
+assert.equal(meta.children[1].textContent, 'Suggested: Totally, Thursday works');
 const side = row.children.find(c => c.className === 'side');
 assert.ok(side.children.some(c => c.className === 'pill unread' && c.textContent === '2'));
 assert.ok(side.children.some(c => c.className === 'pill draft' && c.textContent === '1'));

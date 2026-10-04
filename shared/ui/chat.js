@@ -240,6 +240,8 @@ async function openConvo(roomId) {
       if (box) box.scrollTop = box.scrollHeight;
       applyReadCaption(S.convoRemoteReadTs);
       markRead(roomId, newestRenderedEventId());
+      // The suggestion cluster must sit AFTER the history bubbles.
+      if (composerGhostHook) { try { composerGhostHook(roomId); } catch (e) { /* app hook must not break open */ } }
     }
   } catch (e) {
     if (current()) convoSetStatus('Could not load messages: ' + String(e.message || e));

@@ -9,7 +9,7 @@
 
 import { ROOMID_RE, api } from '../../shared/matrix/client.js';
 import { $, el, sanitize, sanitizeLine } from '../../shared/ui/el.js';
-import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook, setComposerGhostHook } from '../../shared/ui/chat.js';
+import { openConvo, sendConvoMessage, prefillComposer, setAfterSendHook, setComposerGhostHook, convoSetStatus } from '../../shared/ui/chat.js';
 import { buildPlatBadge } from '../../shared/ui/rows.js';
 import { sendCmd, validHandle } from '../../shared/ui/sources.js';
 import { confirmModal } from '../../shared/ui/connections.js';
@@ -64,9 +64,12 @@ function parseProposal(e) {
   const sentEventId = (autoSent && typeof c.sent_event_id === 'string' && c.sent_event_id) ? c.sent_event_id : null;
   const ambiguous = !autoSent && c['com.jkali.send_ambiguous'] === true;
 
+  // Cosmetic: who suggested it (the uplink pins created_by to the server-stamped
+  // manager; the app shows only the localpart). Never an authorization input.
+  const createdBy = typeof c.created_by === 'string' ? c.created_by : '';
   const room = c.target_room;
   if (typeof room === 'string' && room) {
-    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous };
+    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous, createdBy };
   }
   const identifier = typeof c.target_identifier === 'string' ? c.target_identifier.trim() : '';
   if (identifier && validHandle(identifier)) {
@@ -260,7 +263,7 @@ function attachDrafts(proposals, handled, feed) {
     if (!p || p.kind !== 'room' || p.autoSent || p.ambiguous) continue;
     if (handled && typeof handled.has === 'function' && handled.has(p.eventId)) continue;
     if (!byRoom.has(p.targetRoom)) byRoom.set(p.targetRoom, []);
-    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template });
+    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template, createdBy: p.createdBy || '' });
   }
   let rooms = 0;
   for (const rec of feed.values()) {
@@ -276,79 +279,128 @@ function identifierDrafts(proposals, handled) {
     .sort((a, b) => b.ts - a.ts);
 }
 
-// ---- ghost composer ----------------------------------------------------------
-let ghostIndex = 0;      // which pending draft the ghost shows (0 = newest)
+// ---- ghost cluster IN the timeline ----------------------------------------------
+// Suggestions render as a dashed, right-aligned cluster at the END of
+// #convo-messages — where the teammate's own reply would appear — one bubble
+// per pending suggestion with its own Send, plus "Send all in order". The
+// cluster is a plain container appended after the bubbles; it is NEVER
+// produced by renderMessageEvent (so the render whitelist / from_me gate are
+// untouched) and carries no event_id/messageTs, so the renderer's ordering
+// and 200-bubble cap ignore it. Re-appended (moved to the end) after every
+// tail render through composerGhostHook.
 let ghostRoom = null;
+let ghostExpanded = false;   // "+N more" toggle (per open room)
+const GHOST_SHOW = 3;
+let sendAllBusy = false;
+
+function whoSuggested(d) {
+  const mx = d && typeof d.createdBy === 'string' ? d.createdBy : '';
+  const lp = mx.startsWith('@') ? mx.slice(1, mx.indexOf(':') > 0 ? mx.indexOf(':') : undefined) : '';
+  return lp ? sanitizeLine(lp) : 'your manager';
+}
+
+function ghostBubble(d, idx, total, roomId) {
+  // F14: display and send the SAME string. sanitize() keeps newlines, strips
+  // bidi/zero-width/control chars and clamps at 4000.
+  const shown = sanitize(d.body);
+  const g = el('div', 'ghost pending');
+  g.appendChild(el('div', 'ghost-text', shown));
+  const bar = el('div', 'ghost-bar');
+  bar.appendChild(el('span', 'ghost-st', total > 1 ? (idx + 1) + ' of ' + total : (d.template ? 'template' : whoSuggested(d))));
+  const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';
+  edit.addEventListener('click', (e) => { e.stopPropagation(); prefillComposer(shown); markHandled({ eventId: d.eventId }); afterHandled(); });
+  const dismiss = el('button', 'ghost-link', 'Dismiss'); dismiss.type = 'button';
+  dismiss.addEventListener('click', (e) => { e.stopPropagation(); markHandled({ eventId: d.eventId }); afterHandled(); });
+  const send = el('button', 'ghost-send', 'Send'); send.type = 'button';
+  send.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    send.disabled = true;
+    // Explicit target, the one guarded send path; `shown` is exactly what was read.
+    const ok = await sendConvoMessage(roomId, shown, { fromProposal: d.eventId });
+    send.disabled = false;
+    if (!ok) return;
+    markHandled({ eventId: d.eventId });
+    // F16: siblings are NOT marked handled — the sent message bumps lastTs and
+    // draftPending retires them visibly (struck through, Restore) on render.
+    afterHandled();
+  });
+  bar.appendChild(edit); bar.appendChild(dismiss); bar.appendChild(send);
+  g.appendChild(bar);
+  return g;
+}
+
+// Send every pending ghost in order (oldest first), one at a time, stopping on
+// the first failure and saying which. Each send is the same guarded call.
+async function sendAllInOrder(roomId, pending) {
+  if (sendAllBusy) return;
+  sendAllBusy = true;
+  try {
+    const ordered = pending.slice().sort((a, b) => a.ts - b.ts);
+    for (let i = 0; i < ordered.length; i++) {
+      const d = ordered[i];
+      const ok = await sendConvoMessage(roomId, sanitize(d.body), { fromProposal: d.eventId });
+      if (!ok) { convoSetStatus('Stopped at suggestion ' + (i + 1) + ' of ' + ordered.length + ' — it did not send.'); break; }
+      markHandled({ eventId: d.eventId });
+    }
+  } finally { sendAllBusy = false; afterHandled(); }
+}
 
 function renderGhost(roomId) {
-  const host = $('convo-ghost');
-  if (!host) return;
-  if (roomId !== ghostRoom) { ghostRoom = roomId; ghostIndex = 0; }
-  host.replaceChildren();
+  const box = $('convo-messages');
+  const legacy = $('convo-ghost');
+  if (legacy) legacy.classList.add('hidden');
+  if (!box) return;
+  if (roomId !== ghostRoom) { ghostRoom = roomId; ghostExpanded = false; }
+  const old = box.querySelector('.ghosts');
+  if (old) old.remove();
+  if (S.openRoomId !== roomId) return;
   const rec = feedModel.get(roomId);
-  if (!rec) { host.classList.add('hidden'); return; }
-  const pending = pendingDrafts(rec.drafts, rec.lastTs);
+  if (!rec) return;
+  const pendingNewestFirst = pendingDrafts(rec.drafts, rec.lastTs);
+  const pending = pendingNewestFirst.slice().sort((a, b) => a.ts - b.ts);     // oldest first = send order
   const retired = retiredDrafts(rec.drafts, rec.lastTs, Date.now());
   const ambiguous = allProposals.filter(p => p && p.kind === 'room' && p.ambiguous && p.targetRoom === roomId);
-  if (!pending.length && !retired.length && !ambiguous.length) { host.classList.add('hidden'); return; }
-  host.classList.remove('hidden');
+  if (!pending.length && !retired.length && !ambiguous.length) return;
+  const wrap = el('div', 'ghosts');
   for (const a of ambiguous.slice(0, 1)) {
-    const box = el('div', 'ghost ambiguous');
-    box.appendChild(el('div', 'ghost-cap', 'A suggestion may already have been sent here (' + feedRelTime(a.ts) + ' ago) — check above before replying'));
-    box.appendChild(el('div', 'ghost-text', sanitize(a.body)));
-    host.appendChild(box);
+    const g = el('div', 'ghost ambiguous');
+    g.appendChild(el('div', 'ghost-text', sanitize(a.body)));
+    g.appendChild(el('div', 'ghost-bar', 'May already have been sent (' + feedRelTime(a.ts) + ' ago) — check above before replying'));
+    wrap.appendChild(g);
   }
   if (pending.length) {
-    if (ghostIndex >= pending.length) ghostIndex = 0;
-    const d = pending[ghostIndex];
-    // F14: display and send the SAME string. sanitize() keeps newlines, strips
-    // bidi/zero-width/control chars and clamps at 4000 — sanitizeLine would show
-    // 64 chars of a body that then sends at full length.
-    const shown = sanitize(d.body);
-    const box = el('div', 'ghost pending');
-    const cap = el('div', 'ghost-cap');
-    cap.appendChild(el('span', '', (d.template ? 'Template suggested' : 'Suggested by your manager') + ' · ' + feedRelTime(d.ts) + ' ago'));
+    const cap = el('div', 'ghosts-cap');
+    const newest = pendingNewestFirst[0];
+    cap.appendChild(el('span', '', whoSuggested(newest) + ' suggested ' + (pending.length === 1 ? 'a reply' : pending.length + ' messages') + ' · ' + feedRelTime(newest.ts) + ' ago'));
     if (pending.length > 1) {
-      const sw = el('button', 'ghost-switch', (ghostIndex + 1) + ' of ' + pending.length + ' ↕');
-      sw.type = 'button'; sw.title = 'Show the next suggestion';
-      sw.addEventListener('click', () => { ghostIndex = (ghostIndex + 1) % pending.length; renderGhost(roomId); });
-      cap.appendChild(sw);
-    } else cap.appendChild(el('span', 'muted', 'Retires if the thread moves on'));
-    box.appendChild(cap);
-    box.appendChild(el('div', 'ghost-text', shown));
-    const acts = el('div', 'ghost-acts');
-    const dismiss = el('button', 'ghost-btn', 'Dismiss'); dismiss.type = 'button';
-    dismiss.addEventListener('click', () => { markHandled({ eventId: d.eventId }); afterHandled(); });
-    const edit = el('button', 'ghost-btn', 'Edit'); edit.type = 'button';
-    edit.addEventListener('click', () => { prefillComposer(shown); markHandled({ eventId: d.eventId }); afterHandled(); });
-    const send = el('button', 'ghost-btn primary', 'Send as me'); send.type = 'button';
-    send.addEventListener('click', async () => {
-      send.disabled = true;
-      // Explicit target, the one guarded send path. `shown` is exactly what the
-      // teammate read above.
-      const ok = await sendConvoMessage(roomId, shown, { fromProposal: d.eventId });
-      send.disabled = false;
-      if (!ok) return;
-      markHandled({ eventId: d.eventId });
-      // F16: siblings are NOT marked handled — the sent message bumps lastTs and
-      // draftPending retires them visibly (struck through, Restore) on render.
-      afterHandled();
-    });
-    acts.appendChild(dismiss); acts.appendChild(edit); acts.appendChild(send);
-    box.appendChild(acts);
-    host.appendChild(box);
+      const all = el('button', 'ghost-link', 'Send all in order'); all.type = 'button';
+      all.addEventListener('click', (e) => { e.stopPropagation(); sendAllInOrder(roomId, pending); });
+      const none = el('button', 'ghost-link', 'Dismiss all'); none.type = 'button';
+      none.addEventListener('click', (e) => { e.stopPropagation(); for (const d of pending) markHandled({ eventId: d.eventId }); afterHandled(); });
+      cap.appendChild(all); cap.appendChild(none);
+    }
+    wrap.appendChild(cap);
+    const shown = (ghostExpanded || pending.length <= GHOST_SHOW) ? pending : pending.slice(pending.length - GHOST_SHOW);
+    if (shown.length < pending.length) {
+      const more = el('button', 'ghost-link ghost-more', '+' + (pending.length - shown.length) + ' more'); more.type = 'button';
+      more.addEventListener('click', (e) => { e.stopPropagation(); ghostExpanded = true; renderGhost(roomId); });
+      wrap.appendChild(more);
+    }
+    shown.forEach((d) => wrap.appendChild(ghostBubble(d, pending.indexOf(d), pending.length, roomId)));
   }
   for (const d of retired.slice(0, 2)) {
-    const box = el('div', 'ghost retired');
-    const cap = el('div', 'ghost-cap');
-    cap.appendChild(el('span', '', 'Manager suggested ' + feedRelTime(d.ts) + ' ago · the thread moved on'));
-    const restore = el('button', 'ghost-switch', 'Restore'); restore.type = 'button';
-    restore.addEventListener('click', () => { prefillComposer(sanitize(d.body)); markHandled({ eventId: d.eventId }); afterHandled(); });
-    cap.appendChild(restore);
-    box.appendChild(cap);
-    box.appendChild(el('div', 'ghost-text', sanitize(d.body)));
-    host.appendChild(box);
+    const g = el('div', 'ghost retired');
+    g.appendChild(el('div', 'ghost-text', sanitize(d.body)));
+    const bar = el('div', 'ghost-bar');
+    bar.appendChild(el('span', 'ghost-st', whoSuggested(d) + ' suggested ' + feedRelTime(d.ts) + ' ago · the thread moved on'));
+    const restore = el('button', 'ghost-link', 'Restore'); restore.type = 'button';
+    restore.addEventListener('click', (e) => { e.stopPropagation(); prefillComposer(sanitize(d.body)); markHandled({ eventId: d.eventId }); afterHandled(); });
+    bar.appendChild(restore);
+    g.appendChild(bar);
+    wrap.appendChild(g);
   }
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
 }
 
 function afterHandled() {

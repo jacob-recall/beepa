@@ -111,8 +111,8 @@ const stackOpen = ctx.openRoom('!A:master');
 // without being newer than $different-proposal, so the latter is still
 // 'pending' here — only the LATER message below (ts=5000) retires it.
 history().resolve({ chunk: [{ ...msg('$ack', 'hello', { 'com.jkali.auto_sent_from_proposal': '$proposal' }), origin_server_ts: 850 }] }); await stackOpen;
-const stack = elements.get('proposal-stack');
-const cardStates = () => stack.children.map(c => c.className.replace('sug ', ''));
+const stack = { get children() { const g = box.querySelector('.ghosts'); return g ? g.children.filter(c => c.className.startsWith('ghost ')) : []; } };
+const cardStates = () => stack.children.map(c => c.className.replace('ghost ', ''));
 assert.deepEqual(cardStates(), ['auto', 'pending'], 'exact id acknowledged; same text alone is not acknowledgement');
 // A later mirrored message retires the still-pending suggestion, never marks it sent.
 ctx.renderBubble({ ...msg('$later', 'anything'), origin_server_ts: 5000 });

@@ -79,7 +79,8 @@ function wireOpen(row, roomId) {
 function previewText(rec, pend) {
   // HF-4: single-line, clamped, textContent only. A pending manager draft
   // previews as "Draft: …" so the row says what is waiting.
-  return pend.length ? 'Draft: ' + sanitizeLine(pend[0].body || '') : sanitizeLine(rec.lastBody || '');
+  if (!pend.length) return sanitizeLine(rec.lastBody || '');
+  return (pend.length > 1 ? pend.length + ' suggestions · ' : 'Suggested: ') + sanitizeLine(pend[0].body || '');
 }
 
 // A feed row (Triage Rail anatomy): stripe · avatar+badge · title/preview · side.

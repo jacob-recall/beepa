@@ -1752,32 +1752,52 @@ function suggestionStates(proposals, messages, readState, now) {
 // ---- Suggestion stack (replaces the single-bubble overlay). All proposals
 // for the OPEN room's target, newest at the bottom, each carrying its own
 // sent/auto/retired/seen/pending state — never a hidden single bubble. ----
+// The manager's suggestions render as a ghost CLUSTER at the end of the
+// mirrored timeline (#room-messages), the same shape the teammate sees — one
+// dashed right-aligned bubble per suggestion with its state. It is a plain
+// container with no event_id, appended after the bubbles and moved back to
+// the end after every render; never a message, never a send. Double-click a
+// pending one to edit: Enter files a NEW proposal (events are immutable; the
+// old one stays visible until it retires).
 function renderSuggestionStack() {
-  const host = $('proposal-stack');
+  const box = $('room-messages');
+  const legacy = $('proposal-stack');
+  if (legacy) legacy.classList.add('hidden');
   const ctx = MS.openProposalCtx;
-  if (!host || !ctx) return;
-  host.replaceChildren();
-  if (!ctx.targetRoom) return;
+  if (!box) return;
+  const old = box.querySelector('.ghosts');
+  if (old) old.remove();
+  if (!ctx || !ctx.targetRoom || MS.openRoomId !== ctx.mirrorRoomId) return;
   const rec = MS.rooms[ctx.mirrorRoomId];
   const props = MS.proposalsByRoom.get(ctx.targetRoom) || [];
+  if (!props.length) return;
   const msgs = [...MS.roomEvents.values()].map(ev => ({ type: ev.type, ts: mirrorTs(ev), content: ev.content }));
   const states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse(); // oldest at top
-  for (const s of states.slice(-6)) {
-    const card = el('div', 'sug ' + s.state);
-    const cap = el('div', 'sug-cap');
-    const label = { sent: '✓ Sent by ' + (ctx.label || 'teammate'), auto: '⚡ Sent as ' + (ctx.label || 'teammate') + ' automatically',
-      retired: 'Retired · the thread moved on', seen: 'Seen by ' + (ctx.label || 'teammate') + ' · not sent', pending: 'Pending · not yet seen' }[s.state];
-    cap.appendChild(el('span', '', label + ' · ' + shortTime(s.ts)));
+  const who = nameFor(ctx.label || '') || 'teammate';
+  const wrap = el('div', 'ghosts');
+  const pendingN = states.filter(s => s.state === 'pending' || s.state === 'seen').length;
+  const cap = el('div', 'ghosts-cap');
+  cap.appendChild(el('span', '', 'Your suggestions · ' + (pendingN ? pendingN + ' pending' : 'none pending')));
+  wrap.appendChild(cap);
+  for (const s of states.slice(-8)) {
+    const g = el('div', 'ghost ' + s.state);
+    g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
+    const bar = el('div', 'ghost-bar');
+    const label = { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
+      retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'pending · not seen yet' }[s.state];
+    bar.appendChild(el('span', 'ghost-st', label));
     if (s.state === 'pending' || s.state === 'seen') {
-      const edit = el('button', 'sug-link', 'Edit'); edit.type = 'button';
-      edit.addEventListener('click', () => { const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
-      cap.appendChild(edit);
+      const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';
+      edit.title = 'Edit in the bar; Enter files a new suggestion';
+      edit.addEventListener('click', (e) => { e.stopPropagation(); const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
+      bar.appendChild(edit);
+      g.addEventListener('dblclick', () => { const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
     }
-    card.appendChild(cap);
-    card.appendChild(el('div', 'sug-text', sanitize(s.body)));
-    host.appendChild(card);
+    g.appendChild(bar);
+    wrap.appendChild(g);
   }
-  host.scrollTop = host.scrollHeight;
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
 }
 
 // Loads every teammate's proposals-room history once per refresh and indexes

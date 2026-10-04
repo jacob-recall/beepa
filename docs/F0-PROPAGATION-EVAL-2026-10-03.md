@@ -84,6 +84,20 @@ it. Required and adopted:
 | 6 | JS/Python conformance harness for the invite gate, including Discord's child space name, wired into `tests/run.py` | `tests/conformance/invites_conformance.py` |
 | 7 | The claim that a bridge session secret can never land in a portal rests on `isBotDmMgmt()`'s full-state check, not on join ordering; stale comment fixed; Discord portal marker verified | `apps/user` docs |
 
+## Verification (independent, 2026-10-03 late)
+
+A fresh verifier confirmed all ten claims over the F0 slice and the
+suggestion-flow rework: unit suites and the 8,112-vector invite conformance
+harness green; `deliver_pending` isolates bad events; the invite stage is
+fail-closed behind the account ack (currently **404 on this machine until
+the teammate app is reloaded once**, which writes the ack for an install
+that already confirmed); D2-12 is last, clamped, fail-closed, and exempts
+only the daemon's own auto-sends; provenance stripping and hop stamps in
+place; one browser conversation send path, none on the console; ghost text
+equals sent text; optimistic console bar; health payload integers only;
+hourly passive probe sends nothing. Four P4 advisories, one fixed
+(duplicated block), three wording.
+
 ## Not yet done (F0 remainder)
 
 - Repeat the probe on a schedule and keep a history, so a regression shows as

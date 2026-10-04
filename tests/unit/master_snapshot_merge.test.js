@@ -5,7 +5,7 @@
 // state_key with tombstones, corrections accumulate, left rooms drop.
 // Run: node tests/unit/master_snapshot_merge.test.js
 import assert from 'node:assert/strict';
-import { parseSnapshot, healthText, hopLagMs } from '../../apps/master/main.js';
+import { parseSnapshot, healthText, hopLagMs, medianLagMs } from '../../apps/master/main.js';
 
 const create = { type: 'm.room.create', state_key: '', sender: '@david:master', content: { 'com.jkali.mirror_of': '!local:localhost' } };
 const full = { rooms: { join: {
@@ -90,4 +90,6 @@ const lagged = parseSnapshot({ rooms: { join: { '!a:master': { timeline: { event
 ] } } } } }, h);
 assert.equal(lagged['!a:master'].lastLagMs, 350);
 assert.equal(hopLagMs({ origin_server_ts: 5, content: { 'com.jkali.hops': { local_ts: 10 } } }), null, 'negative lag is implausible');
+assert.equal(medianLagMs([{ lastLagMs: 900 }, { lastLagMs: null }, { lastLagMs: 100 }, { lastLagMs: 300 }]), 300);
+assert.equal(medianLagMs([]), null);
 console.log('master_snapshot_merge.test.js: ok');

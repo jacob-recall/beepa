@@ -17,6 +17,13 @@ no setting, and prints only its own canary text. Exit 1 = a hop missed its
 budget. Not part of `tests/run.py`; run it after any change to the iMessage
 daemon, the uplink, or the Synapse stacks.
 
+`--passive` sends nothing: it reads the hop stamps on the newest mirrored
+events (median/max mirror lag), the uplink's health age and errors, and the
+daemon's `/health`, exiting 1 when something is stale or retrying.
+`tests/integration/launchd/com.jkali.beepa-probe.plist` runs it hourly and
+appends to `agents/uplink/logs/probe.log` (install with
+`launchctl bootstrap gui/$(id -u) tests/integration/launchd/com.jkali.beepa-probe.plist`).
+
 ## Disposable integration
 
 `tests/integration/run.sh` creates BOTH local and master Synapse/PostgreSQL

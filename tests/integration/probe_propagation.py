@@ -178,15 +178,73 @@ def leg_native(s, canary, report):
     return bool(echo) and renders_sent and (master is not None or not (s["mirror"] and s["master_token"]))
 
 
+def passive(s, report, stale_s=900, lag_budget_ms=60000):
+    """No message is sent. Read the newest mirrored events of the self-chat on
+    the master and report their hop lags, plus how fresh the daemons' own
+    health reports are. Exit 1 when the uplink or daemon report is stale or
+    the median lag is over budget. Safe to run on a schedule."""
+    print("== passive: recent hop stamps + daemon freshness (nothing is sent)")
+    ok = True
+    lags = []
+    if s["mirror"] and s["master_token"]:
+        try:
+            data = http(MASTER_HS, s["master_token"], "GET", "/_matrix/client/v3/rooms/%s/messages?dir=b&limit=50" % urllib.parse.quote(s["mirror"], safe=""))
+        except Exception as e:
+            data = {}
+            print("  master read failed: %s" % type(e).__name__); ok = False
+        for e in data.get("chunk") or []:
+            hops = (e.get("content") or {}).get("com.jkali.hops") or {}
+            lt, mt = hops.get("local_ts"), e.get("origin_server_ts")
+            if isinstance(lt, int) and isinstance(mt, int) and 0 <= mt - lt < 86400000:
+                lags.append(mt - lt)
+        if lags:
+            lags.sort(); med = lags[len(lags) // 2]
+            print("  mirror lag over %d stamped events: median %.2fs, max %.2fs" % (len(lags), med / 1000, lags[-1] / 1000))
+            if med > lag_budget_ms:
+                ok = False
+        else:
+            print("  no stamped events yet (hop stamps start with the 2026-10-03 uplink)")
+    try:
+        health = json.loads(sqlite3.connect("file:%s?mode=ro" % s["uplink_db"], uri=True).execute(
+            "SELECT v FROM meta WHERE k='sync_health'").fetchone()[0])
+        age = time.time() - (health.get("updated_at") or 0)
+        print("  uplink health age %.0fs  queued=%s refused=%s errors=%s" % (age, health.get("pending_events"), health.get("delivery_refused"), sorted((health.get("errors") or {}).keys())))
+        if age > stale_s or (health.get("errors") or {}):
+            ok = False
+    except Exception as e:
+        print("  uplink health unreadable (%s)" % type(e).__name__); ok = False
+    try:
+        d = json.loads(urllib.request.urlopen("http://127.0.0.1:29350/health", timeout=5).read().decode())
+        out = d.get("outbound") or {}
+        print("  imessage daemon: confirmed=%s refused=%s retryable=%s ambiguous=%s last_inbound_age=%s" % (
+            out.get("confirmed", 0), out.get("refused", 0), out.get("retryable", 0), out.get("ambiguous", 0),
+            ("%.0fs" % (time.time() - d["last_inbound_ts"])) if d.get("last_inbound_ts") else "n/a"))
+        if out.get("retryable") or out.get("ambiguous"):
+            ok = False
+    except Exception as e:
+        print("  imessage daemon /health unreachable (%s)" % type(e).__name__); ok = False
+    report["passive"] = {"lags_ms": lags, "ok": ok}
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--i-am-sending-real-imessages", action="store_true", help="required: this sends real iMessages to your own handle")
+    ap.add_argument("--i-am-sending-real-imessages", action="store_true", help="required for the live legs: this sends real iMessages to your own handle")
     ap.add_argument("--leg", choices=["matrix", "native", "both"], default="both")
+    ap.add_argument("--passive", action="store_true", help="send nothing; read recent hop stamps and daemon health (safe for a schedule)")
     ap.add_argument("--report", default=None, help="write a JSON report here")
     a = ap.parse_args()
-    if not a.i_am_sending_real_imessages:
-        die("refusing: pass --i-am-sending-real-imessages (the canary is a real iMessage to yourself)")
     s = load_setup()
+    if a.passive:
+        report = {"started": time.time(), "room": s["room"], "mirror": s["mirror"]}
+        ok = passive(s, report)
+        if a.report:
+            with open(a.report, "w") as f:
+                json.dump(report, f, indent=2)
+        print("\nprobe: %s" % ("HEALTHY" if ok else "ATTENTION NEEDED"))
+        sys.exit(0 if ok else 1)
+    if not a.i_am_sending_real_imessages:
+        die("refusing: pass --i-am-sending-real-imessages (the canary is a real iMessage to yourself), or --passive")
     print("probe: self-chat %s -> room %s -> mirror %s" % (s["chat_id"], s["room"], s["mirror"] or "(none)"))
     report = {"started": time.time(), "room": s["room"], "mirror": s["mirror"], "budgets": BUDGET}
     ok = True

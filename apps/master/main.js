@@ -282,6 +282,13 @@ function parseUplinkHealth(content) {
   h.stage_errors = Array.isArray(content.stage_errors) ? content.stage_errors.filter(x => typeof x === 'string').map(x => sanitizeLine(x)).slice(0, 12) : [];
   return h;
 }
+// Median of the known mirror lags across a teammate's rooms (ms), or null.
+function medianLagMs(convos) {
+  const xs = (convos || []).map(c => c.lastLagMs).filter(v => typeof v === 'number').sort((a, b) => a - b);
+  if (!xs.length) return null;
+  return xs[Math.floor(xs.length / 2)];
+}
+function lagText(ms) { return ms === null ? '' : (ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's'); }
 // One line for a teammate's uplink health. `now` in ms. Pure.
 function healthText(h, now) {
   if (!h || typeof h.updated_at !== 'number') return 'no sync report yet';
@@ -589,6 +596,7 @@ function buildByUser(rooms) {
         continue;
       }
       convos.push({
+        lastLagMs: (typeof r.lastLagMs === 'number') ? r.lastLagMs : null,
         id: childId,
         title: sanitizeLine(r.name || childId),
         preview: sanitizeLine(r.lastBody || ''),
@@ -1259,8 +1267,9 @@ function renderListTitle() {
   sub.appendChild(document.createTextNode(convos.length + ' shared' + (nameFor(label) !== label ? ' · ' + sanitizeLine(label) : '') + ' '));
   sub.appendChild(buildUserPlatformsRow(label));
   who.appendChild(sub);
+  const lag = medianLagMs(convos);
   const health = el('span', 'list-title-sub health' + (/STALE|refused|retrying|disconnected|no sync/.test(healthText(MS.healthByUser.get(label), Date.now())) ? ' warn' : ''),
-    healthText(MS.healthByUser.get(label), Date.now()));
+    healthText(MS.healthByUser.get(label), Date.now()) + (lag === null ? '' : ' · mirror lag ' + lagText(lag)));
   who.appendChild(health);
   host.appendChild(who);
   host.appendChild(buildTitleKebab(label, nameEl));
@@ -2426,7 +2435,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot, healthText, hopLagMs };
+export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot, healthText, hopLagMs, medianLagMs };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {

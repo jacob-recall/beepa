@@ -122,10 +122,18 @@ lives where, security invariants, and how to run/test each piece:
 
 **Data flow:** each teammate's local Synapse (bridges + iMessage daemon)
 stays the source of truth for their own conversations. A teammate's
-EXPLICIT per-conversation level — `share`, `direct`, or `private` (the
-default; absent or unrecognized resolves private, and nothing is inherited
-from a contact profile or a standing policy) — decides which conversations
-the uplink mirrors, as an ordinary outbound Matrix client, into per-teammate
+per-conversation level — `share`, `direct`, or `private` — decides which
+conversations the uplink mirrors; a conversation with no level set (absent or
+unrecognized) takes that ACCOUNT's own default, `com.jkali.share_policy`'s
+`default_level`, which is `private` unless the account holder has opted in.
+An explicit level always wins, in both directions (a room set `private` stays
+private under a `direct` default), and nothing is inherited from a contact
+profile or from the dead per-source / global standing policies. The account
+default is therefore the one standing setting that can share a conversation —
+and under a non-private default, a conversation the teammate never touched
+(including one the uplink joined unattended) is shared, and under `direct`
+auto-sendable. The uplink mirrors as an ordinary outbound Matrix client, into
+per-teammate
 rooms on the always-on master homeserver. The master is a **copy** and never
 holds a teammate credential; the manager reads it through `apps/master/`,
 which cannot send, and may only leave a proposal. For a `share` conversation
@@ -138,9 +146,13 @@ that teammate's real accounts for those conversations; what bounds it is
 D2's twelve gates in `agents/uplink/`.
 
 **Security model, in one line per layer:** render whitelist + anti-spoof
-from_me gate (shared UI) → explicit per-conversation consent resolver as the
-authorization boundary, enforced identically in JS and Python (shared model
-+ uplink) → mirror-room power levels pinning the manager to read-only, set
+from_me gate (shared UI) → the consent resolver as the authorization boundary
+— per-conversation level, else the account default, enforced identically in JS
+and Python through one two-input function (`resolvedLevel` / `resolved_level`),
+with a policy read that could not be performed never treated as a revocation
+(the pass aborts) and, at the one site where a read authorizes rather than
+revokes, failing closed to private (shared model + uplink) → mirror-room power
+levels pinning the manager to read-only, set
 at room creation (uplink) → no composer / no send code at all in the master
 app (build-time separation) → the one deliberate send path, the uplink's
 `direct` auto-send, bounded by D2's twelve teammate-side gates (manager

@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "agents", "uplink"))
 import consent  # noqa: E402
 from consent import (  # noqa: E402
-    resolve, effective_shared, effective_level, resolve_all,
+    resolve, effective_shared, effective_level, resolved_level, resolve_all,
     normalize_policy, normalize_override, overrides_from_sync,
 )
 
@@ -248,10 +248,99 @@ for cc in (None, 5, "imessage", [], {}, {"id": "!r:l", "sourceId": 5},
     eq(resolve(cc, DENY_POLICY, "share", DENY_PROFILE), {"shared": True, "reason": "explicit"},
        "hostile convo %r: explicit share still holds" % (cc,))
 
+
+# ---------------------------------------------------------------------------
+# 14. THE ACCOUNT DEFAULT (share_policy's default_level, roadmap section 6).
+#     Mirrors section 14 of consent.test.js case-for-case. An explicit per-room
+#     override always wins; with NO override the account default decides, and
+#     an absent/unrecognized default is 'private'. resolved_level() is a NEW
+#     function — effective_level() keeps its one-argument "explicit level only"
+#     meaning on purpose, and `policy` is a REQUIRED positional here so a
+#     defaulted call cannot silently under-claim.
+# ---------------------------------------------------------------------------
+def DEF(lv):
+    return {"global": "private", "sources": {}, "default_level": lv}
+
+
+eq(resolved_level(None, DEF("direct")), "direct", "resolved_level: unset takes a direct default")
+eq(resolved_level(None, DEF("share")), "share", "resolved_level: unset takes a share default")
+eq(resolved_level(None, DEF("private")), "private", "resolved_level: unset takes a private default")
+eq(resolved_level(None, {}), "private", "resolved_level: no default at all -> private")
+eq(resolved_level("private", DEF("direct")), "private",
+   "resolved_level: an EXPLICIT private beats a direct default")
+eq(resolved_level("share", DEF("direct")), "share",
+   "resolved_level: explicit share beats a direct default")
+eq(resolved_level("direct", DEF("private")), "direct",
+   "resolved_level: explicit direct beats a private default")
+eq(resolved_level({"state": "private"}, DEF("direct")), "private",
+   "resolved_level: object form, explicit wins")
+
+eq(effective_level(None), "private", "effective_level: still 1-arg, still 'explicit level'")
+eq(effective_level("share"), "share", "effective_level: unchanged for an explicit level")
+
+for junk in [None, "", "inherit", "junk", "Direct", "direct ", "share-all", 0, 5,
+             True, False, [], {}, ["direct"], {"state": "junk"}, {"state": ["share"]},
+             {"State": "direct"}, {"default_level": "direct"}]:
+    lab = "junk override %r" % (junk,)
+    eq(resolved_level(junk, DEF("direct")), "direct", lab + " degrades to 'no override'")
+    eq(resolved_level(junk, {}), "private", lab + " with no default -> private")
+
+for bad in ["Direct", "direct ", " direct", "DIRECT", "inherit", "share-all", "",
+            None, True, False, 0, 5, [], ["direct"], {}, {"state": "direct"}]:
+    eq(consent.policy_default_level({"default_level": bad}), "private",
+       "policy_default_level: junk %r -> private" % (bad,))
+for container in [None, 5, "direct", [], ["direct"], {"default_level": "direct", "extra": 1}]:
+    want = ("direct" if isinstance(container, dict)
+            and container.get("default_level") == "direct" else "private")
+    eq(consent.policy_default_level(container), want,
+       "policy_default_level: container %r" % (container,))
+eq(consent.policy_default_level({"__proto__": {"default_level": "direct"}}), "private",
+   "policy_default_level: a __proto__-nested default is not a default")
+eq(consent.policy_default_level({"sources": {"default_level": "direct"}}), "private",
+   "policy_default_level: a nested default under sources is not a default")
+
+eq(resolve(convo("x"), DEF("share"), None), {"shared": True, "reason": "default-share"},
+   "resolve: unset under a share default")
+eq(resolve(convo("x"), DEF("direct"), None), {"shared": True, "reason": "default-direct"},
+   "resolve: unset under a direct default")
+eq(resolve(convo("x"), DEF("private"), None), {"shared": False, "reason": "private"},
+   "resolve: unset under a private default stays 'private'")
+eq(resolve(convo("x"), DEF("direct"), "private"), {"shared": False, "reason": "excluded"},
+   "resolve: explicit private under a direct default is 'excluded'")
+eq(resolve(convo("x"), DEF("direct"), "share"), {"shared": True, "reason": "explicit"},
+   "resolve: explicit share under a direct default is still 'explicit'")
+eq(resolve(convo("x"), DEF("private"), "direct"), {"shared": True, "reason": "direct"},
+   "resolve: explicit direct under a private default is still 'direct'")
+eq(effective_shared(convo("x"), DEF("direct"), None), True,
+   "effective_shared follows resolve under a default")
+eq(effective_shared(convo("x"), DEF("direct"), "private"), False,
+   "effective_shared: an explicit private is not shared under a direct default")
+eq(resolve(convo("imessage"), LOUD_POLICY, None), {"shared": False, "reason": "private"},
+   "resolve: share-all WITHOUT a default_level still shares nothing")
+
+_list = [{"id": "!a:l"}, {"id": "!b:l"}, {"id": "!c:l"}]
+eq([r["reason"] for r in resolve_all(_list, DEF("direct"), {"!b:l": "private"})],
+   ["default-direct", "excluded", "default-direct"], "resolve_all: threads default_level")
+eq([r["shared"] for r in resolve_all(_list, {}, {"!b:l": "share"})],
+   [False, True, False], "resolve_all: no default -> only the explicit share")
+
+eq(normalize_policy({"default_level": "direct"}).get("default_level"), "direct",
+   "normalize_policy: keeps a valid default_level")
+eq(normalize_policy({"default_level": "Direct"}).get("default_level"), None,
+   "normalize_policy: drops a near-miss default_level")
+eq(normalize_policy({"default_level": ["direct"]}).get("default_level"), None,
+   "normalize_policy: drops a non-string default_level")
+eq(consent.policy_default_level(normalize_policy({"default_level": "inherit"})), "private",
+   "normalize_policy round-trip: junk reads back as private")
+eq(normalize_policy(normalize_policy({"global": "share-all", "default_level": "share"})),
+   {"global": "share-all", "sources": {}, "default_level": "share"},
+   "normalize_policy: idempotent over a valid default")
+
 # The model-version marker constants the uplink writes and apps/user reads must
 # stay identical on both sides (F7).
 eq(consent.CONSENT_MODEL_TYPE, "com.jkali.consent_model", "marker: account-data type")
-eq(consent.CONSENT_MODEL_EXPLICIT, 2, "marker: explicit-model version")
+eq(consent.CONSENT_MODEL_EXPLICIT, 3, "marker: explicit-model version")
+eq(consent.CONSENT_MODEL_PER_ROOM, 2, "marker: per-room-only model version")
 eq(sorted(consent.OVERRIDE_STATES), ["direct", "private", "share"],
    "exactly three conversation levels exist")
 

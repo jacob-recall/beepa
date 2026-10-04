@@ -22,14 +22,44 @@ This capability is intentional and remains governed by the existing gates.
 
 | Conversation setting | Copy to master | Manager proposal behavior |
 |---|---|---|
-| Private, absent, or unrecognized | No new forwarding | No automatic send |
+| Private (explicitly set on the room) | No new forwarding | No automatic send |
 | Share | Mirror authorized history and new events | Teammate reviews, edits, sends or dismisses |
 | Direct | Mirror authorized history and new events | Eligible proposals may be sent automatically by the local uplink |
+| Absent or unrecognized | Whatever the ACCOUNT DEFAULT says | Whatever the account default says |
+| Absent, and no account default (or an unrecognized one) | No new forwarding | No automatic send |
 
-Conversation settings are explicit per room (`com.jkali.share_override`).
-Global/source standing policies and a contact profile's share flag do not
-implicitly share a conversation. Existing migration code can materialize
+A conversation's setting is per room (`com.jkali.share_override`) and always
+wins, in both directions: an explicit Private beats a Direct account default.
+A room with no recognized setting takes the account default,
+`com.jkali.share_policy`'s `default_level` ∈ `private | share | direct`, which
+is absent (therefore `private`) unless the account holder sets it. An
+unrecognized override is "no setting", not a share: it falls through to the
+default exactly as an absent one does, and can never share a room on its own.
+
+The account default is the ONLY standing setting that decides a conversation.
+The per-source policy, the global share-all and a contact profile's share flag
+remain dead and do not share anything. Existing migration code can materialize
 older choices as explicit room overrides once; it does not enable new rooms.
+
+Consequences of a non-private account default, stated plainly:
+
+- Every conversation the holder has not set individually is shared — including
+  conversations that arrive later, and conversations joined unattended by the
+  uplink's `invites` stage. Joining such a room now DOES share it.
+- Under a `direct` default those conversations are also auto-sendable, behind
+  the same twelve teammate-side gates, with no per-conversation confirm.
+- Read position (F10) mirrors for every shared conversation, so a default
+  mirrors the holder's read position across every defaulted conversation too.
+- Clearing a room's setting means "take the default", which under a non-private
+  default re-shares it. Making a room private requires writing `private`.
+- Setting an existing conversation to Direct in bulk writes EXPLICIT overrides:
+  changing the account default back later does not un-Direct them.
+
+Both resolvers read the two inputs through one function
+(`resolvedLevel` / `resolved_level`). A policy read the daemon could not
+perform is never treated as a revocation: the pass aborts and retries. In the
+one place where a read authorizes rather than revokes — the uplink's send-time
+point-read — an unreadable policy resolves `private` instead.
 
 Contacts have a separate sharing policy with global/source settings and
 per-contact overrides. Sharing a contact does not authorize sending to them

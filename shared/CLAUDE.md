@@ -20,13 +20,28 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   homeserver (used only by `apps/master`). Each HTML page gets its own ES
   module graph, so repointing one page's copy never affects another.
 - `model/consent.js` — the authorization boundary (PLAN §4, as amended by
-  the direct-share-level plan's D1): the pure **explicit-only** conversation
-  resolver `resolve()`/`effectiveShared()`/`effectiveLevel()`/`resolveAll()`.
-  A conversation carries exactly ONE per-conversation level — `share` and
-  `direct` mirror, `private` does not, and **absent or any unrecognized value
-  resolves `private`**. There is no inheritance on the conversation path:
-  contact-profile share-state, the per-source policy and the global standing
-  policy are still accepted as arguments and deliberately ignored. The
+  the direct-share-level plan's D1 and the 2026-10-03 roadmap §6): the pure
+  conversation resolver
+  `resolve()`/`effectiveShared()`/`effectiveLevel()`/`resolvedLevel()`/`resolveAll()`.
+  A conversation carries at most ONE per-conversation level — `share` and
+  `direct` mirror, `private` does not — and an **absent or unrecognized
+  override is "no level set", which takes the ACCOUNT DEFAULT**
+  (`com.jkali.share_policy`'s `default_level` ∈ `private|share|direct`,
+  absent or unrecognized ⇒ `private`). An explicit level always wins, in both
+  directions: a room set to `private` stays private under a `direct` default.
+  **`effectiveLevel(override)` keeps its one-argument "the EXPLICIT level"
+  meaning; `resolvedLevel(override, policy)` is the default-aware one** — the
+  split is deliberate, so a call site nobody converted UNDER-claims (shows
+  private where the default shares) instead of mis-claiming. In Python
+  `resolved_level`'s `policy` is a REQUIRED positional for the same reason.
+  `resolve()` gains the reasons `default-share` / `default-direct`; `reason`
+  stays UI-only, never an authorization input.
+  The account default is the ONLY standing setting that still decides a
+  conversation — contact-profile share-state, the per-source policy and the
+  global standing policy are still accepted as arguments and deliberately
+  ignored. `readSharePolicy()` distinguishes 404 (empty, safe default) from
+  any other failure (`status: 'error'`): the caller must DISABLE its default
+  control and say so rather than render a level it never read. The
   layered, most-specific-wins model survives only in the SEPARATE
   contact-sharing dimension (`resolveContactShare`), which as of the
   per-contact-share plan gains a third, most-specific level: a per-CONTACT

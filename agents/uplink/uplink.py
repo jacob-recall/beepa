@@ -802,12 +802,42 @@ class Uplink(durable_sync.DurableSync):
                 and m.rsplit(":", 1)[-1] == local_server}
 
     def read_policy(self):
+        """The account share policy, which now carries `default_level`.
+
+        404/ABSENT -> the safe default (global 'private', no sources, and thus
+        a 'private' account default): nothing shared unless a level says so.
+        ANY OTHER FAILURE PROPAGATES (same shape as read_contact_policy, which
+        returns None for the same reason). This is load-bearing now that the
+        policy decides rooms: collapsing a transient 500 into "no default"
+        would look exactly like "the account holder revoked their default" and
+        mass-revoke every defaulted room on one blip. A read we could not
+        perform is NOT a revocation — the exception aborts the pass and
+        run_stage backs the stage off.
+        """
         path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
                 + "/account_data/" + consent.SHARE_POLICY_TYPE)
         try:
-            return consent.normalize_policy(self.local("GET", path))
-        except urllib.error.HTTPError:
+            data = self.local("GET", path)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
             return {"global": "private", "sources": {}}  # absent -> safe default
+        return consent.normalize_policy(data)
+
+    def pass_policy(self):
+        """The account policy for THIS stage pass, read at most once.
+
+        run_stage() clears the cache at the start of every stage, so a policy
+        can never outlive the pass that read it. Every per-write consent
+        recheck (durable_sync.archive_level) and the reconcile/ingestion
+        resolution go through here, so one pass sees one consistent default
+        rather than a per-room race. A non-404 read failure propagates out of
+        here exactly as read_policy() raises it: pause, never revoke.
+        """
+        pol = getattr(self, "_pass_policy", None)
+        if pol is None:
+            pol = self._pass_policy = self.read_policy()
+        return pol
 
     def read_profiles(self):
         """Return {local_room_id: {'id','displayName','share'}} from account-data.
@@ -1098,6 +1128,23 @@ class Uplink(durable_sync.DurableSync):
                 + "/account_data/" + consent.CONSENT_MODEL_TYPE)
         self.local("PUT", path, {"version": consent.CONSENT_MODEL_EXPLICIT})
 
+    MODEL_MARKER_META = "consent_model_written"
+
+    def ensure_consent_model_marker(self):
+        """Keep com.jkali.consent_model at the CURRENT model version.
+
+        The D0 migration flag is one-shot, so a LATER model bump (3: per-room
+        override, else the account default) would otherwise never reach an
+        already-migrated install and its UI would wait forever for a daemon
+        that had in fact already updated. Written once per version, tracked in
+        state.db; a failed PUT raises and the next pass retries.
+        """
+        want = str(consent.CONSENT_MODEL_EXPLICIT)
+        if self.meta_get(self.MODEL_MARKER_META) == want:
+            return
+        self.write_consent_model_marker()
+        self.meta_set(self.MODEL_MARKER_META, want)
+
     def migrate_explicit_levels(self):
         """Materialize standing-policy shares as explicit 'share' overrides.
 
@@ -1121,9 +1168,10 @@ class Uplink(durable_sync.DurableSync):
         next pass retries; already-written overrides are simply skipped then.
         """
         if self.meta_get(MIGRATED_FLAG) == "1":
+            self.ensure_consent_model_marker()
             return {}
         sync_data = self.full_sync()
-        policy = self.read_policy()
+        policy = self.pass_policy()
         overrides = consent.overrides_from_sync(sync_data)
         source_of = self.sources_from_sync(sync_data)
         profile_of = self.read_profiles()
@@ -1146,7 +1194,7 @@ class Uplink(durable_sync.DurableSync):
                 continue
             self.write_share_override(rid, "share", migrated=True)
             written[rid] = "share"
-        self.write_consent_model_marker()
+        self.ensure_consent_model_marker()
         self.meta_set(MIGRATED_FLAG, "1")   # flag LAST: the pass is idempotent
         log.info("consent model 2 (explicit levels): materialized %d inherited "
                  "share(s) as explicit overrides", len(written))
@@ -1168,8 +1216,14 @@ class Uplink(durable_sync.DurableSync):
         extra_overrides is the map D0's migration just wrote; merging it makes
         this pass independent of whether the /sync snapshot below already
         reflects those brand-new account-data events.
+
+        A room with NO explicit override now takes the ACCOUNT DEFAULT
+        (share_policy.default_level, absent => 'private'), so this pass reads
+        the policy through pass_policy() — one read for the whole stage, and a
+        non-404 read failure aborts it rather than fabricating "no default"
+        and mass-revoking every defaulted room.
         """
-        policy = self.read_policy()
+        policy = self.pass_policy()
         overrides = consent.overrides_from_sync(sync_data)
         if extra_overrides:
             overrides.update(extra_overrides)
@@ -1190,7 +1244,7 @@ class Uplink(durable_sync.DurableSync):
             # level is only carried alongside it for the D2b stamp. If the two
             # ever disagreed we keep the RESOLVER's answer and record private,
             # so a stamp can never widen what is mirrored.
-            level = consent.effective_level(override)
+            level = consent.resolved_level(override, policy)
             if not consent.effective_shared(convo, policy, override, profile_arg):
                 level = "private"
             desired[rid] = level
@@ -2007,9 +2061,15 @@ class Uplink(durable_sync.DurableSync):
         point of `direct` is that it authorizes a send with no human in the
         loop — so the level is re-read from the teammate's own account-data at
         the moment of sending, through the SAME resolver
-        (consent.effective_level) the rest of the system uses. ANY failure —
-        bad room id, HTTP error, transport error, junk content — resolves
-        'private', never 'direct'.
+        (consent.resolved_level) the rest of the system uses. BOTH inputs are
+        re-read here: the room override AND the account policy whose
+        `default_level` applies when the room has no override.
+
+        ANY failure — bad room id, HTTP error, transport error, junk content,
+        an unreadable policy — resolves 'private', never 'direct'. That is the
+        opposite of read_policy()'s propagate-on-error rule ON PURPOSE: there,
+        a failed read must not REVOKE; here, a failed read must not AUTHORIZE,
+        so the policy read sits INSIDE this blanket except.
         """
         if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
             return "private"
@@ -2017,7 +2077,15 @@ class Uplink(durable_sync.DurableSync):
                 + "/rooms/" + urllib.parse.quote(local_room_id, safe="")
                 + "/account_data/" + consent.SHARE_OVERRIDE_TYPE)
         try:
-            return consent.effective_level(self.local("GET", path))
+            override = self.local("GET", path)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return "private"                   # fail closed
+            override = None                        # no override -> the default decides
+        except Exception:                          # noqa: BLE001 — fail closed
+            return "private"
+        try:
+            return consent.resolved_level(override, self.read_policy())
         except Exception:                          # noqa: BLE001 — fail closed
             return "private"
 
@@ -2767,6 +2835,12 @@ class Uplink(durable_sync.DurableSync):
                           timeout=(self.cfg.sync_timeout // 1000) + 30)
         # Apply account-data privacy changes before staging any batch event.
         join = (((data or {}).get("rooms") or {}).get("join")) or {}
+        # ONE policy read for this whole tail: an override CHANGE below is
+        # resolved against the CURRENT account default, so clearing an override
+        # under a 'direct' default is not a revocation (and a per-room read
+        # would let the default change mid-tail and flap rooms in and out).
+        # A non-404 policy failure raises out of here: pause, never revoke.
+        policy = self.pass_policy()
         for event in (data.get("account_data") or {}).get("events", []):
             if event.get("type") == self.MASTER_LINK_TYPE:
                 link = event.get("content")
@@ -2781,7 +2855,7 @@ class Uplink(durable_sync.DurableSync):
                 continue
             changed = [e for e in (room.get("account_data") or {}).get("events", [])
                        if e.get("type") == consent.SHARE_OVERRIDE_TYPE]
-            if changed and consent.effective_level(changed[-1].get("content")) not in ("share", "direct"):
+            if changed and consent.resolved_level(changed[-1].get("content"), policy) not in ("share", "direct"):
                 self.mark_revoking(local_room_id)
                 continue
             if self.mirror_status(local_room_id) == "revoking":
@@ -2899,6 +2973,10 @@ class Uplink(durable_sync.DurableSync):
         until, attempt = schedules.get(name, (0, 0))
         if time.monotonic() < until:
             return False
+        # One consent-policy read per stage pass, never reused across passes:
+        # the account default decides rooms, so a stale cached copy would keep
+        # mirroring (or keep refusing) after the holder changed it.
+        self._pass_policy = None
         try:
             action()
             schedules.pop(name, None)

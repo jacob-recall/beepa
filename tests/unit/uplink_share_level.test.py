@@ -143,11 +143,18 @@ def make_uplink(levels, path=None, mirrors=()):
     u.state_puts = []      # (path, body) for every master state PUT
     u.created = []
 
+    u.local_puts = []
+
     def local(method, path, body=None, query=None, timeout=60):
         if method == "GET":
             if path.endswith("/sync"):
                 return u.sync_data
             raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
+        if method == "PUT" and consent.CONSENT_MODEL_TYPE in path:
+            # The model-version marker is re-announced once per version bump,
+            # even on an already-migrated install (ensure_consent_model_marker).
+            u.local_puts.append((path, body))
+            return {}
         raise AssertionError("unexpected local %s %s" % (method, path))
 
     def master(method, path, body=None, query=None, timeout=60):

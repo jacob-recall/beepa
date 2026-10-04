@@ -2,7 +2,7 @@
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
 import { fetchSnapshot, seedFeed, startFeedSync, startFeedRefresh } from '../../shared/ui/account-data.js';
-import { countSharedNow, initConsentUI } from './consent.js';
+import { countSharedNow, accountDefaultLevel, initConsentUI } from './consent.js';
 import { bridgeInvitesToJoin } from './invites.js';
 import { initContactsUI, openAddToContact } from './contacts.js';
 import { autoMergeContacts } from './enrich.js';
@@ -211,9 +211,24 @@ async function joinBridgeInvites() {
     let visible = 0;
     try { visible = countSharedNow(labelJoins(fresh, res.join, sources, S.userId)); }
     catch (e) { visible = 0; }
+    // Name the account default explicitly when it is not private: under a
+    // default, accepting an invite is no longer "membership only" — the
+    // conversation is shared the moment it is joined, and under `direct` it
+    // also becomes remotely sendable. The count alone does not say that.
+    let defaultNote = '';
+    try {
+      const dl = accountDefaultLevel();
+      if (dl === 'share') {
+        defaultNote = ' Your account default is Share, so any of these you do not set '
+          + 'individually will be shared with your manager.';
+      } else if (dl === 'direct') {
+        defaultNote = ' Your account default is Direct, so any of these you do not set '
+          + 'individually will be Direct: your manager can send as you in them.';
+      }
+    } catch (e) { defaultNote = ''; }
     const ok = await confirmModal('Accept pending conversations?',
-      'Accept ' + res.join.length + ' pending conversation(s)? Under your current sharing policy, '
-      + visible + ' would become visible to your manager.', false);
+      'Accept ' + res.join.length + ' pending conversation(s)? Under your current sharing settings, '
+      + visible + ' would become visible to your manager.' + defaultNote, false);
     if (!ok) {
       autojoinPending.declined = res.join.length;   // still pending, and now visible as such
       renderAutojoinNote();

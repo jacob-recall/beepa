@@ -34,6 +34,9 @@ class DurableSyncTests(unittest.TestCase):
             UPLINK_DB=str(Path(self.tmp.name) / 'state.db'))))
         self.addCleanup(lambda: self.u.db.close())
         self.level = 'share'
+        # The ACCOUNT DEFAULT (com.jkali.share_policy). Absent default_level =>
+        # 'private', so `self.level` alone still decides unless a test sets one.
+        self.policy = {}
         self.calls = []
         self.events = {}
         self.link = {'master_hs_url': 'https://master.invalid', 'master_token': 'fixture',
@@ -47,7 +50,11 @@ class DurableSyncTests(unittest.TestCase):
             if method == 'PUT':
                 self.link = body
             return self.link
+        if path.endswith('/account_data/com.jkali.share_policy'):
+            return self.policy
         if path.endswith('/account_data/com.jkali.share_override'):
+            if self.level is None:
+                raise urllib.error.HTTPError('', 404, '', {}, None)
             return {'state': self.level}
         if '/event/' in path:
             return self.events[urllib.parse.unquote(path.rsplit('/', 1)[1])]

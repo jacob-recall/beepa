@@ -111,7 +111,10 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
 - **First-run consent confirm.** The first time this app would accept invites
   (per browser profile, flag `beepa_autojoin_ack` in `localStorage`), it asks
   first and states how many of those rooms would become **visible to the
-  manager** under the current sharing policy. That count comes from the shared
+  manager** under the current sharing settings. When the ACCOUNT DEFAULT is not
+  private it also says so in words ("…will be Direct: your manager can send as
+  you in them"), because under a default, accepting an invite is no longer
+  membership-only. That count comes from the shared
   resolver (`consent.js`'s `countSharedNow()` → `resolveAll()`), never from a
   hand-rolled rule; it is a prompt, never an authorization decision. Declining
   leaves the invites pending. The `localStorage` flag is per-viewer
@@ -203,10 +206,53 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   was already mirrored — tombstones are state events, so prior content stays
   readable from room history to anyone already joined. Never restore copy that
   claims removal deletes what was shared.
+- **The ACCOUNT DEFAULT (roadmap §6) is the one standing setting that shares.**
+  `com.jkali.share_policy.default_level` (`private|share|direct`, absent ⇒
+  private) applies to every conversation the holder has NOT set individually —
+  the ones they have now and the ones that arrive later. An explicit
+  per-conversation level always wins, in both directions. The UI must say
+  "conversations you haven't set individually", never "new conversations", and
+  the "default" marker on a chip/row is driven by the RESOLVER'S REASON
+  (`default-share`/`default-direct`/`private`), never re-derived locally.
+  Setting the default to Direct goes through the same risk confirm as a
+  single conversation, worded for its real scope. The control is DISABLED, with
+  a stated reason, when the policy read failed (`policyStatus === 'error'`) or
+  the daemon has not yet announced consent model 3 — a UI that offered a
+  default an older daemon does not implement would be claiming a sharing state
+  the enforcer has not got. Resolution itself stays default-aware at every
+  marker version, because over-claiming exposure is the safe direction.
+  **A non-private default is advertised by a persistent, NON-DISMISSIBLE banner
+  above the chat list** (`#default-level-banner`), so the holder can always see
+  it and revert it without a raw Matrix client. Never add a dismiss control.
+- **Deploy order for the account default: APP FILES FIRST, daemon second.**
+  The consent-model marker moves 2 → 3 ("per-room override, else the account
+  default"), and the daemon writes it (`ensure_consent_model_marker`, once per
+  version, even on an already-migrated install). New app over old daemon is the
+  safe skew: the app resolves defaults and OVER-claims exposure while the
+  daemon mirrors nothing extra, and the control stays disabled with "waiting
+  for the sync service to update" until the marker reaches 3. Old app over new
+  daemon is the unsafe skew and is the honest residual here: **a browser tab
+  left open on the previous app build keeps showing "Private" for conversations
+  the updated daemon is already sharing under the default.** Nothing in the app
+  can fix that — the fix is to reload the app after a daemon update, and never
+  to ship the daemon first.
+- **Clearing an override is not the same as making a room private.** An unset
+  override means "take the account default", which under a share/direct
+  default RE-SHARES the room. Every surface whose intent is "stop sharing this"
+  writes `'private'` explicitly — including the summary panel's "Shared but not
+  mirrorable" Clear button.
+- **The bulk "set every conversation to Direct" sweep writes EXPLICIT
+  overrides.** Its confirm carries the total count, the per-source breakdown,
+  the verbatim Direct risk copy, every affected conversation by name in a
+  scrollable region, the sentence that changing the default back later will NOT
+  un-Direct them, and a typed `DIRECT` (`confirmModal`'s third argument takes
+  the required word, not just a boolean). Writes go one room at a time through
+  `writeShareOverride` and STOP at the first failure, reporting how many
+  landed — a half-applied sweep the user believes complete is a consent lie.
 - **A profile links a room; it never shares one.** Conversation sharing is
-  EXPLICIT-ONLY since the direct-share-level plan's D1: the per-conversation
-  level (`share`/`direct`/`private`, absent-or-unrecognized = private) is the
-  whole decision, and a contact profile's `share` field no longer affects
+  per-conversation since the direct-share-level plan's D1: the per-conversation
+  level (`share`/`direct`/`private`), else the account default, is the whole
+  decision, and a contact profile's `share` field no longer affects
   conversation mirroring at all. That resolution lives in the shared
   resolver, not here — `contacts.js` only sets the *profile* level's `share`
   field via `setProfileShare()`.

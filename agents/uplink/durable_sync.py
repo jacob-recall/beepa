@@ -98,16 +98,27 @@ class DurableSync:
             return None
 
     def archive_level(self, room):
-        """A failed read pauses forwarding; it is not an explicit revocation."""
+        """The per-write consent recheck every master write goes through.
+
+        Resolves through the SAME two-input function as everything else
+        (override + account policy): an absent override takes the account
+        default, so a defaulted room is forwarded exactly as the resolver says.
+        Both reads are lenient on 404 ONLY — the room has no override / the
+        account has no policy, which are real states — and raise on anything
+        else. A failed read PAUSES forwarding; it is never an explicit
+        revocation, so a transient local blip must not look like consent
+        withdrawal. The policy comes from pass_policy(), read once per stage.
+        """
         import consent
         path = ('/_matrix/client/v3/user/' + q(self.cfg.local_user) + '/rooms/' + q(room)
                 + '/account_data/' + consent.SHARE_OVERRIDE_TYPE)
         try:
-            return consent.effective_level(self.local('GET', path))
+            override = self.local('GET', path)
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return 'private'
-            raise
+            if exc.code != 404:
+                raise
+            override = None
+        return consent.resolved_level(override, self.pass_policy())
 
     def active_link_for_dispatch(self):
         if self.meta_get('link_disabled') == '1':

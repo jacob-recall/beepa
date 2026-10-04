@@ -3,17 +3,19 @@
 // panel, the contact-share controls, and — only while the daemon has not yet
 // reported the explicit consent model — the legacy global Share All switch and
 // per-source Share-all-<source> switch. Under the explicit model those two are
-// dead and replaced by a banner; see the consent-model guard below.
+// dead and replaced by the ACCOUNT DEFAULT control (roadmap §6: the level for
+// conversations the holder has not set individually) plus the one-shot "set
+// every conversation to Direct" sweep; see the consent-model guard below.
 // Reuses shared/model/consent.js for all resolution + storage;
 // wires into shared/ui/{rows,search,nav}.js via their app-injection hooks so no
 // shared module needs to know apps/user exists. textContent-only, no innerHTML,
 // no CSP change. Local state + UI ONLY — the uplink (Phase 2) is not built here.
 
 import {
-  resolve, resolveAll, effectiveLevel,
+  resolve, resolveAll, resolvedLevel, policyDefaultLevel,
   readSharePolicy, writeSharePolicy,
   writeShareOverride, overridesFromSync, SHARE_OVERRIDE_TYPE,
-  readConsentModel, CONSENT_MODEL_EXPLICIT,
+  readConsentModel, CONSENT_MODEL_EXPLICIT, CONSENT_MODEL_PER_ROOM,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
   CONTACT_OVERRIDES_CAP, CONTACT_OVERRIDE_STATES,
   contactOverrideKey, splitContactOverrideKey,
@@ -39,6 +41,12 @@ import { sessionConnectBase, SESSION_CONNECT_HEADERS } from './enrich.js';
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.
 let policy = { global: 'private', sources: {} };
+// 'ok' | 'error' — whether the policy above is what the homeserver actually
+// holds. On 'error' every resolver call still answers with the fail-closed
+// default, but the account-default CONTROL is disabled and says so: rendering
+// "Private" as if it were the stored setting would be a consent lie in the
+// one direction that matters (the real default may be Direct).
+let policyStatus = 'ok';
 // The CONTACT-share policy (com.jkali.contact_share_policy) — a SEPARATE
 // consent dimension from conversation sharing above: it decides whether this
 // teammate's ADDRESS BOOK (contacts, per source) leaves the machine for the
@@ -68,26 +76,32 @@ let migratedRoomIds = [];
 // module writes below; nothing here talks to the uplink directly.
 let directSendSuspension = null;
 
-// ---- consent-model guard (direct-share-level plan, D0/F7) -------------------
-// Conversation sharing is now EXPLICIT-ONLY in shared/model/consent.js: a
-// conversation mirrors only on its own 'share'/'direct' override, never through
-// a contact profile, a per-source policy or the global Share-All. Those three
-// standing-policy controls below are therefore DEAD — but only once the uplink
-// on this machine has actually migrated (it writes com.jkali.consent_model = 2
-// when its one-time migration completes). Until then an older daemon may still
-// be inheriting, so:
-//   - marker present (v2): the dead conversation controls are removed and an
-//     "updating to explicit levels…" banner takes their place, so this UI can
-//     never show a room as shared on the strength of a policy the daemon has
-//     stopped honoring;
-//   - marker absent (v1): the controls stay, plus a banner warning that the
-//     daemon has not confirmed the new model yet — the UI must not quietly
-//     claim Private while a standing policy may still be mirroring.
-// A failed/absent read is treated as v1 (the conservative direction).
-// The full three-level surface (Share / Direct / Private) ships in the next
-// slice; this slice only removes what can no longer be honored.
+// ---- consent-model guard (direct-share-level plan D0/F7; roadmap §6) --------
+// A conversation mirrors on its own 'share'/'direct' level, else on the ACCOUNT
+// DEFAULT (share_policy.default_level) — never through a contact profile, a
+// per-source policy or the global Share-All. What this UI may OFFER depends on
+// what the daemon on this machine has confirmed it implements, via
+// com.jkali.consent_model:
+//   - v1 (also: absent, junk, or a failed read — the conservative direction):
+//     an un-migrated daemon may still be inheriting. The dead standing-policy
+//     controls stay, plus a banner saying the model has not been confirmed, so
+//     the UI never quietly claims Private while a policy may still mirror.
+//   - v2 (per-room overrides only): the dead conversation controls are removed.
+//   - v3 (per-room override, else the account default): the account-default
+//     control appears. Below v3 it renders DISABLED with "waiting for the sync
+//     service to update" — a daemon that does not implement defaults must never
+//     be told by this UI that one is in force.
+// RESOLUTION is default-aware at every version: over-claiming exposure (the app
+// shows shared, the daemon has not caught up) is the safe direction; the
+// dangerous skew is a stale BROWSER over an updated daemon, which only a reload
+// fixes. Deploy the app files before the daemon — see apps/user/CLAUDE.md.
 let consentModel = 1;
-function explicitModel() { return consentModel >= CONSENT_MODEL_EXPLICIT; }
+function explicitModel() { return consentModel >= CONSENT_MODEL_PER_ROOM; }
+function defaultModel() { return consentModel >= CONSENT_MODEL_EXPLICIT; }
+// The account default this app would apply. Resolution is default-aware at
+// EVERY marker version (over-claiming exposure is the safe direction); only
+// the control and the "in force" wording wait for marker 3.
+function accountDefaultLevel() { return policyDefaultLevel(policy); }
 
 // h3 + p.muted, not the share-global-label title/desc pair: settings.css hides
 // `.share-global-label .desc` (and `.share-newly-box > p.muted`) inside
@@ -233,7 +247,16 @@ async function ackDirectSendSuspension(affordance) {
 async function loadConsentState() {
   // The model marker first: every render below branches on it.
   try { consentModel = await readConsentModel(); } catch (e) { consentModel = 1; }
-  try { policy = await readSharePolicy(); } catch (e) { /* keep previous cache */ }
+  // readSharePolicy no longer throws: it returns a status-tagged, normalized
+  // policy ('error' = we could not read it; the fields are the safe default).
+  // The old try/catch here was dead code that hid a failed read as "private".
+  const p = await readSharePolicy();
+  policyStatus = p.status === 'error' ? 'error' : 'ok';
+  // On an error KEEP the previous cache rather than overwriting it with the
+  // fail-closed default: a reload that blips must not downgrade a Direct
+  // default we already read to "Private", which is the UNDER-claiming
+  // direction. The banner + disabled control say the read failed either way.
+  if (policyStatus === 'ok') policy = p;
   try { contactPolicy = await readContactPolicy(); } catch (e) { /* keep previous cache */ }
   try {
     const syncData = await fetchOverridesSnapshot();
@@ -283,12 +306,25 @@ function effectiveFor(convo) {
   return resolve(convo, policy, overrides.get(convo.id), profileMap[convo.id]);
 }
 
-// Three levels, no inherit (F13/consent-summary copy fix): the reason a
-// resolve()/resolveAll() result carries is always one of exactly these four
-// under the explicit model, and the wording never implies a standing policy.
+// The six reasons resolve()/resolveAll() can carry. The three "default-" ones
+// mean the conversation was NEVER set individually and is taking the account
+// default — the wording has to say that, because the user's remedy differs
+// (set this conversation, or change the account default).
+const DEFAULT_REASONS = new Set(['default-share', 'default-direct', 'private']);
+// By-default == "you have not set this conversation individually". Driven by
+// the RESOLVER's reason, never by re-deriving the override here: an explicit
+// 'private' reports 'excluded', an absent one under a private default reports
+// 'private'.
+function byDefault(r) { return DEFAULT_REASONS.has(r && r.reason); }
 function reasonText(r) {
-  if (r.shared) return r.reason === 'direct' ? 'Direct — sent automatically' : 'Shared';
-  return r.reason === 'excluded' ? 'Private' : 'Private (default)';
+  switch (r.reason) {
+    case 'direct': return 'Direct — sent automatically';
+    case 'explicit': return 'Shared';
+    case 'excluded': return 'Private';
+    case 'default-direct': return 'Direct by default — sent automatically';
+    case 'default-share': return 'Shared by default';
+    default: return 'Private by default';
+  }
 }
 
 // ---- sliding tri-state control (kebab rows + per-source headers) ----
@@ -410,12 +446,13 @@ function buildTriStateSlider(cycle, opts) {
 
 function shareCycleIndex(convo) {
   if (explicitModel()) {
-    // Absent / unrecognized resolves PRIVATE — never fall back to index 0
-    // ("Share"), which would show a private conversation as shared. A stored
-    // 'direct' is shared, so it sits on the Share position until the next
-    // slice gives it its own control; tapping either position only ever
-    // de-escalates it.
-    return effectiveLevel(overrides.get(convo.id)) === 'private' ? 1 : 0;
+    // RESOLVED level (override, else the account default) — never fall back to
+    // index 0 ("Share"), which would show a private conversation as shared. A
+    // 'direct' level is shared, so it sits on the Share position; tapping
+    // either position only ever de-escalates it. A conversation sitting on
+    // Share because of the account default is honest: it IS shared, and
+    // tapping Private writes an explicit override that beats the default.
+    return resolvedLevel(overrides.get(convo.id), policy) === 'private' ? 1 : 0;
   }
   const cur = overrides.get(convo.id) || 'inherit';
   const idx = SHARE_CYCLE.findIndex((o) => o.val === cur);
@@ -483,7 +520,7 @@ async function escalateToDirect(convo) {
 // escalation into 'direct' requires one.
 function buildDirectRow(convo, onChange) {
   const row = el('div', 'share-direct-row');
-  const isDirect = effectiveLevel(overrides.get(convo.id)) === 'direct';
+  const isDirect = resolvedLevel(overrides.get(convo.id), policy) === 'direct';
   const btn = el('button', 'share-direct-btn' + (isDirect ? ' active' : ''), isDirect ? 'Direct ✓' : 'Turn on Direct…');
   btn.type = 'button';
   btn.title = 'Auto-send: your manager’s messages go out without your review';
@@ -514,7 +551,7 @@ function buildShareMenuBody(convo) {
   function refreshDirect() {
     directHost.replaceChildren();
     if (!explicitModel()) return;
-    if (effectiveLevel(overrides.get(convo.id)) === 'private') return;
+    if (resolvedLevel(overrides.get(convo.id), policy) === 'private') return;
     directHost.appendChild(buildDirectRow(convo, refreshDirect));
   }
   wrap.appendChild(buildShareSlider(convo, refreshDirect));
@@ -573,8 +610,15 @@ function headerChip(roomId, host, sub) {
   if (!host) return;
   const convo = allConvos().find(c => c.id === roomId) || { id: roomId, title: roomId };
   const err = el('span', 'share-chip-error hidden');
-  function levelOf(id) { return effectiveLevel(overrides.get(id)); }
-  function label(level) { return level === 'direct' ? 'Direct' : level === 'share' ? 'Shared' : 'Private'; }
+  function levelOf(id) { return resolvedLevel(overrides.get(id), policy); }
+  // The "default" marker is driven by the RESOLVER'S REASON, never by
+  // re-deriving the override here, so the chip and the summary panel can never
+  // disagree about whether a conversation was set individually.
+  function defaultedAt(id) { return byDefault(resolve({ id }, policy, overrides.get(id), undefined)); }
+  function label(level, defaulted) {
+    const base = level === 'direct' ? 'Direct' : level === 'share' ? 'Shared' : 'Private';
+    return defaulted ? base + ' · default' : base;
+  }
   function showErr(message) {
     err.textContent = 'Not saved — ' + sanitizeLine(message || 'try again') + '. Showing your last saved setting.';
     err.classList.remove('hidden');
@@ -582,13 +626,18 @@ function headerChip(roomId, host, sub) {
   function render() {
     host.replaceChildren();
     const level = levelOf(roomId);
+    const defaulted = defaultedAt(roomId);
     if (!explicitModel()) {
-      host.appendChild(el('span', 'share-badge' + (level === 'private' ? '' : ' shared'), label(level)));
+      host.appendChild(el('span', 'share-badge' + (level === 'private' ? '' : ' shared'), label(level, defaulted)));
     } else {
-      const chip = el('button', 'share-badge share-chip-btn' + (level === 'private' ? '' : ' shared'), label(level));
+      const chip = el('button', 'share-badge share-chip-btn' + (level === 'private' ? '' : ' shared'), label(level, defaulted));
       chip.type = 'button';
-      chip.title = level === 'private' ? 'Private — click to share this conversation with your manager'
-        : 'Shared with your manager — click to make it private';
+      chip.title = (defaulted
+        ? 'You have not set this conversation individually, so it follows your account default ('
+          + label(level, false) + '). '
+        : '')
+        + (level === 'private' ? 'Click to share this conversation with your manager'
+          : 'Shared with your manager — click to make it private');
       chip.setAttribute('aria-pressed', level === 'private' ? 'false' : 'true');
       chip.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -838,20 +887,26 @@ const BULK_CYCLE = [
   { val: 'private', label: 'Private' },
 ];
 
-// Common explicit level across every convo in this source, or null if mixed /
-// empty. Drives the bulk slider thumb; a mixed source shows no thumb so we
-// never claim a level that isn't actually set on every conversation.
-function bulkCommonLevel(source) {
+// Common RESOLVED level across every convo in this source, or null if mixed /
+// empty, plus whether every one of them is taking the account default rather
+// than a level someone chose. Drives the bulk slider thumb and its hint: a
+// mixed source shows no thumb so we never claim a level that isn't actually
+// in force, and an all-defaulted source says so rather than implying the
+// conversations were set individually.
+function bulkCommonState(source) {
   const convos = convosBySource[source.id] || [];
-  if (!convos.length) return null;
+  if (!convos.length) return { level: null, allDefault: false };
   let common = null;
+  let allDefault = true;
   for (const c of convos) {
-    const lv = effectiveLevel(overrides.get(c.id));
+    const lv = resolvedLevel(overrides.get(c.id), policy);
+    if (!byDefault(resolve(c, policy, overrides.get(c.id), undefined))) allDefault = false;
     if (common === null) common = lv;
-    else if (common !== lv) return null;
+    else if (common !== lv) return { level: null, allDefault };
   }
-  return common;
+  return { level: common, allDefault };
 }
+function bulkCommonLevel(source) { return bulkCommonState(source).level; }
 
 function buildBulkShareRow(source) {
   const wrap = el('div', 'share-bulk-row');
@@ -865,12 +920,13 @@ function buildBulkShareRow(source) {
     },
     getHint: () => {
       const n = (convosBySource[source.id] || []).length;
-      const common = bulkCommonLevel(source);
+      const { level: common, allDefault } = bulkCommonState(source);
       if (!n) return 'No ' + source.label + ' conversations yet';
       if (!common) return 'Set all ' + source.label + ' conversations';
-      if (common === 'direct') return 'All Direct — sent automatically';
-      if (common === 'share') return 'All shared';
-      return 'All private';
+      const suffix = allDefault ? ' (your account default — none set individually)' : '';
+      if (common === 'direct') return 'All Direct — sent automatically' + suffix;
+      if (common === 'share') return 'All shared' + suffix;
+      return 'All private' + suffix;
     },
     hintShared: () => {
       const common = bulkCommonLevel(source);
@@ -902,6 +958,225 @@ function mountSourceSwitch(sourceId) {
   if (source) host.appendChild(buildSourcePolicySlider(source));
 }
 
+// ===========================================================================
+// THE ACCOUNT DEFAULT LEVEL (2026-10-03 roadmap §6) — the one standing setting
+// that still decides a conversation. It applies to every conversation with NO
+// individual setting, now and in future; an individual setting always wins,
+// in both directions (an explicit Private beats a Direct default).
+// ===========================================================================
+
+const DEFAULT_CYCLE = [
+  { val: 'private', label: 'Private' },
+  { val: 'share', label: 'Share' },
+  { val: 'direct', label: 'Direct' },
+];
+
+// The SAME risk copy as every other Direct escalation, worded for the scope
+// this one actually has: not one conversation, but every unset conversation
+// including ones that do not exist yet.
+function defaultDirectConfirmText() {
+  return directRiskCopy('any conversation you have not set individually')
+    + '\n\nThis sets your ACCOUNT DEFAULT, not one conversation. Every '
+    + 'conversation you have not set individually becomes Direct — including '
+    + 'conversations that arrive later. Conversations you have set to Private '
+    + 'stay Private.\n\nMake Direct your default?';
+}
+
+// F3 WRITE DISCIPLINE: a MERGE over a FRESH read, and a failed read writes
+// NOTHING. Blind-PUTting this module's cached policy would silently drop a
+// per-source rule (or another device's newer default) we never actually read.
+async function writeDefaultLevel(level) {
+  const fresh = await readSharePolicy();
+  if (fresh.status === 'error') {
+    throw new Error('we could not read your current sharing settings, so nothing was changed');
+  }
+  policy = await writeSharePolicy({ ...fresh, default_level: level });
+  policyStatus = 'ok';
+  return policy;
+}
+
+function defaultLevelHint(level) {
+  if (level === 'direct') {
+    return 'Direct — conversations you haven’t set individually are shared, and your manager can send as you in them';
+  }
+  if (level === 'share') {
+    return 'Shared — conversations you haven’t set individually are mirrored to your manager';
+  }
+  return 'Private — nothing is shared unless you share it';
+}
+
+function buildDefaultLevelRow() {
+  const wrap = el('div', 'share-global-row share-default-row');
+  const label = el('div', 'share-global-label');
+  label.appendChild(el('div', 'title',
+    'Default sharing level for conversations you haven’t set individually'));
+  label.appendChild(el('div', 'desc',
+    'Applies to every conversation with no individual setting — the ones you '
+    + 'have now and the ones that arrive later. Anything you set on a '
+    + 'conversation itself always wins, including setting it to Private.'));
+  wrap.appendChild(label);
+
+  // Two reasons to DISABLE rather than render a level: we could not read the
+  // stored setting (showing "Private" would be a consent lie if it is really
+  // Direct), or the daemon has not confirmed it applies defaults at all.
+  const blocked = policyStatus === 'error'
+    ? 'We couldn’t read your sharing default, so this control is disabled and '
+      + 'nothing was changed. Reload once your homeserver responds.'
+    : (!defaultModel()
+      ? 'Waiting for the sync service to update: the background sync on this '
+        + 'machine has not confirmed that it applies an account default yet, so '
+        + 'setting one here would not be in force.'
+      : null);
+  if (blocked) {
+    wrap.appendChild(el('p', 'muted', blocked));
+    return wrap;
+  }
+
+  wrap.appendChild(buildTriStateSlider(DEFAULT_CYCLE, {
+    ariaLabel: 'Default sharing level for conversations you have not set individually',
+    getIndex: () => DEFAULT_CYCLE.findIndex((o) => o.val === accountDefaultLevel()),
+    getHint: () => defaultLevelHint(accountDefaultLevel()),
+    hintShared: () => accountDefaultLevel() !== 'private',
+    onAdvance: async (opt) => {
+      // Direct is an escalation wherever it is reached: same confirm, same
+      // risk copy. A decline is a deliberate refusal, not a write error.
+      if (opt.val === 'direct'
+        && !(await confirmModal('Make Direct your default?', defaultDirectConfirmText(), false))) {
+        return false;
+      }
+      await writeDefaultLevel(opt.val);
+      renderSharingView();
+      scheduleFeedRender();
+    },
+  }));
+  return wrap;
+}
+
+// The PERSISTENT, non-dismissible indicator (security review's closing note):
+// an account holder must be able to see a non-private default and revert it
+// without a raw Matrix client, from wherever they are in the app.
+function renderDefaultBanner() {
+  const host = $('default-level-banner');
+  if (!host) return;
+  host.replaceChildren();
+  if (policyStatus === 'error') {
+    host.classList.remove('hidden');
+    host.appendChild(el('span', '',
+      'Sharing default unknown — your homeserver did not answer. Conversations '
+      + 'you haven’t set individually may be shared. Reload to check.'));
+    return;
+  }
+  const level = accountDefaultLevel();
+  if (level === 'private') { host.classList.add('hidden'); return; }
+  host.classList.remove('hidden');
+  host.appendChild(el('span', '',
+    (level === 'direct'
+      ? 'Default: Direct — conversations you haven’t set individually are shared and your manager can send as you.'
+      : 'Default: Share — conversations you haven’t set individually are shared with your manager.')
+    + (defaultModel() ? '' : ' (Not in force yet: the background sync has not confirmed it.)')
+    + ' Change in Settings › Sharing.'));
+}
+
+// ---- "Set everything to Direct" across EVERY source -------------------------
+// PURE: the per-source breakdown plus the flat plan, deduped across sources
+// (the same room can appear under more than one source list).
+function planAllDirect() {
+  const bySource = [];
+  const all = [];
+  const seen = new Set();
+  for (const s of SOURCES) {
+    if (s.kind === 'all') continue;
+    const mine = [];
+    for (const c of (convosBySource[s.id] || [])) {
+      if (!c || typeof c.id !== 'string' || !c.id || seen.has(c.id)) continue;
+      seen.add(c.id);
+      mine.push(c);
+      all.push(c);
+    }
+    if (mine.length) bySource.push({ label: s.label, convos: mine });
+  }
+  return { bySource, all, plan: planBulkShareChange(all, overrides, 'direct') };
+}
+
+function allDirectConfirmText(breakdown) {
+  const { bySource, all, plan } = breakdown;
+  const names = all.map((c) => '  • ' + sanitizeLine(c.title || c.id));
+  let text = directRiskCopy('any of these ' + plan.ids.length + ' conversations')
+    + '\n\nThis turns on Direct for all ' + plan.ids.length
+    + ' conversation(s) across every connected source:\n'
+    + bySource.map((g) => '  ' + g.label + ': ' + g.convos.length).join('\n');
+  text += '\n\nThis writes an EXPLICIT Direct setting on each of these '
+    + 'conversations. Changing your account default back later will NOT '
+    + 'un-Direct them — you would have to change them individually or in bulk '
+    + 'again.';
+  if (plan.overwritesPrivate.length) {
+    text += '\n\n' + plan.overwritesPrivate.length + ' of them are currently set '
+      + 'to Private and will change to Direct.';
+  }
+  text += '\n\nEvery affected conversation, in full:\n' + names.join('\n');
+  text += '\n\nType DIRECT to confirm.';
+  return text;
+}
+
+// Writes go through the SAME per-room primitive as every other Direct
+// escalation (writeShareOverride), one write per room, and STOP at the first
+// failure with a count of what did land — a half-applied sweep the user
+// believes complete is the consent lie this surface must never tell.
+async function bulkSetEverythingDirect(onProgress) {
+  const breakdown = planAllDirect();
+  if (!breakdown.plan || !breakdown.plan.ids.length) {
+    return { ok: false, reason: 'empty', message: 'no conversations to set' };
+  }
+  const ok = await confirmModal('Set every conversation to Direct?',
+    allDirectConfirmText(breakdown), 'DIRECT');
+  if (!ok) return { ok: false, reason: 'declined' };
+  let done = 0;
+  for (const rid of breakdown.plan.ids) {
+    try {
+      await writeShareOverride(rid, 'direct');
+      overrides.set(rid, 'direct');
+      done++;
+      if (onProgress) onProgress(done, breakdown.plan.ids.length);
+    } catch (e) {
+      return { ok: false, reason: 'write', done, total: breakdown.plan.ids.length,
+        message: (e && e.message) || 'write failed' };
+    }
+  }
+  return { ok: true, done, total: breakdown.plan.ids.length };
+}
+
+function buildAllDirectRow() {
+  const wrap = el('div', 'share-bulk-row share-all-direct-row');
+  const { plan } = planAllDirect();
+  const total = plan ? plan.ids.length : 0;
+  const btn = el('button', 'danger', 'Set all ' + total + ' existing conversations to Direct…');
+  btn.type = 'button';
+  const note = el('p', 'muted',
+    'A one-time sweep over the conversations you have right now. It writes an '
+    + 'explicit Direct on each one, so changing your default back later will '
+    + 'not un-Direct them.');
+  const err = el('p', 'error hidden');
+  btn.disabled = !total;
+  btn.addEventListener('click', async () => {
+    err.classList.add('hidden');
+    btn.disabled = true;
+    const res = await bulkSetEverythingDirect(
+      (done, n) => { btn.textContent = 'Setting Direct… ' + done + ' of ' + n; });
+    btn.disabled = false;
+    if (!res.ok && res.reason === 'write') {        // F8: visible, never silent
+      err.textContent = 'Stopped after ' + res.done + ' of ' + res.total + ' — '
+        + sanitizeLine(res.message) + '. The rest were not changed.';
+      err.classList.remove('hidden');
+    }
+    renderSharingView();
+    scheduleFeedRender();
+  });
+  wrap.appendChild(btn);
+  wrap.appendChild(note);
+  wrap.appendChild(err);
+  return wrap;
+}
+
 // ---- consent summary panel (§4.2): truthfully what the manager can see now ----
 
 function renderConsentSummary() {
@@ -914,12 +1189,11 @@ function renderConsentSummary() {
   const shared = results.filter((r) => r.shared);
   const seen = loadSeen();
   // "Newly" = currently shared WITHOUT a deliberate per-conversation action,
-  // and not already surfaced in a previous render of this panel. Under the
-  // explicit model that set is always empty — nothing can be auto-shared — and
-  // 'direct' is excluded because it is a deliberate (separately confirmed)
-  // per-conversation choice, not a standing policy sweeping a room in.
-  const newlyShared = shared.filter((r) => r.reason !== 'explicit'
-    && r.reason !== 'direct' && !seen.has(r.convo.id));
+  // and not already surfaced in a previous render of this panel. The explicit
+  // levels ('explicit'/'direct') are per-conversation decisions and are never
+  // flagged; what lands here now is a conversation the ACCOUNT DEFAULT swept
+  // in, which is exactly what this box exists to surface.
+  const newlyShared = shared.filter((r) => byDefault(r) && !seen.has(r.convo.id));
 
   if (!shared.length) {
     host.appendChild(el('p', 'muted', 'The manager can currently see: nothing.'));
@@ -929,15 +1203,22 @@ function renderConsentSummary() {
       if (!groups.has(r.reason)) groups.set(r.reason, []);
       groups.get(r.reason).push(r.convo);
     }
-    // Three levels, no inherit (F13): under the explicit model `reason` is
-    // always exactly 'explicit' (Share) or 'direct' — nothing else can make a
-    // conversation shared any more, so the copy states exactly that rather
-    // than a generic reason list left over from the standing-policy model.
+    // Four ways a conversation can be shared now: set individually (Share or
+    // Direct), or taking the account default (share or direct). All four get
+    // their own clause — a purely DEFAULTED account has no 'explicit'/'direct'
+    // group at all, and the old builder rendered "can currently see: ." for it.
     const parts = [];
-    if (groups.has('explicit')) parts.push(groups.get('explicit').length + ' shared');
-    if (groups.has('direct')) parts.push(groups.get('direct').length + ' set to Direct');
-    host.appendChild(el('p', '', 'The manager can currently see: ' + parts.join(', ') + '.'));
-    if (groups.has('direct')) {
+    if (groups.has('explicit')) parts.push(groups.get('explicit').length + ' you set to Share');
+    if (groups.has('direct')) parts.push(groups.get('direct').length + ' you set to Direct');
+    if (groups.has('default-share')) {
+      parts.push(groups.get('default-share').length + ' shared by your account default');
+    }
+    if (groups.has('default-direct')) {
+      parts.push(groups.get('default-direct').length + ' Direct by your account default');
+    }
+    host.appendChild(el('p', '', 'The manager can currently see: '
+      + (parts.length ? parts.join(', ') : shared.length + ' conversation(s)') + '.'));
+    if (groups.has('direct') || groups.has('default-direct')) {
       host.appendChild(el('p', 'muted',
         'Direct conversations are sent by your manager as you, without your review. A '
         + 'compromised manager session or master server could send messages as you into '
@@ -980,8 +1261,11 @@ function renderConsentSummary() {
       const rowErr = el('span', 'share-slider-error hidden');
       btn.addEventListener('click', async () => {
         try {
-          await writeShareOverride(rid, null);
-          overrides.delete(rid);
+          // 'private' EXPLICITLY, not an unset: unsetting means "take the
+          // account default", which under a share/direct default would
+          // re-share the room this button exists to stop sharing.
+          await writeShareOverride(rid, 'private');
+          overrides.set(rid, 'private');
         } catch (e) {
           rowErr.textContent = 'Not saved — ' + sanitizeLine((e && e.message) || 'try again')
             + '. Still showing your last saved setting.';
@@ -999,9 +1283,13 @@ function renderConsentSummary() {
 
   if (newlyShared.length) {
     const box = el('div', 'share-newly-box');
-    box.appendChild(el('h3', '', 'Newly auto-shared'));
+    box.appendChild(el('h3', '', 'Newly shared by your account default'));
     box.appendChild(el('p', 'muted',
-      'These became visible to the manager automatically under a standing "share all" policy. Exclude any you did not mean to share.'));
+      'You have not set these conversations individually, so they follow your '
+      + 'account default (' + accountDefaultLevel() + ') and became visible to '
+      + 'your manager without a per-conversation choice. Exclude any you did '
+      + 'not mean to share — that writes an explicit Private, which beats the '
+      + 'default.'));
     for (const r of newlyShared) {
       const row = el('div', 'share-summary-row new');
       row.appendChild(el('span', 'title', sanitizeLine(r.convo.title || r.convo.id)));
@@ -1625,11 +1913,13 @@ function renderSharingView() {
   if (globalHost) {
     globalHost.replaceChildren();
     if (explicitModel()) {
-      globalHost.appendChild(modelBanner('Updating to explicit levels…',
-        'Standing "share all" policies no longer share anything: each '
-        + 'conversation is now shared, or private, entirely on its own. Share a '
-        + 'conversation from the ⋯ menu on its row. The full set of levels '
-        + 'arrives in the next update.'));
+      globalHost.appendChild(buildDefaultLevelRow());
+      globalHost.appendChild(buildAllDirectRow());
+      globalHost.appendChild(modelBanner('Per-source and global "share all" are gone',
+        'The old standing policies no longer share anything. Each conversation '
+        + 'is shared, Direct, or private on its own — and anything you have not '
+        + 'set individually follows the default above. Set one conversation from '
+        + 'the ⋯ menu on its row.'));
     } else {
       globalHost.appendChild(pendingModelBanner());
       globalHost.appendChild(buildGlobalSwitch());
@@ -1649,6 +1939,7 @@ function renderSharingView() {
   renderMigratedReview();
   renderConsentSummary();
   renderContactShareView();
+  renderDefaultBanner();
 }
 
 // ---- entry point (call once from apps/user/main.js after sign-in) ----
@@ -1658,11 +1949,16 @@ async function initConsentUI() {
   setSourceViewHook(mountSourceSwitch);
   setSharingViewHook(renderSharingView);
   await loadConsentState();
+  // The account-default indicator is NOT part of the sharing view: it must be
+  // visible from anywhere in the app, so it renders once on load (and again
+  // after every write that can change it).
+  renderDefaultBanner();
 }
 
 export {
   initConsentUI, renderSharingView, loadConsentState, countSharedNow,
-  planBulkShareChange, migratedRoomIdsFromSync,
+  accountDefaultLevel, planBulkShareChange, migratedRoomIdsFromSync,
+  planAllDirect, allDirectConfirmText, defaultLevelHint, byDefault, reasonText,
   suspensionAffordance, directSendAckContent,
   knownSourceIds, validImportedContacts, planHandleFanOut,
   planContactOverrideWrite, isDestructiveOnly,

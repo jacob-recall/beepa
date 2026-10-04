@@ -164,7 +164,18 @@
 .contact-manage-btn { align-self: flex-start; margin-top: 4px; font-size: 12px; padding: 4px 8px; }
 
 #modal-backdrop { position: fixed; inset: 0; display: flex; z-index: 100; }
-#modal { margin: auto; width: 380px; padding: 18px; }
+#modal { margin: auto; width: 380px; padding: 18px; max-height: 86vh; overflow-y: auto; }
+/* A confirm that enumerates every affected conversation must stay scrollable
+   and keep its line breaks — a 500-name list that silently overflows (or
+   collapses to one paragraph) is not informed consent. */
+#modal-text { max-height: 50vh; overflow-y: auto; white-space: pre-wrap; }
+
+/* The persistent, non-dismissible account-default indicator, above the chat
+   list: a non-private default is always visible, from anywhere in the app. */
+#default-level-banner {
+  padding: 6px 12px; font-size: 12px; line-height: 1.35;
+  background: #fff4e5; color: #6b4300; border-bottom: 1px solid #f0d9b5;
+}
 
 #bridge-cards, #command-groups, #console-card, #settings-source-tabs { max-width: none; }
 #console { height: 200px; overflow-y: auto; padding: 10px; font-size: 12px; }

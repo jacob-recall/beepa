@@ -24,8 +24,17 @@ only cover the cases someone thought of. This harness instead:
      compared — because "absent or unrecognized resolves private" is a stated
      invariant, and two implementations agreeing on a leak would still be a
      leak.
+  1c. Carries a dedicated ACCOUNT-DEFAULT vector class (roadmap §6): the
+     SECOND authorization input, share_policy's `default_level`, crossed with
+     every override shape. Junk defaults (near-miss strings, every wrong JSON
+     type, nested/prototype-named placements) are self-checked to resolve
+     PRIVATE, and so is the NEGATIVE LEGACY class — a loud share-all policy
+     with NO default_level — which proves the dead global/per-source levels
+     were not revived by the new field. An acceptance guard fails the run if
+     no vector carried a default_level at all.
   2. FUZZES the other entry points (normalize_policy, normalize_override,
-     effective_level, overrides_from_sync, normalize_contact_policy,
+     effective_level, resolved_level, policy_default_level,
+     overrides_from_sync, normalize_contact_policy,
      resolve_contact_share, resolve_all, effective_shared) with a seeded random
      JSON generator that mixes valid tokens with junk of every JSON type at
      every level,
@@ -231,6 +240,126 @@ def unknown_override_vectors():
     return out
 
 
+# ------------------------------------- the ACCOUNT DEFAULT class (roadmap §6)
+# share_policy gains `default_level`: with NO per-room override it decides the
+# conversation, and absent/unrecognized is 'private'. That makes it the second
+# authorization input the two implementations must agree on EXACTLY, so it gets
+# a deterministic class of its own rather than relying on the fuzzer.
+#
+# Three things are asserted, not merely compared:
+#   - every JUNK default (near-miss string, wrong JSON type, nested/prototype
+#     placement) resolves PRIVATE for an unset conversation;
+#   - the NEGATIVE LEGACY class — a loud standing policy with NO default_level
+#     — still resolves private, i.e. the dead global/per-source levels were not
+#     accidentally revived by the new field;
+#   - an explicit per-room 'private' stays private under a 'direct' default.
+VALID_DEFAULTS = ["private", "share", "direct"]
+# Near-miss strings: case, whitespace (incl. a trailing newline — Python's `$`
+# would match before it), NFKC fullwidth lookalike, zero-width, NUL, NBSP, and
+# the tokens from the OTHER vocabularies (per-source states, the old 'inherit').
+JUNK_DEFAULTS_STR = [
+    "Direct", "DIRECT", "direct ", " direct", "direct\n", "direct\t",
+    "\uff44irect", "di\u200brect", "direct\u0000", "private\u00a0",
+    "Share", "share ", "share-all", "private-all", "inherit", "auto", "",
+    "__proto__", "constructor", "toString", "0", "null",
+]
+JUNK_DEFAULTS_JSON = [None, True, False, 0, 5, -1, [], ["direct"], {},
+                      {"state": "direct"}, {"default_level": "direct"},
+                      {"level": "direct"}]
+# Placements that LOOK like a default but are not one.
+NESTED_DEFAULT_POLICIES = [
+    {"__proto__": {"default_level": "direct"}},
+    {"constructor": {"default_level": "direct"}},
+    {"prototype": {"default_level": "direct"}},
+    {"sources": {"default_level": "direct"}},
+    {"policy": {"default_level": "direct"}},
+    {"global": {"default_level": "direct"}},
+    {"default": "direct"},
+    {"defaultLevel": "direct"},
+    {"default_Level": "direct"},
+    {"default_level ": "direct"},
+    {"DEFAULT_LEVEL": "direct"},
+]
+# The NEGATIVE legacy class: the loudest pre-default policy there is, with no
+# default_level anywhere. Asserted private — a standing share-all must still be
+# incapable of sharing an unset conversation.
+LEGACY_NO_DEFAULT = [
+    {"global": "share-all", "sources": {"imessage": "share-all"}},
+    {"global": "share-all", "sources": {}},
+    {"global": "share-all", "sources": {"imessage": "share-all"},
+     "default": "share-all"},
+]
+
+
+def default_level_vectors():
+    """default_level x override cross-product, plus every junk/placement class."""
+    out = []
+    conv = {"id": "!r:l", "sourceId": "imessage", "sourceLabel": "iMessage"}
+
+    def add(policy, override, expect_private=False):
+        v = {"kind": "resolve", "convo": conv, "policy": policy,
+             "override": override, "profile": None}
+        if expect_private:
+            v["expect_private"] = True
+        out.append(v)
+        rl = {"kind": "resolved_level", "override": override, "policy": policy}
+        if expect_private:
+            rl["expect_private"] = True
+        out.append(rl)
+        es = {"kind": "effective_shared", "convo": conv, "policy": policy,
+              "override": override, "profile": None}
+        if expect_private:
+            es["expect_private"] = True
+        out.append(es)
+        out.append({"kind": "policy_default_level", "policy": policy})
+        out.append({"kind": "normalize_policy", "p": policy})
+        out.append({"kind": "resolve_all", "convos": [conv, {"id": "!b:l"}],
+                    "policy": policy, "overrides": {"!b:l": override},
+                    "profiles": None})
+
+    # valid defaults x every override shape, including the explicit-private-
+    # under-direct-default case the whole "explicit beats default" rule rests on
+    for d in VALID_DEFAULTS:
+        for g in (None, "share-all", "private"):
+            policy = {"sources": {}, "default_level": d}
+            if g is not None:
+                policy["global"] = g
+            for override in OVERRIDES:
+                add(policy, override)
+
+    # junk defaults -> private for an UNSET conversation (asserted on both
+    # sides), and never able to beat an explicit level either way
+    for d in JUNK_DEFAULTS_STR + JUNK_DEFAULTS_JSON:
+        policy = {"global": "share-all", "sources": {"imessage": "share-all"},
+                  "default_level": d}
+        add(policy, None, expect_private=True)
+        add(policy, "", expect_private=True)
+        add(policy, "junk", expect_private=True)
+        add(policy, "private", expect_private=True)
+        add(policy, "share")          # explicit share is unaffected by junk
+        # the normalized form must read back as "no default" too
+        out.append({"kind": "resolved_level", "override": None,
+                    "policy": consent.normalize_policy(policy),
+                    "expect_private": True})
+
+    # nested / prototype-named placements are not defaults
+    for policy in NESTED_DEFAULT_POLICIES:
+        add(policy, None, expect_private=True)
+        add(policy, "junk", expect_private=True)
+
+    # the NEGATIVE legacy class
+    for policy in LEGACY_NO_DEFAULT:
+        for override in (None, "", "inherit", "junk", 5, True, [], {},
+                         {"state": "junk"}):
+            add(policy, override, expect_private=True)
+
+    # non-dict policy containers
+    for policy in (None, 5, "direct", [], ["direct"], {"default_level": None}):
+        add(policy, None, expect_private=True)
+
+    return out
+
+
 # ------------------------------------------- the per-contact override class
 # The contact dimension KEEPS its standing policies, so its fall-through rule is
 # the opposite of the conversation dimension's: an unrecognized override VALUE
@@ -311,6 +440,12 @@ class Gen:
                                 for _ in range(self.r.randint(0, 4))}
             else:
                 p["sources"] = self.junk()
+        # The ACCOUNT DEFAULT, mixed with junk of every type at the same rate
+        # as the other tokens — this is what makes the fuzz class exercise the
+        # second authorization input rather than only the curated vectors.
+        if self.r.random() < 0.35:
+            p["default_level"] = self.pick(VALID_DEFAULTS * 3 + JUNK_DEFAULTS_STR
+                                           + JUNK_DEFAULTS_JSON + JUNK_STR + SCALARS)
         if self.r.random() < 0.1:
             p[self.pick(JUNK_STR)] = self.junk()
         return p
@@ -400,6 +535,8 @@ def fuzz_vectors(n, seed):
         out.append({"kind": "normalize_policy", "p": g.policy()})
         out.append({"kind": "normalize_override", "data": g.override()})
         out.append({"kind": "effective_level", "override": g.override()})
+        out.append({"kind": "resolved_level", "override": g.override(), "policy": g.policy()})
+        out.append({"kind": "policy_default_level", "policy": g.policy()})
         out.append({"kind": "normalize_contact_policy", "raw": g.policy()})
         out.append({"kind": "resolve_contact_share",
                     "source": g.pick(SOURCE_IDS + SCALARS + [["x"], {}]),
@@ -435,6 +572,10 @@ def eval_py(v):
             return consent.normalize_override(v["data"])
         if k == "effective_level":
             return consent.effective_level(v["override"])
+        if k == "resolved_level":
+            return consent.resolved_level(v["override"], v["policy"])
+        if k == "policy_default_level":
+            return consent.policy_default_level(v["policy"])
         if k == "overrides_from_sync":
             return consent.overrides_from_sync(v["sync"])
         if k == "normalize_contact_policy":
@@ -489,7 +630,7 @@ def check_invariants(vectors, py, js):
         if not v.get("expect_private"):
             continue
         for side, r in (("py", py[i]), ("js", js[i])):
-            if v["kind"] == "effective_level":
+            if v["kind"] in ("effective_level", "resolved_level"):
                 ok = r == "private"
             elif v["kind"] == "effective_shared":
                 ok = r is False
@@ -500,10 +641,23 @@ def check_invariants(vectors, py, js):
     return bad
 
 
+def carries_default_level(v):
+    """Does this vector put a `default_level` key on a policy input?
+
+    Used by the acceptance guard: a green run that never fed the resolvers an
+    account default proves nothing about the account default."""
+    for key in ("policy", "p", "raw"):
+        pol = v.get(key)
+        if isinstance(pol, dict) and "default_level" in pol:
+            return True
+    return False
+
+
 def main():
     unknown = unknown_override_vectors()
     contact = contact_override_vectors()
-    vectors = (exhaustive_resolve_vectors() + unknown + contact
+    defaults = default_level_vectors()
+    vectors = (exhaustive_resolve_vectors() + unknown + defaults + contact
                + fuzz_vectors(FUZZ_N, SEED))
     py = [eval_py(v) for v in vectors]
     js = eval_js(vectors)
@@ -528,23 +682,35 @@ def main():
         if a != b or pe or je:
             mismatches.append((i, v, py[i], js[i]))
 
-    n_fuzz = FUZZ_N * 10  # entry points per fuzz iteration (see fuzz_vectors)
+    n_fuzz = FUZZ_N * 12  # entry points per fuzz iteration (see fuzz_vectors)
     # ACCEPTANCE (per-contact-share C4): the run must actually EXERCISE the new
     # override argument, not merely keep passing without it.
     n_override_bearing = sum(1 for v in vectors
                              if v["kind"] == "resolve_contact_share"
                              and v.get("override") is not None)
     n_override_maps = sum(1 for v in vectors if v["kind"] == "normalize_contact_overrides")
+    # ACCEPTANCE (roadmap §6): the run must actually feed the resolvers an
+    # ACCOUNT DEFAULT, including through the default-aware entry point.
+    n_default_bearing = sum(1 for v in vectors if carries_default_level(v))
+    n_resolved_level = sum(1 for v in vectors if v["kind"] == "resolved_level")
     print("consent conformance: %d vectors (%d exhaustive resolve + %d unknown-value "
-          "+ %d per-contact-override + %d fuzz), seed=%d"
-          % (len(vectors), len(vectors) - n_fuzz - len(unknown) - len(contact),
-             len(unknown), len(contact), n_fuzz, SEED))
+          "+ %d account-default + %d per-contact-override + %d fuzz), seed=%d"
+          % (len(vectors),
+             len(vectors) - n_fuzz - len(unknown) - len(contact) - len(defaults),
+             len(unknown), len(defaults), len(contact), n_fuzz, SEED))
     print("  override-bearing resolve_contact_share vectors=%d  "
           "normalize_contact_overrides vectors=%d"
           % (n_override_bearing, n_override_maps))
+    print("  default_level-bearing vectors=%d  resolved_level vectors=%d"
+          % (n_default_bearing, n_resolved_level))
     if not n_override_bearing or not n_override_maps:
         print("NO OVERRIDE-BEARING VECTORS: the per-contact override argument was "
               "never exercised, so this run proves nothing about it")
+        sys.exit(1)
+    if not n_default_bearing or not n_resolved_level:
+        print("NO DEFAULT-BEARING VECTORS: no vector carried a default_level (or "
+              "reached resolved_level), so this run proves nothing about the "
+              "account default — the second authorization input")
         sys.exit(1)
     print("  python errors=%d  js errors=%d  differing/erroring vectors=%d"
           % (py_err, js_err, len(mismatches)))

@@ -6,15 +6,21 @@ per-conversation level and nothing else can share it:
   'share'   -> mirrored; manager suggestions wait in the proposal inbox
   'direct'  -> mirrored; the uplink auto-sends a manager proposal into the
                conversation (the auto-send code itself lands in a later slice)
-  'private' -> not mirrored (the default)
-ABSENT OR ANY UNRECOGNIZED VALUE RESOLVES 'private' — a stated invariant with
-its own conformance vector class. A stored override this code does not
-recognize must never be able to share a conversation.
+  'private' -> not mirrored
+ABSENT OR ANY UNRECOGNIZED OVERRIDE FALLS BACK TO THE ACCOUNT DEFAULT
+(com.jkali.share_policy's `default_level`), and an absent or unrecognized
+default is 'private'. A stored override this code does not recognize must never
+be able to share a conversation ON ITS OWN — it degrades to "no override",
+exactly as if nothing were stored. A stated invariant with its own conformance
+vector class.
 
-There is NO inheritance on the conversation path any more: contact-profile
-share-state, the per-source policy and the global standing policy do NOT affect
-whether a conversation mirrors. resolve() still ACCEPTS those arguments (call
-sites + conformance vectors) and deliberately ignores them. The layered,
+The account default is the ONE standing setting that still decides a
+conversation (account-holder scope, set once, opt-in). Everything else —
+contact-profile share-state, the per-source policy, the global standing policy
+— stays dead (D1): resolve() still ACCEPTS those arguments (call
+sites + conformance vectors) and deliberately ignores them. An EXPLICIT
+per-room level always wins, in both directions: 'private' on a room beats a
+'direct' default. The layered,
 most-specific-wins model survives only in the SEPARATE contact-sharing
 dimension at the bottom of this file, which keeps its standing policies on
 purpose — and, as of the per-contact-share plan, gains a per-CONTACT override
@@ -37,13 +43,20 @@ SHARE_OVERRIDE_TYPE = "com.jkali.share_override"  # per-room account-data
 # once the explicit-levels migration has completed, so the teammate UI knows the
 # daemon no longer honors standing policies.
 CONSENT_MODEL_TYPE = "com.jkali.consent_model"
-CONSENT_MODEL_EXPLICIT = 2
+# 3 = "per-room override, else the ACCOUNT DEFAULT (share_policy.default_level)".
+# 2 was "per-room override only". Mirrors consent.js.
+CONSENT_MODEL_PER_ROOM = 2
+CONSENT_MODEL_EXPLICIT = 3
 
 GLOBAL_STATES = {"share-all", "private"}
 SOURCE_STATES = {"share-all", "private-all", "inherit"}
 # The THREE explicit conversation levels. Anything else (including the old
 # 'inherit', an absent event, or junk) is 'private' — see effective_level().
 OVERRIDE_STATES = {"share", "direct", "private"}
+# The ACCOUNT DEFAULT level (share_policy's default_level) — the same three
+# tokens, applied to every conversation that carries NO explicit override.
+# Absent or anything unrecognized is 'private'.
+DEFAULT_LEVEL_STATES = {"share", "direct", "private"}
 # Profile share-state. Retained for the contact-profile storage shape ONLY:
 # since D1 a profile's share-state has NO effect on conversation mirroring.
 PROFILE_STATES = {"share", "private", "inherit"}
@@ -104,25 +117,61 @@ def effective_level(override):
     return normalize_override(override) or "private"
 
 
+def policy_default_level(policy):
+    """The ACCOUNT DEFAULT level from com.jkali.share_policy.
+
+    Gated exactly like _source_rule(): dict container, key present, an
+    exactly-valid string. Absent / wrong type / unrecognized => 'private' (the
+    fail-closed value every account had before this field existed). Mirrors
+    policyDefaultLevel() in consent.js.
+    """
+    p = _plain(policy)
+    if p is None or "default_level" not in p:
+        return "private"
+    v = p.get("default_level")
+    return v if isinstance(v, str) and v in DEFAULT_LEVEL_STATES else "private"
+
+
+def resolved_level(override, policy):
+    """The conversation's RESOLVED level: the explicit per-room override if it
+    has one, otherwise the account default.
+
+    THIS — not effective_level() — is what a default-aware call site wants.
+    effective_level() keeps its one-argument meaning ("the EXPLICIT level") so
+    an unconverted site under-claims (private where the default shares) rather
+    than mis-claiming. `policy` is a REQUIRED positional: a defaulted call
+    would be exactly the silent under-claim the split exists to prevent.
+    Mirrors resolvedLevel() in consent.js.
+    """
+    return normalize_override(override) or policy_default_level(policy)
+
+
 def resolve(convo, policy, override, profile=None):
     """Resolve one conversation's effective shared-state AND the reason.
 
-    convo / policy / profile are IGNORED (D1: no inheritance on the
-    conversation path); they stay in the signature so existing call sites and
-    the conformance vectors keep working. Returns {"shared": bool, "reason":
-    str} where reason is one of 'explicit' | 'direct' | 'excluded' | 'private'.
-    `reason` is UI-only — never parse it for authorization. Mirrors resolve()
-    in consent.js exactly.
+    convo / profile are IGNORED (D1: no inheritance on the conversation path);
+    of `policy` only `default_level` is read — the global and per-source
+    standing policies stay dead. They stay in the signature so existing call
+    sites and the conformance vectors keep working. Returns {"shared": bool,
+    "reason": str} where reason is one of
+      'explicit' | 'direct' | 'excluded'              (an explicit override)
+      'default-share' | 'default-direct' | 'private'  (no override: the default)
+    An EXPLICIT 'private' still beats a 'direct' default. `reason` is UI-only —
+    never parse it for authorization. Mirrors resolve() in consent.js exactly.
     """
-    level = effective_level(override)
-    if level == "share":
+    explicit = normalize_override(override)
+    if explicit == "share":
         return {"shared": True, "reason": "explicit"}
-    if level == "direct":
+    if explicit == "direct":
         return {"shared": True, "reason": "direct"}
-    # Private either way; the reason distinguishes a deliberate exclusion from
-    # "never set" purely for the UI's wording.
-    return {"shared": False,
-            "reason": "excluded" if normalize_override(override) else "private"}
+    if explicit:
+        return {"shared": False, "reason": "excluded"}
+    default = policy_default_level(policy)
+    if default == "share":
+        return {"shared": True, "reason": "default-share"}
+    if default == "direct":
+        return {"shared": True, "reason": "default-direct"}
+    return {"shared": False, "reason": "private"}
 
 
 def effective_shared(convo, policy, override, profile=None):
@@ -133,7 +182,8 @@ def effective_shared(convo, policy, override, profile=None):
 def resolve_all(convos, policy, overrides, profiles=None):
     """Batch resolve. overrides may be a dict keyed by room id, or None.
 
-    policy/profiles are IGNORED (D1). Returns a list of
+    profiles are IGNORED (D1); of `policy` only default_level is read (see
+    resolve). Returns a list of
     {"convo", "shared", "reason"} in input order.
     """
     if not isinstance(convos, list):
@@ -173,7 +223,13 @@ def normalize_policy(p):
             continue
         if v == "share-all" or v == "private-all":
             sources[k] = v
-    return {"global": global_, "sources": sources}
+    out = {"global": global_, "sources": sources}
+    # default_level survives ONLY as exactly one of the three level strings;
+    # anything else is DROPPED, which reads back as absent == 'private'.
+    d = p.get("default_level") if isinstance(p, dict) else None
+    if isinstance(d, str) and d in DEFAULT_LEVEL_STATES:
+        out["default_level"] = d
+    return out
 
 
 def normalize_override(data):

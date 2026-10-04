@@ -9,10 +9,19 @@
 //   'direct'  -> mirrored to the master; the teammate's uplink auto-sends a
 //                manager proposal into the conversation (see the plan's D2 —
 //                the auto-send code itself lands in a later slice)
-//   'private' -> not mirrored (the default)
-// ABSENT OR ANY UNRECOGNIZED VALUE RESOLVES 'private'. That is a stated
-// invariant with its own conformance vector class — a stored override this
-// code does not recognize must never be able to share a conversation.
+//   'private' -> not mirrored
+// ABSENT OR ANY UNRECOGNIZED OVERRIDE FALLS BACK TO THE ACCOUNT DEFAULT
+// (`com.jkali.share_policy.default_level`), and an absent or unrecognized
+// default is 'private'. A stored override this code does not recognize must
+// never be able to share a conversation ON ITS OWN — it degrades to "no
+// override", exactly as if nothing were stored. That is a stated invariant
+// with its own conformance vector class.
+//
+// The account default is the ONE standing setting that still decides a
+// conversation (account-holder scope, set once, opt-in). Everything else
+// below — the per-source policy, the global share-all, a contact profile's
+// share flag — stays dead (D1). An EXPLICIT per-room level always wins, in
+// both directions: 'private' on a room beats a 'direct' default.
 //
 // There is NO inheritance on the conversation path any more: contact-profile
 // share-state, the per-source policy and the global standing policy do NOT
@@ -41,7 +50,12 @@ const SHARE_OVERRIDE_TYPE = 'com.jkali.share_override';   // per-room account-da
 // tells the teammate UI that the daemon no longer honors standing policies, so
 // the UI can stop offering (and stop claiming to honor) the dead controls.
 const CONSENT_MODEL_TYPE = 'com.jkali.consent_model';
-const CONSENT_MODEL_EXPLICIT = 2;
+// 3 = "per-room override, else the ACCOUNT DEFAULT (share_policy.default_level)".
+// 2 was "per-room override only". The bump matters because a UI that renders a
+// default as being in force over a daemon that still ignores it would be
+// claiming a sharing state the enforcer does not implement.
+const CONSENT_MODEL_PER_ROOM = 2;
+const CONSENT_MODEL_EXPLICIT = 3;
 
 // ---- valid state tokens ------------------------------------------------------
 const GLOBAL_STATES = new Set(['share-all', 'private']);
@@ -49,6 +63,11 @@ const SOURCE_STATES = new Set(['share-all', 'private-all', 'inherit']);
 // The THREE explicit conversation levels. Anything else (including the old
 // 'inherit', an absent event, or junk) is 'private' — see effectiveLevel().
 const OVERRIDE_STATES = new Set(['share', 'direct', 'private']);
+// The ACCOUNT DEFAULT level (share_policy.default_level) — the same three
+// tokens, applied to every conversation that carries NO explicit override.
+// Absent or anything unrecognized is 'private', so an account that never sets
+// one behaves exactly as before.
+const DEFAULT_LEVEL_STATES = new Set(['share', 'direct', 'private']);
 // Profile share-state (from a contact profile). Retained for shared/model/
 // contacts.js's storage shape ONLY: since D1 a profile's share-state has NO
 // effect on conversation mirroring.
@@ -108,23 +127,50 @@ function effectiveLevel(override) {
   return normalizeOverride(override) || 'private';
 }
 
+// The ACCOUNT DEFAULT level stored on com.jkali.share_policy. Gated exactly
+// like sourceRule(): plain-object container, OWN property, exactly-valid
+// string. Absent / wrong type / unrecognized => 'private' (the fail-closed
+// value every account had before this field existed).
+function policyDefaultLevel(policy) {
+  const p = plainObject(policy);
+  if (!p) return 'private';
+  if (!Object.prototype.hasOwnProperty.call(p, 'default_level')) return 'private';
+  const v = p.default_level;
+  return (typeof v === 'string' && DEFAULT_LEVEL_STATES.has(v)) ? v : 'private';
+}
+
+// The conversation's RESOLVED level: the explicit per-room override if it has
+// one, otherwise the account default. This — not effectiveLevel() — is what a
+// default-aware call site wants. effectiveLevel() keeps its old one-argument
+// meaning ("the EXPLICIT level") on purpose: a site that was never converted
+// then under-claims (shows private where the default shares) rather than
+// mis-claiming, and the arity makes an unconverted site a compile-visible
+// difference rather than a silent one.
+function resolvedLevel(override, policy) {
+  return normalizeOverride(override) || policyDefaultLevel(policy);
+}
+
 // Resolve one conversation's effective shared-state AND the reason for it.
 //   convo    : { sourceId, sourceLabel, ... }   IGNORED (see D1)
-//   policy   : the standing-policy object       IGNORED (see D1)
-//   override : 'share' | 'direct' | 'private' | undefined — the ONLY input
+//   policy   : the account policy — ONLY its `default_level` is read; the
+//              global / per-source standing policies stay dead (D1)
+//   override : 'share' | 'direct' | 'private' | undefined — wins outright
 //   profile  : the room's contact profile       IGNORED (see D1)
-// Returns { shared: boolean, reason: 'explicit'|'direct'|'excluded'|'private' }.
-// convo/policy/profile stay in the signature so existing call sites and the
-// conformance vectors keep working; they can no longer influence the decision.
-// `reason` is UI-only — never parse it for authorization (that is what
-// `shared` / effectiveLevel() are for).
+// Returns { shared, reason } with reason one of
+//   'explicit' | 'direct' | 'excluded'              (an explicit override)
+//   'default-share' | 'default-direct' | 'private'  (no override: the default)
+// An EXPLICIT 'private' still beats a 'direct' default — explicit beats
+// default in both directions. `reason` is UI-only — never parse it for
+// authorization (that is what `shared` / resolvedLevel() are for).
 function resolve(convo, policy, override, profile) {
-  const level = effectiveLevel(override);
-  if (level === 'share') return { shared: true, reason: 'explicit' };
-  if (level === 'direct') return { shared: true, reason: 'direct' };
-  // Private either way; the reason distinguishes a deliberate exclusion from
-  // "never set" purely for the UI's wording.
-  return { shared: false, reason: normalizeOverride(override) ? 'excluded' : 'private' };
+  const explicit = normalizeOverride(override);
+  if (explicit === 'share') return { shared: true, reason: 'explicit' };
+  if (explicit === 'direct') return { shared: true, reason: 'direct' };
+  if (explicit) return { shared: false, reason: 'excluded' };
+  const def = policyDefaultLevel(policy);
+  if (def === 'share') return { shared: true, reason: 'default-share' };
+  if (def === 'direct') return { shared: true, reason: 'default-direct' };
+  return { shared: false, reason: 'private' };
 }
 
 // The boolean the uplink asks for when deciding whether to mirror a room.
@@ -134,7 +180,7 @@ function effectiveShared(convo, policy, override, profile) {
 
 // Resolve a whole list at once (drives the consent summary panel + row badges).
 //   convos    : array of conversation objects (each with an `id` room id)
-//   policy    : IGNORED (see D1) — kept so call sites need no change
+//   policy    : the account policy — only `default_level` is read (see resolve)
 //   overrides : per-room overrides keyed by room id — a Map or a plain object,
 //               value 'share'|'direct'|'private' (absent/unknown = private).
 //   profiles  : IGNORED (see D1) — a profile no longer shares a conversation.
@@ -186,7 +232,13 @@ function normalizePolicy(p) {
     const v = src[k];
     if (v === 'share-all' || v === 'private-all') sources[k] = v; // drop 'inherit'/junk
   }
-  return { global, sources };
+  const out = { global, sources };
+  // default_level survives ONLY as exactly one of the three level strings;
+  // anything else is DROPPED, which reads back as absent == 'private'. Never
+  // echoed through from a raw event, so a round-trip cannot launder junk.
+  const d = plainObject(p) ? p.default_level : undefined;
+  if (typeof d === 'string' && DEFAULT_LEVEL_STATES.has(d)) out.default_level = d;
+  return out;
 }
 
 // A per-room override is 'share' | 'direct' | 'private' | null. Accepts either
@@ -218,12 +270,21 @@ function overridePath(roomId) {
     '/rooms/' + encodeURIComponent(roomId) + '/account_data/' + SHARE_OVERRIDE_TYPE;
 }
 
-// Read the global + per-source policy. Absent -> default { global:'private', sources:{} }.
+// Read the account policy — which now carries the ACCOUNT DEFAULT LEVEL, so a
+// read failure is no longer a cosmetic nuisance: fabricating "private" would
+// tell the account holder their default is off when it may be Direct.
+// Returns a NORMALIZED policy with a `status` field:
+//   status 'ok'    — the stored policy (or the safe default on 404/absent)
+//   status 'error' — ANY other failure. The policy fields are still the safe
+//                    default so every resolver call stays fail-closed, but the
+//                    UI must DISABLE the default control and say it could not
+//                    read the setting, never render a level as if it were one.
 async function readSharePolicy() {
   try {
-    return normalizePolicy(await api('GET', policyPath()));
+    return { status: 'ok', ...normalizePolicy(await api('GET', policyPath())) };
   } catch (e) {
-    return { global: 'private', sources: {} };
+    if (e && e.status === 404) return { status: 'ok', global: 'private', sources: {} };
+    return { status: 'error', global: 'private', sources: {} };
   }
 }
 
@@ -236,8 +297,11 @@ async function writeSharePolicy(policy) {
 }
 
 // Write one room's override. state 'share'|'direct'|'private' sets it;
-// anything else (including null) clears the event to empty content, which the
-// explicit model reads back as PRIVATE (account-data cannot be deleted).
+// anything else (including null) UNSETS it — the event is cleared to empty
+// content (account-data cannot be deleted), which reads back as "no explicit
+// level", i.e. the ACCOUNT DEFAULT applies. That is NOT the same as private
+// any more: under a 'direct' default, clearing an override RE-SHARES the
+// conversation. A caller that means private must pass 'private'.
 // Returns the normalized state or null.
 async function writeShareOverride(roomId, state) {
   const s = OVERRIDE_STATES.has(state) ? state : null;
@@ -248,17 +312,21 @@ async function writeShareOverride(roomId, state) {
 // The consent-model marker (D0/F7). The uplink writes it once the explicit-
 // levels migration has completed; the teammate UI reads it to decide whether
 // the daemon still honors the old standing policies. Returns an integer
-// version (1 = the old inherit model). ANY read failure, absent event, or junk
-// content returns 1 — the UI must never assume the new model on a bad read,
-// because a new-model UI over an old inherit daemon is exactly the skew F7
-// forbids (UI says Private while the daemon still shares).
+// version, clamped to a KNOWN model:
+//   1 = the old inherit model (also: any read failure, absent event, or junk)
+//   2 = per-room override only (CONSENT_MODEL_PER_ROOM)
+//   3 = per-room override, else the account default (CONSENT_MODEL_EXPLICIT)
+// The UI must never assume a newer model on a bad read: a new-model UI over an
+// older daemon is exactly the skew F7 forbids (the UI offers a control the
+// enforcer does not implement).
 async function readConsentModel() {
   try {
     const data = await api('GET', '/_matrix/client/v3/user/' +
       encodeURIComponent(S.userId) + '/account_data/' + CONSENT_MODEL_TYPE);
     const v = plainObject(data) ? data.version : null;
-    return (typeof v === 'number' && Number.isFinite(v) && v >= CONSENT_MODEL_EXPLICIT)
-      ? CONSENT_MODEL_EXPLICIT : 1;
+    if (typeof v !== 'number' || !Number.isFinite(v)) return 1;
+    if (v >= CONSENT_MODEL_EXPLICIT) return CONSENT_MODEL_EXPLICIT;
+    return v >= CONSENT_MODEL_PER_ROOM ? CONSENT_MODEL_PER_ROOM : 1;
   } catch (e) {
     return 1;
   }
@@ -484,8 +552,10 @@ async function writeContactOverrides(overrides) {
 
 export {
   SHARE_POLICY_TYPE, SHARE_OVERRIDE_TYPE, PROFILE_STATES,
-  CONSENT_MODEL_TYPE, CONSENT_MODEL_EXPLICIT,
-  resolve, effectiveShared, effectiveLevel, resolveAll,
+  CONSENT_MODEL_TYPE, CONSENT_MODEL_EXPLICIT, CONSENT_MODEL_PER_ROOM,
+  DEFAULT_LEVEL_STATES,
+  resolve, effectiveShared, effectiveLevel, resolvedLevel, policyDefaultLevel,
+  resolveAll,
   normalizePolicy, normalizeOverride,
   readSharePolicy, writeSharePolicy,
   writeShareOverride, readConsentModel,

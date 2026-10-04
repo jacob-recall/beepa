@@ -240,14 +240,20 @@ function updateImsgCard(rawBody) {
   }
 }
 
-// Confirmation modal; type-to-confirm for the most destructive action.
+// Confirmation modal; type-to-confirm for the most destructive actions.
+// `typed`: falsy = no typing; a STRING = the exact word that must be typed
+// (case-sensitive); `true` = the legacy word 'delete'. The word is shown in
+// the input's placeholder so the confirm never depends on the caller having
+// spelled it out in `text` as well.
 function confirmModal(title, text, typed) {
+  const word = (typeof typed === 'string' && typed) ? typed : (typed ? 'delete' : null);
   return new Promise((resolve) => {
     $('modal-title').textContent = title;
     $('modal-text').textContent = text;
     const input = $('modal-input');
     input.value = '';
-    input.classList.toggle('hidden', !typed);
+    input.placeholder = word ? 'type ' + word : '';
+    input.classList.toggle('hidden', !word);
     $('modal-backdrop').classList.remove('hidden');
     const done = (ok) => {
       $('modal-backdrop').classList.add('hidden');
@@ -255,7 +261,7 @@ function confirmModal(title, text, typed) {
       resolve(ok);
     };
     $('modal-ok').onclick = () => {
-      if (typed && input.value !== 'delete') return;
+      if (word && input.value !== word) return;
       done(true);
     };
     $('modal-cancel').onclick = () => done(false);

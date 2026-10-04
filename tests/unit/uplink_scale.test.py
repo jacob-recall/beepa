@@ -40,6 +40,8 @@ with tempfile.TemporaryDirectory(prefix='beepa-uplink-scale-') as directory:
     def local(method, path, body=None, query=None, **kwargs):
         if path.endswith('/account_data/com.jkali.master_link'):
             raise urllib.error.HTTPError('fixture', 404, 'legacy env', {}, None)
+        if path.endswith('/account_data/com.jkali.share_policy'):
+            return {}          # no account default => 'private'
         if path.endswith('/account_data/com.jkali.share_override'):
             return {'state': 'share'}
         if '/event/' in path:

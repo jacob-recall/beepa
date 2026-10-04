@@ -154,17 +154,52 @@ what bounds the capability is the gate list under "Security invariants".
      sender mxid, or a room id from this path** — a DM portal's name is the
      contact's name, a source space's name contains the teammate's phone
      number, and a ghost mxid embeds one.
-  **Joining is membership, not sharing.** A joined room carries no
-  `com.jkali.share_override`, so both resolvers answer `private` and nothing
-  mirrors. Two consequences are ACCEPTED deliberately (finding 3), not
-  oversights: (a) re-joining a portal that still carries the teammate's own
-  earlier explicit override mirrors it again on the next reconcile, and a
-  stale `direct` re-arms auto-send for that conversation — that honors their
-  explicit prior decision for that exact conversation; (b) joining a source
-  SPACE makes previously "shared-but-sourceless" rooms attributable and
-  therefore mirrorable. Both are pinned in
-  `tests/unit/uplink_reconcile.test.py`; if either is ever to change, change
+  **Joining is membership — and under an ACCOUNT DEFAULT, membership is
+  enough to share.** This invariant used to read "joining is membership, not
+  sharing", and that is no longer true in general. A joined room carries no
+  `com.jkali.share_override`, so it takes `com.jkali.share_policy`'s
+  `default_level`:
+  - default absent or `private` (every account that has not opted in,
+    i.e. the unchanged default): both resolvers answer `private` and nothing
+    mirrors. The old wording holds exactly here, and only here.
+  - default `share`: an unattended join of a SOURCE-ATTRIBUTED room mirrors it
+    on the next reconcile, with no per-conversation decision.
+  - default `direct`: the same, and the conversation is additionally
+    auto-sendable behind D2's twelve gates — an unattended join hands the
+    manager a bounded send capability on a conversation nobody reviewed.
+
+  Source attribution is what still bounds this: `sources_from_sync()` only
+  attributes rooms reachable as children of a known source SPACE, so a bridge
+  MANAGEMENT room (a 2-member bot DM that is not a space child) is not a
+  mirror candidate under any default. Verified read-only against the live hub
+  on 2026-10-03: 582 joined rooms, 573 attributed, zero of the five resolved
+  management rooms among them. Keep it that way — if a future bridge files its
+  management DM under its source space, the refusal has to become explicit in
+  both `desired_shared()` and D2-4.
+
+  Three consequences are ACCEPTED deliberately, not oversights: (a) re-joining
+  a portal that still carries the teammate's own earlier explicit override
+  mirrors it again on the next reconcile, and a stale `direct` re-arms
+  auto-send for that conversation — that honors their explicit prior decision
+  for that exact conversation; (b) joining a source SPACE makes previously
+  "shared-but-sourceless" rooms attributable and therefore mirrorable; (c)
+  under a non-private default, (a) and (b) apply to rooms with NO prior
+  decision at all. (a) and (b) are pinned in
+  `tests/unit/uplink_reconcile.test.py` and (c) in
+  `tests/unit/uplink_default_level.test.py`; if any is ever to change, change
   it there first.
+
+  **The account default is a SECOND authorization input, and reading it can
+  fail.** `read_policy()` is lenient on 404 ONLY; every other failure
+  propagates so `run_stage` backs the stage off. A read we could not perform
+  is never a revocation — collapsing a transient 500 into "no default" is
+  indistinguishable from "the holder revoked their default" and would
+  mass-revoke every defaulted room and drop their queues. `pass_policy()`
+  caches it for exactly one stage pass (cleared in `run_stage`), so
+  `archive_level()`, `desired_shared()` and `tail_once()` all resolve against
+  one consistent default. The ONE place that inverts this rule is
+  `read_room_level()` (D2-5), where the read AUTHORIZES rather than revokes:
+  there both reads sit inside a blanket `except -> 'private'`.
 - **Revocation durably retires access, not bytes.** `delete_mirror()`
   removes the master space-child link, kicks the manager, and leaves the
   room — a CS-API client (not a Synapse admin) cannot server-side-purge a

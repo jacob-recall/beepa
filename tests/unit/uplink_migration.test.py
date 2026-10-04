@@ -158,7 +158,8 @@ check("acceptance: written into THIS room's account-data",
 check("acceptance: content is an explicit share stamped migrated:true",
       ops and ops[0][1] == {"state": "share", "migrated": True})
 check("acceptance: consent-model marker written",
-      any(MODEL_PATH_FRAG in p and b == {"version": 2} for p, b in u.puts))
+      any(MODEL_PATH_FRAG in p and b == {"version": consent.CONSENT_MODEL_EXPLICIT}
+          for p, b in u.puts))
 check("acceptance: migration flag set", u.meta_get(uplink.MIGRATED_FLAG) == "1")
 check("acceptance: the kept room is still tailed", u.synced == [CONV])
 

@@ -8,7 +8,8 @@
 // exported resolver functions, so the Python runner is comparing the two real
 // implementations, not two test doubles.
 import {
-  resolve, effectiveShared, effectiveLevel, resolveAll, normalizePolicy, normalizeOverride,
+  resolve, effectiveShared, effectiveLevel, resolvedLevel, policyDefaultLevel,
+  resolveAll, normalizePolicy, normalizeOverride,
   overridesFromSync, normalizeContactPolicy, resolveContactShare,
   normalizeContactOverrides,
 } from '../../shared/model/consent.js';
@@ -27,6 +28,12 @@ function evalOne(v) {
       return normalizeOverride(v.data);
     case 'effective_level':
       return effectiveLevel(v.override);
+    case 'resolved_level':
+      // The account-default-aware resolver. `policy` is required on the Python
+      // side, so the vector always carries one (JSON null included).
+      return resolvedLevel(v.override, v.policy);
+    case 'policy_default_level':
+      return policyDefaultLevel(v.policy);
     case 'overrides_from_sync':
       return overridesFromSync(v.sync);
     case 'normalize_contact_policy':

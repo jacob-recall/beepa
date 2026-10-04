@@ -16,8 +16,9 @@
 // Add a case to one, add it to the other in the same change.
 
 import {
-  resolve, effectiveShared, effectiveLevel, resolveAll,
-  normalizePolicy, normalizeOverride, overridesFromSync,
+  resolve, effectiveShared, effectiveLevel, resolvedLevel, policyDefaultLevel,
+  resolveAll, normalizePolicy, normalizeOverride, overridesFromSync,
+  CONSENT_MODEL_EXPLICIT, CONSENT_MODEL_PER_ROOM,
 } from '../../shared/model/consent.js';
 
 let pass = 0;
@@ -310,6 +311,116 @@ const DENY_PROFILE = { displayName: 'Dana Lewis', share: 'private' };
       'hostile convo ' + JSON.stringify(c === undefined ? '<undefined>' : c) + ': explicit share still holds');
   }
 }
+
+
+// ---------------------------------------------------------------------------
+// 14. THE ACCOUNT DEFAULT (share_policy.default_level, roadmap §6). An explicit
+//     per-room override always wins; with NO override the account default
+//     decides, and an absent/unrecognized default is 'private'.
+//     resolvedLevel() is a NEW function — effectiveLevel() keeps its
+//     one-argument "explicit level only" meaning on purpose.
+// ---------------------------------------------------------------------------
+{
+  const DEF = (lv) => ({ global: 'private', sources: {}, default_level: lv });
+
+  // resolvedLevel: override wins, else the default, else private
+  eq(resolvedLevel(undefined, DEF('direct')), 'direct', 'resolvedLevel: unset takes a direct default');
+  eq(resolvedLevel(undefined, DEF('share')), 'share', 'resolvedLevel: unset takes a share default');
+  eq(resolvedLevel(undefined, DEF('private')), 'private', 'resolvedLevel: unset takes a private default');
+  eq(resolvedLevel(undefined, {}), 'private', 'resolvedLevel: no default at all -> private');
+  eq(resolvedLevel('private', DEF('direct')), 'private',
+    'resolvedLevel: an EXPLICIT private beats a direct default');
+  eq(resolvedLevel('share', DEF('direct')), 'share', 'resolvedLevel: explicit share beats a direct default');
+  eq(resolvedLevel('direct', DEF('private')), 'direct', 'resolvedLevel: explicit direct beats a private default');
+  eq(resolvedLevel({ state: 'private' }, DEF('direct')), 'private', 'resolvedLevel: object form, explicit wins');
+
+  // effectiveLevel is UNCHANGED: it never sees the default (an unconverted
+  // call site must UNDER-claim, never mis-claim).
+  eq(effectiveLevel(undefined), 'private', 'effectiveLevel: still 1-arg, still "explicit level"');
+  eq(effectiveLevel('share'), 'share', 'effectiveLevel: unchanged for an explicit level');
+
+  // An UNRECOGNIZED override is "no override": it falls through to the
+  // default, never shares on its own, and never beats an explicit private.
+  for (const junk of [null, '', 'inherit', 'junk', 'Direct', 'direct ', 'share-all',
+    0, 5, true, false, [], {}, ['direct'], { state: 'junk' }, { state: ['share'] },
+    { State: 'direct' }, { default_level: 'direct' }]) {
+    eq(resolvedLevel(junk, DEF('direct')), 'direct',
+      'junk override ' + JSON.stringify(junk) + ' degrades to "no override"');
+    eq(resolvedLevel(junk, {}), 'private',
+      'junk override ' + JSON.stringify(junk) + ' with no default -> private');
+  }
+
+  // policyDefaultLevel: only the three exact strings survive.
+  for (const bad of ['Direct', 'direct ', ' direct', 'DIRECT', 'inherit', 'share-all', '',
+    null, true, false, 0, 5, [], ['direct'], {}, { state: 'direct' }]) {
+    eq(policyDefaultLevel({ default_level: bad }), 'private',
+      'policyDefaultLevel: junk ' + JSON.stringify(bad) + ' -> private');
+  }
+  for (const container of [null, undefined, 5, 'direct', [], ['direct'],
+    { default_level: 'direct', extra: 1 }]) {
+    const want = (container && container.default_level === 'direct') ? 'direct' : 'private';
+    eq(policyDefaultLevel(container), want,
+      'policyDefaultLevel: container ' + JSON.stringify(container === undefined ? '<undefined>' : container));
+  }
+  // Prototype-named placements never reach the resolver.
+  eq(policyDefaultLevel(JSON.parse('{"__proto__":{"default_level":"direct"}}')), 'private',
+    'policyDefaultLevel: a __proto__-nested default is not a default');
+  eq(policyDefaultLevel({ sources: { default_level: 'direct' } }), 'private',
+    'policyDefaultLevel: a nested default under sources is not a default');
+
+  // resolve(): the two NEW reasons, and the old ones unchanged.
+  eq(resolve(convo('x'), DEF('share'), undefined), { shared: true, reason: 'default-share' },
+    'resolve: unset under a share default');
+  eq(resolve(convo('x'), DEF('direct'), undefined), { shared: true, reason: 'default-direct' },
+    'resolve: unset under a direct default');
+  eq(resolve(convo('x'), DEF('private'), undefined), { shared: false, reason: 'private' },
+    'resolve: unset under a private default stays "private"');
+  eq(resolve(convo('x'), DEF('direct'), 'private'), { shared: false, reason: 'excluded' },
+    'resolve: explicit private under a direct default is "excluded"');
+  eq(resolve(convo('x'), DEF('direct'), 'share'), { shared: true, reason: 'explicit' },
+    'resolve: explicit share under a direct default is still "explicit"');
+  eq(resolve(convo('x'), DEF('private'), 'direct'), { shared: true, reason: 'direct' },
+    'resolve: explicit direct under a private default is still "direct"');
+  eq(effectiveShared(convo('x'), DEF('direct'), undefined), true,
+    'effectiveShared follows resolve under a default');
+  eq(effectiveShared(convo('x'), DEF('direct'), 'private'), false,
+    'effectiveShared: an explicit private is not shared under a direct default');
+
+  // The per-source / global standing policies are STILL dead: only
+  // default_level can share an unset conversation.
+  eq(resolve(convo('imessage'), LOUD_POLICY, undefined), { shared: false, reason: 'private' },
+    'resolve: share-all WITHOUT a default_level still shares nothing');
+
+  // resolveAll threads the policy.
+  {
+    const list = [{ id: '!a:l' }, { id: '!b:l' }, { id: '!c:l' }];
+    eq(resolveAll(list, DEF('direct'), { '!b:l': 'private' }).map((r) => r.reason),
+      ['default-direct', 'excluded', 'default-direct'], 'resolveAll: threads default_level');
+    eq(resolveAll(list, {}, { '!b:l': 'share' }).map((r) => r.shared),
+      [false, true, false], 'resolveAll: no default -> only the explicit share');
+  }
+
+  // normalizePolicy keeps default_level only when exactly valid, and a
+  // round-trip drops junk rather than laundering it.
+  eq(normalizePolicy({ default_level: 'direct' }).default_level, 'direct',
+    'normalizePolicy: keeps a valid default_level');
+  eq(normalizePolicy({ default_level: 'Direct' }).default_level, undefined,
+    'normalizePolicy: drops a near-miss default_level');
+  eq(normalizePolicy({ default_level: ['direct'] }).default_level, undefined,
+    'normalizePolicy: drops a non-string default_level');
+  eq(policyDefaultLevel(normalizePolicy({ default_level: 'inherit' })), 'private',
+    'normalizePolicy round-trip: junk reads back as private');
+  eq(normalizePolicy(normalizePolicy({ global: 'share-all', default_level: 'share' })),
+    { global: 'share-all', sources: {}, default_level: 'share' },
+    'normalizePolicy: idempotent over a valid default');
+}
+
+// ---------------------------------------------------------------------------
+// 15. The consent-model marker constants (F7) — apps/user gates the new
+//     account-default control on 3, and the dead standing controls on 2.
+// ---------------------------------------------------------------------------
+eq(CONSENT_MODEL_EXPLICIT, 3, 'marker: explicit-model version');
+eq(CONSENT_MODEL_PER_ROOM, 2, 'marker: per-room-only model version');
 
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -100,7 +100,7 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   accepted (deliberately no `is_direct` filter; stripped invite state does not
   carry it anyway). Joins are capped per pass (30) and per session (200),
   hard (non-429 4xx) failures are memoized in a session-scoped `Set` and never
-  retried, and joining is membership — not a send, and not a capability grant.
+  retried, and joining is membership — not a send; under an account default of `direct` it is, however, enough for the uplink to mirror and auto-send into that conversation (see `agents/uplink/CLAUDE.md`).
 - **`invites.js` stays a pure zero-import leaf and the single definition of
   these predicates.** Never add an import, DOM access, network call, or a
   fallback/sentinel return value to it, and never sanitize *inside* a

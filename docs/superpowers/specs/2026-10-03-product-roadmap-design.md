@@ -215,3 +215,21 @@ level with a "default" tag.
 
 **Owner's account.** Default Direct; all existing conversations set to Direct
 explicitly. Teammates: untouched.
+
+**Security review (2026-10-03, pre-implementation): PROCEED WITH FIXES.** Twelve
+required, all adopted: (P0) the uplink's standing-policy read must never
+fabricate a default on a non-404 error (a transient 500 would otherwise
+mass-revoke every defaulted room and drop their queues); the per-write consent
+recheck `archive_level` and the ingestion path's override-change revocation
+must resolve with the current policy; (P1) a new `resolvedLevel(override,
+policy)` instead of changing `effectiveLevel`'s arity, so an unconverted UI
+site under-claims rather than mis-claims; the UI's policy read distinguishes
+404 from error; the "Clear" action writes `private` explicitly; copy says
+"conversations you haven't set individually", with the "default" marker driven
+by the resolver's reason; consent model marker bumped to 3 with deploy order
+app-then-daemon; (P2) verify no bridge management room becomes a mirror
+candidate under a default; default write is merge-over-fresh-read; the bulk
+"everything Direct" confirm is count + per-source + typed `DIRECT` + scrollable
+list; docs rewritten where they state "joining is membership, not sharing".
+Plus a persistent banner whenever the default is not private, so an account
+holder can always see and revert it.

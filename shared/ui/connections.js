@@ -2,6 +2,7 @@
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
 import { $, el, sanitize, sanitizeLine } from './el.js';
+import { ROOMID_RE, api } from '../matrix/client.js';
 import { GMSG, IG, IMSG, LI, PLANNED_SOURCES, SOURCES, TW, WA, clearQR, groupsFor, redactMgmtEvent, sendCmd, sendSecretToMgmt, sendStatusRefresh } from './sources.js';
 import { S, runtime } from '../state.js';
 import { discordCard } from './discord.js';
@@ -194,6 +195,22 @@ function imsgHealthLine(line, now) {
   if (typeof line !== 'string' || line.indexOf('Delivery journal:') !== 0) return null;
   let j;
   try { j = JSON.parse(line.slice('Delivery journal:'.length).trim()); } catch (e) { return null; }
+  return imsgHealthSummary(j, now);
+}
+// Freshness + one-line summary for the daemon's com.jkali.imessage_health
+// room state (F0). Pure. null when the content is not an object.
+function imsgHealthFromState(content, now) {
+  if (!content || typeof content !== 'object') return null;
+  const age = typeof content.updated_at === 'number' ? Math.max(0, now / 1000 - content.updated_at) : null;
+  const fresh = age !== null && age < 180;
+  const head = age === null ? 'Daemon has not reported yet'
+    : fresh ? 'Daemon reporting (' + Math.round(age) + 's ago)'
+    : 'Daemon NOT reporting for ' + (age < 3600 ? Math.round(age / 60) + 'm' : Math.round(age / 3600) + 'h') + ' — is it running?';
+  const poll = content.poll_ok === false ? ' · last Messages poll failed (' + sanitizeLine(String(content.poll_error || 'error')) + ')' : '';
+  const summary = imsgHealthSummary(content, now);
+  return { text: head + poll + (summary ? ' · ' + summary : ''), fresh, pollOk: content.poll_ok !== false };
+}
+function imsgHealthSummary(j, now) {
   if (!j || typeof j !== 'object') return null;
   const out = (j.outbound && typeof j.outbound === 'object') ? j.outbound : {};
   const n = (k) => (typeof out[k] === 'number' ? out[k] : 0);
@@ -210,6 +227,36 @@ function imsgHealthLine(line, now) {
   parts.push('last inbound ' + rel(j.last_inbound_ts));
   if (typeof j.chats_mapped === 'number') parts.push(j.chats_mapped + ' chats');
   return parts.join(' · ');
+}
+
+// Read the daemon's health STATE from its verified management room (the room
+// resolveImsgMgmt already pinned), render it, and keep it fresh every 30s
+// while the card exists. Read-only GET through api(); the daemon's loopback
+// /health is outside the CSP on purpose, so this is the one path.
+let imsgHealthTimer = null;
+async function refreshImsgHealth() {
+  const node = $('imsg-health');
+  if (!node) return;
+  const mid = runtime.imessage.mgmtRoomId;
+  if (!mid || !ROOMID_RE.test(mid)) { node.textContent = 'Daemon health: management room not set up yet.'; return; }
+  let content = null;
+  try {
+    content = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(mid) + '/state/com.jkali.imessage_health/');
+  } catch (e) {
+    const code = e && typeof e.status === 'number' ? e.status : 0;
+    node.textContent = code === 404 ? 'Daemon health: no report yet (daemon older than this app, or not running).' : 'Daemon health: could not read.';
+    node.classList.add('warn');
+    return;
+  }
+  const h = imsgHealthFromState(content, Date.now());
+  if (!h) { node.textContent = 'Daemon health: unreadable report.'; node.classList.add('warn'); return; }
+  node.textContent = 'Daemon health: ' + h.text;
+  node.classList.toggle('warn', !h.fresh || !h.pollOk);
+}
+function startImsgHealthLoop() {
+  refreshImsgHealth().catch(() => {});
+  if (imsgHealthTimer) return;
+  imsgHealthTimer = setInterval(() => { if ($('imsg-health')) refreshImsgHealth().catch(() => {}); }, 30000);
 }
 
 function updateImsgCard(rawBody) {
@@ -627,10 +674,15 @@ function buildConnections() {
   imActions.appendChild(imStatus);
   im.appendChild(imActions);
 
+  const health = el('p', 'muted imsg-health-line');
+  health.id = 'imsg-health';
+  health.textContent = 'Daemon health: waiting for its first report…';
+  im.appendChild(health);
   const checklist = el('ul', 'checklist');
   checklist.id = 'imsg-checklist';
   im.appendChild(checklist);
   holder.appendChild(im);
+  startImsgHealthLoop();
 
   // Google Messages card — ONE-CLICK connect via the loopback helper (:8020).
   // The browser can't read Chrome cookies or `docker exec` the bridge, so the
@@ -1084,4 +1136,4 @@ function renderCommandGroups(sourceId) {
 export {
   logConsole, setButtonsDisabled, setLoginFlow, updateCardStatus, updateImsgCard, confirmModal,
   buildConnections, buildSettings, ensureConnections, ensureSettings,
-  renderSettingsTabs, renderCommandGroups, setPlatformRailHook, imsgHealthLine };
+  renderSettingsTabs, renderCommandGroups, setPlatformRailHook, imsgHealthLine, imsgHealthFromState, imsgHealthSummary, refreshImsgHealth };

@@ -1080,12 +1080,61 @@ def reconcile_edit(chat_id, m):
         log.info("inbound edit failed chat=%s", sha(chat_id)[:8])
         raise
 
+# ---------------------------------------------------------------- health as room state (F0)
+# The app cannot reach this daemon's loopback /health (CSP), so the same
+# aggregate counters are published as a STATE event the bot owns in its own
+# management room (the room the app already verifies before it trusts a
+# command reply). Counts and unix-second timestamps only — no bodies, no
+# handles, no room ids. Written at most every 30s and only on change, or every
+# 5 minutes as a heartbeat; failure is logged by type only.
+HEALTH_STATE_TYPE = "com.jkali.imessage_health"
+_health_pub = {"sig": None, "ts": 0.0, "poll_ok": None, "poll_err": None}
+
+
+def health_state():
+    d = delivery_status()
+    state = {"outbound": {k: int(v) for k, v in (d.get("outbound") or {}).items() if isinstance(v, int)},
+             "inbound_pending": sum(int(v) for v in (d.get("inbound") or {}).values() if isinstance(v, int)),
+             "inbound_refused_components": int(d.get("inbound_refused_components") or 0),
+             "last_outbound_ts": d.get("last_outbound_ts"), "last_inbound_ts": d.get("last_inbound_ts"),
+             "chats_mapped": int(d.get("chats_mapped") or 0),
+             "poll_ok": _health_pub["poll_ok"], "poll_error": _health_pub["poll_err"],
+             "updated_at": int(time.time())}
+    return {k: v for k, v in state.items() if v is not None}
+
+
+def publish_health_state(force=False):
+    mid = meta_get("mgmt_room")
+    if not mid:
+        return
+    now = time.time()
+    if not force and now - _health_pub["ts"] < 30:
+        return
+    state = health_state()
+    sig = json.dumps({k: v for k, v in state.items() if k != "updated_at"}, sort_keys=True)
+    if not force and sig == _health_pub["sig"] and now - _health_pub["ts"] < 300:
+        return
+    try:
+        mx("PUT", "/_matrix/client/v3/rooms/%s/state/%s/" % (urllib.parse.quote(mid, safe=""), HEALTH_STATE_TYPE),
+           state, user=BOT_ID)
+        _health_pub["sig"], _health_pub["ts"] = sig, now
+    except Exception as e:                       # noqa: BLE001 — diagnostics never block the poll
+        _health_pub["ts"] = now                  # back off even on failure
+        log.info("health state not published: %s", type(e).__name__)
+
+
 def poll_loop():
     while True:
         try:
             poll_once()
+            _health_pub["poll_ok"], _health_pub["poll_err"] = True, None
         except Exception as e:
+            _health_pub["poll_ok"], _health_pub["poll_err"] = False, type(e).__name__
             log.info("poll error: %s", type(e).__name__)
+        try:
+            publish_health_state()
+        except Exception as e:                   # noqa: BLE001
+            log.info("health publish error: %s", type(e).__name__)
         time.sleep(int(CFG.get("poll_interval", 3)))
 
 # ---------------------------------------------------------------- mgmt room (B-2)

@@ -465,3 +465,6 @@ button:not(.primary):not(.danger):not(.navitem):not(.tab):not(.share-kebab):not(
 .ghost.retired .ghost-bar { color: var(--color-muted); }
 .ghost.ambiguous { border-color: #c9810a; background: #fbeed3; }
 .ghost.ambiguous .ghost-bar { color: #8a5a00; }
+
+.imsg-health-line { font-size: 12px; }
+.imsg-health-line.warn { color: #c9810a; }

@@ -98,6 +98,16 @@ equals sent text; optimistic console bar; health payload integers only;
 hourly passive probe sends nothing. Four P4 advisories, one fixed
 (duplicated block), three wording.
 
+## Daemon health in the app (2026-10-03, 22:42)
+
+The iMessage daemon's loopback `/health` is outside the app's CSP by design, so
+the daemon now publishes the same counters as `com.jkali.imessage_health`
+state in its own verified management room (bot-owned, counts and
+unix-second timestamps only, every 30 s on change, 5 min heartbeat). The
+Settings card reads it and shows "Daemon reporting (12s ago) · Sends: 7
+confirmed · last send … · last inbound … · 6 chats", turning amber when the
+daemon has not reported for 3 minutes or its last Messages poll failed.
+
 ## Not yet done (F0 remainder)
 
 - Repeat the probe on a schedule and keep a history, so a regression shows as

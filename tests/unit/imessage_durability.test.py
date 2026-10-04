@@ -378,6 +378,28 @@ class DaemonTest(unittest.TestCase):
         # terminal: a replay never re-enters the handler
         self.assertEqual(self.transaction([ev], 'third'), 200)
 
+    def test_health_state_is_counts_only_and_bot_owned(self):
+        """F0: /health is unreachable from the app (CSP), so the daemon publishes
+        the same counters as com.jkali.imessage_health STATE in its own
+        management room, as the bot. Counts and timestamps only; no bodies,
+        handles or room ids; throttled; a failed PUT never raises."""
+        puts = []
+        self.d.meta_set('mgmt_room', '!mgmt:test')
+        self.d.mx = lambda method, path, body=None, user=None, **k: puts.append((method, path, body, user)) or {}
+        self.d.publish_health_state(force=True)
+        self.assertEqual(len(puts), 1)
+        method, path, body, user = puts[0]
+        self.assertEqual((method, user), ('PUT', '@imessagebot:test'))
+        self.assertTrue(path.endswith('/state/com.jkali.imessage_health/'))
+        self.assertEqual(set(body) - {'outbound', 'inbound_pending', 'inbound_refused_components', 'last_outbound_ts',
+                                      'last_inbound_ts', 'chats_mapped', 'poll_ok', 'poll_error', 'updated_at'}, set())
+        flat = json.dumps(body)
+        self.assertNotIn('!portal', flat); self.assertNotIn('@', flat); self.assertNotIn('hello', flat)
+        self.d.publish_health_state()               # unchanged + inside 30s -> no second write
+        self.assertEqual(len(puts), 1)
+        self.d.mx = lambda *a, **k: (_ for _ in ()).throw(OSError('down'))
+        self.d.publish_health_state(force=True)     # must not raise
+
     def test_rate_cap_survives_restart(self):
         self.assertTrue(self.d.rate_ok('chat'))
         self.d.initialize(self.config, state_dir=self.tmp.name)

@@ -2058,17 +2058,6 @@ class Uplink(durable_sync.DurableSync):
             content = e.get("content") if isinstance(e.get("content"), dict) else {}
             if e.get("sender") == self.cfg.local_user and isinstance(content.get(AUTO_SENT_FROM_PROPOSAL_KEY), str):
                 continue
-            # This daemon's OWN auto-sends do not mean the conversation moved
-            # on — they are the manager's queued suggestions going out in
-            # order. Recognised by BOTH the server-stamped sender being this
-            # account AND our provenance key; a remote party cannot be
-            # local_user on this homeserver, and a message typed by the
-            # teammate in the app carries no provenance key, so both still count
-            # as activity. Without this, a queue of three suggestions auto-sent
-            # only the first (the first send superseded the rest).
-            content = e.get("content") if isinstance(e.get("content"), dict) else {}
-            if e.get("sender") == self.cfg.local_user and isinstance(content.get(AUTO_SENT_FROM_PROPOSAL_KEY), str):
-                continue
             ts = e.get("origin_server_ts")
             if isinstance(ts, int) and not isinstance(ts, bool) and ts > since_ts:
                 return False

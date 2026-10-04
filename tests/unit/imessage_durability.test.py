@@ -358,6 +358,26 @@ class DaemonTest(unittest.TestCase):
         ev['content'] = {'m.relates_to': {'rel_type': 'm.annotation', 'event_id': '$target', 'key': '❤️'}}
         self.assertEqual(self.transaction([ev], 'third'), 200)
 
+    def test_non_send_events_are_filed_as_ignored_not_refused(self):
+        """F0 (2026-10-03): a stranger's event, a management-room command and a
+        state event are not sends. They used to land in the outbound journal as
+        refused/ignored_or_invalid, so /health read "144 refused" with zero real
+        send failures. They are terminal ("ignored") and counted apart."""
+        self.d.engine_send = lambda *a: self.fail('untrusted dispatch')
+        ev = self.event('$stranger')
+        ev['sender'] = '@stranger:test'
+        self.assertEqual(self.transaction([ev]), 200)
+        self.assertEqual(self.d.outbound_get('$stranger'), ('ignored', 'not_a_send'))
+        state_ev = self.event('$state')
+        state_ev['type'] = 'com.beepa.timestamp_correction'
+        self.assertEqual(self.transaction([state_ev], 'second'), 200)
+        self.assertEqual(self.d.outbound_get('$state'), ('ignored', 'not_a_send'))
+        health = self.d.delivery_status()
+        self.assertEqual(health['outbound'].get('ignored'), 2)
+        self.assertNotIn('refused', health['outbound'])
+        # terminal: a replay never re-enters the handler
+        self.assertEqual(self.transaction([ev], 'third'), 200)
+
     def test_rate_cap_survives_restart(self):
         self.assertTrue(self.d.rate_ok('chat'))
         self.d.initialize(self.config, state_dir=self.tmp.name)

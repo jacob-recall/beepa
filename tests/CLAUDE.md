@@ -7,6 +7,16 @@ The runner discovers every `tests/unit/*.test.py` and `*.test.js`, then runs
 into a virtual environment when testing without an installed Beepa runtime.
 The CI workflow pins Node/Python versions and records actual runtime versions.
 
+## Live propagation probe (operator's own account only)
+
+`python3 tests/integration/probe_propagation.py --i-am-sending-real-imessages`
+sends ONE canary iMessage from the operator to their own handle (the
+self-chat mapped in `imessage/state.db`) and times every hop with budgets
+(daemon 30s, local echo 60s, master 90s). It addresses no other chat, changes
+no setting, and prints only its own canary text. Exit 1 = a hop missed its
+budget. Not part of `tests/run.py`; run it after any change to the iMessage
+daemon, the uplink, or the Synapse stacks.
+
 ## Disposable integration
 
 `tests/integration/run.sh` creates BOTH local and master Synapse/PostgreSQL

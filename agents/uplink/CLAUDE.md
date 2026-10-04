@@ -359,3 +359,22 @@ See `tests/CLAUDE.md`.
 7. Run the full integration suite after any change here (see
    `tests/CLAUDE.md`) — this daemon has no meaningful "does it look right"
    check short of the real two-homeserver scenarios.
+
+## F0 propagation baseline (2026-10-03)
+
+- **Hop stamp.** Every mirrored message carries `com.jkali.hops` =
+  `{local_ts, uplink_ts}` (the local hs's `origin_server_ts` and this daemon's
+  forward time); the master adds its own `origin_server_ts`. Diagnostics
+  only: stripped from inbound content before stamping, never read by any gate.
+- **No head-of-line blocking in delivery.** `deliver_pending` retires a
+  redacted/hollow message with `error='redacted'` (the redaction itself is
+  its own forwarded event) and records a definitive master 4xx (not 429) on
+  that ONE event as `error='master_http_<code>'` (counter
+  `meta.delivery_refused_count`) instead of re-raising; 429/5xx/transport
+  errors still raise so the stage backs off and retries the same event.
+  Found live: one redacted event held 66 events behind it for five days.
+  Regression: `tests/unit/uplink_durable_sync.test.py::test_hollow_or_refused_event_never_blocks_the_queue`.
+- **Probe.** `tests/integration/probe_propagation.py` sends one canary to the
+  operator's OWN iMessage handle and times app→daemon→Messages, Messages→
+  daemon→local hs (checks the echo renders as sent) and local→uplink→master.
+  On demand only (`--i-am-sending-real-imessages`); never in `tests/run.py`.

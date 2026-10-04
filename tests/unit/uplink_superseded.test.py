@@ -80,12 +80,16 @@ try:
     inbound = {"type": "m.room.message", "event_id": "$in", "sender": "@whatsapp_555:localhost",
                "origin_server_ts": now, "content": {"msgtype": "m.text", "body": "hi",
                "com.jkali.origin_avatar": "mxc://attacker.example/x", "com.jkali.from_proposal": "$p",
-               "com.jkali.auto_sent_from_proposal": "$p"}}
+               "com.jkali.auto_sent_from_proposal": "$p", "com.jkali.hops": {"forged": 1}}}
     try: fw._forward_message("!t:localhost", "!m:master", "whatsapp", inbound)
     except Exception: pass
     check("inbound origin_avatar stripped", "com.jkali.origin_avatar" not in captured)
     check("inbound from_proposal stripped on non-from_me", "com.jkali.from_proposal" not in captured)
     check("inbound auto_sent_from_proposal stripped on non-from_me", "com.jkali.auto_sent_from_proposal" not in captured)
+    # F0 hop stamp: ours, replacing any inbound copy; carries the local server
+    # time and this daemon's forward time (the master adds its own ts).
+    hops = captured.get("com.jkali.hops")
+    check("hops stamped", isinstance(hops, dict) and hops.get("local_ts") == now and isinstance(hops.get("uplink_ts"), int))
 
     # ... and a from_me message keeps the teammate's own stamps (the avatar key
     # is ours alone and is stripped on every path).

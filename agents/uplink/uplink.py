@@ -164,6 +164,7 @@ SUPERSEDED_SCAN_LIMIT = 10                  # D2-12: newest local messages to in
 READ_STATE_TYPE = "com.jkali.read_state"    # mirror-room state the uplink owns (read state)
 ORIGIN_AVATAR_KEY = "com.jkali.origin_avatar"
 FROM_PROPOSAL_KEY = "com.jkali.from_proposal"
+HOPS_KEY = "com.jkali.hops"                 # F0: per-hop timestamps on mirrored events
 # Bridge bot mxids from the shared catalog (already imported above) — a bot's
 # own read receipt is never a person reading.
 SOURCE_BOT_MXIDS = frozenset(s["botMxid"] for s in SOURCES if s.get("botMxid"))
@@ -1481,6 +1482,10 @@ class Uplink(durable_sync.DurableSync):
         # and keep the teammate-authored ones only on a message the from_me gate
         # owns.
         content.pop(ORIGIN_AVATAR_KEY, None)
+        # F0 hop stamp (read-only diagnostics): when the local hs accepted the
+        # event and when this daemon forwarded it; the master adds its own
+        # origin_server_ts. Ours alone — any inbound copy is replaced.
+        content[HOPS_KEY] = {"local_ts": ev.get("origin_server_ts"), "uplink_ts": int(time.time() * 1000)}
         if content.get(FROM_ME_KEY) is not True:
             content.pop(FROM_PROPOSAL_KEY, None)
             content.pop(AUTO_SENT_FROM_PROPOSAL_KEY, None)

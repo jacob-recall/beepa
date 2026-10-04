@@ -120,6 +120,51 @@ class DurableSyncTests(unittest.TestCase):
         self.u.deliver_pending()
         self.assertFalse(any('/send/' in p for _, p, _ in self.calls))
 
+    def test_hollow_or_refused_event_never_blocks_the_queue(self):
+        """F0 (2026-10-03): one redacted event at the head of pending_events kept
+        66 events behind it stuck for days — the master refused the empty message
+        with 4xx and the ordered loop re-raised every pass. A redacted/hollow
+        event is retired with error='redacted'; a definitive 4xx on one event is
+        recorded on that event only; the rest of the queue still delivers."""
+        self.seed()
+        redacted = dict(event_id='$redacted', type='m.room.message', sender='@alice:local',
+                        origin_server_ts=1, content={}, redacted_because={'type': 'm.room.redaction'})
+        bad = message('$bad', 2); bad['content']['body'] = 'master-refuses'
+        good = message('$good', 3)
+        self.events = {'$redacted': redacted, '$bad': bad, '$good': good}
+        base_master = self.master
+        def master(method, path, body=None, query=None, **kw):
+            if '/send/' in path and isinstance(body, dict) and body.get('body') == 'master-refuses':
+                self.calls.append((method, path, body))
+                raise urllib.error.HTTPError('', 400, 'bad', {}, io.BytesIO(b'{}'))
+            return base_master(method, path, body, query, **kw)
+        self.u.master = master
+        self.u.enqueue_events(ROOM, MIRROR, [redacted, bad, good])
+        self.u.deliver_pending()          # must not raise
+        sent = [urllib.parse.unquote(p.rsplit('/', 1)[1]) for _, p, _ in self.calls if '/send/' in p]
+        self.assertEqual(sent, ['uplink_$bad', 'uplink_$good'], 'hollow event never forwarded; good one still delivered')
+        rows = dict(self.u.db.execute('SELECT local_event_id, error FROM pending_events').fetchall())
+        self.assertEqual(rows, {'$redacted': 'redacted', '$bad': 'master_http_400'})
+        self.assertEqual(self.u.meta_get('delivery_refused_count'), '1')
+        self.assertEqual(self.u.sync_health()['delivery_refused'], 1)
+        # the redaction OF the retired event cannot wait forever for a target that will never deliver
+        redaction = dict(event_id='$redaction', type='m.room.redaction', sender='@alice:local', origin_server_ts=5, redacts='$redacted', content={})
+        self.events['$redaction'] = redaction
+        self.u.enqueue_events(ROOM, MIRROR, [redaction])
+        self.u.deliver_pending()
+        self.assertEqual(self.u.db.execute("SELECT error FROM pending_events WHERE local_event_id='$redaction'").fetchone()[0], 'missing_relation_target')
+        # a 5xx still raises so the stage backs off and retries the same event
+        flaky = message('$flaky', 4); self.events['$flaky'] = flaky
+        def master500(method, path, body=None, query=None, **kw):
+            if '/send/' in path:
+                raise urllib.error.HTTPError('', 502, 'bad gateway', {}, io.BytesIO(b'{}'))
+            return base_master(method, path, body, query, **kw)
+        self.u.master = master500
+        self.u.enqueue_events(ROOM, MIRROR, [flaky])
+        with self.assertRaises(urllib.error.HTTPError):
+            self.u.deliver_pending()
+        self.assertEqual(self.u.db.execute("SELECT error FROM pending_events WHERE local_event_id='$flaky'").fetchone()[0], None)
+
     def test_epoch_change_invalidates_archive_not_direct_ledger(self):
         self.link['master_data_epoch'] = 'original-1'
         self.assertTrue(self.u.refresh_master_config())

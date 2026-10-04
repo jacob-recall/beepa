@@ -8,6 +8,7 @@ export function syncHealthText(health, now = Date.now()) {
     ['pending_events', 'messages queued'], ['proposal_pending', 'Direct requests queued'], ['media_retry', 'attachments retrying'],
     ['history_pages_pending', 'history scans pending'], ['revocations_pending', 'sharing changes pending'],
     ['retired_revocations_pending', 'previous connection changes pending'],
+    ['delivery_refused', 'messages the organization server refused (kept, not retried)'],
   ].filter(([key]) => Number.isFinite(health[key]) && health[key] > 0)
     .map(([key, label]) => `${Math.floor(health[key])} ${label}`);
   const parts = [age > 120 ? 'Sync status is stale; the background service may be stopped.' : 'Background sync is reporting.'];

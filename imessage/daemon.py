@@ -185,6 +185,10 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
     DB.execute("UPDATE outbound_event SET state='ambiguous', reason='restart_during_dispatch' "
                "WHERE state='dispatching'")
     DB.execute("UPDATE outbound_event SET state='retryable' WHERE state='processing'")
+    # One-time relabel (2026-10-03): non-send events used to be journaled as
+    # refused/ignored_or_invalid; they are terminal non-sends, not refusals.
+    DB.execute("UPDATE outbound_event SET state='ignored', reason='not_a_send' "
+               "WHERE state='refused' AND reason='ignored_or_invalid'")
     DB.commit()
     os.chmod(db_path, 0o600)
     _rate.clear()
@@ -1317,7 +1321,11 @@ def handle_command(ev, room_id, content):
     # (zero engine call, nothing logged from the body).
 
 # ---------------------------------------------------------------- durable outbound receipts
-TERMINAL_OUTCOMES = {"confirmed", "refused", "ambiguous"}
+# "ignored" = the event was never a send (a management-room command, a state
+# event, a non-owner sender): terminal, but not a refusal. Before 2026-10-03
+# these were filed as refused/ignored_or_invalid, which made /health read as
+# "144 refused sends" when zero real sends had failed.
+TERMINAL_OUTCOMES = {"confirmed", "refused", "ambiguous", "ignored"}
 
 
 def delivery_status():
@@ -1391,7 +1399,7 @@ def process_outbound_event(ev):
             handle_event(ev)
             state = outbound_get(event_id)[0]
             if state == "processing":
-                outbound_set("refused", "ignored_or_invalid")
+                outbound_set("ignored", "not_a_send")
         except Exception as e:
             previous = outbound_get(event_id)
             if previous[0] not in TERMINAL_OUTCOMES:

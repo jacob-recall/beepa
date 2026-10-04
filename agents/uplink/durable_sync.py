@@ -506,17 +506,44 @@ class DurableSync:
                     continue
                 raise
             content = event.get('content') or {}
+            # A redacted message has empty content; the master refuses an empty
+            # m.room.message with 4xx, and because this loop is ordered, one such
+            # event at the head of the queue used to block every event behind it
+            # (observed 2026-10-03: 66 events stuck for five days). The redaction
+            # itself is forwarded as its own event, so the hollow original is
+            # simply retired here. Never forwarded, never dropped silently.
+            redacted = bool(event.get('redacted_because') or (event.get('unsigned') or {}).get('redacted_because'))
+            hollow = event.get('type') == 'm.room.message' and not isinstance(content.get('msgtype'), str)
+            if redacted or hollow:
+                self.db.execute("UPDATE pending_events SET error='redacted' WHERE master_room_id=? AND local_event_id=?", (master_room, event_id))
+                self.db.commit()
+                continue
             relation = content.get('m.relates_to') or {}
             target = (event.get('redacts') or content.get('redacts') if event.get('type') == 'm.room.redaction'
                       else relation.get('event_id') if relation.get('rel_type') == 'm.replace' else None)
             if target and not self.delivery_for(master_room, target):
-                known = self.db.execute('SELECT 1 FROM pending_events WHERE master_room_id=? AND local_event_id=?', (master_room, target)).fetchone()
+                # A target that was itself retired (error set) will never deliver,
+                # so a redaction/edit of it must not wait forever at priority 20.
+                known = self.db.execute('SELECT 1 FROM pending_events WHERE master_room_id=? AND local_event_id=? AND error IS NULL', (master_room, target)).fetchone()
                 discovering = self.db.execute("SELECT 1 FROM history_jobs WHERE master_room_id=? AND status='discover'", (master_room,)).fetchone()
                 self.db.execute('UPDATE pending_events SET priority=20,error=? WHERE master_room_id=? AND local_event_id=?',
                                 (None if known or discovering else 'missing_relation_target', master_room, event_id))
                 self.db.commit()
                 continue
-            self.forward_events(room, master_room, [event])
+            try:
+                self.forward_events(room, master_room, [event])
+            except urllib.error.HTTPError as exc:
+                # Per-event isolation: a definitive master refusal (4xx other than
+                # 429) is recorded on THIS event and the queue moves on; transport
+                # failures, 429 and 5xx still raise so the stage backs off and
+                # retries the same event. Hash-free: only the status code is kept.
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    self.db.execute("UPDATE pending_events SET error=? WHERE master_room_id=? AND local_event_id=?",
+                                    ('master_http_%d' % exc.code, master_room, event_id))
+                    self.db.commit()
+                    self.meta_set('delivery_refused_count', str(int(self.meta_get('delivery_refused_count') or 0) + 1))
+                    continue
+                raise
             if not self.delivery_for(master_room, event_id):
                 continue
             self.db.execute('DELETE FROM pending_events WHERE master_room_id=? AND local_event_id=?', (master_room, event_id))
@@ -592,11 +619,15 @@ class DurableSync:
         counts = {}
         for table in ('pending_events', 'proposal_pending', 'media_retry'):
             counts[table] = self.db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
+        # Retired rows (error set) are reported under delivery_incomplete below,
+        # not as queued work — otherwise a retired redaction reads as "stuck".
+        counts['pending_events'] = self.db.execute('SELECT count(*) FROM pending_events WHERE error IS NULL').fetchone()[0]
         counts['history_pages_pending'] = self.db.execute("SELECT count(*) FROM history_jobs WHERE status='discover'").fetchone()[0]
         counts['history_incomplete'] = self.db.execute("SELECT count(*) FROM history_jobs WHERE status='incomplete'").fetchone()[0]
         counts['revocations_pending'] = self.db.execute("SELECT count(*) FROM mirror_lifecycle WHERE status='revoking'").fetchone()[0]
         counts['retired_revocations_pending'] = self.db.execute('SELECT count(*) FROM retired_mirrors').fetchone()[0]
         counts['delivery_incomplete'] = self.db.execute('SELECT count(*) FROM pending_events WHERE error IS NOT NULL').fetchone()[0]
+        counts['delivery_refused'] = int(self.meta_get('delivery_refused_count') or 0)   # F0: master 4xx on single events
         counts['last_ingestion'] = int(self.meta_get('last_ingestion_success') or 0) or None
         counts['last_delivery'] = int(self.meta_get('last_delivery_success') or 0) or None
         oldest = self.db.execute('SELECT min(origin_ts) FROM pending_events').fetchone()[0]

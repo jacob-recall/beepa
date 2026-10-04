@@ -233,3 +233,21 @@ candidate under a default; default write is merge-over-fresh-read; the bulk
 list; docs rewritten where they state "joining is membership, not sharing".
 Plus a persistent banner whenever the default is not private, so an account
 holder can always see and revert it.
+
+## 7. Amendment (2026-10-03): schedule send — security review
+
+**Verdict: PROCEED WITH FIXES.** The design keeps the daemon as the one
+machine sender, but the review names it honestly: the daemon now has **two
+send paths**. Direct auto-send is bounded by a live manager-identity and
+consent read at dispatch; a scheduled send is bounded by a durable record of
+the teammate's own intent that later checks can only weaken (hold or refuse),
+never strengthen. Required and adopted:
+
+| # | Requirement |
+|---|---|
+| 1 | A separate `_scheduled_send_gate` and dispatcher; no sender switch inside the Direct gate. Gate order S-1…S-11: fire-time re-read authorship (sender + type + room), cancel point-read fail-closed to hold, send-grade sanitize, fire window (late ⇒ held, never a late silent fire), 30-day horizon, target = persisted non-space source attribution (not the mirror set, which would forbid private rooms; never the proposals room or a mirror), shared rate cap, superseded anchored on the server timestamp, intent before dispatch, one outcome record with the pre/post failure split, hash-only audit. |
+| 2 | Separate storage; a static test that no daemon code writes a `scheduled_send` event (the event type is the only thing separating teammate-authored schedules from manager content the daemon transcribes). |
+| 3 | Manager-timed Direct re-reads the master event and re-runs all twelve existing gates at fire time (freshness anchored on `send_at`), plus link-active, not-suspended, no-prior-outcome; any failure files the ordinary draft; 24 h horizon; no implicit withdrawal. |
+| 4 | The teammate-scheduled stage runs above the master-connectivity gate so an unlinked or offline-master install still fires its owner's message. |
+| 5 | Cancel is a state event keyed by the scheduled event id; a failed cancel read holds the send. |
+| 6–12 | Own scheduled sends exempt from the superseded check only when evaluating another teammate schedule, never a manager proposal; arm from the existing local sync before the cursor advances; outcomes as content-classified events with ids and timestamps only; same `!`-command refusal and 4000-char clamp in the UI; per-pass burst cap; scheduler counters in health; clock-skew refusal in the browser is UX, not a boundary. |

@@ -104,3 +104,15 @@ hourly passive probe sends nothing. Four P4 advisories, one fixed
   a trend rather than a complaint.
 - Teammates' machines (David, Elliot) still run the pre-fix uplink. Not
   touched per instruction.
+
+## Owner account policy change (2026-10-03, 22:12)
+
+Per the product owner's decision (spec §6), the owner's account was set to
+`default_level: direct` and all 565 attributed conversation rooms that were not
+already Direct were pinned with an explicit `direct` override (same account-data
+writes the app performs; 572 rooms attributed, spaces excluded; Google Messages
+540, Discord 26, iMessage 6). The uplink's next reconcile reported
+`create=566` and began creating mirror rooms on the master. Teammates'
+accounts were not touched; the owner deploys to them separately. The
+unattended invite stage stays inert on this machine until the teammate app
+is reloaded once (server-side ack 404 at the time of writing).

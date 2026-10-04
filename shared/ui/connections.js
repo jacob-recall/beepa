@@ -187,13 +187,41 @@ function updateCardStatus(logins, pillId, discId) {
 
 // ---- iMessage Connections card (Phase 2 B2 / P2.5) ----
 // Renders the bot's plain-text checklist reply via sanitize + textContent.
+// F0: the daemon's `status` reply ends with "Delivery journal: {json}". Turn
+// that into one readable health line (counts + relative times only). Pure;
+// returns null when the line is not the journal or is malformed.
+function imsgHealthLine(line, now) {
+  if (typeof line !== 'string' || line.indexOf('Delivery journal:') !== 0) return null;
+  let j;
+  try { j = JSON.parse(line.slice('Delivery journal:'.length).trim()); } catch (e) { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const out = (j.outbound && typeof j.outbound === 'object') ? j.outbound : {};
+  const n = (k) => (typeof out[k] === 'number' ? out[k] : 0);
+  const rel = (ts) => {
+    if (typeof ts !== 'number' || !ts) return 'never';
+    const d = Math.max(0, now / 1000 - ts);
+    return d < 60 ? Math.round(d) + 's ago' : d < 3600 ? Math.round(d / 60) + 'm ago' : d < 86400 ? Math.round(d / 3600) + 'h ago' : Math.round(d / 86400) + 'd ago';
+  };
+  const parts = ['Sends: ' + n('confirmed') + ' confirmed'];
+  if (n('refused')) parts.push(n('refused') + ' refused');
+  if (n('retryable')) parts.push(n('retryable') + ' retrying');
+  if (n('ambiguous')) parts.push(n('ambiguous') + ' uncertain');
+  parts.push('last send ' + rel(j.last_outbound_ts));
+  parts.push('last inbound ' + rel(j.last_inbound_ts));
+  if (typeof j.chats_mapped === 'number') parts.push(j.chats_mapped + ' chats');
+  return parts.join(' · ');
+}
+
 function updateImsgCard(rawBody) {
   const ul = $('imsg-checklist');
   if (!ul) return;
   ul.replaceChildren();
   const clean = sanitize(rawBody);                 // keeps \n; strips controls/bidi
   const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
-  for (const line of lines) ul.appendChild(el('li', '', sanitize(line)));
+  for (const line of lines) {
+    const health = imsgHealthLine(line, Date.now());
+    ul.appendChild(el('li', health ? 'imsg-health' : '', health || sanitize(line)));
+  }
   const pill = $('imsg-status');
   if (pill) {
     // The daemon marks each permission [ok] / [--] (definitely missing) / [??]
@@ -1050,5 +1078,4 @@ function renderCommandGroups(sourceId) {
 export {
   logConsole, setButtonsDisabled, setLoginFlow, updateCardStatus, updateImsgCard, confirmModal,
   buildConnections, buildSettings, ensureConnections, ensureSettings,
-  renderSettingsTabs, renderCommandGroups, setPlatformRailHook,
-};
+  renderSettingsTabs, renderCommandGroups, setPlatformRailHook, imsgHealthLine };

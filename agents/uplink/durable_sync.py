@@ -630,7 +630,7 @@ class DurableSync:
         counts['delivery_refused'] = int(self.meta_get('delivery_refused_count') or 0)   # F0: master 4xx on single events
         counts['last_ingestion'] = int(self.meta_get('last_ingestion_success') or 0) or None
         counts['last_delivery'] = int(self.meta_get('last_delivery_success') or 0) or None
-        oldest = self.db.execute('SELECT min(origin_ts) FROM pending_events').fetchone()[0]
+        oldest = self.db.execute('SELECT min(origin_ts) FROM pending_events WHERE error IS NULL').fetchone()[0]
         counts['oldest_pending_ts'] = oldest / 1000 if oldest else None
         counts['connected'] = bool(getattr(self, '_conn_state', self.cfg.master_token)) and self.meta_get('link_disabled') != '1'
         counts['errors'] = {row[0].split(':', 1)[1]: row[1] for row in self.db.execute(
@@ -647,3 +647,40 @@ class DurableSync:
         self.meta_set('sync_health', json.dumps(health))
         self.local('PUT', '/_matrix/client/v3/user/' + q(self.cfg.local_user)
                    + '/account_data/com.beepa.sync_health', health)
+        self.publish_health_to_master(health)
+
+    # F0: the same aggregate counters, as a STATE event this uplink owns on its
+    # own master space (com.jkali.uplink_health, state_key ''), so the manager
+    # console can show "last sync 12s ago · 0 queued · 2 refused" per teammate.
+    # Counts and timestamps only — no room ids, no bodies, no credentials.
+    # Written at most once a minute and only when something changed; any
+    # failure is swallowed (diagnostics never block delivery).
+    HEALTH_TO_MASTER_FIELDS = ('pending_events', 'proposal_pending', 'media_retry', 'history_pages_pending',
+                               'history_incomplete', 'revocations_pending', 'delivery_incomplete',
+                               'delivery_refused', 'last_ingestion', 'last_delivery', 'oldest_pending_ts',
+                               'connected', 'updated_at')
+
+    def publish_health_to_master(self, health):
+        space = getattr(self.cfg, 'master_space', '') or ''
+        if not space or not health.get('connected') or self.meta_get('link_disabled') == '1':
+            return
+        # Matrix event content is canonical JSON: no floats. Everything here is a
+        # count or a unix-seconds timestamp, so integers lose nothing.
+        payload = {k: (int(v) if isinstance(v, float) else v)
+                   for k, v in ((k, health.get(k)) for k in self.HEALTH_TO_MASTER_FIELDS) if v is not None}
+        payload['stage_errors'] = sorted((health.get('errors') or {}).keys())
+        sig = json.dumps({k: v for k, v in payload.items() if k != 'updated_at'}, sort_keys=True)
+        last_sig = self.meta_get('uplink_health_master_sig')
+        last_ts = int(self.meta_get('uplink_health_master_ts') or 0)
+        if sig == last_sig and time.time() - last_ts < 300:
+            return
+        if time.time() - last_ts < 60:
+            return
+        try:
+            self.master('PUT', '/_matrix/client/v3/rooms/' + q(space) + '/state/com.jkali.uplink_health/', payload, timeout=15)
+            self.meta_set('uplink_health_master_sig', sig)
+            self.meta_set('uplink_health_master_ts', str(int(time.time())))
+            log.info('uplink health published to master space')
+        except Exception as exc:               # noqa: BLE001 — diagnostics only; type name + status, never the body
+            log.info('uplink health not published (%s%s)', type(exc).__name__,
+                     (' %s' % getattr(exc, 'code', '')) if getattr(exc, 'code', None) else '')

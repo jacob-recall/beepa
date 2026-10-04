@@ -263,3 +263,10 @@ exercises `groupByProfile()`. See `tests/CLAUDE.md`.
   Search nav is gone (`navTo('search')` redirects to Recent).
 - **From-chip**: cross-teammate rows mark whose account a row belongs to with
   an initials chip (`fromChip`, tooltip = full name) instead of a text badge.
+- **F0 health (2026-10-03).** `com.jkali.uplink_health` on a verified
+  teammate space is parsed by `parseUplinkHealth` (whitelisted numeric/boolean
+  fields only) into `MS.healthByUser`; `healthText()` renders it in the list
+  title and the rail tooltip (red dot when stale/disconnected/refusing). The
+  room header's read line adds "mirror lag" from each mirrored message's
+  `com.jkali.hops` stamp (`hopLagMs`). Display only; nothing here is trusted
+  for any decision.

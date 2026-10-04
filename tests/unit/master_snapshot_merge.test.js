@@ -5,7 +5,7 @@
 // state_key with tombstones, corrections accumulate, left rooms drop.
 // Run: node tests/unit/master_snapshot_merge.test.js
 import assert from 'node:assert/strict';
-import { parseSnapshot } from '../../apps/master/main.js';
+import { parseSnapshot, healthText, hopLagMs } from '../../apps/master/main.js';
 
 const create = { type: 'm.room.create', state_key: '', sender: '@david:master', content: { 'com.jkali.mirror_of': '!local:localhost' } };
 const full = { rooms: { join: {
@@ -75,4 +75,19 @@ assert.equal('!gone:master' in merged, false, 'left room dropped');
 const older = parseSnapshot({ rooms: { join: { '!a:master': { timeline: { events: [
   { type: 'm.room.message', event_id: '$0', origin_server_ts: 10, content: { msgtype: 'm.text', body: 'old' } }] } } } } }, merged);
 assert.equal(older['!a:master'].lastBody, 'second');
+
+// F0: uplink health rides on the space as state; mirror lag comes from the hop stamp.
+const h = parseSnapshot({ rooms: { join: { '!space:master': { timeline: { events: [
+  { type: 'com.jkali.uplink_health', state_key: '', content: { pending_events: 3, delivery_refused: 1, updated_at: 1000, connected: true, stage_errors: ['delivery'], room_id: 'never kept' } },
+] } } } } }, base);
+assert.deepEqual(h['!space:master'].uplinkHealth.stage_errors, ['delivery']);
+assert.equal(h['!space:master'].uplinkHealth.room_id, undefined, 'only whitelisted fields survive');
+assert.equal(healthText(h['!space:master'].uplinkHealth, 1030 * 1000), 'synced 30s ago · 3 queued · 1 refused · retrying delivery');
+assert.equal(healthText(h['!space:master'].uplinkHealth, 2000 * 1000), 'sync STALE (17m ago) · 3 queued · 1 refused · retrying delivery');
+assert.equal(healthText(null, 0), 'no sync report yet');
+const lagged = parseSnapshot({ rooms: { join: { '!a:master': { timeline: { events: [
+  { type: 'm.room.message', event_id: '$h', origin_server_ts: 10350, content: { msgtype: 'm.text', body: 'x', 'com.jkali.hops': { local_ts: 10000, uplink_ts: 10100 } } },
+] } } } } }, h);
+assert.equal(lagged['!a:master'].lastLagMs, 350);
+assert.equal(hopLagMs({ origin_server_ts: 5, content: { 'com.jkali.hops': { local_ts: 10 } } }), null, 'negative lag is implausible');
 console.log('master_snapshot_merge.test.js: ok');

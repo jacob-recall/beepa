@@ -147,6 +147,20 @@ class DurableSyncTests(unittest.TestCase):
         self.assertEqual(rows, {'$redacted': 'redacted', '$bad': 'master_http_400'})
         self.assertEqual(self.u.meta_get('delivery_refused_count'), '1')
         self.assertEqual(self.u.sync_health()['delivery_refused'], 1)
+        self.assertEqual(self.u.sync_health()['pending_events'], 0, 'retired rows are not queued work')
+        self.assertIsNone(self.u.sync_health()['oldest_pending_ts'], 'retired rows do not age the queue')
+        # master copy of health: canonical JSON (no floats), counts only, written once per change
+        self.u.cfg.master_space = '!space:master'
+        self.u._conn_state = True
+        health = dict(self.u.sync_health(), updated_at=1000, oldest_pending_ts=1790724603.027)
+        self.u.publish_health_to_master(health)
+        puts = [(p, b) for m, p, b in self.calls if '/state/com.jkali.uplink_health/' in p]
+        self.assertEqual(len(puts), 1)
+        self.assertNotIn(float, {type(v) for v in puts[0][1].values()})
+        self.assertEqual(puts[0][1]['oldest_pending_ts'], 1790724603)
+        self.assertNotIn('errors', puts[0][1]); self.assertEqual(puts[0][1]['stage_errors'], [])
+        self.u.publish_health_to_master(health)
+        self.assertEqual(len([1 for m, p, b in self.calls if '/state/com.jkali.uplink_health/' in p]), 1, 'unchanged health is not re-written')
         # the redaction OF the retired event cannot wait forever for a target that will never deliver
         redaction = dict(event_id='$redaction', type='m.room.redaction', sender='@alice:local', origin_server_ts=5, redacts='$redacted', content={})
         self.events['$redaction'] = redaction

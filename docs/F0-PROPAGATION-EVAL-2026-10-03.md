@@ -53,10 +53,20 @@ process start, not Beepa.
 After restarting the uplink the queue went 66 → 14 within twenty seconds and
 to the single retired redacted row within two minutes.
 
+## Health surfaces added the same evening
+
+- Manager console: per-teammate uplink health from `com.jkali.uplink_health`
+  on the teammate's space ("synced 12s ago · 0 queued · 2 refused", red dot
+  when stale/disconnected), and "mirror lag" in the conversation header from
+  the hop stamps. First write failed with HTTP 400 because one field was a
+  float — Matrix event content is canonical JSON — now cast to int.
+- Teammate app: the iMessage daemon's `status` reply now carries last send,
+  last inbound and chats mapped; the Settings card renders it as one line
+  ("Sends: 7 confirmed · last send 2m ago · last inbound 1m ago · 6 chats").
+  The uplink line gained "messages the organization server refused".
+
 ## Not yet done (F0 remainder)
 
-- Health panel in the teammate app does not yet show the daemon's `/health`
-  (its port is outside the app's CSP) or the uplink's refused-delivery count.
 - New-conversation discovery while the browser is closed (uplink accepting
   bridge invites through a Python port of the invite gate) — security review
   first.

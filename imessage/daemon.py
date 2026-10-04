@@ -1333,7 +1333,14 @@ def delivery_status():
         pending = dict(DB.execute("SELECT status,COUNT(*) FROM inbound_pending GROUP BY status"))
         outbound = dict(DB.execute("SELECT state,COUNT(*) FROM outbound_event GROUP BY state"))
         refused = DB.execute("SELECT COUNT(*) FROM inbound_component WHERE status LIKE 'refused%' ").fetchone()[0]
+        last_out = DB.execute("SELECT max(updated) FROM outbound_event WHERE state='confirmed'").fetchone()[0]
+        # Inbound: the newest per-chat cursor the poller advanced (engine ms timestamps).
+        last_in = DB.execute("SELECT max(CAST(v AS INTEGER)) FROM meta WHERE k LIKE 'cursor:%'").fetchone()[0]
+        chats = DB.execute("SELECT count(*) FROM map").fetchone()[0]
     return {"inbound": pending, "inbound_refused_components": refused, "outbound": outbound,
+            "last_outbound_ts": int(last_out) if last_out else None,
+            "last_inbound_ts": int(last_in / 1000) if last_in else None,
+            "chats_mapped": chats,
             "confirmed_means": "engine acceptance; not recipient delivery"}
 
 

@@ -130,3 +130,7 @@
 
 #list-status { font-size: 12px; padding: 0 2px; }
 #list-status.error { color: #ea0038; }
+
+.list-title-sub.health { font-size: 11px; }
+.list-title-sub.health.warn { color: #c9810a; }
+.teammate-rail-btn .warn-dot { position: absolute; left: 4px; top: 4px; width: 8px; height: 8px; border-radius: 50%; background: #d64545; }

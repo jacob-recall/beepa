@@ -128,6 +128,7 @@ const MS = {
   skippedUnverified: { spaces: 0, children: 0 },
   hidden: new Set(),   // teammate labels this browser omits from lists
   names: new Map(),    // teammate label -> display name this browser shows (convenience)
+  healthByUser: new Map(), // teammate label -> uplink health (com.jkali.uplink_health on their space)
 };
 
 let roomEpoch = 0;
@@ -265,7 +266,43 @@ function freshRoomInfo(rid) {
            lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
            profileId: null, profileDisplayName: null, createSender: null,
            isContacts: false, contacts: [], contactsByKey: {}, shareLevelContent: null,
-           readState: null, avatarByEvent: null, timestampCorrections: new Map() };
+           readState: null, avatarByEvent: null, timestampCorrections: new Map(),
+           uplinkHealth: null, lastLagMs: null };
+}
+
+// F0: health the teammate's uplink publishes on its own space (counts and
+// timestamps only). Whitelisted numeric/boolean fields; nothing else is kept.
+const HEALTH_NUM = ['pending_events', 'proposal_pending', 'media_retry', 'history_pages_pending', 'history_incomplete',
+  'revocations_pending', 'delivery_incomplete', 'delivery_refused', 'last_ingestion', 'last_delivery', 'oldest_pending_ts', 'updated_at'];
+function parseUplinkHealth(content) {
+  if (!content || typeof content !== 'object') return null;
+  const h = {};
+  for (const k of HEALTH_NUM) if (typeof content[k] === 'number' && isFinite(content[k])) h[k] = content[k];
+  h.connected = content.connected === true;
+  h.stage_errors = Array.isArray(content.stage_errors) ? content.stage_errors.filter(x => typeof x === 'string').map(x => sanitizeLine(x)).slice(0, 12) : [];
+  return h;
+}
+// One line for a teammate's uplink health. `now` in ms. Pure.
+function healthText(h, now) {
+  if (!h || typeof h.updated_at !== 'number') return 'no sync report yet';
+  const age = Math.max(0, Math.round(now / 1000 - h.updated_at));
+  const parts = [age > 180 ? 'sync STALE (' + Math.round(age / 60) + 'm ago)' : 'synced ' + age + 's ago'];
+  if (h.connected === false) parts.push('disconnected');
+  if (h.pending_events) parts.push(h.pending_events + ' queued');
+  if (h.delivery_refused) parts.push(h.delivery_refused + ' refused');
+  if (h.history_pages_pending) parts.push('history catching up');
+  if (h.stage_errors && h.stage_errors.length) parts.push('retrying ' + h.stage_errors.join(', '));
+  return parts.join(' · ');
+}
+// Mirror lag of one mirrored event from its hop stamp: master server time minus
+// the local server time the uplink stamped. null when absent or implausible.
+function hopLagMs(ev) {
+  const hops = ev && ev.content && ev.content['com.jkali.hops'];
+  const lt = hops && hops.local_ts;
+  const mt = ev && ev.origin_server_ts;
+  if (typeof lt !== 'number' || typeof mt !== 'number') return null;
+  const lag = mt - lt;
+  return (lag >= 0 && lag < 86400000) ? lag : null;
 }
 
 // Apply one /sync room section (full OR incremental delta) onto an info
@@ -322,6 +359,7 @@ function applyRoom(info, r) {
       info.readState = { teammate_read_ts: Number(e.content.teammate_read_ts) || 0,
                          remote_read_ts: Number(e.content.remote_read_ts) || 0 };
     }
+    if (e.type === 'com.jkali.uplink_health' && e.state_key === '') info.uplinkHealth = parseUplinkHealth(e.content);
     // m.space.child: non-empty content links, empty content unlinks (revocation).
     if (e.type === 'm.space.child' && e.state_key) {
       if (e.content && Object.keys(e.content).length) info.childSet[e.state_key] = true;
@@ -341,6 +379,8 @@ function applyRoom(info, r) {
     if (!resolved) continue;
     const ts = mirrorTs(ev, info.timestampCorrections);
     if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; }
+    const lag = hopLagMs(ev);
+    if (lag !== null) info.lastLagMs = lag;
   }
   return info;
 }
@@ -506,11 +546,15 @@ function buildByUser(rooms) {
   for (const r of Object.values(rooms)) if (r.isSpace) skipped.spaces++;
   skipped.spaces -= accepted.length;      // every space the identity gate refused
 
+  const healthByUser = new Map();
   for (const { label, space } of accepted) {
     // Same-label spaces MERGE into one rail entry (never overwrite): a second
     // verified space for the same teammate adds its conversations rather than
     // replacing the first one's.
     const convos = byUser.get(label) || [];
+    if (space.uplinkHealth && (!healthByUser.get(label) || (space.uplinkHealth.updated_at || 0) > (healthByUser.get(label).updated_at || 0))) {
+      healthByUser.set(label, space.uplinkHealth);
+    }
     for (const childId of space.children.slice().sort()) {
       const r = rooms[childId];
       if (!r) continue;                              // not in the joined set -> excluded
@@ -569,6 +613,7 @@ function buildByUser(rooms) {
   }
   MS.proposalsByUser = proposalsByUser;
   MS.proposalsRoomSet = proposalsRoomSet;
+  MS.healthByUser = healthByUser;
   MS.contacts = allContacts;
   MS.skippedUnverified = skipped;
   return byUser;
@@ -967,9 +1012,11 @@ function renderTeammateRail() {
   for (const [label, convos] of sharingUsers(MS.byUser, MS.hidden)) {
     const btn = el('button', 'navitem nav-icon teammate-rail-btn');
     btn.type = 'button';
-    btn.title = nameFor(label);
+    const ht = healthText(MS.healthByUser.get(label), Date.now());
+    btn.title = nameFor(label) + ' · ' + ht;
     btn.setAttribute('aria-label', nameFor(label));
     btn.appendChild(el('span', 'avatar avatar-sm', initials(nameFor(label))));
+    if (/STALE|disconnected|refused|retrying/.test(ht)) btn.appendChild(el('span', 'warn-dot'));
     const pending = convos.reduce((sum, c) => sum + pendingDrafts(c.drafts, c.lastTs).length, 0);
     if (pending) btn.appendChild(el('span', 'n', String(pending)));
     btn.classList.toggle('active', MS.activeView === 'teammate:' + label);
@@ -1195,7 +1242,9 @@ function renderListTitle() {
   if (view === 'recent') {
     host.appendChild(el('span', 'list-title-name', 'All shared conversations'));
     const n = visibleFeed(MS.feed, MS.hidden).length;
-    host.appendChild(el('span', 'list-title-sub muted', n + ' conversation' + (n === 1 ? '' : 's') + ' · ' + sharingUsers(MS.byUser, MS.hidden).length + ' sharing'));
+    const stale = sharingUsers(MS.byUser, MS.hidden).filter(([l]) => /STALE|no sync report|disconnected/.test(healthText(MS.healthByUser.get(l), Date.now()))).length;
+    host.appendChild(el('span', 'list-title-sub muted', n + ' conversation' + (n === 1 ? '' : 's') + ' · ' + sharingUsers(MS.byUser, MS.hidden).length + ' sharing'
+      + (stale ? ' · ' + stale + ' not syncing' : '')));
     if (search) search.placeholder = 'Search everyone’s shared chats';
     return;
   }
@@ -1210,6 +1259,9 @@ function renderListTitle() {
   sub.appendChild(document.createTextNode(convos.length + ' shared' + (nameFor(label) !== label ? ' · ' + sanitizeLine(label) : '') + ' '));
   sub.appendChild(buildUserPlatformsRow(label));
   who.appendChild(sub);
+  const health = el('span', 'list-title-sub health' + (/STALE|refused|retrying|disconnected|no sync/.test(healthText(MS.healthByUser.get(label), Date.now())) ? ' warn' : ''),
+    healthText(MS.healthByUser.get(label), Date.now()));
+  who.appendChild(health);
   host.appendChild(who);
   host.appendChild(buildTitleKebab(label, nameEl));
   if (search) search.placeholder = 'Search ' + nameFor(label) + '’s shared chats';
@@ -1303,6 +1355,7 @@ function renderRoomReadLine(rec) {
   parts.push(teammate_read_ts >= rec.lastTs && rec.lastTs > 0
     ? teammateLabel + ' has read everything'
     : teammateLabel + ' has unread messages');
+  if (typeof rec.lastLagMs === 'number') parts.push('mirror lag ' + (rec.lastLagMs < 1000 ? rec.lastLagMs + 'ms' : (rec.lastLagMs / 1000).toFixed(1) + 's'));
   line.textContent = parts.join(' · ');
 }
 
@@ -2373,7 +2426,7 @@ async function enterApp() {
 // importable outside the browser, so the one top-level DOM binding below is
 // guarded — importing under node must not touch `document`. In the browser
 // `document` always exists and behavior is unchanged.
-export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot };
+export { buildIdentifierProposalContent, latestRoomProposal, shareLevelLabel, nativeEchoGroups, roomProposals, suggestionStates, parseSnapshot, healthText, hopLagMs };
 
 if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
   $('btn-signin').addEventListener('click', async () => {

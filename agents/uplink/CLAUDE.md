@@ -374,6 +374,13 @@ See `tests/CLAUDE.md`.
   errors still raise so the stage backs off and retries the same event.
   Found live: one redacted event held 66 events behind it for five days.
   Regression: `tests/unit/uplink_durable_sync.test.py::test_hollow_or_refused_event_never_blocks_the_queue`.
+- **Health to the master.** `publish_health_to_master` writes the same
+  aggregate counters as `com.jkali.uplink_health` (state_key `''`) on this
+  uplink's own master space — counts and unix-second timestamps only, cast to
+  int (Matrix event content is canonical JSON: a float is a 400), written at
+  most once a minute and only on change, failure logged by type and status
+  only. The manager console shows it per teammate ("synced 12s ago · 0
+  queued"); it never feeds a gate.
 - **Probe.** `tests/integration/probe_propagation.py` sends one canary to the
   operator's OWN iMessage handle and times app→daemon→Messages, Messages→
   daemon→local hs (checks the echo renders as sent) and local→uplink→master.

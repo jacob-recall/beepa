@@ -2,7 +2,10 @@
 
 Run `tests/run.sh` (or the configured host-runtime Python with `tests/run.py`).
 The runner discovers every `tests/unit/*.test.py` and `*.test.js`, then runs
-114,235 deterministic/fuzz consent vectors through both real resolvers.
+114,235 deterministic/fuzz consent vectors through both real resolvers and the
+bridge-invite vectors through both real invite predicates
+(`tests/conformance/invites_conformance.py`: `apps/user/invites.js` vs
+`agents/uplink/invites.py`).
 `--unit-only` omits conformance. Install the hash-locked `requirements-host.txt`
 into a virtual environment when testing without an installed Beepa runtime.
 The CI workflow pins Node/Python versions and records actual runtime versions.

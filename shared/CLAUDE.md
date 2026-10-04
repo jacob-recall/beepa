@@ -152,6 +152,14 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
   rules: `effectiveShared()`/`effective_shared()` is the only value the
   uplink acts on, and `reason` strings are UI-only — never parse them for
   authorization.
+  **The same rule now covers a SECOND ported pair:**
+  `apps/user/invites.js` ↔ `agents/uplink/invites.py`, the bridge-invite trust
+  predicate — the browser joins invites while it is open, the uplink daemon
+  joins them while it is closed, and a drift means the unattended daemon joins
+  a room the reviewed browser gate refuses (a ghost-created portal, or a space
+  mislabelled as another source). Change both in ONE commit and run
+  `tests/conformance/invites_conformance.py` (same harness shape, same
+  node:20-alpine evaluator) alongside the consent one.
 
 ## How to run / test
 
@@ -190,7 +198,9 @@ via the running Docker stacks in `docker-compose.yml` / `master/`).
    authorization boundary / the sharing unit): update
    `agents/uplink/consent.py` in lockstep for any resolver change, and run
    both `tests/unit/consent.test.js` and `tests/unit/consent_py.test.py`
-   before considering the change done.
+   before considering the change done. The same lockstep applies to
+   `apps/user/invites.js` ↔ `agents/uplink/invites.py`
+   (`tests/unit/user_invites.test.js` + `tests/conformance/invites_conformance.py`).
 4. Touching `render.js` is security-sensitive (anti-spoof gate, render
    whitelist): a diff of `convoResolveContent()` and the `trustedFromMe`
    condition is part of any review.

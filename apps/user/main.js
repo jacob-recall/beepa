@@ -99,6 +99,31 @@ async function signOut() {
 // policy (that count comes from the shared resolver via consent.js).
 // ===========================================================================
 const AUTOJOIN_ACK_KEY = 'beepa_autojoin_ack';
+// The DAEMON's copy of the same confirm. localStorage is per browser profile and
+// the uplink cannot read it, so the affirmative confirm is ALSO written to
+// user account-data; agents/uplink's invites stage joins nothing until this
+// event says {ok:true} (fail-closed). Written on an affirmative answer only —
+// never on decline, never on render.
+const AUTOJOIN_ACK_TYPE = 'com.jkali.autojoin_ack';
+function autojoinAckPath() {
+  return '/_matrix/client/v3/user/' + encodeURIComponent(S.userId) + '/account_data/' + AUTOJOIN_ACK_TYPE;
+}
+async function writeAutojoinAck() {
+  await api('PUT', autojoinAckPath(), { ok: true, ts: Date.now() });
+}
+// One-time migration for installs that confirmed before the daemon existed:
+// localStorage already says acked and the account-data twin is absent (404), so
+// the earlier confirm was affirmative and is replayed into account-data once.
+// Any other error leaves it absent — the daemon simply keeps waiting.
+async function migrateAutojoinAck() {
+  let acked = false;
+  try { acked = localStorage.getItem(AUTOJOIN_ACK_KEY) === '1'; } catch (e) { return; }
+  if (!acked) return;
+  try { await api('GET', autojoinAckPath()); return; } catch (e) {
+    if (!e || e.status !== 404) return;
+  }
+  await writeAutojoinAck();
+}
 const AUTOJOIN_MAX_EXAMINE = 100;   // per call
 const AUTOJOIN_MAX_JOINS = 30;      // per call
 const AUTOJOIN_MAX_SESSION = 200;   // per session, across calls (anti-join-storm)
@@ -195,6 +220,9 @@ async function joinBridgeInvites() {
       return;
     }
     try { localStorage.setItem(AUTOJOIN_ACK_KEY, '1'); } catch (e) { /* re-ask next session */ }
+    // The daemon's gate: only an AFFIRMATIVE answer writes it. A failed write
+    // leaves the daemon waiting (fail-closed) — the browser still joins below.
+    try { await writeAutojoinAck(); } catch (e) { /* retried by migrateAutojoinAck */ }
   }
 
   let joined = 0;
@@ -253,9 +281,14 @@ async function enterApp() {
   catch (e) { logConsole('error', 'X management room: ' + String(e.message || e)); }
   try { runtime.linkedin.mgmtRoomId = await resolveMgmt(LI); }
   catch (e) { logConsole('error', 'LinkedIn management room: ' + String(e.message || e)); }
-  // AFTER mgmt-room resolution on purpose: resolveMgmt scans joined rooms with a
-  // GET per room, so accepting invites first would enlarge that scan, and the
-  // mgmt rooms are pinned before any newly joined room can be considered.
+  // AFTER mgmt-room resolution only as an optimization: resolveMgmt scans joined
+  // rooms with a GET per room, so accepting invites first would enlarge that
+  // scan. It is NOT what keeps a session secret out of a portal room — ordering
+  // cannot be, now that the uplink daemon joins invites while this app is
+  // closed. That guarantee is isBotDmMgmt()'s full-state check in
+  // shared/ui/sources.js (a portal carries uk.half-shot.bridge, a source space
+  // is an m.space; either marker refuses the room), plus verifyImsgMgmt()'s.
+  try { await migrateAutojoinAck(); } catch (e) { /* daemon keeps waiting; harmless */ }
   try { await joinBridgeInvites(); }
   catch (e) { /* invites stay pending; the note keeps the count visible */ }
   // New conversations from bridges that INVITE (every bridge except Google

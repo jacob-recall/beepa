@@ -275,6 +275,65 @@ eq(select_contacts_to_tombstone({A, B}, set()), [A, B],
 eq(select_contacts_to_tombstone(None, None), [], "contact-revoke: None inputs")
 
 
+# ---- a DAEMON-joined invite: membership is not sharing (invites stage) -----
+# agents/uplink's invites stage can now join a bridge portal while the browser
+# is closed. Joining is MEMBERSHIP ONLY: a freshly joined room carries no
+# com.jkali.share_override, so the explicit-only resolver answers 'private' and
+# reconcile plans no mirror. The second case is the deliberately ACCEPTED
+# consequence (finding 3): a RE-invited portal that still carries the
+# teammate's own earlier explicit override is mirrored again on the next pass —
+# that honors their prior decision for that exact conversation, and a stale
+# 'direct' re-arms auto-send for it. Both are pinned here so neither can change
+# by accident.
+import types  # noqa: E402
+import uplink as uplink_mod  # noqa: E402
+
+
+def _sync_with_joined_portal(override=None):
+    """A /sync where a source space ("WhatsApp") has one child portal room the
+    daemon has just joined, with `override` as its per-room account-data."""
+    space, portal = "!space:localhost", "!portal:localhost"
+    account_data = {"events": [{"type": "com.jkali.share_override",
+                                "content": {"state": override}}]} if override else {}
+    return {"rooms": {"join": {
+        space: {"state": {"events": [
+            {"type": "m.room.create", "state_key": "", "content": {"type": "m.space"}},
+            {"type": "m.room.name", "state_key": "", "content": {"name": "WhatsApp"}},
+            {"type": "m.space.child", "state_key": portal, "content": {"via": ["localhost"]}},
+        ]}},
+        portal: {"state": {"events": [
+            {"type": "m.room.create", "state_key": "", "content": {}},
+        ]}, "account_data": account_data},
+    }}}, portal
+
+
+def _plan_for(override):
+    u = object.__new__(uplink_mod.Uplink)
+    u.cfg = types.SimpleNamespace(local_user="@jkali:localhost")
+    u.read_policy = lambda: {}
+    u.read_profiles = lambda: {}
+    u._last_sourceless = None
+    sync, portal = _sync_with_joined_portal(override)
+    desired, _src, _join, _prof = uplink_mod.Uplink.desired_shared(u, sync)
+    return reconcile_decisions(desired, []), portal, desired
+
+
+plan_none, portal, desired_none = _plan_for(None)
+eq(desired_none[portal], "private", "daemon-joined: no override resolves private")
+eq(plan_none["create"], [], "daemon-joined room with no override -> no mirror created")
+plan_share, portal, desired_share = _plan_for("share")
+eq(desired_share[portal], "share", "re-invited portal keeps its explicit 'share'")
+eq(plan_share["create"], [portal],
+   "daemon-joined room with a pre-existing 'share' override -> mirror created")
+plan_direct, portal, desired_direct = _plan_for("direct")
+eq(desired_direct[portal], "direct",
+   "a stale 'direct' override survives a re-join (auto-send re-arms: accepted)")
+eq(plan_direct["create"], [portal], "daemon-joined 'direct' room -> mirror created")
+plan_junk, portal, desired_junk = _plan_for("shared")
+eq(desired_junk[portal], "private", "an unrecognized override still resolves private")
+eq(plan_junk["create"], [], "unrecognized override -> no mirror created")
+
+
 print("\n%d passed, %d failed" % (_pass, _fail))
 if _fail:
     sys.stderr.write("\nFailures:\n")

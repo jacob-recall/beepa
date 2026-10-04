@@ -2173,6 +2173,56 @@ def scenario_17_discord_dms():
     return True, 'Nested DM/group DM consent, authorship, timestamps, media reupload, restart catch-up without duplicates and revocation verified with synthetic Matrix events.'
 
 
+def scenario_18_daemon_joins_invite_no_mirror():
+    """The uplink accepts a bridge invite while the browser is closed, and that
+    join shares NOTHING: membership is not consent. Then the teammate shares the
+    conversation and the mirror appears on the next reconcile."""
+    environment = fresh_env('invites')
+    token = environment['tuser_tok']
+    identity = environment['tuser_id']
+    # The bridge BOT (a code-owned SOURCES[].botMxid on this server_name) creates
+    # the portal and invites the teammate, who never joins it themselves.
+    bot_id, bot_token = register_user('whatsappbot')
+    assert bot_id == '@whatsappbot:localhost', 'bot identity must match the catalog'
+    space = create_space(token, 'WhatsApp')
+    portal = local(bot_token, 'POST', '/_matrix/client/v3/createRoom',
+                   {'name': 'Contact One', 'preset': 'private_chat',
+                    'invite': [identity]})['room_id']
+    link_child(token, space, portal)
+
+    def joined():
+        return portal in local(token, 'GET', '/_matrix/client/v3/joined_rooms')['joined_rooms']
+
+    assert not joined(), 'the teammate must still only be INVITED'
+    process = start_uplink(environment)
+    try:
+        # No com.jkali.autojoin_ack yet: the ack gate is fail-closed, so the
+        # daemon joins nothing however many passes it makes.
+        wait_until(lambda: meta_get(environment['db_path'], 'last_ingestion_success'),
+                   desc='uplink first pass')
+        time.sleep(6)
+        assert not joined(), 'joined without the teammate confirm (ack gate failed open)'
+        # The teammate confirms in the app -> the daemon may join.
+        local(token, 'PUT', '/_matrix/client/v3/user/' + urllib.parse.quote(identity, safe='')
+              + '/account_data/com.jkali.autojoin_ack', {'ok': True, 'ts': 1})
+        wait_until(joined, timeout=90, desc='daemon joins the bridge invite')
+        # Joining is membership only: no override -> nothing mirrored.
+        time.sleep(6)
+        assert mirror_of(environment['db_path'], portal) is None, 'a joined room was mirrored'
+        # ...and the teammate's own explicit share is what starts the mirror.
+        post_msg(bot_token, portal, 'incoming after the daemon join')
+        set_override(token, identity, portal, 'share')
+        mirror = wait_until(lambda: mirror_of(environment['db_path'], portal),
+                            timeout=90, desc='mirror after explicit share')[0]
+        wait_until(lambda: master_messages(mirror), desc='mirrored message')
+        assert master_source_tag(mirror) == 'whatsapp'
+    finally:
+        stop_uplink(process)
+    return True, ('Daemon-side invite auto-join verified: refused without the '
+                  'teammate ack, joined after it, mirrored nothing until the '
+                  'conversation was explicitly shared.')
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2191,6 +2241,7 @@ SCENARIOS = [
     ("15_revocation_retains_history", scenario_15_revocation_retains_history),
     ("16_original_timestamps", scenario_16_original_timestamps),
     ("17_discord_dms", scenario_17_discord_dms),
+    ("18_daemon_joins_invite_no_mirror", scenario_18_daemon_joins_invite_no_mirror),
 ]
 
 

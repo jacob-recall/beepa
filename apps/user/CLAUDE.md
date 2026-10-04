@@ -116,6 +116,26 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   hand-rolled rule; it is a prompt, never an authorization decision. Declining
   leaves the invites pending. The `localStorage` flag is per-viewer
   convenience only — it gates the *prompt*, never the identity gate.
+- **The account-data twin is the DAEMON's gate, and it is a real consent
+  record.** An affirmative confirm ALSO writes user account-data
+  `com.jkali.autojoin_ack` = `{ok:true, ts}` (`writeAutojoinAck()`), and that
+  event is what `agents/uplink`'s `invites` stage requires — fail-closed,
+  `ok` must *be* `true` — before it joins anything while this app is closed.
+  Never write it on a decline and never on render. Existing installs that
+  confirmed before the daemon existed are migrated once by
+  `migrateAutojoinAck()` (localStorage says acked AND the account-data GET is
+  404 → write it); any other error leaves it absent, so those installs simply
+  stay joined-by-browser-only. The two flags have different jobs: the
+  `localStorage` one gates the *prompt* in this browser profile, the
+  account-data one authorizes *unattended* joining by the daemon.
+- **Mgmt-room resolution runs before `joinBridgeInvites()` only as an
+  optimization** (`resolveMgmt` does a GET per joined room, so joining first
+  enlarges that scan). Ordering is NOT what keeps a session secret out of a
+  bridge portal — it cannot be, now that the uplink joins invites while this
+  app is closed. That guarantee is `isBotDmMgmt()`'s full-state check in
+  `shared/ui/sources.js`: a portal carries `uk.half-shot.bridge` and a source
+  space is an `m.space`, and either marker refuses the room (plus
+  `verifyImsgMgmt()`'s marker-and-not-a-portal test for iMessage).
 - **Refusals are visible, not silent.** Invites refused on identity grounds,
   deferred by the per-pass cap, or left pending by a declined confirm are
   counted and rendered as "N pending invitation(s) not accepted"

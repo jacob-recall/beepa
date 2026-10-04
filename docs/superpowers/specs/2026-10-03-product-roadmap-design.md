@@ -179,3 +179,39 @@ Normalized on every read like `contact_profiles`. Cap 50 classes, 2000 tracked. 
 ## 5. Suggested first slice
 
 F0's probe script and health panel, then F1. Both are read-only, both make every later feature testable, and F1's indicator stack is where F2's draft badge and F4's overdue badge land.
+
+## 6. Amendment (2026-10-03, product owner): account default level, "everything Direct"
+
+**Ask.** New conversations default to Direct, and everything is Direct. The
+owner acknowledges this changes the security policy.
+
+**Decision.** Implemented as a per-account standing default that the account
+holder sets once, not as a code default. Reason: a code default of Direct
+deployed to a teammate's machine would share and auto-send every conversation
+of theirs with no choice on their side. The per-account default gives the owner
+exactly the requested behaviour on their own account while every other
+account stays at the fail-closed rule until its holder opts in.
+
+**Model change (authorization boundary; security review before, verifier
+after, conformance harness extended).**
+- `com.jkali.share_policy` gains `default_level` ∈ `private | share | direct`.
+  Absent or unrecognized ⇒ `private` (unchanged behaviour for every existing
+  account).
+- `effectiveLevel(override, policy)` / `effective_level(override, policy)`: an
+  explicit per-room override wins; when absent, the policy's `default_level`
+  applies. Reasons gain `default-share` and `default-direct` so the UI can say
+  "shared by your default" rather than "you set this".
+- The uplink's D2-5 fresh point-read reads BOTH the room override and the
+  account policy at send time, through the same function. Every other gate is
+  unchanged; D2-12 (superseded) still applies.
+- Per-room `private` still wins over a `direct` default (explicit beats default).
+
+**UI.** Settings → Sharing: "Default for new conversations" with the three
+levels; choosing Direct goes through the existing Direct risk confirm, worded
+for "every conversation you have not set individually, now and in future".
+A "Set all existing conversations to Direct" action across all sources, behind
+the existing enumerating confirm. The row/header chips show the defaulted
+level with a "default" tag.
+
+**Owner's account.** Default Direct; all existing conversations set to Direct
+explicitly. Teammates: untouched.

@@ -103,7 +103,10 @@ lives where, security invariants, and how to run/test each piece:
   into a conversation in exactly one case: a `direct`-level conversation
   auto-sends manager proposals behind D2's twelve gates. Its `consent.py` is
   a byte-parity Python port of `shared/model/consent.js` — the two must
-  never drift.
+  never drift. Its `invites` stage accepts bridge-created
+  room invites so a new conversation appears while the browser is closed —
+  membership only, behind a fail-closed `com.jkali.autojoin_ack` gate, with
+  `invites.py` a second byte-parity port (of `apps/user/invites.js`).
 - `agents/contacts/CLAUDE.md` — the teammate's durable address-book store
   (`contacts.db`, mode 600) and the hourly macOS Contacts importer
   (`import_macos.py`, JXA via `osascript`, TCC-prompted, fail-closed).

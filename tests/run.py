@@ -26,8 +26,11 @@ def main():
         if subprocess.call(command, cwd=ROOT, env=env):
             failed.append(path.name)
     if not args.unit_only:
-        if subprocess.call([sys.executable, "tests/conformance/consent_conformance.py"], cwd=ROOT, env=env):
-            failed.append("consent_conformance")
+        for harness in ("consent_conformance", "invites_conformance"):
+            print("\n==", harness, "==", flush=True)
+            if subprocess.call([sys.executable, "tests/conformance/%s.py" % harness],
+                               cwd=ROOT, env=env):
+                failed.append(harness)
     print("\nFailed: " + ", ".join(failed) if failed else "\nAll discovered checks passed.")
     return int(bool(failed))
 

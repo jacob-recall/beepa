@@ -85,6 +85,7 @@ import urllib.request
 # explicitly so `python3 agents/uplink/uplink.py` works from any cwd.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import consent            # noqa: E402
+import invites            # noqa: E402  (bridge-invite predicate, pure leaf)
 import reconcile          # noqa: E402
 import durable_sync       # noqa: E402
 
@@ -219,6 +220,35 @@ LOCAL_PROPOSALS_TOPIC = (
     "Suggested messages from the manager. Review each one and send it yourself "
     "— EXCEPT in conversations you have set to Direct, where your uplink "
     "already sent it and files the record here after the fact.")
+
+# ---- bridge-invite auto-join (the "invites" stage) ------------------------
+# The decision of WHICH invites may be accepted lives entirely in invites.py, a
+# pure leaf that is a byte-for-byte port of apps/user/invites.js — change one
+# and change the other in the SAME commit, then rerun
+# tests/conformance/invites_conformance.py. Nothing below re-implements any of
+# its checks; this module only performs the joins it returns.
+AUTOJOIN_ACK_TYPE = "com.jkali.autojoin_ack"  # LOCAL user account-data (apps/user writes it)
+INVITE_MAX_EXAMINE = 100                      # candidates inspected per pass
+INVITE_MAX_JOINS = 30                         # joins admitted per pass
+INVITE_JOIN_HOURLY = 200                      # PERSISTED rolling cap, all rooms
+INVITE_JOIN_WINDOW_S = 3600                   # rolling window for that cap
+# A hard (non-429 4xx) join failure is memoized with an exponential deadline and
+# NEVER permanently: a withdrawn-then-reissued invite must still be joinable.
+INVITE_RETRY_BACKOFF_S = (3600, 6 * 3600, 24 * 3600)
+INVITE_RETRY_MAX_S = 7 * 24 * 3600
+# apps/user/main.js's bridgeIdentities(), evaluated here: the code-owned bots and
+# their space names from the SHARED catalog, with childSpaceNames (Discord's
+# "Direct Messages" is a real m.space whose name is NOT prefixed with the source
+# spaceName). Deliberately NOT shared/source_catalog.py's SPACE_SOURCES, which
+# drops that field, nor SOURCE_LABEL_TO_ID's X="twitter" display alias.
+INVITE_SOURCE_SPACES = [
+    {"spaceName": s["spaceName"], "botMxid": s["botMxid"],
+     "childSpaceNames": list(s.get("childSpaceNames") or [])}
+    for s in SOURCES
+    if s.get("kind") == "source" and isinstance(s.get("botMxid"), str) and s["botMxid"]
+    and isinstance(s.get("spaceName"), str) and s["spaceName"]
+]
+INVITE_BOT_MXIDS = [s["botMxid"] for s in INVITE_SOURCE_SPACES]
 
 # Byte-parity with shared/matrix/client.js MXC_RE (server / media-id charset).
 MXC_RE = re.compile(r"^mxc://([A-Za-z0-9.\-:]+)/([A-Za-z0-9_-]+)$")
@@ -589,6 +619,10 @@ class Uplink(durable_sync.DurableSync):
         # D2-11: auto-send is suspended until refresh_direct_send_binding()
         # (called at the top of ensure_proposal_rooms) says otherwise.
         self._direct_suspended = True
+        # The rooms.invite section of reconcile's full /sync, handed to the
+        # invites stage that runs right after it. One snapshot, one pass.
+        self._last_invites = None
+        self._invite_ack_logged = False   # the "waiting for the confirm" line, once
 
     # -- local (read) and master (write) transports -------------------------
     def local(self, method, path, body=None, query=None, timeout=60):
@@ -643,6 +677,25 @@ class Uplink(durable_sync.DurableSync):
             "CREATE TABLE IF NOT EXISTS contact_mirror ("
             "source TEXT, network_id TEXT, mirrored_version INTEGER, "
             "master_state_key TEXT, PRIMARY KEY(source, network_id))")
+        # Bridge-invite auto-join ledger (the "invites" stage). Three NEW tables,
+        # so they belong in this CREATE-IF-NOT-EXISTS block rather than in
+        # _migrate_db(): nothing here evolves an existing table's shape, and this
+        # block runs for a brand-new AND a pre-existing db alike (SCHEMA_VERSION
+        # is only for shape changes — see _migrate_db's docstring).
+        # Hash-only, like direct_send_log: a room id names a conversation and a
+        # DM portal's name is the contact's name, so neither is ever stored here.
+        db.execute(                      # persisted rolling join-rate cap
+            "CREATE TABLE IF NOT EXISTS invite_join_log ("
+            "ts INTEGER NOT NULL, room_hash TEXT NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS invite_join_log_ts "
+                   "ON invite_join_log (ts)")
+        db.execute(                      # bounded memo of hard join failures
+            "CREATE TABLE IF NOT EXISTS invite_join_failed ("
+            "room_hash TEXT PRIMARY KEY, code INTEGER, ts INTEGER, "
+            "attempts INTEGER, next_attempt INTEGER)")
+        db.execute(                      # which rooms THIS daemon joined
+            "CREATE TABLE IF NOT EXISTS daemon_joined ("
+            "room_hash TEXT PRIMARY KEY, ts INTEGER)")
         db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         db.commit()
         Uplink._migrate_db(db)
@@ -871,6 +924,148 @@ class Uplink(durable_sync.DurableSync):
         return self.local("GET", "/_matrix/client/v3/sync",
                            query={"filter": flt, "timeout": "0"}, timeout=120)
 
+    # -- invites: accept bridge-created portal invites while the app is shut --
+    #
+    # The bridges create a room per conversation and INVITE the teammate. Until
+    # now only the browser app accepted those, so a new conversation stayed
+    # invisible until someone opened the hub. This stage does the same thing,
+    # under the SAME predicate (invites.py == apps/user/invites.js), from the
+    # daemon.
+    #
+    # Joining is MEMBERSHIP, not a send and not a share: a joined room has no
+    # com.jkali.share_override, so both consent resolvers answer 'private' and
+    # nothing is mirrored. See CLAUDE.md for the two consequences that are
+    # deliberately accepted (a re-invited portal that still carries an OLD
+    # explicit override, and source-space joins making rooms attributable).
+    #
+    # LOGGING RULE for everything on this path: counts only. Never log
+    # m.room.name (a DM portal's name is the contact's name; a source space's
+    # name contains the teammate's phone number), never a sender mxid (a ghost
+    # mxid embeds a phone number), never a room id. If a per-room line is ever
+    # needed, use _room_hash(rid).
+    def autojoin_acked(self):
+        """FAIL-CLOSED ack gate: has the teammate confirmed auto-join in the app?
+
+        apps/user writes com.jkali.autojoin_ack {ok: true, ts} into LOCAL user
+        account-data on the affirmative first-run confirm (and only then). The
+        daemon joins nothing until that event says exactly ok is True: any
+        error, 404, non-dict content, or ok != True means no. Same shape as
+        _direct_send_ack_matches.
+        """
+        path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
+                + "/account_data/" + AUTOJOIN_ACK_TYPE)
+        try:
+            data = self.local("GET", path)
+        except Exception:                          # noqa: BLE001 — fail closed
+            return False
+        return isinstance(data, dict) and data.get("ok") is True
+
+    def invite_join_under_cap(self, now=None):
+        """Is the daemon under the PERSISTED rolling join cap?
+
+        invite_join_log lives in state.db (hash-only), so a join storm cannot be
+        reset by crashing the daemon. Expired ticks are pruned on read, which
+        keeps the table bounded by the cap itself. Same shape as
+        direct_send_under_cap, but global rather than per-room: the thing being
+        bounded is the total number of rooms this daemon joins unattended.
+        """
+        now = int(time.time() if now is None else now)
+        cutoff = now - INVITE_JOIN_WINDOW_S
+        self.db.execute("DELETE FROM invite_join_log WHERE ts < ?", (cutoff,))
+        self.db.commit()
+        used = self.db.execute(
+            "SELECT COUNT(*) FROM invite_join_log WHERE ts>=?", (cutoff,)).fetchone()[0]
+        return used < INVITE_JOIN_HOURLY
+
+    def invite_deferred(self, room_hash, now):
+        """True while a memoized hard failure's retry deadline is in the future."""
+        row = self.db.execute("SELECT next_attempt FROM invite_join_failed WHERE room_hash=?",
+                              (room_hash,)).fetchone()
+        return bool(row) and isinstance(row[0], int) and row[0] > now
+
+    def memoize_invite_failure(self, room_hash, code, now):
+        """Record a hard (non-429 4xx) join failure with an EXPONENTIAL deadline.
+
+        Never permanent: a withdrawn invite that the bridge reissues, or a
+        forbidden room that is later opened, must become joinable again. 429 /
+        5xx / transport failures never reach here — they stay plainly
+        retryable and back the whole stage off through run_stage.
+        """
+        row = self.db.execute("SELECT attempts FROM invite_join_failed WHERE room_hash=?",
+                              (room_hash,)).fetchone()
+        attempts = (row[0] if row and isinstance(row[0], int) else 0) + 1
+        delay = (INVITE_RETRY_BACKOFF_S[attempts - 1]
+                 if attempts <= len(INVITE_RETRY_BACKOFF_S) else INVITE_RETRY_MAX_S)
+        self.db.execute(
+            "INSERT OR REPLACE INTO invite_join_failed "
+            "(room_hash, code, ts, attempts, next_attempt) VALUES (?,?,?,?,?)",
+            (room_hash, int(code), now, attempts, now + delay))
+        self.db.commit()
+
+    def join_invites(self):
+        """One pass: admit the bridge-identified pending invites and join them."""
+        section = self._last_invites
+        self._last_invites = None      # one snapshot, one pass: never replayed
+        if not section:
+            return
+        if not self.autojoin_acked():
+            if not self._invite_ack_logged:
+                self._invite_ack_logged = True
+                log.info("invite auto-join waiting for the teammate's confirm in the app")
+            return
+        self._invite_ack_logged = False
+        now = int(time.time())
+        # Pre-filter BEFORE the predicate so memoized-failed rooms never consume
+        # the examine budget (anti-starvation). Already-joined rooms cannot
+        # appear here at all: this is a full /sync's rooms.invite.
+        fresh = {}
+        deferred = 0
+        for rid, entry in section.items():
+            if isinstance(rid, str) and self.invite_deferred(self._room_hash(rid), now):
+                deferred += 1
+                continue
+            fresh[rid] = entry
+        res = invites.bridge_invites_to_join(
+            fresh, INVITE_BOT_MXIDS, self.cfg.local_user, INVITE_SOURCE_SPACES,
+            {"maxExamine": INVITE_MAX_EXAMINE, "maxJoins": INVITE_MAX_JOINS})
+        deferred += res["overCap"]
+        joined = 0
+        try:
+            for rid in res["join"]:
+                if not ROOMID_RE.match(rid):   # server shape re-asserted at the call
+                    continue
+                if not self.invite_join_under_cap(now):
+                    deferred += 1
+                    continue
+                try:
+                    self.local("POST", "/_matrix/client/v3/rooms/"
+                               + urllib.parse.quote(rid, safe="") + "/join", {})
+                except urllib.error.HTTPError as e:
+                    # A 4xx other than 429 will not succeed by retrying soon
+                    # (withdrawn invite, forbidden, gone) -> memoize with a
+                    # deadline. 429/5xx raise, so run_stage backs the stage off
+                    # and honors any Retry-After.
+                    if e.code == 429 or not (400 <= e.code < 500):
+                        raise
+                    self.memoize_invite_failure(self._room_hash(rid), e.code, now)
+                    deferred += 1
+                    continue
+                rh = self._room_hash(rid)
+                self.db.execute("INSERT INTO invite_join_log (ts, room_hash) VALUES (?,?)",
+                                (now, rh))
+                self.db.execute("INSERT OR REPLACE INTO daemon_joined (room_hash, ts) "
+                                "VALUES (?,?)", (rh, now))
+                self.db.execute("DELETE FROM invite_join_failed WHERE room_hash=?", (rh,))
+                self.db.commit()
+                joined += 1
+        finally:
+            # Counts only, and only on change (a steady state of permanently
+            # refused invites must not repeat itself every pass).
+            counts = (joined, res["refusedNonBridge"], deferred)
+            if any(counts) and counts != getattr(self, "_last_invite_counts", None):
+                self._last_invite_counts = counts
+                log.info("invites: joined=%d refused=%d deferred=%d", *counts)
+
     # -- D0: one-time migration to explicit per-conversation levels ----------
     def write_share_override(self, local_room_id, state, migrated=False):
         """PUT one room's explicit share level into the teammate's OWN room
@@ -1022,6 +1217,12 @@ class Uplink(durable_sync.DurableSync):
         # share. No-op on every pass after the first.
         migrated = self.migrate_explicit_levels()
         sync_data = self.full_sync()
+        # Hand this pass's rooms.invite to the "invites" stage, which the run()
+        # loop calls immediately after this one. It needs a FULL /sync:
+        # tail_once's incremental stream delivers each invite exactly once and
+        # advances sync_since unconditionally, so an invite deferred by a cap or
+        # a transient error would be lost there, not retried.
+        self._last_invites = (((sync_data or {}).get("rooms") or {}).get("invite")) or {}
         desired, source_of, join, profile_of = self.desired_shared(sync_data, migrated)
         for rid in self.existing_mirror_ids():
             if self.mirror_status(rid) == "revoking":
@@ -2761,6 +2962,12 @@ class Uplink(durable_sync.DurableSync):
                 if now - self._last_reconcile >= self.cfg.reconcile_ms / 1000.0:
                     self._last_reconcile = now  # throttle even on failed reconcile
                     self.run_stage("reconcile", self.reconcile)
+                    # Right after reconcile, on the same cadence: it consumes
+                    # that pass's rooms.invite (see join_invites). If reconcile
+                    # failed before its /sync there is nothing to consume and
+                    # this is a no-op; if it failed after, the invites are still
+                    # good — a mirroring failure is no reason to refuse a join.
+                    self.run_stage("invites", self.join_invites)
                 if now - getattr(self, "_last_recovery", float("-inf")) >= 60:
                     self._last_recovery = now
                     self.run_stage("recovery", self.refresh_recovery)

@@ -64,6 +64,14 @@ what bounds the capability is the gate list under "Security invariants".
   persisted disconnect; only a truly absent legacy record can adopt env credentials.
   Never fall back to environment credentials after a persisted disconnect.
 
+- `invites.py` — pure Python port of `apps/user/invites.js`: the bridge-invite
+  trust predicate (`bridge_invites_to_join`, `localpart`, `ROOM_SHAPE_RE`). A
+  PURE LEAF — it imports `re` and nothing else, has no I/O, no logging, no
+  sentinel/fallback returns, and never sanitizes inside a predicate. It uses
+  `re.fullmatch` everywhere, never `re.match` with a trailing `$` (Python's `$`
+  also matches before a final newline; JS's does not, and that gap would admit
+  `"@bot:localhost\n"`). **Must stay byte-parity with
+  `apps/user/invites.js`** — see "How to change this safely".
 - `consent.py` — pure Python port of `shared/model/consent.js`. **Must stay
   byte-parity with it** — same explicit three-level conversation model
   (`share`/`direct` mirror, absent-or-unrecognized is private, nothing
@@ -108,6 +116,55 @@ what bounds the capability is the gate list under "Security invariants".
   **and `tests/conformance/consent_conformance.py`** — the conformance
   harness proves parity on ~84k exhaustive+fuzz vectors and is the
   authority; any differing output or crash on either side is a red build.
+- **The `invites` stage joins rooms, and that is ALL it does.** It runs from
+  the scheduler immediately after `reconcile`, on the same cadence, and
+  consumes THAT pass's `rooms.invite` (`self._last_invites`, stored by
+  `reconcile`, cleared as it is read — one snapshot, one pass). It needs a
+  FULL `/sync`: `tail_once`'s incremental stream delivers each invite once and
+  advances `sync_since` unconditionally, so an invite deferred by a cap or a
+  transient error would be lost there. What bounds it:
+  1. **Fail-closed ack gate.** `autojoin_acked()` reads
+     `com.jkali.autojoin_ack` from LOCAL user account-data and joins only if
+     the content is a dict whose `ok` **is** `True`. 404, 500, a transport
+     error, a non-dict, `{ok:"true"}`, `{ok:1}` and `{}` all mean no. That
+     event is written by `apps/user` on the AFFIRMATIVE first-run confirm only
+     (never on decline, never on render) — the teammate's consent to
+     unattended joining, not a UI convenience; `localStorage`'s
+     `beepa_autojoin_ack` gates the prompt and the daemon cannot read it.
+  2. **The decision is `invites.py`'s, never a local check.** Two
+     server-stamped fields must agree (the `m.room.create` sender and the
+     single `m.room.member` invite sender addressed to this user), and that
+     account must be one of the code-owned `SOURCES[].botMxid` bots; a space
+     invite additionally binds its name to the SAME source (`spaceName` prefix
+     or an exact `childSpaceNames` entry). Ghosts, the user, multiplicity and
+     cross-bridge laundering fail closed.
+  3. **Caps.** 100 candidates examined and 30 joins admitted per pass, plus a
+     PERSISTED rolling cap of 200 joins/hour in `invite_join_log` — in
+     state.db, so crashing the daemon cannot reset the budget. Pruned on read,
+     so the table stays bounded by the cap.
+  4. **A hard failure is memoized, never permanently.** A 4xx other than 429
+     gets an `invite_join_failed` row with an exponential `next_attempt` (1h,
+     6h, 24h, then weekly) — a withdrawn-then-reissued invite must become
+     joinable again. 429/5xx/transport failures are NEVER memoized: they raise,
+     and `run_stage` backs the stage off honoring any `Retry-After`.
+  5. **Hash-only, counts-only.** `invite_join_log`, `invite_join_failed` and
+     `daemon_joined` store `_room_hash(rid)`, never a room id. The ONLY log
+     line is `invites: joined=N refused=N deferred=N` (and the once-per-wait
+     "waiting for the teammate's confirm"). **Never log `m.room.name`, a
+     sender mxid, or a room id from this path** — a DM portal's name is the
+     contact's name, a source space's name contains the teammate's phone
+     number, and a ghost mxid embeds one.
+  **Joining is membership, not sharing.** A joined room carries no
+  `com.jkali.share_override`, so both resolvers answer `private` and nothing
+  mirrors. Two consequences are ACCEPTED deliberately (finding 3), not
+  oversights: (a) re-joining a portal that still carries the teammate's own
+  earlier explicit override mirrors it again on the next reconcile, and a
+  stale `direct` re-arms auto-send for that conversation — that honors their
+  explicit prior decision for that exact conversation; (b) joining a source
+  SPACE makes previously "shared-but-sourceless" rooms attributable and
+  therefore mirrorable. Both are pinned in
+  `tests/unit/uplink_reconcile.test.py`; if either is ever to change, change
+  it there first.
 - **Revocation durably retires access, not bytes.** `delete_mirror()`
   removes the master space-child link, kicks the manager, and leaves the
   room — a CS-API client (not a Synapse admin) cannot server-side-purge a
@@ -304,6 +361,11 @@ python3 tests/unit/uplink_share_level.test.py    # D2b share-level stamping
 python3 tests/unit/uplink_superseded.test.py    # D2-12 superseded gate + inbound stamp stripping
 python3 tests/unit/uplink_read_state.test.py    # com.jkali.read_state mirroring
 python3 tests/unit/uplink_contact_overrides.test.py  # per-contact override gates
+python3 tests/unit/uplink_invites.test.py       # invites stage: ack gate, caps, memo
+
+# JS<->Python parity for the two ported leaves (needs docker, or CONSENT_NODE=node):
+python3 tests/conformance/consent_conformance.py
+python3 tests/conformance/invites_conformance.py
 
 # run the daemon against a real local + master pair (see master/CLAUDE.md
 # to bring the master stack up first):
@@ -330,6 +392,12 @@ See `tests/CLAUDE.md`.
 1. Any change to `consent.py`'s resolution logic must be mirrored in
    `shared/model/consent.js` in the same commit, and both unit test files
    re-run. Do not let these drift even for a "temporary" fix.
+1b. The same rule, same severity, for `invites.py` <-> `apps/user/invites.js`:
+   change both in ONE commit and rerun `node tests/unit/user_invites.test.js`
+   **and `python3 tests/conformance/invites_conformance.py`**, which runs the
+   same vectors through both real modules and fails on any differing output or
+   any crash. A drift here means the unattended daemon joins a room the
+   reviewed browser gate refuses.
 2. Any new master-write call must decide, explicitly, which power-level
    override applies (mirror-room read-only vs. proposals-room
    proposal-only) and must not accidentally grant the manager

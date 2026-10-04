@@ -65,11 +65,27 @@ to the single retired redacted row within two minutes.
   ("Sends: 7 confirmed · last send 2m ago · last inbound 1m ago · 6 chats").
   The uplink line gained "messages the organization server refused".
 
+## Unattended invite acceptance — security review (2026-10-03)
+
+Design reviewed: the uplink accepts bridge-created room invites through a
+Python port of `apps/user/invites.js`, so new conversations appear while the
+browser is closed. Verdict: proceed with fixes. The consent claim held:
+joining is membership only, a joined room resolves `private` in both
+resolvers, no mirror is created, and the Direct auto-send gate cannot target
+it. Required and adopted:
+
+| # | Requirement | Where |
+|---|---|---|
+| 1 | Run the gate off `reconcile()`'s full sync, not the incremental tail (an invite left behind by a cap or error would otherwise be lost); verify `invite_state` carries `m.room.create` | uplink `invites` stage |
+| 2 | Replace the browser's per-session 200 cap with a persisted rolling hour cap; bounded, expiring memo for hard 4xx; never memoize 429 | `state.db` tables |
+| 3 | Daemon joins only after a server-side ack `com.jkali.autojoin_ack = {ok:true}` written by the browser on an affirmative confirm (migrated once for installs that already confirmed); read fail-closed | browser + uplink |
+| 4 | Log counts and room hashes only; never room names (contact names, the operator's own number) or sender mxids (ghosts embed phone numbers) | uplink |
+| 5 | Recorded decision: a re-invited portal with a stale `share`/`direct` override is mirrored again, honoring the prior explicit choice; joining a source space can make shared-but-sourceless rooms mirror | documented + tested |
+| 6 | JS/Python conformance harness for the invite gate, including Discord's child space name, wired into `tests/run.py` | `tests/conformance/invites_conformance.py` |
+| 7 | The claim that a bridge session secret can never land in a portal rests on `isBotDmMgmt()`'s full-state check, not on join ordering; stale comment fixed; Discord portal marker verified | `apps/user` docs |
+
 ## Not yet done (F0 remainder)
 
-- New-conversation discovery while the browser is closed (uplink accepting
-  bridge invites through a Python port of the invite gate) — security review
-  first.
 - Repeat the probe on a schedule and keep a history, so a regression shows as
   a trend rather than a complaint.
 - Teammates' machines (David, Elliot) still run the pre-fix uplink. Not

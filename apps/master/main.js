@@ -1783,7 +1783,7 @@ function renderSuggestionStack() {
     const g = el('div', 'ghost ' + s.state);
     g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
     const bar = el('div', 'ghost-bar');
-    const label = { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
+    const label = s.sending ? 'sending…' : { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
       retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'pending · not seen yet' }[s.state];
     bar.appendChild(el('span', 'ghost-st', label));
     if (s.state === 'pending' || s.state === 'seen') {
@@ -1925,22 +1925,30 @@ async function submitProposal(opts) {
     origin_ts: Date.now(),
   };
   const txn = 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  // QUEUEABLE: clear the bar and show the ghost BEFORE the write completes, so
+  // the next Enter can follow at once; origin_ts preserves the order. The
+  // optimistic entry is keyed by txn until the server id arrives; on failure
+  // it is removed and the text returns to the bar.
+  if (input && !(opts && typeof opts.body === 'string')) input.value = '';
+  proposalStatus('');
+  const optimistic = { body, eventId: 'txn:' + txn, ts: content.origin_ts, sending: true };
+  MS.proposalsByRoom.set(target, [optimistic, ...(MS.proposalsByRoom.get(target) || [])]);
+  renderSuggestionStack();
   try {
     // NOTE: event type is the literal 'com.jkali.proposal'. This is the only
     // write endpoint in apps/master and it targets ONLY a proposals room.
     const result = await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(proposalsRoom)
       + '/send/com.jkali.proposal/' + encodeURIComponent(txn), content);
-    if (MS.openProposalCtx !== ctx) return;
-    if (input) input.value = '';
-    proposalStatus('');
-    // Optimistic update: push the new proposal onto this target's index so the
-    // stack shows it as pending immediately, without waiting for the next
-    // loadProposalsIndex() pass.
-    const list = MS.proposalsByRoom.get(target) || [];
-    MS.proposalsByRoom.set(target, [{ body, eventId: result && result.event_id, ts: content.origin_ts }, ...list]);
-    renderSuggestionStack();
+    optimistic.eventId = (result && result.event_id) || optimistic.eventId;
+    optimistic.sending = false;
+    if (MS.openProposalCtx === ctx) renderSuggestionStack();
   } catch (e) {
-    proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
+    MS.proposalsByRoom.set(target, (MS.proposalsByRoom.get(target) || []).filter(p => p !== optimistic));
+    if (MS.openProposalCtx === ctx) {
+      renderSuggestionStack();
+      if (input && !input.value) input.value = body;      // give the text back
+      proposalStatus('Could not send suggestion: ' + String(e.message || e), true);
+    }
   }
 }
 

@@ -53,6 +53,22 @@ check("reaction is not activity", gate is None)
 
 check("superseded is a loud gate", "superseded" not in uplink.Uplink.QUIET_GATES)
 
+# Queueable bursts: the daemon's OWN auto-send (local_user + provenance key) is not "the
+# conversation moved on"; a teammate-typed message (local_user, no key) and a remote
+# message that forges the key both still supersede.
+u = make({"chunk": [{"type": "m.room.message", "sender": "@me:localhost", "origin_server_ts": now - 100,
+                     "content": {"msgtype": "m.text", "body": "first", "com.jkali.auto_sent_from_proposal": "$p1"}}]})
+body, gate = u._direct_send_gate(ev, clean, cold_start=False, suspended=False)
+check("own auto-send does not supersede the next queued suggestion", gate is None)
+u = make({"chunk": [{"type": "m.room.message", "sender": "@me:localhost", "origin_server_ts": now - 100,
+                     "content": {"msgtype": "m.text", "body": "typed"}}]})
+body, gate = u._direct_send_gate(ev, clean, cold_start=False, suspended=False)
+check("teammate-typed message still supersedes", gate == "superseded")
+u = make({"chunk": [{"type": "m.room.message", "sender": "@whatsapp_555:localhost", "origin_server_ts": now - 100,
+                     "content": {"msgtype": "m.text", "body": "forged", "com.jkali.auto_sent_from_proposal": "$p1"}}]})
+body, gate = u._direct_send_gate(ev, clean, cold_start=False, suspended=False)
+check("remote party forging the key still supersedes", gate == "superseded")
+
 # F5: a future-dated proposal (within D2-3's +60s tolerance) must not hide a
 # reply that falls inside its future window. The reply is stamped INSIDE that
 # window (now+5s) rather than exactly at `now`: the gate recomputes now_ms a few

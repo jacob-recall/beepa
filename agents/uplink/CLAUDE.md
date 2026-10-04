@@ -258,10 +258,14 @@ what bounds the capability is the gate list under "Security invariants".
       This is the daemon-side twin of the app's draft-retirement rule — it is
       what stops the double text where the teammate already answered. Two
       honest limits: it **reduces, does not eliminate** the race (the TOCTOU
-      window between this read and the PUT remains, F7), and because a send
-      supersedes the proposals behind it, a manager burst self-limits to one
-      auto-send per room per batch (F4). It is the only gate that makes a
-      network read, so it runs LAST, after the cheap cap check (F3).
+      window between this read and the PUT remains, F7). A manager's queued
+      burst goes out in order: this daemon's OWN auto-sends (server-stamped
+      sender == `local_user` AND the `com.jkali.auto_sent_from_proposal`
+      provenance key) are not counted as the conversation moving on, while a
+      teammate-typed message (no key) or any remote message (never
+      `local_user`, even if it forges the key) still supersedes. It is the
+      only gate that makes a network read, so it runs LAST, after the cheap
+      cap check (F3).
   The `com.jkali.auto_sent_from_proposal` field on the sent message is
   **cosmetic** (F14) — forgeable by anything holding the teammate token, and
   it must never feed the `from_me` gate or any other trust decision.

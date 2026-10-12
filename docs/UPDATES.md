@@ -1,5 +1,8 @@
 # Applying releases without disconnecting accounts
 
+For the 0.2.1 receipt reliability release, bots updating Elliot's and David's
+installations should follow [the peer rollout instructions](PEER-ROLLOUT-2026-10-12.md).
+
 Keep a canonical upstream repository and a `stable` deployment branch. Each
 person's repository should preserve that Git history; deployment values and
 credentials belong in local state, not tenant-specific source edits. Propagate

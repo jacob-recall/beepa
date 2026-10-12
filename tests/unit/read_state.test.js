@@ -1,3 +1,4 @@
+import { parseMessageReceipts, mergeReceipts } from '../../shared/model/message_receipts.js';
 // Plain-node test for parseReadState (shared/ui/account-data.js): the server's
 // notification_count is the only unread source, and "the other party read" is
 // the newest m.receipt from a sender that is not us, not our ghost, not a bot.
@@ -8,7 +9,7 @@ import vm from 'node:vm';
 
 const src = fs.readFileSync(new URL('../../shared/ui/account-data.js', import.meta.url), 'utf8')
   .replace(/^import .*;\n/gm, '').replace(/^export .*;\n/gm, '');
-const ctx = vm.createContext({ S: {}, SOURCES: [{ id: 'whatsapp', botMxid: '@whatsappbot:localhost' }], setTimeout });
+const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts, S: {}, SOURCES: [{ id: 'whatsapp', botMxid: '@whatsappbot:localhost' }], setTimeout });
 vm.runInContext(src, ctx);
 const self = new Set(['@me:localhost', '@whatsapp_123:localhost']);
 

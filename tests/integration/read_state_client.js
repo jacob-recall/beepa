@@ -1,3 +1,4 @@
+import { parseMessageReceipts, mergeReceipts } from '../../shared/model/message_receipts.js';
 // Exercise the app's real receipt writer/parser against the disposable homeserver.
 // Credentials arrive on stdin, never argv; sandbox.py owns the server lifecycle.
 import fs from 'node:fs';
@@ -9,7 +10,7 @@ const source = path => fs.readFileSync(new URL(path, import.meta.url), 'utf8')
   .replace(/^import .*;\n/gm, '').replace(/^export .*;\n/gm, '');
 const model = new Map([[input.roomId, { unread: 1 }]]);
 let writes = 0;
-const ctx = vm.createContext({
+const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts,
   S: { openRoomId: input.roomId, joinedSet: new Set([input.roomId]) },
   ROOMID_RE: /^![^:]+:.+$/, feedModel: model, SOURCES: [], setTimeout,
   localStorage: { getItem: () => null }, scheduleFeedRender() {},
@@ -31,5 +32,5 @@ if (input.action === 'mark') {
   assert.equal(model.get(input.roomId).unread, 0, 'app cleared local badge after success');
   console.log(JSON.stringify({ marked: true }));
 } else {
-  console.log(JSON.stringify(ctx.parseReadState(input.room, new Set([input.userId]))));
+  console.log(JSON.stringify((() => { const value = ctx.parseReadState(input.room, new Set([input.userId]), input.sourceId); return {...value, receipts: Object.fromEntries(value.receipts)}; })()));
 }

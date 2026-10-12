@@ -57,6 +57,14 @@ def install_schema(db):
         destination TEXT NOT NULL, master_room_id TEXT NOT NULL,
         connection TEXT NOT NULL, revoke_step INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(destination,master_room_id));
+      CREATE TABLE IF NOT EXISTS room_unread (
+        local_room_id TEXT PRIMARY KEY, master_room_id TEXT NOT NULL, unread_count INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS message_receipts (
+        local_room_id TEXT NOT NULL, master_room_id TEXT NOT NULL, target TEXT NOT NULL,
+        read INTEGER NOT NULL DEFAULT 0, delivered INTEGER NOT NULL DEFAULT 0,
+        teammate_read INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0,
+        failed INTEGER NOT NULL DEFAULT 0, dirty INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(local_room_id,target));
       CREATE TABLE IF NOT EXISTS receipt_outbox (
         local_room_id TEXT PRIMARY KEY, master_room_id TEXT NOT NULL,
         teammate_read_ts INTEGER NOT NULL DEFAULT 0,
@@ -269,6 +277,8 @@ class DurableSync:
         self.db.execute("UPDATE history_jobs SET status='revoked' WHERE local_room_id=? AND direction='up'", (room,))
         self.db.execute('DELETE FROM media_retry WHERE local_room_id=?', (room,))
         self.db.execute('DELETE FROM receipt_outbox WHERE local_room_id=?', (room,))
+        self.db.execute('DELETE FROM message_receipts WHERE local_room_id=?', (room,))
+        self.db.execute('DELETE FROM room_unread WHERE local_room_id=?', (room,))
         self.db.commit()
 
     def destination_binding(self, authority='', epoch=''):
@@ -302,7 +312,7 @@ class DurableSync:
             # These tables describe copies on the destination, NOT send safety.
             for table in ('mirror_rooms', 'mirror_lifecycle', 'delivery_map', 'legacy_mirrors',
                           'pending_events', 'history_jobs', 'history_refs', 'contact_mirror',
-                          'proposal_pending', 'media_retry', 'receipt_outbox'):
+                          'proposal_pending', 'media_retry', 'receipt_outbox', 'message_receipts', 'room_unread'):
                 self.db.execute('DELETE FROM ' + table)
             self.db.execute("DELETE FROM meta WHERE k IN ('master_contacts_room','master_proposals_room',"
                             "'proposal_sync_since','sync_since') OR k LIKE 'mname:%' OR k LIKE 'last_event:%' "
@@ -458,6 +468,8 @@ class DurableSync:
                 return
             raise
         events = result.get('chunk') or []
+        if direction == 'up' and hasattr(self, 'queue_message_receipts'):
+            self.queue_message_receipts(room, master_room, {'timeline': {'events': events}})
         end = result.get('end')
         done = not end  # a short/empty page WITH a new token is not terminal
         expected = ('m.room.message', 'm.room.redaction') if direction == 'up' else ('com.jkali.proposal',)
@@ -639,7 +651,7 @@ class DurableSync:
         # Retired rows (error set) are reported under delivery_incomplete below,
         # not as queued work — otherwise a retired redaction reads as "stuck".
         counts['pending_events'] = self.db.execute('SELECT count(*) FROM pending_events WHERE error IS NULL').fetchone()[0]
-        counts['receipts_pending'] = self.db.execute('SELECT count(*) FROM receipt_outbox WHERE dirty=1').fetchone()[0]
+        counts['receipts_pending'] = self.db.execute('SELECT count(*) FROM receipt_outbox WHERE dirty=1').fetchone()[0] + self.db.execute('SELECT count(*) FROM message_receipts WHERE dirty=1').fetchone()[0]
         counts['history_pages_pending'] = self.db.execute("SELECT count(*) FROM history_jobs WHERE status='discover'").fetchone()[0]
         counts['history_incomplete'] = self.db.execute("SELECT count(*) FROM history_jobs WHERE status='incomplete'").fetchone()[0]
         counts['revocations_pending'] = self.db.execute("SELECT count(*) FROM mirror_lifecycle WHERE status='revoking'").fetchone()[0]

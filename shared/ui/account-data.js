@@ -1,3 +1,4 @@
+import { parseMessageReceipts, mergeReceipts } from '../model/message_receipts.js';
 import { feedPreviewFromEvent } from '../model/message_preview.js';
 import { sourceRoomIds } from '../model/source_rooms.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../model/message_timestamps.js';
@@ -133,9 +134,9 @@ function feedLastPreview(room, corrections) {
 // notification_count (never a local count); `remoteReadTs` is the newest
 // m.receipt timestamp from a sender that is NOT us, NOT one of our own bridge
 // ghosts and NOT a bridge bot — i.e. the other party actually read. Missing or
-// malformed => 0 (no caption, no badge). Pure; no DOM.
-function parseReadState(room, selfIds) {
-  const out = { unread: 0, remoteReadTs: 0 };
+// malformed => 0. remoteReadTs is legacy metadata; checks use exact receipts. Pure; no DOM.
+function parseReadState(room, selfIds, sourceId) {
+  const out = { unread: 0, remoteReadTs: 0, receipts: parseMessageReceipts(room, selfIds, new Set(SOURCES.map(s => s.botMxid).filter(Boolean)), SOURCES.find(s => s.id === sourceId)?.botMxid) };
   if (!room || typeof room !== 'object') return out;
   const n = room.unread_notifications && room.unread_notifications.notification_count;
   if (typeof n === 'number' && isFinite(n) && n > 0) out.unread = n;
@@ -267,19 +268,20 @@ async function seedFeed() {
       seen.add(c.id);
       const corrections = S.timestampCorrections?.get(c.id);
       const p = feedLastPreview(join[c.id], corrections);
-      const rs = parseReadState(join[c.id], selfIdSet());
+      const rs = parseReadState(join[c.id], selfIdSet(), s.id);
       const existing = feedModel.get(c.id);
       if (existing) {
         existing.name = c.title;                    // refresh name; keep original attribution
         if (p && (p.ts > existing.lastTs || corrections?.size)) { existing.lastBody = p.body; existing.lastTs = p.ts; }
         existing.unread = rs.unread;
+        existing.receipts = mergeReceipts(existing.receipts, rs.receipts);
         if (rs.remoteReadTs > (existing.remoteReadTs || 0)) existing.remoteReadTs = rs.remoteReadTs;
         if (!Array.isArray(existing.drafts)) existing.drafts = [];
       } else {
         feedModel.set(c.id, {
           id: c.id, name: c.title,                  // c.title already sanitizeLine'd by buildConvos
           lastBody: p ? p.body : '', lastTs: p ? p.ts : 0, sourceId: s.id,
-          unread: rs.unread, remoteReadTs: rs.remoteReadTs, drafts: [],
+          receipts: rs.receipts, unread: rs.unread, remoteReadTs: rs.remoteReadTs, drafts: [],
         });
       }
     }
@@ -364,8 +366,10 @@ function feedIngest(data) {
   for (const rid of Object.keys(join)) {
     if (!feedModel.has(rid)) { sawUnknown = true; continue; }  // HF-3: ignore unknown room ids
     const rec0 = feedModel.get(rid);
-    const rs = parseReadState(join[rid], selfIdSet());
+    const rs = parseReadState(join[rid], selfIdSet(), rec0.sourceId);
     if (join[rid] && join[rid].unread_notifications && rs.unread !== rec0.unread) { rec0.unread = rs.unread; changed = true; }
+    rec0.receipts = mergeReceipts(rec0.receipts, rs.receipts);
+    if (S.openRoomId === rid) { S.convoReceipts = rec0.receipts; applyReadCaption(); }
     if (rs.remoteReadTs > (rec0.remoteReadTs || 0)) {
       rec0.remoteReadTs = rs.remoteReadTs; changed = true;
       if (S.openRoomId === rid) { S.convoRemoteReadTs = rs.remoteReadTs; applyReadCaption(rs.remoteReadTs); }

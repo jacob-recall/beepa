@@ -1,3 +1,4 @@
+import { mergeReceipts } from '../model/message_receipts.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -190,6 +191,7 @@ async function openConvo(roomId) {
 
   const rec = feedModel.get(roomId);
   S.convoRemoteReadTs = (rec && rec.remoteReadTs) || 0;
+  S.convoReceipts = new Map(rec?.receipts || []);
   const p = profileOf(roomId);
   const titleEl = $('convo-title');
   if (titleEl) titleEl.textContent = sanitizeLine((p && p.displayName) || (rec && rec.name) || roomId);
@@ -234,10 +236,13 @@ async function openConvo(roomId) {
   }
 
   try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=50&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message', 'com.beeper.message_send_status'] }));
     const data = await api('GET', q);
     if (!current()) return;
     const chunk = Array.isArray(data.chunk) ? data.chunk.slice().sort((a, b) => messageTimestamp(a, S.timestampCorrections?.get(roomId)) - messageTimestamp(b, S.timestampCorrections?.get(roomId))) : [];
+    const receiptState = parseReadState({ timeline: { events: chunk } }, selfIds(), rec?.sourceId);
+    S.convoReceipts = mergeReceipts(S.convoReceipts, receiptState.receipts);
+    if (rec) rec.receipts = S.convoReceipts;
     cacheAppend(roomId, chunk.filter(isCacheable));   // keep the cache warm regardless of the guard below
     if (S.openRoomId === roomId) {                    // guard: user may have switched rooms mid-fetch
       // renderMessageEvent dedups via convoSeen against whatever the cache
@@ -307,8 +312,12 @@ async function startConvoWatch(roomId) {
         if (typeof document === 'undefined' || document.visibilityState !== 'hidden') markRead(watchRoom, newestRenderedEventId());
         if (composerGhostHook) { try { composerGhostHook(watchRoom); } catch (e) { /* app hook must not break the tail */ } }
       }
-      if (room && room.ephemeral && S.openRoomId === watchRoom) {
-        const rs = parseReadState(room, selfIds());
+      if (room && S.openRoomId === watchRoom) {
+        const rec = feedModel.get(watchRoom);
+        const rs = parseReadState(room, selfIds(), rec?.sourceId);
+        S.convoReceipts = mergeReceipts(S.convoReceipts, rs.receipts);
+        if (rec) rec.receipts = S.convoReceipts;
+        applyReadCaption();
         if (rs.remoteReadTs > S.convoRemoteReadTs) { S.convoRemoteReadTs = rs.remoteReadTs; applyReadCaption(rs.remoteReadTs); }
       }
     } catch (e) {
@@ -387,13 +396,21 @@ async function sendConvoMessage(targetRoom, bodyOverride, meta) {
   const box = $('convo-messages');
   if (box) box.scrollTop = box.scrollHeight;
   try {
-    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
+    const result = await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) +
       '/send/m.room.message/' + encodeURIComponent(t), content);
+    if (S.openRoomId === roomId) {
+      for (const b of $('convo-messages')?.children || []) if (b.dataset?.txnId === t && result?.event_id) b.dataset.eventId = result.event_id;
+      applyReadCaption();
+    }
     if (fromComposer && afterSendHook) {
       try { afterSendHook(roomId, body); } catch (e) { /* app hook must not break send */ }
     }
     return true;
   } catch (e) {
+    if (S.openRoomId === roomId) {
+      for (const b of $('convo-messages')?.children || []) if (b.dataset?.txnId === t) b.dataset.failed = '1';
+      applyReadCaption();
+    }
     convoSetStatus('Message failed to send: ' + String(e.message || e));  // CV-R3: status, not a bubble
     return false;
   }

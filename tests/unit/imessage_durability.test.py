@@ -63,6 +63,23 @@ class DaemonTest(unittest.TestCase):
         handler.do_PUT()
         return replies[-1]
 
+    def test_message_status_publication_retries_without_resending(self):
+        calls = []
+        self.d.DB.execute("INSERT INTO outbound_event VALUES (?,?,?,?,?,?)", ('$receipt', '!portal:test', 'confirmed', 1, 'engine_delivered', 'native-id'))
+        self.d.DB.commit()
+        self.d.mx = lambda *args, **kw: (_ for _ in ()).throw(OSError('offline'))
+        with self.assertRaises(OSError): self.d.publish_message_statuses()
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM published_message_status').fetchone()[0], 0)
+        self.d.mx = lambda *args, **kw: calls.append(args) or {'event_id': '$status'}
+        self.d.publish_message_statuses(); self.d.publish_message_statuses()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][2]['com.jkali.delivered'])
+        self.assertEqual(calls[0][2]['m.relates_to']['event_id'], '$receipt')
+        self.d.DB.execute("INSERT INTO outbound_event VALUES (?,?,?,?,?,?)", ('$accepted', '!portal:test', 'confirmed', 2, 'engine_accepted', 'native-id2'))
+        self.d.DB.commit()
+        self.d.publish_message_statuses()
+        self.assertFalse(calls[-1][2]['com.jkali.delivered'])
+
     def test_inbound_retry_after_matrix_failure(self):
         calls = []
         def matrix(*args, **kwargs):

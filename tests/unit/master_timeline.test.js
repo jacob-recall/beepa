@@ -1,3 +1,4 @@
+import { paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -19,6 +20,7 @@ class Element {
   replaceChildren() { for (const child of [...this.children]) child.remove(); }
   get firstElementChild() { return this.children[0]; }
   get lastElementChild() { return this.children.at(-1); }
+  setAttribute(key, value) { (this.attributes ||= {})[key] = value; }
   get childElementCount() { return this.children.length; }
   get parentNode() { return this.parent || null; }
   contains(node) { return this === node || this.children.some(child => child.contains(node)); }
@@ -41,7 +43,7 @@ const elements = new Map([
   'proposal-stack', 'room-read', 'nav-teammates-rail',
 ].map(id => [id, new Element()]));
 const S = { token: 'session-1' };
-const ctx = vm.createContext({ S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
+const ctx = vm.createContext({ paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE, S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
   displayName, parseNames, dumpNames, rename, sharingUsers, visibleUsers, visibleFeed,
   messageTimestamp, timestampCorrections, CORRECTION_TYPE,
   initials, indicatorsFor, pendingDrafts, clusterFeed,
@@ -57,8 +59,8 @@ vm.runInContext(`
   buildPlatBadge = () => el('span', 'badge', 'iMessage');
   platformLabel = () => 'iMessage';
   showWorkspace = () => {}; setDetailMode = () => {};
-  MS.rooms['!A:master'] = { name: 'A', userLabel: 'owner', sourceId: 'imessage' };
-  MS.rooms['!B:master'] = { name: 'B', userLabel: 'owner', sourceId: 'imessage' };
+  MS.rooms['!A:master'] = { ...freshRoomInfo('!A:master'), name: 'A', userLabel: 'owner', sourceId: 'imessage' };
+  MS.rooms['!B:master'] = { ...freshRoomInfo('!B:master'), name: 'B', userLabel: 'owner', sourceId: 'imessage' };
   globalThis.ms = MS;
 `, ctx);
 const tick = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };

@@ -117,6 +117,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # A local room's source is the source-space (by m.room.name) it is a child of.
 sys.path.insert(0, os.path.normpath(os.path.join(BASE, "..", "..", "shared")))
 from source_catalog import SOURCES, SPACE_SOURCES
+import message_receipts
 from message_timestamps import stamp_timestamp, valid_ts, ORIGIN_TS, TS_SOURCE, CORRECTION_TYPE
 SOURCE_LABEL_TO_ID = dict(SPACE_SOURCES, X="twitter")
 SOURCE_ID_TO_LABEL = {source["id"]: source["label"] for source in SOURCES if source["kind"] == "source"}
@@ -499,6 +500,9 @@ def read_state_from_room(room, self_ids, bot_ids):
     out = {"teammate_read_ts": 0, "remote_read_ts": 0}
     if not isinstance(room, dict):
         return out
+    unread = (room.get("unread_notifications") or {}).get("notification_count")
+    if isinstance(unread, int) and not isinstance(unread, bool) and unread >= 0:
+        out["unread_count"] = unread
     for e in ((room.get("ephemeral") or {}).get("events") or []):
         if not isinstance(e, dict) or e.get("type") != "m.receipt" or not isinstance(e.get("content"), dict):
             continue
@@ -1475,6 +1479,7 @@ class Uplink(durable_sync.DurableSync):
                 state = read_state_from_room(join.get(rid),
                                              set(self.self_mxids) | {self.cfg.local_user}, SOURCE_BOT_MXIDS)
                 self._queue_read_state(rid, row[0], state)
+                self.queue_message_receipts(rid, row[0], join.get(rid))
 
     # -- mirror lifecycle ---------------------------------------------------
     def stamped_levels(self):
@@ -3410,6 +3415,9 @@ class Uplink(durable_sync.DurableSync):
             conn.close()
 
     # -- main loop ----------------------------------------------------------
+    def queue_message_receipts(self, room, master, section):
+        message_receipts.queue(self, room, master, section)
+
     def _queue_read_state(self, local_room_id, master_room_id, state):
         """Persist coalesced receipt positions before advancing local /sync.
 
@@ -3418,25 +3426,33 @@ class Uplink(durable_sync.DurableSync):
         """
         teammate = max(0, int(state.get("teammate_read_ts") or 0))
         remote = max(0, int(state.get("remote_read_ts") or 0))
-        if not (teammate or remote):
+        unread = state.get("unread_count")
+        if not (teammate or remote) and unread is None:
             return
-        self.db.execute('''INSERT INTO receipt_outbox VALUES (?,?,?,?,1)
+        old_unread = self.db.execute('SELECT master_room_id,unread_count FROM room_unread WHERE local_room_id=?',
+                                     (local_room_id,)).fetchone()
+        unread_changed = unread is not None and old_unread != (master_room_id, unread)
+        if unread is not None:
+            self.db.execute('INSERT OR REPLACE INTO room_unread VALUES (?,?,?)', (local_room_id, master_room_id, unread))
+        self.db.execute('''INSERT INTO receipt_outbox (local_room_id,master_room_id,teammate_read_ts,remote_read_ts,dirty) VALUES (?,?,?,?,1)
             ON CONFLICT(local_room_id) DO UPDATE SET
               teammate_read_ts=CASE WHEN master_room_id=excluded.master_room_id
                 THEN max(teammate_read_ts,excluded.teammate_read_ts) ELSE excluded.teammate_read_ts END,
               remote_read_ts=CASE WHEN master_room_id=excluded.master_room_id
                 THEN max(remote_read_ts,excluded.remote_read_ts) ELSE excluded.remote_read_ts END,
               dirty=CASE WHEN master_room_id!=excluded.master_room_id
+                OR ?
                 OR excluded.teammate_read_ts>teammate_read_ts OR excluded.remote_read_ts>remote_read_ts
                 THEN 1 ELSE dirty END,
-              master_room_id=excluded.master_room_id''', (local_room_id, master_room_id, teammate, remote))
+              master_room_id=excluded.master_room_id''', (local_room_id, master_room_id, teammate, remote, int(unread_changed)))
         self.db.commit()
 
     def flush_read_state(self):
         """Retry persisted receipts independently of message ingestion/delivery."""
-        for local_room_id, master_room_id, teammate, remote in self.db.execute(
-                'SELECT local_room_id,master_room_id,teammate_read_ts,remote_read_ts '
-                'FROM receipt_outbox WHERE dirty=1 ORDER BY rowid LIMIT 16').fetchall():
+        for local_room_id, master_room_id, teammate, remote, unread in self.db.execute(
+                'SELECT r.local_room_id,r.master_room_id,r.teammate_read_ts,r.remote_read_ts,u.unread_count '
+                'FROM receipt_outbox r LEFT JOIN room_unread u ON r.local_room_id=u.local_room_id AND r.master_room_id=u.master_room_id '
+                'WHERE r.dirty=1 ORDER BY r.rowid LIMIT 16').fetchall():
             row = self.mirror_for(local_room_id)
             if not row or row[0] != master_room_id or self.mirror_status(local_room_id) == 'revoking':
                 self.db.execute('DELETE FROM receipt_outbox WHERE local_room_id=?', (local_room_id,))
@@ -3450,6 +3466,8 @@ class Uplink(durable_sync.DurableSync):
                 continue
             payload = {"teammate_read_ts": teammate, "remote_read_ts": remote,
                        "updated_ts": int(time.time() * 1000)}
+            if unread is not None:
+                payload["unread_count"] = unread
             # Failure leaves the row dirty; run_stage backs off (including 429).
             self.master("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="")
                         + "/state/" + READ_STATE_TYPE + "/", payload, timeout=15)
@@ -3510,6 +3528,7 @@ class Uplink(durable_sync.DurableSync):
             # sync_since; remote failures cannot stall ingestion. Consent is
             # re-read immediately before the eventual master state write.
             self._queue_read_state(local_room_id, master_room_id, rs)
+            self.queue_message_receipts(local_room_id, master_room_id, room)
             timeline = room.get("timeline") or {}
             events = timeline.get("events") or []
             if timeline.get("limited"):
@@ -3707,6 +3726,7 @@ class Uplink(durable_sync.DurableSync):
                     continue
                 self.run_stage("delivery", self.deliver_pending)
                 self.run_stage("receipts", self.flush_read_state)
+                self.run_stage("message_receipts", lambda: message_receipts.flush(self))
                 def proposals():
                     self.ensure_proposal_rooms()
                     self.pull_proposals()

@@ -1,3 +1,4 @@
+import { paintReceipt } from '../model/message_receipts.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -95,7 +96,11 @@ function renderMessageEvent(ev) {
     ? ev.unsigned.transaction_id : null;
   if (eid && convoSeen.has(eid)) return;            // already rendered this event
   if (txnId && convoSeen.has('txn:' + txnId)) {     // echo of our optimistic bubble
-    if (eid) convoSeen.add(eid);
+    if (eid) {
+      convoSeen.add(eid);
+      for (const b of box.children) if (b.dataset?.txnId === txnId) b.dataset.eventId = eid;
+      applyReadCaption();
+    }
     return;
   }
   if (eid) convoSeen.add(eid);
@@ -139,7 +144,12 @@ function renderMessageEvent(ev) {
   bubble.appendChild(el('div', 'when', convoTime(messageTimestamp(ev, S.timestampCorrections?.get(S.openRoomId)))));
   const ts = messageTimestamp(ev, S.timestampCorrections?.get(S.openRoomId));
   bubble.dataset.messageTs = String(ts);
-  if (sent) bubble.dataset.own = '1';
+  if (sent) {
+    bubble.dataset.own = '1';
+    const checks = el('span', 'message-receipt');
+    paintReceipt(checks, S.convoReceipts?.get(eid));
+    bubble.querySelector('.when').appendChild(checks);
+  }
   const later = Array.from(box.children).find(node => Number(node.dataset?.messageTs) > ts);
   if (later) box.insertBefore(bubble, later);
   else box.appendChild(bubble);
@@ -155,22 +165,15 @@ function renderMessageEvent(ev) {
   }
 }
 
-// "Read" caption under the newest OWN bubble whose time is at or before the
-// other party's newest receipt. Caption only; removed from every other bubble
-// so at most one shows. No receipt (0) => no caption anywhere.
-function applyReadCaption(remoteReadTs) {
+// Exact target matching: a delayed receipt never reads a different message.
+function applyReadCaption() {
   const box = $('convo-messages');
   if (!box) return;
-  let target = null;
   for (const b of box.children) {
-    const old = b.querySelector('.read-caption');
-    if (old) old.remove();
-    if (b.dataset && b.dataset.own === '1') {
-      const ts = Number(b.dataset.messageTs);
-      if (isFinite(ts) && remoteReadTs > 0 && ts <= remoteReadTs) target = b;
-    }
+    if (b.dataset?.own !== '1') continue;
+    const checks = b.querySelector('.message-receipt');
+    if (checks) paintReceipt(checks, S.convoReceipts?.get(b.dataset.eventId) || (b.dataset.failed ? { failed: true } : null));
   }
-  if (target) target.appendChild(el('div', 'read-caption', 'Read'));
 }
 
 export { convoTime, convoLocalpart, convoDisplayName, convoFetchName, convoResolveContent, renderMessageEvent, applyReadCaption };

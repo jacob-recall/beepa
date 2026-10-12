@@ -179,6 +179,7 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
                "component TEXT, event_id TEXT, status TEXT, PRIMARY KEY(room_id,msg_id,component))")
     DB.execute("CREATE TABLE IF NOT EXISTS outbound_event (event_id TEXT PRIMARY KEY, room_id TEXT, "
                "state TEXT NOT NULL, updated REAL NOT NULL, reason TEXT, engine_id TEXT)")
+    DB.execute("CREATE TABLE IF NOT EXISTS published_message_status (event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
     DB.execute("CREATE TABLE IF NOT EXISTS dispatch_rate (chat_hash TEXT, ts REAL)")
     # The only safe recovery after an interrupted native invocation is ambiguity.
     # A queued/preflight failure is replayable; a dispatch may already have sent.
@@ -1132,6 +1133,10 @@ def poll_loop():
             _health_pub["poll_ok"], _health_pub["poll_err"] = False, type(e).__name__
             log.info("poll error: %s", type(e).__name__)
         try:
+            publish_message_statuses()
+        except Exception as e:
+            log.info("message status publish error: %s", type(e).__name__)
+        try:
             publish_health_state()
         except Exception as e:                   # noqa: BLE001
             log.info("health publish error: %s", type(e).__name__)
@@ -1391,6 +1396,32 @@ def delivery_status():
             "last_inbound_ts": int(last_in / 1000) if last_in else None,
             "chats_mapped": chats,
             "confirmed_means": "engine acceptance; not recipient delivery"}
+
+
+def publish_message_statuses():
+    """Retry status publication independently; never retry a native send here.
+
+    The durable engine_delivered reason is explicit recipient confirmation.
+    Engine acceptance alone must stay a single gray check.
+    """
+    with DBLOCK:
+        rows = DB.execute("SELECT o.event_id,o.room_id,o.state,o.reason FROM outbound_event o "
+                          "LEFT JOIN published_message_status p ON p.event_id=o.event_id "
+                          "WHERE o.state IN ('confirmed','refused') AND "
+                          "(p.signature IS NULL OR p.signature != o.state || ':' || o.reason) "
+                          "ORDER BY o.updated LIMIT 16").fetchall()
+    for event_id, room_id, state, reason in rows:
+        signature = state + ':' + reason
+        content = {"m.relates_to": {"rel_type": "m.reference", "event_id": event_id},
+                   "status": "SUCCESS" if state == "confirmed" else "FAIL_PERMANENT",
+                   "com.jkali.delivered": reason == "engine_delivered"}
+        txn_id = 'receipt_' + sha(event_id + signature)
+        path = ('/_matrix/client/v3/rooms/' + urllib.parse.quote(room_id, safe='') +
+                '/send/com.beeper.message_send_status/' + txn_id)
+        mx('PUT', path, content, user=BOT_ID)
+        with DBLOCK:
+            DB.execute('INSERT OR REPLACE INTO published_message_status VALUES (?,?)', (event_id, signature))
+            DB.commit()
 
 
 def outbound_get(event_id):

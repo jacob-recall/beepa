@@ -25,7 +25,7 @@ STATIC_FILES = frozenset({
     'apps/master/invites.js', 'apps/master/hidden.js', 'apps/master/transport.js',
     'shared/matrix/client.js', 'shared/state.js', 'shared/ui/el.js',
     'shared/model/source_catalog.js', 'shared/model/message_preview.js',
-    'shared/model/message_timestamps.js', 'shared/model/attention.js',
+    'shared/model/message_timestamps.js', 'shared/model/message_receipts.js', 'shared/model/attention.js',
     'shared/style/organic.css', 'shared/style/beepa.css',
     'shared/assets/motherload_master.svg', 'shared/assets/motherload_master.png',
     'shared/assets/logo-whatsapp.png', 'shared/assets/logo-imessage.png',

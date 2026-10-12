@@ -1,3 +1,4 @@
+import { mergeReceipts, paintReceipt, MESSAGE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
 // apps/master/main.js — read-only manager console (PLAN-MASTER-SYNC.md §6.4).
 //
 // Reuses the genuinely app-agnostic shared/ leaves: shared/matrix/client.js
@@ -266,7 +267,7 @@ function freshRoomInfo(rid) {
            lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
            profileId: null, profileDisplayName: null, createSender: null,
            isContacts: false, contacts: [], contactsByKey: {}, shareLevelContent: null,
-           readState: null, avatarByEvent: null, timestampCorrections: new Map(),
+           readState: null, receipts: new Map(), lastEventId: null, avatarByEvent: null, timestampCorrections: new Map(),
            uplinkHealth: null, lastLagMs: null };
 }
 
@@ -320,6 +321,7 @@ function hopLagMs(ev) {
 // in the timeline window; in a delta, all new state rides in the timeline).
 function applyRoom(info, r) {
   const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
+  if (!info.createSender) info.createSender = stateEvents.find(e => e?.type === 'm.room.create' && e.state_key === '')?.sender || null;
   for (const e of stateEvents) {
     if (!e || typeof e.type !== 'string') continue;
     if (e.type === 'm.room.name' && e.state_key === '') info.name = e.content && e.content.name;
@@ -366,6 +368,10 @@ function applyRoom(info, r) {
     if (e.type === 'com.jkali.read_state' && e.state_key === '' && e.content && typeof e.content === 'object') {
       info.readState = { teammate_read_ts: Number(e.content.teammate_read_ts) || 0,
                          remote_read_ts: Number(e.content.remote_read_ts) || 0 };
+      if (Number.isInteger(e.content.unread_count) && e.content.unread_count >= 0) info.readState.unread_count = e.content.unread_count;
+    }
+    if (e.type === MESSAGE_RECEIPT_TYPE && e.sender === info.createSender && typeof e.state_key === 'string') {
+      info.receipts = mergeReceipts(info.receipts, [[e.state_key, e.content || {}]]);
     }
     if (e.type === 'com.jkali.uplink_health' && e.state_key === '') info.uplinkHealth = parseUplinkHealth(e.content);
     // m.space.child: non-empty content links, empty content unlinks (revocation).
@@ -386,7 +392,7 @@ function applyRoom(info, r) {
     const resolved = resolveMirrorContent(ev);
     if (!resolved) continue;
     const ts = mirrorTs(ev, info.timestampCorrections);
-    if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; }
+    if (ts >= info.lastTs) { info.lastBody = resolved.text; info.lastTs = ts; info.lastEventId = ev.event_id; }
     const lag = hopLagMs(ev);
     if (lag !== null) info.lastLagMs = lag;
   }
@@ -607,7 +613,7 @@ function buildByUser(rooms) {
         profileId: r.profileId || null,
         profileDisplayName: r.profileDisplayName || null,
         mirrorOf: r.mirrorOf || null,
-        unread: (r.readState && r.readState.teammate_read_ts < r.lastTs) ? 1 : 0,
+        unread: r.readState?.unread_count || 0,
         readState: r.readState,
         drafts: [],  // filled in refreshAll once loadProposalsIndex() has run
       });
@@ -1357,14 +1363,13 @@ function shortTime(ts) {
 function renderRoomReadLine(rec) {
   const line = $('room-read');
   if (!line) return;
-  if (!rec || !rec.readState) { line.textContent = 'Read state unknown'; return; }
-  const { remote_read_ts, teammate_read_ts } = rec.readState;
+  if (!rec) { line.textContent = 'Read state unknown'; return; }
+  const receipt = rec.receipts?.get(rec.lastEventId);
   const teammateLabel = rec.userLabel ? nameFor(rec.userLabel) : 'Teammate';
   const parts = [];
-  if (remote_read_ts >= rec.lastTs && rec.lastTs > 0) parts.push('Other party read the latest message');
-  parts.push(teammate_read_ts >= rec.lastTs && rec.lastTs > 0
-    ? teammateLabel + ' has read everything'
-    : teammateLabel + ' has unread messages');
+  if (receipt?.read) parts.push('Latest message read by recipient');
+  else if (receipt?.delivered) parts.push('Latest message delivered to recipient');
+  parts.push(receipt?.teammate_read ? teammateLabel + ' read the latest message' : 'Teammate read state unconfirmed');
   if (typeof rec.lastLagMs === 'number') parts.push('mirror lag ' + (rec.lastLagMs < 1000 ? rec.lastLagMs + 'ms' : (rec.lastLagMs / 1000).toFixed(1) + 's'));
   line.textContent = parts.join(' · ');
 }
@@ -1493,6 +1498,11 @@ function renderBubble(ev) {
     : (typeof c0['com.jkali.from_schedule'] === 'string') ? 'scheduled'
     : 'teammate';
   meta.appendChild(el('span', 'msg-role-time', role + ' · ' + shortTime(ts)));
+  if (sent) {
+    const checks = el('span', 'message-receipt');
+    paintReceipt(checks, MS.rooms[MS.openRoomId]?.receipts?.get(eventId));
+    meta.appendChild(checks);
+  }
   row.appendChild(meta);
 
   let cls = 'msg';
@@ -1605,7 +1615,7 @@ async function startTail(roomId) {
   while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { rooms: [roomId], timeline: { limit: 20 }, state: { types: [] } },
+        room: { rooms: [roomId], timeline: { limit: 20 }, state: { types: [MESSAGE_RECEIPT_TYPE] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -1616,6 +1626,10 @@ async function startTail(roomId) {
       MS.tailSince = owner.since;
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[roomId];
+      if (room && MS.rooms[roomId]) {
+        const stateOnly = (room.state?.events || []).concat(room.timeline?.events || []).filter(e => e.type === MESSAGE_RECEIPT_TYPE);
+        applyRoom(MS.rooms[roomId], { state: { events: stateOnly } });
+      }
       if (room && room.timeline && Array.isArray(room.timeline.events) && MS.openRoomId === roomId) {
         const rec = MS.rooms[roomId];
         const corrections = timestampCorrections(room.timeline.events, rec?.createSender);
@@ -1631,6 +1645,11 @@ async function startTail(roomId) {
         for (const ev of room.timeline.events.slice().sort((a, b) => mirrorTs(a) - mirrorTs(b))) {
           renderBubble(ev);
         }
+        for (const [id, row] of MS.roomRows) {
+          const checks = row.querySelector('.message-receipt');
+          if (checks) paintReceipt(checks, rec?.receipts?.get(id));
+        }
+        renderRoomReadLine(rec);
         reconcileNativeEchoes();
         renderSuggestionStack();
         const box = $('room-messages');

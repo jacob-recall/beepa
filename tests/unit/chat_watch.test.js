@@ -1,3 +1,4 @@
+import { parseMessageReceipts, mergeReceipts } from '../../shared/model/message_receipts.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -7,7 +8,7 @@ const source = fs.readFileSync(new URL('../../shared/ui/chat.js', import.meta.ur
   .replace(/^import .*;\n/gm, '').replace(/^export .*;\n/gm, '');
 const requests = [], rendered = [];
 const S = { token: 'first-session', joinedSet: new Set(['!A:local', '!B:local']) };
-const ctx = vm.createContext({ S, ROOMID_RE: /^!/, convoSeen: new Set(), feedModel: new Map(), runtime: {},
+const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts, S, ROOMID_RE: /^!/, convoSeen: new Set(), feedModel: new Map(), runtime: {},
   messageTimestamp, timestampCorrections, IMSG_BOT_MXID: '@imessagebot:local',
   $: () => null, sanitizeLine: s => s, setActiveNav() {}, showSection() {}, setDetailMode() {},
   setActiveConvoRow() {}, renderMessageEvent: e => rendered.push(e.event_id), convoResolveContent: () => true,

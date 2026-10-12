@@ -146,3 +146,8 @@
 #proposal-pane.direct .proposal-mode { color: var(--color-accent-700); }
 body.room-direct #room-messages .ghost.pending, body.room-direct #room-messages .ghost.seen { border-color: var(--color-accent); background: #e7f8f3; }
 body.room-direct #room-messages .ghost-bar, body.room-direct #room-messages .ghosts-cap { color: var(--color-accent-700); }
+
+/* Delivery/read evidence, with accessible text in title + aria-label. */
+.message-receipt { display: inline-block; margin-left: 6px; color: #8b929c; font-size: 13px; font-weight: 600; letter-spacing: -3px; padding-right: 3px; }
+.message-receipt.read { color: #2799e8; }
+.message-receipt.failed { color: #cf5555; letter-spacing: normal; }

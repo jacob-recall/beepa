@@ -2551,11 +2551,13 @@ def scenario_25_receipt_outage_recovery():
         wait_until(lambda: len(master_messages(mr)) >= 1, desc="seed delivery")
         docker(["stop", SANDBOX["master_container"]]); stopped = True
         expected = {}
+        targets = {}
         for room in (rid, private_rid):
             eid = post_msg(e["contact_tok"], room, "read while master sleeps")
             path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(room, safe="")
             event = local(e["tuser_tok"], "GET", path + "/event/" + urllib.parse.quote(eid, safe=""))
             expected[room] = event["origin_server_ts"]
+            targets[room] = eid
             local(e["tuser_tok"], "POST", path + "/read_markers", {"m.fully_read": eid, "m.read": eid})
 
         def queued(room):
@@ -2573,6 +2575,16 @@ def scenario_25_receipt_outage_recovery():
         wait_until(lambda: master(MASTER_ALICE_TOKEN, "GET", path).get("teammate_read_ts", 0) >= expected[rid],
                    timeout=90, desc="receipt retried after restart with no new receipt")
         wait_until(lambda: queued(rid) and queued(rid)[1] == 0, desc="receipt acknowledged")
+        def exact_clean():
+            with sqlite3.connect(e['db_path']) as db:
+                row = db.execute('SELECT dirty FROM message_receipts WHERE local_room_id=? AND target=?', (rid, targets[rid])).fetchone()
+                revoked_rows = db.execute('SELECT count(*) FROM message_receipts WHERE local_room_id=?', (private_rid,)).fetchone()[0]
+                mapped = db.execute('SELECT master_event_id FROM delivery_map WHERE master_room_id=? AND local_event_id=?', (mr, targets[rid])).fetchone()
+            if not row or row[0] or not mapped or revoked_rows: return False
+            exact = master(MASTER_ALICE_TOKEN, 'GET', '/_matrix/client/v3/rooms/' + urllib.parse.quote(mr, safe='') +
+                           '/state/com.jkali.message_receipt/' + urllib.parse.quote(mapped[0], safe=''))
+            return exact.get('teammate_read') is True
+        wait_until(exact_clean, timeout=90, desc='exact receipt survives outage/restart and revoked target stays absent')
         # The scoped account may have left the revoked room. Either absence or
         # membership denial proves no new state was published to it.
         try:
@@ -2587,6 +2599,60 @@ def scenario_25_receipt_outage_recovery():
         if stopped:
             docker(["start", SANDBOX["master_container"]], check=False)
             wait_master_health()
+
+
+def scenario_26_message_checks():
+    """Trusted delivery + exact late read targets, across both real homeservers."""
+    e = fresh_env("s26")
+    space = create_space(e["tuser_tok"], "iMessage")
+    rid = make_convo(e, space, "Message checkmarks")
+    bot_id, bot_token = register_user('imessagebot')
+    path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(rid, safe="")
+    local(e["tuser_tok"], 'POST', path + '/invite', {'user_id': bot_id})
+    join_room(bot_token, rid)
+    set_override(e["tuser_tok"], e["tuser_id"], rid, "share")
+    a = post_msg(e["tuser_tok"], rid, "older outgoing")
+    b = post_msg(e["tuser_tok"], rid, "newer outgoing")
+    proc = start_uplink(e)
+    try:
+        mr = wait_until(lambda: mirror_of(e["db_path"], rid), desc="checks mirror")[0]
+        def mapped(eid):
+            with sqlite3.connect(e['db_path']) as db:
+                row = db.execute('SELECT master_event_id FROM delivery_map WHERE master_room_id=? AND local_event_id=?', (mr, eid)).fetchone()
+                return row[0] if row else None
+        ma = wait_until(lambda: mapped(a), desc='A mapped')
+        mb = wait_until(lambda: mapped(b), desc='B mapped')
+        def stamp(eid):
+            try:
+                return master(MASTER_ALICE_TOKEN, 'GET', '/_matrix/client/v3/rooms/' + urllib.parse.quote(mr, safe='') +
+                              '/state/com.jkali.message_receipt/' + urllib.parse.quote(eid, safe=''))
+            except MxError as exc:
+                if exc.code == 404: return {}
+                raise
+        def status(token, eid, **extra):
+            local(token, 'PUT', path + '/send/com.beeper.message_send_status/' + uniq('status'),
+                  {'status': 'SUCCESS', 'm.relates_to': {'rel_type': 'm.reference', 'event_id': eid}, **extra})
+        status(bot_token, a)
+        wait_until(lambda: stamp(ma).get('sent'), desc='bridge acceptance mirrored')
+        assert not stamp(ma).get('delivered'), 'acceptance is not delivery'
+        status(bot_token, a, **{'com.jkali.delivered': True})
+        wait_until(lambda: stamp(ma).get('delivered'), desc='confirmed delivery mirrored')
+        # A forged delivery on B and a late read of A cannot advance B.
+        status(e['contact_tok'], b, **{'com.jkali.delivered': True})
+        local(e['contact_tok'], 'POST', path + '/read_markers', {'m.read': a, 'm.fully_read': a})
+        wait_until(lambda: stamp(ma).get('read'), desc='A exact read mirrored')
+        assert not stamp(mb).get('read') and not stamp(mb).get('delivered')
+        room = local(e['tuser_tok'], 'GET', '/_matrix/client/v3/sync', query={'timeout': '0'})['rooms']['join'][rid]
+        result = subprocess.run(['node', os.path.join(HERE, 'read_state_client.js')], input=json.dumps({
+            'base': TEST_HS, 'token': e['tuser_tok'], 'roomId': rid, 'userId': e['tuser_id'],
+            'action': 'parse', 'sourceId': 'imessage', 'room': room}), capture_output=True, text=True, check=True)
+        checks = json.loads(result.stdout)['receipts']
+        assert checks[a]['read'] and not checks.get(b, {}).get('read') and not checks.get(b, {}).get('delivered')
+        stop_uplink(proc); proc = start_uplink(e)
+        wait_until(lambda: stamp(ma).get('read'), desc='read persists across restart')
+        return True, 'one gray on acceptance; two gray on delivery; two blue for exact A; newer B stays unconfirmed; restart'
+    finally:
+        stop_uplink(proc)
 
 
 SCENARIOS = [
@@ -2615,6 +2681,7 @@ SCENARIOS = [
     ("23_manager_timed_direct_superseded", scenario_23_manager_timed_direct_superseded),
     ("24_read_unread", scenario_24_read_unread),
     ("25_receipt_outage_recovery", scenario_25_receipt_outage_recovery),
+    ("26_message_checks", scenario_26_message_checks),
 ]
 
 

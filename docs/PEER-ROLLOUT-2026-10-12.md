@@ -1,11 +1,15 @@
 # Receipt reliability rollout for Elliot and David
 
-Release: **0.2.1**, tag **v0.2.1**, canonical repository
+Release: **0.2.2**, tag **v0.2.2**, canonical repository
 `git@github.com:jacob-recall/beepa.git`. Run this procedure on each person's
 source Mac, one at a time. These are instructions for the bot operating that
 installation; publishing this file does not mean either peer has been upgraded.
 
 ## What this release changes
+
+Both apps now render the requested gray/blue checkmarks on outgoing messages.
+The detailed semantics and provider limits are below.
+
 
 - The uplink coalesces receipt updates in SQLite `receipt_outbox`, one row per
   shared room. It commits before advancing the local sync cursor. A master
@@ -40,13 +44,41 @@ The synthetic integration tests prove the Matrix/app/uplink path, not receipt
 support on every real provider or an actual recipient's actions. In group chats,
 the newest receipt from an eligible participant does **not** mean everyone read.
 
-**Exact read-position accuracy remains incomplete (pm_mng-m07).** The current
-caption/master logic compares receipt wall-clock times to displayed message
-times, rather than carrying the receipt's target event ID. A late receipt for an
-older event, historical import, or clock skew can overstate which message was
-read. Treat “Read”/“has read everything” as approximate. The durable queue fixes
-loss and regression of the received state; it does not resolve this semantic
-limitation. Do not advertise exact per-message or all-participant read proof.
+**Checkmark behavior (0.2.2):** one gray check means sending / delivery
+unconfirmed; two gray checks mean explicit recipient delivery; two blue checks
+mean an eligible recipient supplied a read receipt for that exact message ID.
+Bridge acceptance alone stays one check. Failed sends show an error indicator.
+Group checks mean at least one recipient, as the accessible tooltip explains.
+
+Receipts match exact target IDs, mapped through the current mirror generation.
+They never infer read position from receipt time, displayed timestamps, or
+historical corrections. This fixes pm_mng-m07's false positive. The conservative
+tradeoff is that messages without their own evidence can remain gray even if a
+later message has a receipt. The user view reconstructs available receipt/status
+evidence from Matrix sync/history on reload; it does not invent older receipts
+that a provider no longer exposes. The master retains published per-event state.
+
+Matrix bridge status events are enabled by the managed templates. Only a status
+from that conversation's bridge bot is accepted; `SUCCESS` alone is not delivery.
+A nonempty remote `delivered_to_users` is delivery evidence. The iMessage daemon
+publishes its explicit native `engine_delivered` result through a separate,
+idempotent status publisher. Plain engine acceptance stays unconfirmed. The
+current iMessage adapter does not expose recipient read updates, so do not
+promise blue checks for iMessage until that adapter provides read evidence.
+
+The additive `message_receipts` SQLite table retains per-target evidence before
+sync advances. The independent `message_receipts` stage maps to the current
+master event and retries after outage/restart, rechecking link and consent.
+Unknown targets stay queued instead of attaching to a different message.
+Private/revoked rooms and destination changes clear that queue. The existing
+room receipt outbox now also mirrors Matrix's actual `unread_count` (including
+zero); the master no longer estimates unread badges from receipt timestamps.
+
+The iMessage `published_message_status` ledger prevents duplicate publication;
+a Matrix failure retries the status only, never the native send. These schema
+changes are additive; unread counts use a separate `room_unread` table so the
+0.2.1 receipt table shape remains compatible. Rollback cannot remove already-published Matrix state;
+older releases ignore the new receipt states and retain their old limitations.
 
 ## 1. Identify and preserve the installation
 
@@ -88,9 +120,9 @@ canonical `upstream`; add that remote only if absent and its URL is verified.
 Do not overwrite the fork's origin. The commands below use the chosen remote:
 
 ```sh
-git fetch <canonical-remote> tag v0.2.1
-git show v0.2.1:release.json
-git rev-parse 'v0.2.1^{commit}'
+git fetch <canonical-remote> tag v0.2.2
+git show v0.2.2:release.json
+git rev-parse 'v0.2.2^{commit}'
 ```
 
 Confirm the tag's commit matches Jacob's release handoff. Inspect tracked local
@@ -99,7 +131,7 @@ reset, discard, force-push, automatically stash, or merge unrelated histories.
 For a clean branch that is an ancestor of the release:
 
 ```sh
-git merge --ff-only v0.2.1
+git merge --ff-only v0.2.2
 git status --short
 git rev-parse HEAD
 ```
@@ -189,8 +221,31 @@ rollback guarantee. Older uplinks do not retry the new receipt outbox.
 ## Evidence from Jacob's installation
 
 On 2026-10-12 the full discovered unit/conformance suite passed, including
-122,429 consent vectors and 8,112 invite vectors. Disposable scenarios 7, 24,
-and 25 passed. Scenario 24 uses the actual app receipt writer/parser against
+122,429 consent vectors and 8,112 invite vectors. Disposable scenarios 24, 25, and 26 passed. Scenario 24 uses the actual app receipt writer/parser against
 real Synapse; scenario 25 stops only the disposable master. No real-provider
 messages were sent. Browser visual acceptance was unavailable in the agent
 environment and is still required on each peer's Mac.
+
+## Additional 0.2.2 verification on each peer
+
+After `./update.sh --apply`, verify the active bridge configurations have
+`matrix.message_status_events: true` (Discord uses its existing bridge setting),
+and that the updater restarted changed bridges plus uplink, iMessage, and the
+master gateway where that role is installed. Never print entire configurations;
+they contain credentials. Reload both web apps to pick up the versioned assets.
+
+Run `python3 tests/run.py` and `./tests/integration/run.sh 24 25 26` from the
+activated source when that Mac has the required test dependencies. The harness
+creates disposable servers and cleans up only its own marked resources.
+Scenario 26 verifies acceptance versus delivery, a late read of an older message,
+a forged status on the newer message, and restart persistence. Do not substitute
+production accounts into these tests. Check the live queues/errors separately.
+
+For owner-approved provider acceptance, observe a new outgoing message progress
+through the checks in the existing conversation. Have the recipient acknowledge
+delivery/read themselves where supported; never manufacture a receipt or send
+unrelated messages to claim acceptance. Record platform, observed states, and
+any state the provider did not expose. This synthetic suite does not prove
+actual recipient delivery on every provider.
+
+Bridge delivery interpretation follows the upstream [mautrix status event contract](https://github.com/mautrix/go/blob/main/event/beeper.go).

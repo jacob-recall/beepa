@@ -81,6 +81,7 @@ import urllib.parse
 import urllib.request
 
 import connect  # session-connect/connect.py — same dir; imported side-effect-free
+import discord_connect
 import base64
 
 from http_limits import BoundedBodyMixin
@@ -108,7 +109,7 @@ CONTACTS_DB = os.environ.get('CONTACTS_DB', os.path.join(connect.REPO, "agents",
 # whose source is not here is not a source this system mirrors, so it can never
 # become a valid override key and is filtered out before the response is built.
 CONTACTS_SOURCES = ("whatsapp", "imessage", "gmessages",
-                    "instagram", "linkedin", "twitter")
+                    "instagram", "linkedin", "twitter", "discord")
 CONTACTS_MAX = 2000   # P3: this server is single-threaded; bound the response.
 
 DEFAULT_HOST = "127.0.0.1"
@@ -268,6 +269,7 @@ def _make_handler():
                     self._route()[0] is not None
                     or self.path == ENRICH_NUMBERS_PATH
                     or self.path == ENROLL_EXCHANGE_PATH
+                    or self._discord_action() is not None
                     or self.path == CONTACTS_LIST_PATH):
                 self.send_response(204)
                 self._cors()
@@ -292,6 +294,26 @@ def _make_handler():
 
         def do_POST(self):
             self._diag(-1)
+            action = self._discord_action()
+            if action is not None:
+                if not self._authorized():
+                    return
+                if not _host_allowed(self.headers.get('Host')):
+                    self._json(403, {'error': 'forbidden'}, cors=True)
+                    return
+                body = self._read_json_body()
+                if getattr(self, '_body_rejected', False):
+                    return
+                if body is None:
+                    self._json(400, {'error': 'Invalid Discord request.'}, cors=True)
+                    return
+                try:
+                    result = discord_connect.connector.dispatch(action, body)
+                except (Exception, SystemExit):
+                    self._json(502, {'status': 'failed', 'error': 'Could not complete the Discord request. Check the bridge and try again.'}, cors=True)
+                    return
+                self._json(200, result, cors=True)
+                return
             if self.path == ENRICH_NUMBERS_PATH:
                 if not self._authorized():   # F1: gate BEFORE any DB read
                     return
@@ -336,6 +358,11 @@ def _make_handler():
                 if not self._discard_body():
                     return
                 self._start_provisioning(name)
+
+        def _discord_action(self):
+            prefix = '/connect/discord/'
+            action = self.path[len(prefix):] if self.path.startswith(prefix) else ''
+            return action if action in discord_connect.ACTIONS else None
 
         # ---- read each 1:1 conversation's real phone/email, LOCAL-only ----
         def _enrich_numbers(self):

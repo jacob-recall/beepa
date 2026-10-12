@@ -46,9 +46,10 @@ even where the bridge itself supports them. Existing timestamp and deduplication
 logic applies to history and mirror copies. Double puppeting represents messages
 sent in the native Discord client as the configured local Matrix user.
 
-Every new conversation starts Private. Share and Direct retain their existing
-per-conversation meaning. Linking a Discord account never shares a conversation
-with the master. Discord account credentials and bridge state remain local.
+New conversations inherit the account's configured default sharing level
+(Private unless changed). Per-conversation overrides still take precedence.
+Linking Discord does not change that policy. Discord credentials and bridge
+state remain local.
 
 ## Transport and recovery
 

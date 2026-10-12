@@ -147,11 +147,17 @@ async function markRead(roomId, eventId) {
   if (!receiptsEnabled()) return;
   if (typeof eventId !== 'string' || !eventId.startsWith('$')) return;
   if (!ROOMID_RE.test(roomId) || !S.joinedSet.has(roomId) || S.openRoomId !== roomId) return;
+  const session = S.token;
+  const reading = feedModel.get(roomId);
+  const lastTs = reading && reading.lastTs;
+  const unread = reading && reading.unread;
   try {
     await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/read_markers',
       { 'm.fully_read': eventId, 'm.read': eventId });
     const rec = feedModel.get(roomId);
-    if (rec && rec.unread) { rec.unread = 0; scheduleFeedRender(); }
+    if (S.token === session && rec === reading && rec && rec.lastTs === lastTs && rec.unread === unread && rec.unread) {
+      rec.unread = 0; scheduleFeedRender();
+    }
   } catch (e) { /* receipt failure never affects anything else */ }
 }
 function newestRenderedEventId() {

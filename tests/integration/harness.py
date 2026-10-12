@@ -2468,6 +2468,127 @@ def scenario_23_manager_timed_direct_superseded():
 
 
 
+def scenario_24_read_unread():
+    """Real app receipt writer + local counts + two-homeserver read-state mirror."""
+    e = fresh_env("s24")
+    space = create_space(e["tuser_tok"], "iMessage")
+    rid = make_convo(e, space, "Read state test")
+    set_override(e["tuser_tok"], e["tuser_id"], rid, "share")
+    room_path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(rid, safe="")
+
+    def app(action, **data):
+        payload = dict(base=TEST_HS, token=e["tuser_tok"], roomId=rid,
+                       userId=e["tuser_id"], action=action, **data)
+        run = subprocess.run(["node", os.path.join(HERE, "read_state_client.js")],
+                             input=json.dumps(payload), capture_output=True, text=True, check=True)
+        return json.loads(run.stdout)
+
+    def snapshot():
+        data = local(e["tuser_tok"], "GET", "/_matrix/client/v3/sync", query={"timeout": "0"})
+        return data["rooms"]["join"][rid]
+
+    baseline = post_msg(e["contact_tok"], rid, "baseline")
+    app("mark", eventId=baseline)
+    wait_until(lambda: app("parse", room=snapshot())["unread"] == 0, desc="baseline read")
+    proc = start_uplink(e)
+    try:
+        mr = wait_until(lambda: mirror_of(e["db_path"], rid), desc="read-state mirror")[0]
+        master(MASTER_MANAGER_TOKEN, "POST", "/_matrix/client/v3/rooms/"
+               + urllib.parse.quote(mr, safe="") + "/join", {})
+        state_path = ("/_matrix/client/v3/rooms/" + urllib.parse.quote(mr, safe="")
+                      + "/state/com.jkali.read_state/")
+
+        def state():
+            return master(MASTER_MANAGER_TOKEN, "GET", state_path)
+
+        wait_until(lambda: state().get("teammate_read_ts", 0) > 0, desc="initial teammate receipt")
+        incoming = post_msg(e["contact_tok"], rid, "new unread message")
+        wait_until(lambda: app("parse", room=snapshot())["unread"] == 1, desc="app unread count one")
+        event = local(e["tuser_tok"], "GET", room_path + "/event/" + urllib.parse.quote(incoming, safe=""))
+        incoming_ts = event["origin_server_ts"]
+        wait_until(lambda: any(m["body"] == "new unread message" for m in master_messages(mr)),
+                   desc="incoming mirror")
+        assert state()["teammate_read_ts"] < incoming_ts, "master must show teammate unread"
+        app("mark", eventId=incoming)
+        wait_until(lambda: app("parse", room=snapshot())["unread"] == 0, desc="app clears unread")
+        wait_until(lambda: state()["teammate_read_ts"] >= incoming_ts, desc="master clears teammate unread")
+        before = state()["teammate_read_ts"]
+        reply = post_msg(e["tuser_tok"], rid, "reply for remote receipt")
+        local(e["contact_tok"], "POST", room_path + "/read_markers",
+              {"m.fully_read": reply, "m.read": reply})
+        wait_until(lambda: app("parse", room=snapshot())["remoteReadTs"] > 0, desc="app remote read")
+        wait_until(lambda: state()["remote_read_ts"] > 0, desc="master remote read")
+        assert state()["teammate_read_ts"] >= before, "remote receipt must not erase teammate read position"
+        remote_before = state()["remote_read_ts"]
+        stop_uplink(proc)
+        proc = start_uplink(e)
+        after_restart = post_msg(e["contact_tok"], rid, "unread after restart")
+        restart_event = local(e["tuser_tok"], "GET", room_path + "/event/"
+                              + urllib.parse.quote(after_restart, safe=""))
+        app("mark", eventId=after_restart)
+        wait_until(lambda: state()["teammate_read_ts"] >= restart_event["origin_server_ts"],
+                   desc="new receipt mirrored by restarted daemon")
+        assert state()["remote_read_ts"] >= remote_before, "restart must retain remote read position"
+        return True, "app unread 0→1→0; actual markRead writer; master unread→read; remote receipt; restart"
+    finally:
+        stop_uplink(proc)
+
+
+def scenario_25_receipt_outage_recovery():
+    """Receipt-only changes survive master outage + daemon restart; private drops them."""
+    e = fresh_env("s25")
+    space = create_space(e["tuser_tok"], "iMessage")
+    rid = make_convo(e, space, "Receipt outage")
+    private_rid = make_convo(e, space, "Receipt revoked")
+    for room in (rid, private_rid):
+        set_override(e["tuser_tok"], e["tuser_id"], room, "share")
+        post_msg(e["contact_tok"], room, "seed")
+    proc = start_uplink(e)
+    stopped = False
+    try:
+        mr = wait_until(lambda: mirror_of(e["db_path"], rid), desc="outage mirror")[0]
+        revoked = wait_until(lambda: mirror_of(e["db_path"], private_rid), desc="revocation mirror")[0]
+        wait_until(lambda: len(master_messages(mr)) >= 1, desc="seed delivery")
+        docker(["stop", SANDBOX["master_container"]]); stopped = True
+        expected = {}
+        for room in (rid, private_rid):
+            eid = post_msg(e["contact_tok"], room, "read while master sleeps")
+            path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(room, safe="")
+            event = local(e["tuser_tok"], "GET", path + "/event/" + urllib.parse.quote(eid, safe=""))
+            expected[room] = event["origin_server_ts"]
+            local(e["tuser_tok"], "POST", path + "/read_markers", {"m.fully_read": eid, "m.read": eid})
+
+        def queued(room):
+            with sqlite3.connect(e["db_path"]) as db:
+                return db.execute("SELECT teammate_read_ts,dirty FROM receipt_outbox WHERE local_room_id=?", (room,)).fetchone()
+        wait_until(lambda: all(queued(r) and queued(r)[0] >= expected[r] and queued(r)[1] for r in expected),
+                   desc="receipts durably queued during outage")
+        set_override(e["tuser_tok"], e["tuser_id"], private_rid, "private")
+        wait_until(lambda: queued(private_rid) is None, desc="private drops pending receipt before recovery")
+        stop_uplink(proc)
+        proc = start_uplink(e)
+        docker(["start", SANDBOX["master_container"]]); stopped = False
+        wait_master_health()
+        path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(mr, safe="") + "/state/com.jkali.read_state/"
+        wait_until(lambda: master(MASTER_ALICE_TOKEN, "GET", path).get("teammate_read_ts", 0) >= expected[rid],
+                   timeout=90, desc="receipt retried after restart with no new receipt")
+        wait_until(lambda: queued(rid) and queued(rid)[1] == 0, desc="receipt acknowledged")
+        # The scoped account may have left the revoked room. Either absence or
+        # membership denial proves no new state was published to it.
+        try:
+            leaked = master(MASTER_ALICE_TOKEN, "GET", "/_matrix/client/v3/rooms/"
+                            + urllib.parse.quote(revoked, safe="") + "/state/com.jkali.read_state/")
+            assert leaked.get("teammate_read_ts", 0) < expected[private_rid]
+        except MxError as exc:
+            assert exc.code in (403, 404)
+        return True, "receipt durable during outage; process restart; recovery without new receipt; private suppressed"
+    finally:
+        stop_uplink(proc)
+        if stopped:
+            docker(["start", SANDBOX["master_container"]], check=False)
+            wait_master_health()
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2492,6 +2613,8 @@ SCENARIOS = [
     ("21_cancel_before_send_at", scenario_21_cancel_before_send_at),
     ("22_schedule_fires_with_master_unreachable", scenario_22_schedule_fires_with_master_unreachable),
     ("23_manager_timed_direct_superseded", scenario_23_manager_timed_direct_superseded),
+    ("24_read_unread", scenario_24_read_unread),
+    ("25_receipt_outage_recovery", scenario_25_receipt_outage_recovery),
 ]
 
 

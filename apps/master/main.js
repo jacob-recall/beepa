@@ -272,7 +272,7 @@ function freshRoomInfo(rid) {
 
 // F0: health the teammate's uplink publishes on its own space (counts and
 // timestamps only). Whitelisted numeric/boolean fields; nothing else is kept.
-const HEALTH_NUM = ['pending_events', 'proposal_pending', 'media_retry', 'history_pages_pending', 'history_incomplete',
+const HEALTH_NUM = ['pending_events', 'proposal_pending', 'media_retry', 'receipts_pending', 'history_pages_pending', 'history_incomplete',
   'revocations_pending', 'delivery_incomplete', 'delivery_refused', 'last_ingestion', 'last_delivery', 'oldest_pending_ts', 'updated_at'];
 function parseUplinkHealth(content) {
   if (!content || typeof content !== 'object') return null;
@@ -296,6 +296,7 @@ function healthText(h, now) {
   const parts = [age > 180 ? 'sync STALE (' + Math.round(age / 60) + 'm ago)' : 'synced ' + age + 's ago'];
   if (h.connected === false) parts.push('disconnected');
   if (h.pending_events) parts.push(h.pending_events + ' queued');
+  if (h.receipts_pending) parts.push(h.receipts_pending + ' receipt updates queued');
   if (h.delivery_refused) parts.push(h.delivery_refused + ' refused');
   if (h.history_pages_pending) parts.push('history catching up');
   if (h.stage_errors && h.stage_errors.length) parts.push('retrying ' + h.stage_errors.join(', '));

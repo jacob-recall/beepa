@@ -1468,6 +1468,13 @@ class Uplink(durable_sync.DurableSync):
         # Backfill/tail every kept + freshly-created room.
         for rid in sorted(set(plan["create"]) | set(plan["keep"])):
             self.sync_room(rid)
+            # Full snapshots reseed existing receipts after an upgrade or a
+            # new mirror generation, even if nobody produces another receipt.
+            row = self.mirror_for(rid)
+            if row and desired.get(rid) in ("share", "direct"):
+                state = read_state_from_room(join.get(rid),
+                                             set(self.self_mxids) | {self.cfg.local_user}, SOURCE_BOT_MXIDS)
+                self._queue_read_state(rid, row[0], state)
 
     # -- mirror lifecycle ---------------------------------------------------
     def stamped_levels(self):
@@ -3403,28 +3410,53 @@ class Uplink(durable_sync.DurableSync):
             conn.close()
 
     # -- main loop ----------------------------------------------------------
-    def _mirror_read_state(self, local_room_id, master_room_id, state):
-        """PUT com.jkali.read_state on the mirror when it changed (meta-cached).
-        A state event the uplink owns (PL 100 in its own mirror rooms) is the
-        honest carrier: receipts cannot be forwarded across homeservers. Write
-        failure is logged and retried on the next change; never raised."""
-        key = "read_state:" + local_room_id
-        payload = {"teammate_read_ts": int(state.get("teammate_read_ts") or 0),
-                   "remote_read_ts": int(state.get("remote_read_ts") or 0)}
-        sig = "%d:%d" % (payload["teammate_read_ts"], payload["remote_read_ts"])
-        if self.meta_get(key) == sig:
+    def _queue_read_state(self, local_room_id, master_room_id, state):
+        """Persist coalesced receipt positions before advancing local /sync.
+
+        There is at most one row per shared room, with no bodies or credentials.
+        Positions advance independently; a replacement mirror starts afresh.
+        """
+        teammate = max(0, int(state.get("teammate_read_ts") or 0))
+        remote = max(0, int(state.get("remote_read_ts") or 0))
+        if not (teammate or remote):
             return
-        payload["updated_ts"] = int(time.time() * 1000)
-        try:
-            # F9: short timeout — this runs from local ingestion, which must never
-            # stall on a sleeping master.
+        self.db.execute('''INSERT INTO receipt_outbox VALUES (?,?,?,?,1)
+            ON CONFLICT(local_room_id) DO UPDATE SET
+              teammate_read_ts=CASE WHEN master_room_id=excluded.master_room_id
+                THEN max(teammate_read_ts,excluded.teammate_read_ts) ELSE excluded.teammate_read_ts END,
+              remote_read_ts=CASE WHEN master_room_id=excluded.master_room_id
+                THEN max(remote_read_ts,excluded.remote_read_ts) ELSE excluded.remote_read_ts END,
+              dirty=CASE WHEN master_room_id!=excluded.master_room_id
+                OR excluded.teammate_read_ts>teammate_read_ts OR excluded.remote_read_ts>remote_read_ts
+                THEN 1 ELSE dirty END,
+              master_room_id=excluded.master_room_id''', (local_room_id, master_room_id, teammate, remote))
+        self.db.commit()
+
+    def flush_read_state(self):
+        """Retry persisted receipts independently of message ingestion/delivery."""
+        for local_room_id, master_room_id, teammate, remote in self.db.execute(
+                'SELECT local_room_id,master_room_id,teammate_read_ts,remote_read_ts '
+                'FROM receipt_outbox WHERE dirty=1 ORDER BY rowid LIMIT 16').fetchall():
+            row = self.mirror_for(local_room_id)
+            if not row or row[0] != master_room_id or self.mirror_status(local_room_id) == 'revoking':
+                self.db.execute('DELETE FROM receipt_outbox WHERE local_room_id=?', (local_room_id,))
+                self.db.commit()
+                continue
+            if not self.active_link_for_dispatch():
+                return
+            if self.archive_level(local_room_id) not in ('share', 'direct'):
+                self.db.execute('DELETE FROM receipt_outbox WHERE local_room_id=?', (local_room_id,))
+                self.db.commit()
+                continue
+            payload = {"teammate_read_ts": teammate, "remote_read_ts": remote,
+                       "updated_ts": int(time.time() * 1000)}
+            # Failure leaves the row dirty; run_stage backs off (including 429).
             self.master("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="")
                         + "/state/" + READ_STATE_TYPE + "/", payload, timeout=15)
-            self.meta_set(key, sig)
-        except MasterUnreachable:
-            log.debug("read_state not mirrored (master unreachable)")
-        except Exception as e:                     # noqa: BLE001 — cosmetic state, never blocks delivery
-            log.debug("read_state not mirrored (%s)", type(e).__name__)
+            self.db.execute('UPDATE receipt_outbox SET dirty=0 WHERE local_room_id=? AND master_room_id=? '
+                            'AND teammate_read_ts=? AND remote_read_ts=?',
+                            (local_room_id, master_room_id, teammate, remote))
+            self.db.commit()
 
     def tail_once(self):
         """One /sync of the LOCAL hs; forward new events in shared mirror rooms."""
@@ -3472,17 +3504,12 @@ class Uplink(durable_sync.DurableSync):
             if self.mirror_status(local_room_id) == "revoking":
                 continue
             master_room_id = row[0]
-            try:
-                selfs = set(self.self_mxids) | {self.cfg.local_user}
-                rs = read_state_from_room(room, selfs, SOURCE_BOT_MXIDS)
-                # F9: the SAME per-write consent recheck every other master write
-                # performs, so an unshared room never leaks its read state.
-                if ((rs["teammate_read_ts"] or rs["remote_read_ts"])
-                        and self.active_link_for_dispatch()
-                        and self.archive_level(local_room_id) in ("share", "direct")):
-                    self._mirror_read_state(local_room_id, master_room_id, rs)
-            except Exception as e:                 # noqa: BLE001 — never affects event forwarding
-                log.debug("read_state skipped (%s)", type(e).__name__)
+            selfs = set(self.self_mxids) | {self.cfg.local_user}
+            rs = read_state_from_room(room, selfs, SOURCE_BOT_MXIDS)
+            # Local persistence only. A storage failure must prevent advancing
+            # sync_since; remote failures cannot stall ingestion. Consent is
+            # re-read immediately before the eventual master state write.
+            self._queue_read_state(local_room_id, master_room_id, rs)
             timeline = room.get("timeline") or {}
             events = timeline.get("events") or []
             if timeline.get("limited"):
@@ -3679,6 +3706,7 @@ class Uplink(durable_sync.DurableSync):
                 if self.meta_get("link_disabled") == "1":
                     continue
                 self.run_stage("delivery", self.deliver_pending)
+                self.run_stage("receipts", self.flush_read_state)
                 def proposals():
                     self.ensure_proposal_rooms()
                     self.pull_proposals()

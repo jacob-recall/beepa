@@ -1,6 +1,7 @@
 // Receipt evidence is keyed by target event ID, never receipt/display time.
 // Pure leaf shared by both apps. A group's check means at least one recipient.
 export const MESSAGE_RECEIPT_TYPE = 'com.jkali.message_receipt';
+export const NATIVE_RECEIPT_TYPE = 'com.jkali.imessage_receipt';
 export function mergeReceipts(previous, updates) {
   const merged = new Map(previous || []);
   for (const [id, value] of updates || []) {
@@ -43,14 +44,17 @@ export function parseMessageReceipts(room, selfIds, botIds, sourceBot) {
       }
     }
   }
-  for (const ev of room?.timeline?.events || []) {
-    if (ev?.type !== 'com.beeper.message_send_status' || !sourceBot || ev.sender !== sourceBot) continue;
+  for (const ev of [...(room?.state?.events || []), ...(room?.timeline?.events || [])]) {
+    const native = ev?.type === NATIVE_RECEIPT_TYPE;
+    if ((!native && ev?.type !== 'com.beeper.message_send_status') || !sourceBot || ev.sender !== sourceBot) continue;
     const c = ev.content || {}, rel = c['m.relates_to'];
     if (rel?.rel_type !== 'm.reference') continue;
+    if (native && (!sourceBot.startsWith('@imessagebot:') || ev.state_key !== rel.event_id)) continue;
     const delivered = c.status === 'SUCCESS' && Array.isArray(c.delivered_to_users) &&
       c.delivered_to_users.some(user => typeof user === 'string' && user.startsWith('@') && !selfIds.has(user) && !botIds.has(user));
     const nativeDelivered = sourceBot.startsWith('@imessagebot:') && c.status === 'SUCCESS' && c['com.jkali.delivered'] === true;
-    out = mergeReceipts(out, [[rel.event_id, { delivered: delivered || nativeDelivered, sent: c.status === 'SUCCESS', failed: c.status === 'FAIL_PERMANENT' }]]);
+    const nativeRead = native && c.status === 'SUCCESS' && c['com.jkali.read'] === true;
+    out = mergeReceipts(out, [[rel.event_id, { read: nativeRead, delivered: delivered || nativeDelivered, sent: c.status === 'SUCCESS', failed: c.status === 'FAIL_PERMANENT' }]]);
   }
   return out;
 }

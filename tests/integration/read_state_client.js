@@ -1,4 +1,5 @@
-import { parseMessageReceipts, mergeReceipts } from '../../shared/model/message_receipts.js';
+import { parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
+import { SOURCES } from '../../shared/model/source_catalog.js';
 // Exercise the app's real receipt writer/parser against the disposable homeserver.
 // Credentials arrive on stdin, never argv; sandbox.py owns the server lifecycle.
 import fs from 'node:fs';
@@ -10,9 +11,9 @@ const source = path => fs.readFileSync(new URL(path, import.meta.url), 'utf8')
   .replace(/^import .*;\n/gm, '').replace(/^export .*;\n/gm, '');
 const model = new Map([[input.roomId, { unread: 1 }]]);
 let writes = 0;
-const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts,
+const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE,
   S: { openRoomId: input.roomId, joinedSet: new Set([input.roomId]) },
-  ROOMID_RE: /^![^:]+:.+$/, feedModel: model, SOURCES: [], setTimeout,
+  ROOMID_RE: /^![^:]+:.+$/, feedModel: model, SOURCES, setTimeout,
   localStorage: { getItem: () => null }, scheduleFeedRender() {},
   api: async (method, path, body) => {
     const response = await fetch(input.base + path, {

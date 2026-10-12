@@ -1,4 +1,4 @@
-import { parseMessageReceipts, mergeReceipts } from '../model/message_receipts.js';
+import { parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE } from '../model/message_receipts.js';
 import { feedPreviewFromEvent } from '../model/message_preview.js';
 import { sourceRoomIds } from '../model/source_rooms.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../model/message_timestamps.js';
@@ -395,7 +395,7 @@ async function startFeedSync() {
   while (S.feedRunning && S.token) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { timeline: { limit: 6 }, state: { types: [] }, ephemeral: { types: ['m.receipt'] } },
+        room: { timeline: { limit: 6 }, state: { types: [NATIVE_RECEIPT_TYPE] }, ephemeral: { types: ['m.receipt'] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +

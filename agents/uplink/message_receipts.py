@@ -3,6 +3,7 @@ import urllib.parse
 
 TYPE = 'com.jkali.message_receipt'
 STATUS_TYPE = 'com.beeper.message_send_status'
+NATIVE_TYPE = 'com.jkali.imessage_receipt'
 
 
 def parse_receipts(room, self_ids, bots, source_bot):
@@ -31,8 +32,9 @@ def parse_receipts(room, self_ids, bots, source_bot):
                 if info.get('thread_id') not in (None, 'main'):
                     continue
                 add(target, **({'teammate_read': True} if user in self_ids else {'read': True, 'delivered': True}))
-    for ev in (room.get('timeline') or {}).get('events', []):
-        if not isinstance(ev, dict) or ev.get('type') != STATUS_TYPE or not source_bot or ev.get('sender') != source_bot:
+    events = (room.get('state') or {}).get('events', []) + (room.get('timeline') or {}).get('events', [])
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get('type') not in (STATUS_TYPE, NATIVE_TYPE) or not source_bot or ev.get('sender') != source_bot:
             continue
         c = ev.get('content') or {}
         if not isinstance(c, dict):
@@ -40,11 +42,15 @@ def parse_receipts(room, self_ids, bots, source_bot):
         rel = c.get('m.relates_to')
         if not isinstance(rel, dict) or rel.get('rel_type') != 'm.reference':
             continue
+        native = ev['type'] == NATIVE_TYPE
+        if native and (not source_bot.startswith('@imessagebot:') or ev.get('state_key') != rel.get('event_id')):
+            continue
         users = c.get('delivered_to_users')
         delivered = c.get('status') == 'SUCCESS' and isinstance(users, list) and any(
             isinstance(user, str) and user.startswith('@') and user not in self_ids and user not in bots for user in users)
         delivered = delivered or (source_bot.startswith('@imessagebot:') and c.get('status') == 'SUCCESS' and c.get('com.jkali.delivered') is True)
-        add(rel.get('event_id'), delivered=delivered, sent=c.get('status') == 'SUCCESS', failed=c.get('status') == 'FAIL_PERMANENT')
+        read = native and c.get('status') == 'SUCCESS' and c.get('com.jkali.read') is True
+        add(rel.get('event_id'), read=read, delivered=delivered or read, sent=c.get('status') == 'SUCCESS', failed=c.get('status') == 'FAIL_PERMANENT')
     return out
 
 

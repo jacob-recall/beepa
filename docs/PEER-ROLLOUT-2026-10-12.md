@@ -1,13 +1,15 @@
 # Receipt reliability rollout for Elliot and David
 
-Release: **0.2.2**, tag **v0.2.2**, canonical repository
+Release: **0.2.3**, tag **v0.2.3**, canonical repository
 `git@github.com:jacob-recall/beepa.git`. Run this procedure on each person's
 source Mac, one at a time. These are instructions for the bot operating that
 installation; publishing this file does not mean either peer has been upgraded.
 
 ## What this release changes
 
-Both apps now render the requested gray/blue checkmarks on outgoing messages.
+Both apps render the requested gray/blue checkmarks on outgoing messages.
+Version 0.2.3 adds real outgoing iMessage delivery/read evidence from the existing
+signed engine, including durable recovery and fresh-browser-sync reconstruction.
 The detailed semantics and provider limits are below.
 
 
@@ -44,7 +46,7 @@ The synthetic integration tests prove the Matrix/app/uplink path, not receipt
 support on every real provider or an actual recipient's actions. In group chats,
 the newest receipt from an eligible participant does **not** mean everyone read.
 
-**Checkmark behavior (0.2.2):** one gray check means sending / delivery
+**Checkmark behavior (0.2.3):** one gray check means sending / delivery
 unconfirmed; two gray checks mean explicit recipient delivery; two blue checks
 mean an eligible recipient supplied a read receipt for that exact message ID.
 Bridge acceptance alone stays one check. Failed sends show an error indicator.
@@ -63,8 +65,12 @@ from that conversation's bridge bot is accepted; `SUCCESS` alone is not delivery
 A nonempty remote `delivered_to_users` is delivery evidence. The iMessage daemon
 publishes its explicit native `engine_delivered` result through a separate,
 idempotent status publisher. Plain engine acceptance stays unconfirmed. The
-current iMessage adapter does not expose recipient read updates, so do not
-promise blue checks for iMessage until that adapter provides read evidence.
+iMessage adapter now requests JSON, retains the returned native message IDs,
+and reconciles outgoing `isDelivered` and numeric `seen` timestamps. A read
+confirms delivery. Local `isRead`, own Matrix receipts, and native acceptance
+never establish recipient read. The pinned engine supplies read timestamps for
+one-to-one chats only, and the recipient must enable Apple read receipts.
+Do not promise iMessage group read receipts or infer unknown historical sends.
 
 The additive `message_receipts` SQLite table retains per-target evidence before
 sync advances. The independent `message_receipts` stage maps to the current
@@ -73,6 +79,17 @@ Unknown targets stay queued instead of attaching to a different message.
 Private/revoked rooms and destination changes clear that queue. The existing
 room receipt outbox now also mirrors Matrix's actual `unread_count` (including
 zero); the master no longer estimates unread badges from receipt timestamps.
+
+Native iMessage receipts are stored per exact native part in `native_receipt`,
+with publication acknowledgments in `published_native_receipt`. A multipart
+Beepa send advances only when all mapped parts confirm that state. Bounded
+targeted native reads recover changes outside chat tails, with backoff for
+missing/disabled receipts. Trusted bot state `com.jkali.imessage_receipt`, keyed
+by the original Matrix event, retains evidence through browser refresh. The
+uplink forwards it through the existing consent-gated per-message pipeline.
+These tables are additive; the signed executable and its permissions remain
+unchanged. Polling is the current implementation; no persistent native event
+subscriber is needed for correctness.
 
 The iMessage `published_message_status` ledger prevents duplicate publication;
 a Matrix failure retries the status only, never the native send. These schema
@@ -120,9 +137,9 @@ canonical `upstream`; add that remote only if absent and its URL is verified.
 Do not overwrite the fork's origin. The commands below use the chosen remote:
 
 ```sh
-git fetch <canonical-remote> tag v0.2.2
-git show v0.2.2:release.json
-git rev-parse 'v0.2.2^{commit}'
+git fetch <canonical-remote> tag v0.2.3
+git show v0.2.3:release.json
+git rev-parse 'v0.2.3^{commit}'
 ```
 
 Confirm the tag's commit matches Jacob's release handoff. Inspect tracked local
@@ -131,7 +148,7 @@ reset, discard, force-push, automatically stash, or merge unrelated histories.
 For a clean branch that is an ancestor of the release:
 
 ```sh
-git merge --ff-only v0.2.2
+git merge --ff-only v0.2.3
 git status --short
 git rev-parse HEAD
 ```
@@ -221,12 +238,23 @@ rollback guarantee. Older uplinks do not retry the new receipt outbox.
 ## Evidence from Jacob's installation
 
 On 2026-10-12 the full discovered unit/conformance suite passed, including
-122,429 consent vectors and 8,112 invite vectors. Disposable scenarios 24, 25, and 26 passed. Scenario 24 uses the actual app receipt writer/parser against
-real Synapse; scenario 25 stops only the disposable master. No real-provider
-messages were sent. Browser visual acceptance was unavailable in the agent
-environment and is still required on each peer's Mac.
+122,429 consent vectors and 8,112 invite vectors. Disposable scenarios 24–27
+passed. Scenario 27 runs the actual native-response parser, daemon, two
+homeservers, uplink, and user receipt parser, with only the Apple CLI replaced
+by synthetic responses. It covers acceptance, delivery, read, exact targeting
+for identical texts, an outage, daemon/uplink restarts, and fresh sync with the
+receipt outside the recent timeline.
 
-## Additional 0.2.2 verification on each peer
+One owner-authorized real iMessage self-test confirmed a native read timestamp,
+local delivered/read state, and matching master state. The result survived
+daemon/uplink restarts, with the signed CLI hash/inode unchanged. The diagnostic
+client used the same master's loopback endpoint because its configured hostname
+was unavailable from the test shell; the running uplink published normally.
+This proves this installation's self-chat path, not another recipient's disabled
+receipts or either peer's account. Browser visual acceptance remains required
+on each peer's Mac.
+
+## Additional 0.2.3 verification on each peer
 
 After `./update.sh --apply`, verify the active bridge configurations have
 `matrix.message_status_events: true` (Discord uses its existing bridge setting),
@@ -234,7 +262,7 @@ and that the updater restarted changed bridges plus uplink, iMessage, and the
 master gateway where that role is installed. Never print entire configurations;
 they contain credentials. Reload both web apps to pick up the versioned assets.
 
-Run `python3 tests/run.py` and `./tests/integration/run.sh 24 25 26` from the
+Run `python3 tests/run.py` and `./tests/integration/run.sh 24 25 26 27` from the
 activated source when that Mac has the required test dependencies. The harness
 creates disposable servers and cleans up only its own marked resources.
 Scenario 26 verifies acceptance versus delivery, a late read of an older message,
@@ -249,3 +277,41 @@ any state the provider did not expose. This synthetic suite does not prove
 actual recipient delivery on every provider.
 
 Bridge delivery interpretation follows the upstream [mautrix status event contract](https://github.com/mautrix/go/blob/main/event/beeper.go).
+
+
+## Native iMessage acceptance on each peer (0.2.3)
+
+Preserve the configured signed CLI; do not rebuild/replace it, reset TCC, or
+infer send/read results from a different Messages database. Activate the release
+with the managed updater and reload both apps. Confirm the daemon and uplink
+are using the activated source. Existing unknown sends are not retried.
+
+With the account owner's explicit approval, use its configured self handle:
+
+```bash
+python3 tests/live/imessage_receipts_verify.py \
+  --recipient '<configured self handle>' \
+  --output /tmp/beepa-imessage-receipt-test.json \
+  --i-am-sending-to-myself
+```
+
+This sends one clearly labeled message to the existing self portal. Open it in
+Apple Messages with read receipts enabled. The report must confirm native,
+local, and master read/delivery, plus an unchanged executable fingerprint.
+Rerunning with the same report resumes observation without another send. An
+ambiguous send report fails closed. Preserve the report for the restart check;
+keep its identifiers private. The self portal must already be shared/mirrored
+for the master check; the diagnostic never changes consent.
+
+If the master also runs on that same Mac, an optional
+`--master-loopback-url http://127.0.0.1:<published-master-port>` verifies through
+its loopback endpoint and checks the authenticated master identity. This is a
+diagnostic override only; do not change organization configuration or TLS.
+
+Repeat observation after daemon/uplink restart and after refreshing each app.
+Confirm the tested outgoing message has two blue checks. With a separately
+approved recipient, also verify that delayed delivery remains one gray check,
+confirmed delivery becomes two gray, and receipts disabled never produces blue.
+Opening an incoming message in Beepa and sending OUR read receipt back to Apple
+is a separate feature; this release displays the other person's read of our
+outgoing message.

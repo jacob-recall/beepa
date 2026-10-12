@@ -80,6 +80,130 @@ class DaemonTest(unittest.TestCase):
         self.d.publish_message_statuses()
         self.assertFalse(calls[-1][2]['com.jkali.delivered'])
 
+    def native(self, mid='native-a', **extra):
+        return dict(id=mid, threadID='chat', isSender=True, isDelivered=False, **extra)
+
+    def native_runner(self, payload):
+        def run(argv, **kwargs):
+            self.assertIn('--json', argv)
+            return subprocess.CompletedProcess(argv, 0,
+                ('[00001] call send []\n[00001] ok send (1ms)\n' +
+                 json.dumps(payload, indent=2) + '\nExiting...\n').encode(), b'')
+        self.d._runner = run
+
+    def test_native_send_array_and_all_parts_delivery(self):
+        a, b = self.native(), self.native('native-b')
+        a['isDelivered'] = True
+        self.native_runner([a, b])
+        self.assertEqual(self.transaction([self.event()]), 200)
+        self.assertEqual(self.d.outbound_get('$event'), ('confirmed', 'engine_accepted'))
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM native_receipt').fetchone()[0], 2)
+        calls = []
+        self.d.mx = lambda *args, **kw: calls.append(args) or {}
+        self.d.publish_native_receipts()
+        self.assertFalse(calls[-1][2]['com.jkali.delivered'])
+        a['seen'] = 1000
+        self.d.reconcile_native_receipt('chat', a)
+        self.d.publish_native_receipts()
+        self.assertEqual(len(calls), 1, 'one read part is not a fully read send')
+        b['isDelivered'] = True
+        self.d.reconcile_native_receipt('chat', b)
+        self.d.publish_native_receipts()
+        self.assertTrue(calls[-1][2]['com.jkali.delivered'])
+        self.assertFalse(calls[-1][2]['com.jkali.read'])
+        b['seen'] = 2000
+        self.d.reconcile_native_receipt('chat', b)
+        self.d.publish_native_receipts()
+        self.assertTrue(calls[-1][2]['com.jkali.read'])
+        self.assertTrue(calls[-1][1].endswith('/com.jkali.imessage_receipt/%24event'))
+        self.d.reconcile_native_receipt('chat', self.native())
+        self.d.publish_native_receipts()
+        self.assertEqual(len(calls), 3, 'stale evidence cannot regress receipts')
+
+    def test_native_read_outage_restart_poll_and_no_resend(self):
+        self.native_runner([self.native()])
+        self.assertEqual(self.transaction([self.event()]), 200)
+        self.d.reconcile_native_receipt('chat', self.native(seen=1234))
+        self.d.mx = lambda *a, **k: (_ for _ in ()).throw(OSError('offline'))
+        self.d.publish_native_receipts()
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM published_native_receipt').fetchone()[0], 0)
+        self.d.initialize(self.config, state_dir=self.tmp.name,
+                          runner=lambda *a, **k: self.fail('receipt retried a native send'))
+        self.assertEqual(self.transaction([self.event()], 'replay'), 200)
+        calls = []
+        self.d.mx = lambda *args, **kw: calls.append(args) or {}
+        self.d.publish_native_receipts(); self.d.publish_native_receipts()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][2]['com.jkali.read'])
+        self.assertTrue(calls[0][2]['com.jkali.delivered'])
+
+    def test_native_exact_target_poll_scope_backoff_and_bad_evidence(self):
+        self.native_runner([self.native()])
+        self.transaction([self.event()])
+        self.d.rate_ok = lambda *a: True
+        self.native_runner([self.native('native-b')])
+        self.transaction([self.event('$other')], 'other')
+        queries = []
+        def lookup(*args, **kwargs):
+            queries.append(args)
+            return self.native(args[-1], seen=4567) if args[-1] == 'native-a' else None
+        self.d.cli_json = lookup
+        self.d.poll_native_receipts(); self.d.poll_native_receipts()
+        self.assertEqual(len(queries), 2, 'targeted reads back off and completed reads stop')
+        self.assertTrue(all(q[0:2] == ('message', 'chat') for q in queries))
+        rows = dict(self.d.DB.execute('SELECT event_id,read_ts FROM native_receipt'))
+        self.assertEqual(rows, {'$event': 4567, '$other': 0})
+        for seen in [True, '123', {}, float('nan'), float('inf'), -1, 0]:
+            self.d.reconcile_native_receipt('chat', self.native('native-b', seen=seen))
+        foreign = self.native('native-b', seen=9999); foreign['threadID'] = 'other-chat'
+        self.d.reconcile_native_receipt('chat', foreign)
+        incoming = self.native('native-b', seen=9999); incoming['isSender'] = False
+        self.d.reconcile_native_receipt('chat', incoming)
+        self.d.reconcile_native_receipt('chat', self.native('native-b', isRead=True, behavior='keepRead'))
+        self.assertEqual(self.d.DB.execute("SELECT read_ts FROM native_receipt WHERE event_id='$other'").fetchone()[0], 0)
+        self.assertEqual(self.d.native_receipt_evidence('iMessage;+;group', self.native(seen=5000)), (0, 0))
+
+    def test_receipt_publisher_runs_when_history_and_legacy_status_fail(self):
+        calls = []
+        def fail(): raise OSError('unavailable')
+        self.d.poll_once = fail
+        self.d.publish_message_statuses = fail
+        self.d.poll_native_receipts = lambda: calls.append('poll')
+        self.d.publish_native_receipts = lambda: calls.append('publish')
+        self.d.publish_health_state = lambda: None
+        with patch.object(self.d.time, 'sleep', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt): self.d.poll_loop()
+        self.assertEqual(calls, ['poll', 'publish'])
+
+    def test_native_echo_and_native_other_device_components(self):
+        self.native_runner([self.native()])
+        self.transaction([self.event()])
+        self.d.deliver_inbound('chat', 'name', False, self.native(attachments=[self.attachment()]))
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM inbound_component').fetchone()[0], 0)
+        self.d.upload_media = lambda *a: 'mxc://test/upload'
+        self.d.mx = lambda method, path, content, **kw: {'event_id': '$' + content['msgtype']}
+        m = self.native('from-phone', text='phone text', seen=1234, attachments=[self.attachment()])
+        self.d._relay_message('chat', '!portal:test', 'name', False, m)
+        rows = self.d.DB.execute("SELECT event_id,read_ts FROM native_receipt WHERE native_id='from-phone' ORDER BY event_id").fetchall()
+        self.assertEqual(rows, [('$m.image', 1234), ('$m.text', 1234)])
+
+    def test_native_parser_boolean_null_errors_and_untrusted_shapes(self):
+        for value in [True, None, [], {'id': 'legacy', 'delivered': True},
+                      [dict(self.native(), isSender=False)], [dict(self.native(), threadID='wrong')],
+                      [self.native(), None]]:
+            self.native_runner(value)
+            outcome = self.d.engine_send('chat', 'same text')
+            self.assertFalse(outcome.delivered)
+            self.assertEqual(outcome.messages, [])
+        self.native_runner(False)
+        self.assertEqual(self.d.engine_send('chat', 'text').state, 'ambiguous')
+        self.native_runner([dict(self.native(), isDelivered=True)])
+        outcome = self.d.engine_send_file('chat', '/synthetic/file')
+        self.assertTrue(outcome.delivered)
+        self.assertEqual(outcome.engine_id, 'native-a')
+        self.assertIsNone(self.d._extract_json('[00001] ok message (1ms)\nnull\nExiting...'))
+        with self.assertRaises(ValueError): self.d._extract_json('[\n{"id":"nested"}\nBROKEN')
+
     def test_inbound_retry_after_matrix_failure(self):
         calls = []
         def matrix(*args, **kwargs):

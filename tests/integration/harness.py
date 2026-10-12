@@ -2655,6 +2655,90 @@ def scenario_26_message_checks():
         stop_uplink(proc)
 
 
+def scenario_27_native_imessage_receipts():
+    """Real daemon + both homeservers/uplink/UI parser; only Apple CLI is fake."""
+    import importlib.util
+    e = fresh_env('s27')
+    space = create_space(e['tuser_tok'], 'iMessage')
+    rid = make_convo(e, space, 'Native receipt recovery')
+    bot_id, bot_token = register_user('imessagebot')
+    path = '/_matrix/client/v3/rooms/' + urllib.parse.quote(rid, safe='')
+    local(e['tuser_tok'], 'POST', path + '/invite', {'user_id': bot_id})
+    join_room(bot_token, rid)
+    power = local(e['tuser_tok'], 'GET', path + '/state/m.room.power_levels')
+    power.setdefault('users', {})[bot_id] = 100
+    local(e['tuser_tok'], 'PUT', path + '/state/m.room.power_levels', power)
+    set_override(e['tuser_tok'], e['tuser_id'], rid, 'share')
+    a = post_msg(e['tuser_tok'], rid, 'identical outgoing text')
+    b = post_msg(e['tuser_tok'], rid, 'identical outgoing text')
+    spec = importlib.util.spec_from_file_location('receipt_daemon', os.path.join(REPO, 'imessage/daemon.py'))
+    daemon = importlib.util.module_from_spec(spec); spec.loader.exec_module(daemon)
+    state = os.path.join(os.path.dirname(e['db_path']), 'native-receipts')
+    cfg = dict(port=29350, hs_url=TEST_HS, domain='localhost', user_id=e['tuser_id'],
+               bot_id=bot_id, as_token='synthetic', hs_token='synthetic', cli_path='/never-execute',
+               attachment_allow_prefixes=[], backfill_count=0)
+    native = {'id': 'native-a', 'threadID': 'chat', 'isSender': True, 'isDelivered': False}
+    def runner(argv, **kwargs):
+        assert argv[:3] == ['/never-execute', '--json', '--no-events']
+        assert argv[3] == 'send'
+        return subprocess.CompletedProcess(argv, 0, json.dumps([native]).encode(), b'')
+    daemon.initialize(cfg, state_dir=state, runner=runner)
+    daemon.map_add('chat', rid)
+    daemon.rate_ok = lambda *args: True
+    daemon.mx = lambda method, endpoint, content, **kw: local(bot_token, method, endpoint, content)
+    for event_id, native_id in [(a, 'native-a'), (b, 'native-b')]:
+        native['id'] = native_id
+        assert daemon.process_outbound_event({'event_id': event_id, 'room_id': rid, 'sender': e['tuser_id'],
+            'type': 'm.room.message', 'content': {'msgtype': 'm.text', 'body': 'identical outgoing text'}})
+    proc = start_uplink(e)
+    try:
+        mr = wait_until(lambda: mirror_of(e['db_path'], rid), desc='native receipt mirror')[0]
+        def mapped(event_id):
+            with sqlite3.connect(e['db_path']) as db:
+                row = db.execute('SELECT master_event_id FROM delivery_map WHERE master_room_id=? AND local_event_id=?', (mr, event_id)).fetchone()
+                return row[0] if row else None
+        ma = wait_until(lambda: mapped(a), desc='native A mapped')
+        mb = wait_until(lambda: mapped(b), desc='native B mapped')
+        def stamp(event_id):
+            try:
+                return master(MASTER_ALICE_TOKEN, 'GET', '/_matrix/client/v3/rooms/' + urllib.parse.quote(mr, safe='') +
+                    '/state/com.jkali.message_receipt/' + urllib.parse.quote(event_id, safe=''))
+            except MxError as exc:
+                if exc.code == 404: return {}
+                raise
+        daemon.publish_native_receipts()
+        wait_until(lambda: stamp(ma).get('sent'), desc='native acceptance')
+        assert not stamp(ma).get('delivered')
+        daemon.reconcile_native_receipt('chat', dict(native, id='native-a', isDelivered=True))
+        daemon.publish_native_receipts()
+        wait_until(lambda: stamp(ma).get('delivered'), desc='native delivery')
+        assert not stamp(ma).get('read')
+        stop_uplink(proc); proc = None
+        daemon.reconcile_native_receipt('chat', dict(native, id='native-a', seen=1234567890000))
+        daemon.mx = lambda *args, **kwargs: (_ for _ in ()).throw(OSError('synthetic outage'))
+        daemon.publish_native_receipts()
+        daemon.initialize(cfg, state_dir=state, runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError('native resend')))
+        daemon.mx = lambda method, endpoint, content, **kw: local(bot_token, method, endpoint, content)
+        daemon.publish_native_receipts()
+        proc = start_uplink(e)
+        wait_until(lambda: stamp(ma).get('read'), desc='native read after daemon/uplink restart')
+        assert not stamp(mb).get('read') and not stamp(mb).get('delivered')
+        # Move the receipt out of the limited timeline; fresh room state must retain it.
+        for index in range(8): post_msg(e['tuser_tok'], rid, 'timeline filler ' + str(index))
+        room = local(e['tuser_tok'], 'GET', '/_matrix/client/v3/sync', query={
+            'timeout': '0', 'filter': json.dumps({'room': {'timeline': {'limit': 1}}})})['rooms']['join'][rid]
+        result = subprocess.run(['node', os.path.join(HERE, 'read_state_client.js')], input=json.dumps({
+            'base': TEST_HS, 'token': e['tuser_tok'], 'roomId': rid, 'userId': e['tuser_id'],
+            'action': 'parse', 'sourceId': 'imessage', 'room': room}), capture_output=True, text=True, check=True)
+        checks = json.loads(result.stdout)['receipts']
+        assert checks[a]['read'] and checks[a]['delivered']
+        assert not checks[b]['read'] and not checks[b]['delivered']
+        return True, 'native parser -> durable daemon -> local state -> uplink -> master; gray/gray/blue; exact repeated-text IDs; outage/restart; fresh UI sync'
+    finally:
+        if proc: stop_uplink(proc)
+        daemon.DB.close()
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2682,6 +2766,7 @@ SCENARIOS = [
     ("24_read_unread", scenario_24_read_unread),
     ("25_receipt_outage_recovery", scenario_25_receipt_outage_recovery),
     ("26_message_checks", scenario_26_message_checks),
+    ("27_native_imessage_receipts", scenario_27_native_imessage_receipts),
 ]
 
 

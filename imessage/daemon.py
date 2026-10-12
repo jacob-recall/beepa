@@ -180,6 +180,13 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
     DB.execute("CREATE TABLE IF NOT EXISTS outbound_event (event_id TEXT PRIMARY KEY, room_id TEXT, "
                "state TEXT NOT NULL, updated REAL NOT NULL, reason TEXT, engine_id TEXT)")
     DB.execute("CREATE TABLE IF NOT EXISTS published_message_status (event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
+    # One row per native part and Matrix target; no bodies or recipient handles.
+    DB.execute("CREATE TABLE IF NOT EXISTS native_receipt (event_id TEXT, room_id TEXT, chat_id TEXT, "
+               "native_id TEXT, delivered INTEGER NOT NULL DEFAULT 0, read_ts REAL NOT NULL DEFAULT 0, "
+               "next_check REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, "
+               "PRIMARY KEY(event_id,native_id))")
+    DB.execute("CREATE INDEX IF NOT EXISTS native_receipt_source ON native_receipt(chat_id,native_id)")
+    DB.execute("CREATE TABLE IF NOT EXISTS published_native_receipt (event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
     DB.execute("CREATE TABLE IF NOT EXISTS dispatch_rate (chat_hash TEXT, ts REAL)")
     # The only safe recovery after an interrupted native invocation is ambiguity.
     # A queued/preflight failure is replayable; a dispatch may already have sent.
@@ -463,18 +470,22 @@ def upload_media(path, mime):
 
 # ---------------------------------------------------------------- engine (M-20)
 def _extract_json(raw):
-    """Engine stdout carries log lines around the JSON payload; extract it."""
-    lines = raw.split("\n")
-    buf, started = [], False
-    for l in lines:
-        st = l.strip()
-        if not started and st.startswith("{"):
-            started = True
-        if started:
-            if st == "Exiting...":
-                break
-            buf.append(l)
-    return json.loads("\n".join(buf))
+    """Decode the CLI's JSON value, excluding call/ok log lines and exit text.
+
+    Send returns an array or bool, single-message lookup may return null.
+    raw_decode handles pretty printing without treating nested objects as results.
+    """
+    decoder = json.JSONDecoder()
+    offset = 0
+    for line in raw.splitlines(keepends=True):
+        value = line.lstrip()
+        if re.match(r"^\[(?:[0-9]+|events[^\]]*)\]\s", value):
+            offset += len(line)
+            continue
+        if value.startswith(("{", "[")) or value.strip() in ("true", "false", "null"):
+            return decoder.raw_decode(raw[offset + len(line) - len(value):])[0]
+        offset += len(line)
+    raise ValueError("engine JSON result missing")
 
 def cli_json(*args, timeout=60):
     argv = [CLI, "--no-events", "--json", *args]
@@ -487,9 +498,10 @@ def cli_json(*args, timeout=60):
 
 class EngineOutcome:
     """Confirmed means CLI acceptance; only delivered=True is delivery evidence."""
-    def __init__(self, state, reason, engine_id=None, delivered=False):
+    def __init__(self, state, reason, engine_id=None, delivered=False, messages=None):
         self.state, self.reason = state, reason
         self.engine_id, self.delivered = engine_id, delivered
+        self.messages = messages or []
 
     def __bool__(self):
         return self.state == "confirmed"
@@ -498,7 +510,7 @@ class EngineOutcome:
 def _engine_mut(args, timeout):
     """Keep the signed CLI's own authorization preflight; no Python TCC gate."""
     try:
-        p = _runner([CLI, *args], capture_output=True, timeout=timeout, shell=False)
+        p = _runner([CLI, "--json", *args], capture_output=True, timeout=timeout, shell=False)
     except subprocess.TimeoutExpired:
         return EngineOutcome("ambiguous", "engine_timeout")
     except OSError:
@@ -517,14 +529,19 @@ def _engine_mut(args, timeout):
         result = _extract_json((p.stdout or b"").decode("utf-8", "replace"))
     except (ValueError, TypeError):
         pass
-    if not isinstance(result, dict):
-        result = {}
-    if result.get("error") or result.get("success") is False:
+    if result is False or (isinstance(result, dict) and (result.get("error") or result.get("success") is False)):
         return EngineOutcome("ambiguous", "engine_reported_error")
-    mid = result.get("id")
-    delivered = result.get("delivered") is True
+    # Only actual send responses can establish new outgoing receipt targets.
+    sending = any(command in args[:2] for command in ("send", "send-file"))
+    messages = result if sending and isinstance(result, list) else []
+    if messages and not all(isinstance(m, dict) and isinstance(m.get("id"), str)
+                            and valid_native_id(m["id"]) and m.get("isSender") is True
+                            and m.get("threadID", args[2]) == args[2] for m in messages):
+        messages = []  # Incomplete/ambiguous part lists cannot confirm delivery.
+    mid = messages[0]["id"] if messages else None
+    delivered = bool(messages) and all(m.get("isDelivered") is True for m in messages)
     return EngineOutcome("confirmed", "engine_delivered" if delivered else "engine_accepted",
-                         mid if isinstance(mid, str) else None, delivered)
+                         mid, delivered, messages)
 
 
 def engine_send(chat_id, text):
@@ -548,6 +565,110 @@ def engine_create_chat(handle, message):
     "--message="-prefixed token so a leading-dash message cannot bind as a flag.
     No "--" terminator (it would break --message). list-argv, shell=False (M-20)."""
     return _engine_mut(["--no-events", "create-chat", handle, "--message=" + message], 60)
+
+
+NATIVE_RECEIPT_TYPE = "com.jkali.imessage_receipt"
+
+
+def valid_native_id(value):
+    return isinstance(value, str) and 0 < len(value) <= 512 and not value.startswith("-") and not any(ord(c) < 32 for c in value)
+
+
+def native_receipt_evidence(chat_id, message):
+    """Remote evidence only: local isRead/behavior never establish recipient read."""
+    if not isinstance(message, dict) or message.get("isSender") is not True:
+        return 0, 0
+    seen = message.get("seen")
+    read_ts = (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool)
+               and 0 < seen < float('inf') and ";+;" not in chat_id else 0)
+    return int(message.get("isDelivered") is True or read_ts > 0), read_ts
+
+
+def remember_native_target(event_id, room, chat_id, message):
+    """Caller holds DBLOCK and commits with the corresponding send/relay state."""
+    native_id = message.get("id")
+    if (message.get("isSender") is not True or not valid_native_id(native_id)
+            or message.get("threadID", chat_id) != chat_id):
+        return
+    delivered, read_ts = native_receipt_evidence(chat_id, message)
+    DB.execute("INSERT INTO native_receipt(event_id,room_id,chat_id,native_id,delivered,read_ts) "
+               "VALUES (?,?,?,?,?,?) ON CONFLICT(event_id,native_id) DO UPDATE SET "
+               "delivered=max(delivered,excluded.delivered),read_ts=max(read_ts,excluded.read_ts)",
+               (event_id, room, chat_id, native_id, delivered, read_ts))
+
+
+def reconcile_native_receipt(chat_id, message):
+    if (not isinstance(message, dict) or message.get("isSender") is not True
+            or not valid_native_id(message.get("id")) or message.get("threadID", chat_id) != chat_id):
+        return
+    room = room_for_chat(chat_id)
+    if not room:
+        return
+    native_id = message['id']
+    delivered, read_ts = native_receipt_evidence(chat_id, message)
+    with DBLOCK:
+        # Own messages sent on another Apple device have one Matrix event per
+        # relayed component. All components refer to this exact native message.
+        targets = DB.execute("SELECT event_id FROM inbound_component WHERE room_id=? AND msg_id=? "
+                             "AND event_id!='' AND status LIKE 'confirmed%'", (room, native_id)).fetchall()
+        for target, in targets:
+            remember_native_target(target, room, chat_id, message)
+        DB.execute("UPDATE native_receipt SET delivered=max(delivered,?),read_ts=max(read_ts,?) "
+                   "WHERE chat_id=? AND native_id=? AND room_id=?", (delivered, read_ts, chat_id, native_id, room))
+        DB.commit()
+
+
+def poll_native_receipts():
+    """Bounded, fair reconciliation even for old messages outside the chat tail.
+
+    No expiration: a recipient can read much later. Backoff limits native reads
+    for disabled receipts/missing messages. This path never invokes a mutation.
+    """
+    now = time.time()
+    budget = max(1, min(32, int(CFG.get('receipt_poll_budget', 4))))
+    with DBLOCK:
+        rows = DB.execute("SELECT n.chat_id,n.native_id,max(n.attempts) FROM native_receipt n "
+                          "JOIN map m ON m.chat_id=n.chat_id AND m.room_id=n.room_id "
+                          "WHERE n.read_ts=0 AND n.next_check<=? GROUP BY n.chat_id,n.native_id "
+                          "ORDER BY min(n.next_check) LIMIT ?", (now, budget)).fetchall()
+    for chat_id, native_id, attempts in rows:
+        # Advance even on error so a missing native row cannot starve other IDs.
+        delay = min(3600, 15 * 2 ** min(attempts, 8))
+        with DBLOCK:
+            DB.execute("UPDATE native_receipt SET next_check=?,attempts=attempts+1 WHERE chat_id=? AND native_id=?",
+                       (now + delay, chat_id, native_id))
+            DB.commit()
+        try:
+            message = cli_json('message', chat_id, native_id, timeout=15)
+            if isinstance(message, dict) and message.get('id') == native_id:
+                reconcile_native_receipt(chat_id, message)
+        except Exception as e:
+            log.info("receipt pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
+
+
+def publish_native_receipts():
+    """Durable room state survives fresh /sync; retries never send native messages."""
+    with DBLOCK:
+        rows = DB.execute("SELECT n.event_id,n.room_id,min(n.delivered),min(n.read_ts>0) "
+                          "FROM native_receipt n JOIN map m ON m.chat_id=n.chat_id AND m.room_id=n.room_id "
+                          "GROUP BY n.event_id,n.room_id").fetchall()
+        published = dict(DB.execute("SELECT event_id,signature FROM published_native_receipt"))
+    pending = [(event, room, delivered, read) for event, room, delivered, read in rows
+               if published.get(event) != '%d:%d' % (delivered, read)]
+    for event, room, delivered, read in pending[:32]:
+        signature = '%d:%d' % (delivered, read)
+        content = {'status': 'SUCCESS', 'm.relates_to': {'rel_type': 'm.reference', 'event_id': event},
+                   'com.jkali.delivered': bool(delivered), 'com.jkali.read': bool(read)}
+        path = ('/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='') + '/state/' +
+                NATIVE_RECEIPT_TYPE + '/' + urllib.parse.quote(event, safe=''))
+        try:
+            mx('PUT', path, content, user=BOT_ID)
+        except Exception as e:
+            log.info("receipt publish pending error=%s", type(e).__name__)
+            continue
+        with DBLOCK:
+            DB.execute('INSERT OR REPLACE INTO published_native_receipt VALUES (?,?)', (event, signature))
+            DB.commit()
 
 # ---------------------------------------------------------------- attachments (M-4)
 def decode_asset_url(src):
@@ -722,6 +843,7 @@ def maybe_backfill(chat_id, room, chat_name, is_group):
         try:
             _relay_message(chat_id, room, chat_name, is_group, m)
             reconcile_reactions(chat_id, m)
+            reconcile_native_receipt(chat_id, m)
             inbound_complete(chat_id, mid)
         except Exception:
             complete = False
@@ -908,6 +1030,12 @@ def handle_chat_delta(chat, chat_id):
 def deliver_inbound(chat_id, chat_name, is_group, m):
     text = clean_text(m.get("text") or "")
     from_me = bool(m.get("isSender"))
+    with DBLOCK:
+        mapped = DB.execute("SELECT 1 FROM native_receipt n JOIN outbound_event o ON o.event_id=n.event_id "
+                            "WHERE n.chat_id=? AND n.native_id=? LIMIT 1",
+                            (chat_id, m.get("id"))).fetchone()
+    if from_me and mapped:
+        return  # Exact send mapping also suppresses attachment echoes.
     # R-5: echo ledger is chat-scoped (sha(chat_id\0payload)), not global.
     if from_me and text and ledger_has(chat_id + "\0" + text):
         log.info("echo suppressed chat=%s", sha(chat_id)[:8])
@@ -989,6 +1117,7 @@ def _relay_message(chat_id, room, chat_name, is_group, m):
                 failures.append(type(e).__name__)
     if primary_event:
         event_map_put(chat_id, mid, primary_event, sender, relayed_text_hash)
+    reconcile_native_receipt(chat_id, m)
     if failures:
         raise OSError("source components still pending")
     return primary_event
@@ -1133,9 +1262,17 @@ def poll_loop():
             _health_pub["poll_ok"], _health_pub["poll_err"] = False, type(e).__name__
             log.info("poll error: %s", type(e).__name__)
         try:
+            poll_native_receipts()
+        except Exception as e:
+            log.info("native receipt poll error: %s", type(e).__name__)
+        try:
             publish_message_statuses()
         except Exception as e:
             log.info("message status publish error: %s", type(e).__name__)
+        try:
+            publish_native_receipts()
+        except Exception as e:
+            log.info("native receipt publish error: %s", type(e).__name__)
         try:
             publish_health_state()
         except Exception as e:                   # noqa: BLE001
@@ -1434,7 +1571,7 @@ def outbound_set(state, reason, engine_id=None):
     if event_id is None:
         return
     with DBLOCK:
-        DB.execute("UPDATE outbound_event SET state=?,reason=?,engine_id=?,updated=? WHERE event_id=?",
+        DB.execute("UPDATE outbound_event SET state=?,reason=?,engine_id=COALESCE(?,engine_id),updated=? WHERE event_id=?",
                    (state, reason, engine_id, time.time(), event_id))
         DB.commit()
 
@@ -1454,7 +1591,16 @@ def dispatch_native(function, *args):
         # Compatibility for explicit injected transports returning booleans.
         outcome = EngineOutcome("confirmed" if result else "retryable",
                                 "engine_accepted" if result else "pre_dispatch_failure")
-    outbound_set(outcome.state, outcome.reason, outcome.engine_id)
+    # Commit the send result and every receipt target together. If this process
+    # dies before the commit, existing dispatch recovery remains ambiguous.
+    with DBLOCK:
+        event_id = getattr(_EVENT_CONTEXT, "event_id", None)
+        if event_id and outcome.messages and function in (engine_send, engine_send_file):
+            row = DB.execute("SELECT room_id FROM outbound_event WHERE event_id=?", (event_id,)).fetchone()
+            if row and chat_for_room(row[0]) == args[0]:
+                for message in outcome.messages:
+                    remember_native_target(event_id, row[0], args[0], message)
+        outbound_set(outcome.state, outcome.reason, outcome.engine_id)
     return bool(outcome)
 
 

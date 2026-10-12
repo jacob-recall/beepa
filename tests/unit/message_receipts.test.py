@@ -65,6 +65,27 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(parse(self.receipt(user='@whatsappbot:localhost')), {})
         self.assertEqual(parse(self.receipt(ts=float('nan'))), {})
 
+    def test_native_state_receipts_trust_restart_and_master_mapping(self):
+        self.u.db.execute("UPDATE mirror_rooms SET source='imessage'")
+        self.u.db.commit()
+        event = {'type': receipts.NATIVE_TYPE, 'sender': '@imessagebot:localhost', 'state_key': '$a',
+                 'content': {'status': 'SUCCESS', 'com.jkali.read': True,
+                             'm.relates_to': {'rel_type': 'm.reference', 'event_id': '$a'}}}
+        room = {'state': {'events': [event]}}
+        self.queue(room)
+        self.u.record_delivery('!m:master', '$a', '$nativeMaster')
+        self.u.db.close(); self.u.db = uplink.Uplink._open_db(self.path)
+        receipts.flush(self.u)
+        self.assertTrue(self.u.master.call_args.args[1].endswith('/%24nativeMaster'))
+        self.assertTrue(self.u.master.call_args.args[2]['read'])
+        self.assertTrue(self.u.master.call_args.args[2]['delivered'])
+        for changes in [{'sender': '@evil:localhost'}, {'state_key': '$b'}]:
+            forged = dict(event, **changes)
+            self.assertEqual(receipts.parse_receipts({'state': {'events': [forged]}}, set(), set(), '@imessagebot:localhost'), {})
+        event['content']['com.jkali.read'] = False
+        self.queue(room)
+        self.assertEqual(self.u.db.execute('SELECT read,delivered FROM message_receipts').fetchone(), (1, 1))
+
     def test_partial_updates_consent_generation(self):
         self.queue()
         self.queue(self.receipt('$b', '@me:localhost'))

@@ -37,3 +37,20 @@ assert.equal(rooms['!r:master'].receipts.get('$a').read, true, 'state order inde
 rooms = parseSnapshot({ rooms: { join: { '!r:master': { timeline: { events: [{...stamp, state_key: '$b', sender: '@evil:master'}] } } } } }, rooms);
 assert.equal(rooms['!r:master'].receipts.has('$b'), false, 'master rejects non-owner stamp');
 console.log('message_receipts: sending, delivery, read, late target, bot/self/thread exclusions, forged status, accessibility, master merge pass');
+
+const native = (id, extra = {}, sender = '@imessagebot:local') => ({
+  type: 'com.jkali.imessage_receipt', state_key: id, sender,
+  content: { status: 'SUCCESS', 'm.relates_to': { rel_type: 'm.reference', event_id: id }, ...extra },
+});
+const parseNative = events => parseMessageReceipts({ state: { events } }, self, bots, '@imessagebot:local');
+const nativeRead = native('$native', { 'com.jkali.read': true });
+assert.equal(receiptPresentation(parseNative([nativeRead]).get('$native')).state, 'read');
+assert.equal(parseNative([nativeRead]).get('$native').delivered, true);
+assert.equal(parseNative([{ ...nativeRead, state_key: '$different' }]).size, 0);
+assert.equal(parseNative([{ ...nativeRead, sender: '@evil:local' }]).size, 0);
+assert.equal(parseNative([native('$native', { 'com.jkali.read': 'true' })]).get('$native').read, false);
+assert.equal(parseNative([native('$native', { 'com.jkali.read': true, status: 'FAIL_PERMANENT' })]).get('$native').read, false);
+assert.equal(parse([native('$native', { 'com.jkali.read': true }, bot)]).size, 0);
+assert.equal(parseNative([native('$native', { 'com.jkali.read': true, 'com.jkali.delivered': false })]).get('$native').delivered, true);
+assert.equal(receiptPresentation(mergeReceipts(parseNative([nativeRead]), parseNative([native('$native')])).get('$native')).state, 'read');
+console.log('native receipts: fresh-sync state, exact target, sender/type trust, monotonic read and delivery pass');

@@ -1,8 +1,29 @@
-# Native unread state and master read controls — 0.3.2
+# Native unread state and master read controls — 0.3.3
 
 This fixes stale blue dots, red badges and large unread counts caused by importing
 Apple history into Matrix. Previously the UI displayed Matrix notification counts;
 reading the originals in Apple Messages did not change those counts.
+
+## Master UI fix in 0.3.3
+
+Opening a conversation with multiple messages in 0.3.2 could throw before sending
+its native read request: passing the timestamp helper directly to `Array.map`
+passed the array index as the timestamp-correction map. The regression test now
+uses the actual timestamp helper and multiple messages, including a corrected
+timestamp. The callback now passes only the event.
+
+Native confirmation received by the open conversation now updates the existing
+sidebar/feed rows immediately, including state-only sync responses. The badge
+remains until source confirmation; HTTP acceptance is not a successful native read.
+The real master entry point was tested in Chromium with synthetic intercepted
+Matrix responses: open → read request → confirmed badge clearing, explicit unread
+with the viewer held open, and explicit read. No JavaScript errors or unexpected
+writes occurred. The unit/conformance suite also passed.
+
+This patch changes the master UI only. Existing 0.3.2 source daemons and uplinks
+are compatible and do not need a restart for this UI fix. Older sources still
+need the native-state rollout below. Serve the updated `apps/master/main.js` and
+refresh the master browser. No account, state, token or service migration is needed.
 
 ## Behavior
 
@@ -80,7 +101,7 @@ an unavoidable remaining race in this CLI API. Do not describe it as atomic.
 ## Upgrade existing Macs
 
 Follow [the peer rollout guide](PEER-ROLLOUT-2026-10-18.md). Use the exact published
-0.3.2 SHA supplied with this change. Pulling files is insufficient when services
+0.3.3 SHA supplied with this change. Pulling files is insufficient when services
 run staged releases: use the existing supported `./update.sh --apply` workflow.
 Do not re-enroll Elliot (`@notelliot:master`) or David, rotate tokens, replace the
 signed CLI, reset TCC, empty databases, change sharing, or replay uncertain sends.

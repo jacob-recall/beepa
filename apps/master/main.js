@@ -1552,6 +1552,23 @@ function shortTime(ts) {
 let nativeReadIntent = null;
 let nativeReadSuppressed = false;
 let nativeReadAttempt = null;
+// Tail confirmations update the existing list models immediately. Do not wait
+// for the slower global refresh or clear a badge on HTTP acceptance alone.
+function refreshRoomUnread(roomId) {
+  const rec = MS.rooms[roomId];
+  if (!rec) return;
+  const unread = rec.readState?.unread_count || 0;
+  let changed = false;
+  for (const rows of MS.byUser.values()) {
+    for (const row of rows) {
+      if (row.id !== roomId) continue;
+      changed ||= row.unread !== unread;
+      row.unread = unread;
+      row.readState = rec.readState;
+    }
+  }
+  if (changed) rerenderActiveList();
+}
 function renderNativeReadControls(rec) {
   const ready = rec?.sourceId === 'imessage' && rec.nativeRead?.supported === true && MS.crmCapabilities.get(rec.createSender)?.native_read === true;
   for (const [id, action] of [['room-mark-read', 'read'], ['room-mark-unread', 'unread']]) {
@@ -1571,7 +1588,7 @@ async function requestNativeRead(action, explicit = false) {
     || MS.proposalsByUser.get(pinned.label) !== pinned.proposalsRoomId) return;
   const capability = MS.crmCapabilities.get(rec.createSender);
   if (!capability?.generation || capability.native_read !== true) return;
-  const latestVisible = Math.max(0, ...[...MS.roomEvents.values()].map(mirrorTs));
+  const latestVisible = Math.max(0, ...[...MS.roomEvents.values()].map(ev => mirrorTs(ev)));
   const visible = document.visibilityState !== 'hidden';
   if (!explicit && !canAutoRead(native, latestVisible, visible, nativeReadSuppressed)) return;
   if (nativeReadIntent && native.last_command?.id !== nativeReadIntent.id && Date.now() < nativeReadIntent.expires) return;
@@ -1892,6 +1909,8 @@ async function startTail(roomId) {
       if (room && MS.rooms[roomId]) {
         const stateOnly = (room.state?.events || []).concat(room.timeline?.events || []).filter(e => e.type === MESSAGE_RECEIPT_TYPE || e.type === 'com.jkali.read_state');
         applyRoom(MS.rooms[roomId], { state: { events: stateOnly } });
+        refreshRoomUnread(roomId);
+        renderRoomReadLine(MS.rooms[roomId]);
       }
       if (room && room.timeline && Array.isArray(room.timeline.events) && MS.openRoomId === roomId) {
         const rec = MS.rooms[roomId];

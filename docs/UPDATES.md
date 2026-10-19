@@ -3,7 +3,7 @@
 For native unread badges and master read/unread controls, follow
 [the 0.3.2 acceptance instructions](IMESSAGE-UNREAD-ROLLOUT-2026-10-19.md).
 
-For the current 0.3.2 release, bots updating Elliot's and David's installations
+For the current 0.3.3 release, bots updating Elliot's and David's installations
 should follow [the complete October 18 rollout](PEER-ROLLOUT-2026-10-18.md).
 For already-upgraded installations, also follow the
 [iMessage importer patch supplement](IMESSAGE-IMPORTER-ROLLOUT-2026-10-18.md).

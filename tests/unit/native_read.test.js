@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { nativeReadState, nativeReadFromRoom, canAutoRead } from '../../shared/model/native_read.js';
+import { messageTimestamp } from '../../shared/model/message_timestamps.js';
 import { parseMessageReceipts, mergeReceipts } from '../../shared/model/message_receipts.js';
 const native = { schema:1, supported:true, revision:'a'.repeat(64), unread_count:0, marked_unread:false, latest_ts:100, observed_ts:200 };
 const ev = {type:'com.jkali.imessage_read_state', state_key:'', sender:'@imessagebot:localhost', content:native};
@@ -27,13 +28,13 @@ assert.equal(feedModel.get('!room:localhost').unread,1,'native manual unread arr
 // Exercise the actual master request function, including its pinned context.
 const master = fs.readFileSync(new URL('../../apps/master/main.js',import.meta.url),'utf8');
 const block = master.slice(master.indexOf('let nativeReadIntent = null;'),master.indexOf('function renderRoomReadLine(rec)'));
-const rec = {sourceId:'imessage',nativeRead:{...native,unread_count:1},mirrorOf:'!local:localhost',userLabel:'peer',createSender:'@peer:master'};
+const rec = {sourceId:'imessage',nativeRead:{...native,unread_count:1},mirrorOf:'!local:localhost',userLabel:'peer',createSender:'@peer:master',timestampCorrections:new Map([['$latest',100]])};
 const MS = {openRoomId:'!mirror:master',rooms:{'!mirror:master':rec},openProposalCtx:{mirrorRoomId:'!mirror:master',targetRoom:'!local:localhost',label:'peer',proposalsRoomId:'!proposals:master'},
- proposalsRoomSet:new Set(['!proposals:master']),proposalsByUser:new Map([['peer','!proposals:master']]),crmCapabilities:new Map([['@peer:master',{generation:'current',native_read:true}]]),roomEvents:new Map([['$latest',{ts:100}]])};
+ proposalsRoomSet:new Set(['!proposals:master']),proposalsByUser:new Map([['peer','!proposals:master']]),crmCapabilities:new Map([['@peer:master',{generation:'current',native_read:true}]]),roomEvents:new Map([['$older',{event_id:'$older',origin_server_ts:50}],['$latest',{event_id:'$latest',origin_server_ts:90}]])};
 const writes=[];
-const m = vm.createContext({MS,S:{token:'session'},roomEpoch:1,canAutoRead,document:{visibilityState:'visible'}, ROOM_SHAPE_RE:/^![^:]+:.+$/, mirrorTs:e=>e.ts,
+const m = vm.createContext({MS,S:{token:'session'},roomEpoch:1,canAutoRead,document:{visibilityState:'visible'}, ROOM_SHAPE_RE:/^![^:]+:.+$/, messageTimestamp,
  setTimeout(){}, $:()=>null,renderRoomReadLine(){},roomStatus(){},api:async(...args)=>{writes.push(args);return {};}});
-vm.runInContext(block,m);
+vm.runInContext(master.slice(master.indexOf('function mirrorTs('),master.indexOf('// Display-only name for an mxid.')) + block,m);
 await m.requestNativeRead('read');
 assert.equal(writes.length,1);assert.ok(writes[0][1].includes('/send/com.jkali.read_request/'));
 assert.equal(writes[0][2]['com.jkali.read_action'].action,'read');assert.equal(writes[0][2].body,undefined);
@@ -46,3 +47,15 @@ await m.requestNativeRead('read');assert.equal(writes.length,2,'manual unread su
 MS.proposalsByUser.set('peer','!replacement:master');
 await m.requestNativeRead('read',true);assert.equal(writes.length,2,'changed destination cannot redirect a read action');
 console.log('native_read: source authority, native count precedence, visibility/latest-message guards, pinned master request, dedup and manual-unread hold pass');
+
+// A state-only native confirmation must repaint the existing sidebar/feed rows.
+const row = {id:'!mirror:master',unread:8,drafts:[{body:'retained'}]};
+MS.byUser = new Map([['peer',[row]]]); MS.feed = [row];
+rec.readState = {unread_count:0}; let repaints=0;
+m.rerenderActiveList=()=>{repaints++;};
+m.refreshRoomUnread('!mirror:master');
+assert.equal(row.unread,0);assert.equal(MS.feed[0].unread,0);
+assert.equal(row.drafts.length,1);assert.equal(repaints,1);
+m.refreshRoomUnread('!mirror:master');assert.equal(repaints,1);
+rec.readState={unread_count:1};m.refreshRoomUnread('!mirror:master');
+assert.equal(row.unread,1);assert.equal(repaints,2);

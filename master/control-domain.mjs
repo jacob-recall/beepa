@@ -523,14 +523,24 @@ export function accountHealth(health, now=Date.now()) {
     }
   }
   const native=health?.imessage,native_at=time(native?.updated_at),native_pending=count(native?.inbound_pending),native_refused=count(native?.inbound_refused_components);
+  const retryable=count(native?.inbound_retryable),unavailable=count(native?.inbound_source_unavailable);
+  const detailed=retryable!==null&&unavailable!==null&&native_pending!==null&&retryable+unavailable===native_pending;
+  const failed_chats=count(native?.poll_failed_chats);
   let native_status='unknown';
   if(native_at!==null){
     if(now-native_at>=480000)native_status='stale';
     else if(native.poll_ok===false)native_status='error';
-    else if(native.poll_ok===true)native_status=native_pending>0?'catching_up':native_pending===0?'ok':'unknown';
+    else if(native.poll_ok===true){
+      if(failed_chats>0)native_status='error';
+      else if(detailed&&retryable>0)native_status='retrying';
+      else native_status=native_pending>0?'incomplete':native_pending===0?'ok':'unknown';
+    }
   }
   return {checked_at:now,master:{status,reported_at,ingestion_at,delivery_at,queued,receipts,media,incomplete,history,history_incomplete,error_count:errors},
-    imessage:{status:native_status,reported_at:native_at,pending:native_pending,refused:native_refused},
+    imessage:{status:native_status,reported_at:native_at,pending:native_pending,refused:native_refused,
+      retryable:detailed?retryable:null,source_unavailable:detailed?unavailable:null,
+      attachment_unavailable:detailed&&count(native?.inbound_attachment_unavailable)<=retryable?count(native?.inbound_attachment_unavailable):null,
+      deferred:detailed&&count(native?.inbound_deferred)<=native_pending?count(native?.inbound_deferred):null,failed_chats},
     // This is a source-published snapshot, not an active end-to-end canary.
     live_probe:false};
 }

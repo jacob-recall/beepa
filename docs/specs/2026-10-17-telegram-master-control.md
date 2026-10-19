@@ -115,6 +115,16 @@ identities or credentials. Failed verification/read yields unknown, never a
 reused healthy result after the bounded cache expires. No native binary or TCC
 permission change is required. Existing sharing/send gates are untouched.
 
+The 0.3.1 importer adds `inbound_retryable`, `inbound_source_unavailable`,
+`inbound_attachment_unavailable`, `inbound_deferred` and `poll_failed_chats`.
+The original `inbound_pending` remains the unresolved total for compatibility.
+Only a consistent retryable/source-unavailable breakdown is displayed as such;
+older totals are unresolved work with an unknown reason, not evidence of progress.
+Terminal attachment refusals are reported separately and never called a retry
+queue. A successful outer poll with failed conversation scans is not healthy
+ingestion. See the [importer patch handoff](../IMESSAGE-IMPORTER-ROLLOUT-2026-10-18.md)
+for bounded recovery, retained state and source-local diagnostics.
+
 Deployment: update the master worker and restart it with its existing private
 state mount. Update `agents/uplink/uplink.py` and `durable_sync.py` on each source
 Mac and restart that account's existing uplink service; preserve databases,

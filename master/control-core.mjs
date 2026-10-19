@@ -767,14 +767,19 @@ export class ControlCore {
   pingText(result){
     const ago=ts=>{if(ts===null)return 'unavailable';const seconds=Math.max(0,Math.floor((result.checked_at-ts)/1000));return seconds<60?'just now':seconds<3600?Math.floor(seconds/60)+'m ago':seconds<86400?Math.floor(seconds/3600)+'h ago':Math.floor(seconds/86400)+'d ago';};
     const masterLabels={ok:'Connected; no queued updates',unknown:'Status unavailable',stale:'No recent heartbeat — updates may be delayed',disconnected:'Disconnected',stalled:'Source sync has stopped advancing',error:'Sync reports an error',catching_up:'Catching up'};
-    const nativeLabels={ok:'Reading Messages',unknown:'Not verified — source health is unavailable',stale:'No recent iMessage heartbeat',error:'Messages import is failing',catching_up:'Importing queued messages'};
+    const nativeLabels={ok:'Reading Messages',unknown:'Not verified — source health is unavailable',stale:'No recent iMessage heartbeat',error:'Messages import is failing',retrying:'Retrying incomplete imports',incomplete:'Reading Messages; unresolved imports remain'};
     const blocks=result.accounts.map(a=>{
       const m=a.master,n=a.imessage,lines=[a.account_name,'Master link: '+masterLabels[m.status]+'.',
         'Account report: '+ago(m.reported_at)+' · Last source sync: '+ago(m.ingestion_at),
         'iMessage: '+nativeLabels[n.status]+(n.reported_at?' (report '+ago(n.reported_at)+')':'')+'.'];
       if(m.queued>0||m.receipts>0)lines.push('Last reported queue: '+(m.queued??'?')+' updates · '+(m.receipts??'?')+' receipts.');
       if(m.media>0)lines.push('Attachments still transferring: '+m.media+'.');
-      if(n.pending>0)lines.push('iMessage import queue: '+n.pending+'.');
+      if(n.retryable>0)lines.push('Imports waiting to retry: '+n.retryable+(n.attachment_unavailable>0?' ('+n.attachment_unavailable+' waiting for attachment files)':'')+'.');
+      if(n.source_unavailable>0)lines.push('Messages unavailable from the native source: '+n.source_unavailable+'; checked again with backoff.');
+      if(n.pending>0&&n.retryable===null)lines.push('Unresolved imports: '+n.pending+'; update the source app for a reason breakdown.');
+      if(n.deferred>0)lines.push('Imports in retry backoff: '+n.deferred+'.');
+      if(n.failed_chats>0)lines.push('Conversations that failed their latest scan: '+n.failed_chats+'.');
+      if(n.refused>0)lines.push('Attachment components skipped by safety checks: '+n.refused+' (recorded refusals, not a retry queue).');
       if(m.history>0)lines.push('Older history is still syncing.');
       if(m.incomplete>0||m.history_incomplete>0||n.refused>0)lines.push('Some updates could not be imported; history may have gaps.');
       if(m.delivery_at)lines.push('Last update delivered to master: '+ago(m.delivery_at)+'.');

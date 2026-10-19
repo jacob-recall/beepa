@@ -22,4 +22,11 @@ const stale = ctx.imsgHealthFromState({ outbound: {}, updated_at: 1_000_000 - 72
 assert.equal(stale.fresh, false);
 assert.ok(stale.text.startsWith('Daemon NOT reporting for 2h') && stale.text.includes('last Messages poll failed (TimeoutExpired)'));
 assert.equal(ctx.imsgHealthFromState('nope', now), null);
+const pending = ctx.imsgHealthFromState({outbound:{},updated_at:1_000_000,poll_ok:true,inbound_pending:3,inbound_retryable:1,inbound_source_unavailable:2,inbound_refused_components:7,poll_failed_chats:1},now);
+assert.match(pending.text,/1 imports waiting to retry/);
+assert.match(pending.text,/2 source messages unavailable/);
+assert.match(pending.text,/7 attachment components skipped \(not retrying\)/);
+assert.match(pending.text,/1 conversation scans failed/);
+assert.match(ctx.imsgHealthLine('Delivery journal: '+JSON.stringify({inbound:{source_unavailable:2,attachment_unavailable:1}}),now),/1 imports waiting to retry · 2 source messages unavailable/);
+assert.match(ctx.imsgHealthFromState({updated_at:1_000_000,inbound_pending:3},now).text,/3 unresolved imports \(reason unavailable\)/);
 console.log('imsg_health_line.test.js: ok');

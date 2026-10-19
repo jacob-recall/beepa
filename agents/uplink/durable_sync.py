@@ -14,6 +14,9 @@ import urllib.request
 
 log = logging.getLogger('uplink')
 q = lambda value: urllib.parse.quote(value, safe='')
+IMESSAGE_HEALTH_COUNTS = ('updated_at', 'inbound_pending', 'inbound_refused_components',
+                         'inbound_retryable', 'inbound_source_unavailable',
+                         'inbound_attachment_unavailable', 'inbound_deferred', 'poll_failed_chats')
 
 
 def install_schema(db):
@@ -714,7 +717,7 @@ class DurableSync:
                     and health.get('sender') == bot
                     and event('m.room.member', self.cfg.local_user).get('content', {}).get('membership') == 'join'):
                 source = health.get('content') or {}
-                result = {k: source[k] for k in ('updated_at', 'inbound_pending', 'inbound_refused_components')
+                result = {k: source[k] for k in IMESSAGE_HEALTH_COUNTS
                           if type(source.get(k)) is int and 0 <= source[k] <= 9007199254740991}
                 if type(source.get('poll_ok')) is bool:
                     result['poll_ok'] = source['poll_ok']
@@ -759,7 +762,7 @@ class DurableSync:
         # account identifiers, bodies or arbitrary health extensions.
         native = health.get('imessage')
         if isinstance(native, dict):
-            payload['imessage'] = {k: native[k] for k in ('updated_at', 'inbound_pending', 'inbound_refused_components')
+            payload['imessage'] = {k: native[k] for k in IMESSAGE_HEALTH_COUNTS
                                    if type(native.get(k)) is int and 0 <= native[k] <= 9007199254740991}
             if type(native.get('poll_ok')) is bool:
                 payload['imessage']['poll_ok'] = native['poll_ok']

@@ -34,6 +34,9 @@ class DaemonTest(unittest.TestCase):
         spec.loader.exec_module(self.d)
         if hasattr(self.d, 'initialize'):
             self.d.initialize(self.config, state_dir=str(root))
+        clock_patch = patch.object(self.d.time, 'time', return_value=1800000000.0)
+        self.clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         self.addCleanup(lambda: self.d.DB.close())
         self.real_ensure_portal = self.d.ensure_portal
         self.d.ensure_portal = lambda *a: '!portal:test'
@@ -217,6 +220,7 @@ class DaemonTest(unittest.TestCase):
                 self.d.handle_chat_delta({}, 'chat')
             except OSError:
                 pass
+            self.clock.return_value += 16
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.d.event_map_get('chat', 'message1')[0], '$accepted')
 
@@ -265,6 +269,7 @@ class DaemonTest(unittest.TestCase):
             return {'event_id': '$' + content['msgtype']}
         self.d.mx = matrix
         self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
+        self.clock.return_value += 16
         self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
         self.assertEqual(calls, ['m.image', 'm.text', 'm.text'])
         self.assertEqual(self.d.event_map_get('chat', 'message1')[0], '$m.text')
@@ -277,6 +282,7 @@ class DaemonTest(unittest.TestCase):
         self.d.mx = lambda method, path, content, **k: calls.append(content['msgtype']) or {'event_id': '$text'}
         self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
         self.d.upload_media = lambda *a: 'mxc://test/upload'
+        self.clock.return_value += 16
         self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
         self.assertEqual(calls, ['m.text', 'm.image'])
         self.assertEqual(self.d.event_map_get('chat', 'message1')[0], '$text')
@@ -291,6 +297,7 @@ class DaemonTest(unittest.TestCase):
             return {'event_id': visible[path]}
         self.d.mx = matrix
         self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
+        self.clock.return_value += 16
         self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
         self.assertEqual(len(visible), 1)
         self.assertEqual(requests[0], requests[1])
@@ -302,6 +309,7 @@ class DaemonTest(unittest.TestCase):
         self.d.poll_once()
         self.assertIsNone(self.d.meta_get('cursor:chat'))
         self.d.mx = lambda *a, **k: {'event_id': '$delivered'}
+        self.clock.return_value += 16
         self.d.poll_once()
         self.assertEqual(self.d.meta_get('cursor:chat'), 'same')
         self.assertFalse(self.d.chat_pending('chat'))
@@ -382,6 +390,139 @@ class DaemonTest(unittest.TestCase):
         self.d.cli_json = lambda *a, **k: {'items': []}
         self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
         self.assertEqual(self.d.delivery_status()['inbound']['source_unavailable'], 1)
+
+    def test_failed_messages_do_not_starve_later_messages_and_backoff_survives_restart(self):
+        self.d.CFG['poll_message_budget'] = 2
+        self.d.cli_json = lambda *a, **k: {'items': [dict(self.message(), id='m'+str(i)) for i in range(4)]}
+        attempts = []
+        def deliver(chat, name, group, msg):
+            attempts.append(msg['id'])
+            if msg['id'] in ('m0', 'm1'):
+                raise OSError('offline')
+        self.d.deliver_inbound = deliver
+        self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
+        self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
+        self.assertEqual(attempts, ['m0', 'm1', 'm2', 'm3'])
+        self.d.initialize(self.config, state_dir=self.tmp.name)
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertEqual(len(attempts), 4, 'restart must preserve cooldown')
+        self.clock.return_value += 16
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertEqual(attempts[-2:], ['m0', 'm1'])
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertEqual(len(attempts), 6, 'second failure backs off again')
+        self.assertEqual(self.d.health_state()['inbound_retryable'], 2)
+        self.assertEqual(self.d.health_state()['inbound_deferred'], 2)
+
+    def test_missing_attachment_eventually_recovers_without_duplicate_text(self):
+        att = self.attachment()
+        path = Path(self.tmp.name) / 'picture.png'
+        path.unlink()
+        msg = self.message(attachments=[att])
+        self.d.cli_json = lambda *a, **k: {'items': [msg]}
+        sent = []
+        self.d.mx = lambda method, path, body, **k: sent.append(body['msgtype']) or {'event_id': '$'+body['msgtype']}
+        self.d.upload_media = lambda *a: 'mxc://test/file'
+        self.assertFalse(self.d.handle_chat_delta({}, 'chat'))
+        self.assertEqual(self.d.health_state()['inbound_attachment_unavailable'], 1)
+        path.write_bytes(b'available again')
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertEqual(sent, ['m.text'])
+        self.clock.return_value += 16
+        self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
+        self.assertEqual(sent, ['m.text', 'm.image'])
+        self.assertEqual(self.d.health_state()['inbound_pending'], 0)
+
+    def test_exact_lookup_recovers_missing_tail_and_never_trusts_other_identity(self):
+        self.d.inbound_pending('chat', 'message1')
+        self.d.cli_json = lambda *a, **k: {'items': []}
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertEqual(self.d.health_state()['inbound_source_unavailable'], 1)
+        self.assertEqual(self.d.health_state()['inbound_retryable'], 0)
+        attempts, sent = [], []
+        result = dict(self.message(), threadID='wrong-chat')
+        def source(*args, **kwargs):
+            attempts.append(args)
+            self.assertEqual(args, ('message', 'chat', 'message1'))
+            self.assertEqual(kwargs['timeout'], 5)
+            return result
+        self.d.cli_json = source
+        self.d.mx = lambda *a, **k: sent.append(a) or {'event_id': '$recovered'}
+        self.d.recover_pending_sources()
+        self.assertEqual(sent, [])
+        result = dict(self.message(), id='wrong-id')
+        self.clock.return_value += 16
+        self.d.recover_pending_sources()
+        self.assertEqual(sent, [])
+        result = dict(self.message(), threadID='chat')
+        self.d.recover_pending_sources()
+        self.assertEqual(len(attempts), 2, 'wrong identity must also back off')
+        self.clock.return_value += 31
+        self.d.recover_pending_sources()
+        self.assertEqual(len(sent), 1)
+        self.assertFalse(self.d.chat_pending('chat'))
+        self.d.recover_pending_sources()
+        self.assertEqual(len(sent), 1)
+
+    def test_missing_source_lookup_budget_is_global_fair_and_retains_unavailable(self):
+        self.d.CFG['inbound_source_lookup_budget'] = 1
+        for c in ['first', 'second']:
+            self.d.map_add(c, '!'+c+':test')
+            self.d.inbound_pending(c, 'gone', 'source_unavailable')
+        reads = []
+        self.d.cli_json = lambda *a, **k: reads.append(a) or None
+        self.d.recover_pending_sources()
+        self.assertEqual(len(reads), 1)
+        self.d.recover_pending_sources()
+        self.assertEqual([r[1] for r in reads], ['first', 'second'])
+        self.d.recover_pending_sources()
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(self.d.health_state()['inbound_source_unavailable'], 2)
+        self.assertEqual(self.d.health_state()['inbound_retryable'], 0)
+
+    def test_reappearing_source_bypasses_missing_row_backoff(self):
+        self.d.inbound_pending('chat', 'message1', 'source_unavailable')
+        self.d.inbound_attempt('chat', 'message1')
+        self.d.mx = lambda *a, **k: {'event_id': '$returned'}
+        self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
+
+    def test_terminal_attachment_refusal_is_not_retry_backlog(self):
+        msg = self.message(attachments=[{'srcURL': 'asset://test/'+b'/untrusted/location'.hex()}])
+        self.d.cli_json = lambda *a, **k: {'items': [msg]}
+        self.d.mx = lambda *a, **k: {'event_id': '$text'}
+        self.assertTrue(self.d.handle_chat_delta({}, 'chat'))
+        self.assertEqual(self.d.health_state()['inbound_pending'], 0)
+        self.assertEqual(self.d.health_state()['inbound_refused_components'], 1)
+
+    def test_partial_chat_scan_failure_is_published(self):
+        self.d.sync_portal_name = lambda *a: None
+        def source(command, *args, **kwargs):
+            if command == 'chats': return {'items': [{'id': 'chat', 'timestamp': 100}]}
+            raise OSError('read failed')
+        self.d.cli_json = source
+        self.d.poll_once()
+        self.assertEqual(self.d.health_state()['poll_failed_chats'], 1)
+
+    def test_slow_failed_attempt_still_backs_off_after_completion(self):
+        def deliver(*args):
+            self.clock.return_value += 60
+            raise OSError('slow failure')
+        self.d.deliver_inbound = deliver
+        self.d.handle_chat_delta({}, 'chat')
+        self.assertFalse(self.d.inbound_due('chat'))
+        self.assertEqual(self.d.health_state()['inbound_deferred'], 1)
+
+    def test_disappeared_chat_uses_exact_recovery_without_clearing_pending(self):
+        self.d.inbound_pending('chat', 'message1')
+        calls = []
+        def source(command, *args, **kwargs):
+            calls.append(command)
+            return {'items': []} if command == 'chats' else None
+        self.d.cli_json = source
+        self.d.poll_once()
+        self.assertEqual(calls, ['chats', 'message'])
+        self.assertEqual(self.d.health_state()['inbound_source_unavailable'], 1)
+        self.assertIsNone(self.d.meta_get('cursor:chat'))
 
     def test_reaction_failure_retries_with_stable_transaction(self):
         self.d.event_map_put('chat', 'message1', '$original', '@contact:test', self.d.sha('hello'))
@@ -533,6 +674,8 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual((method, user), ('PUT', '@imessagebot:test'))
         self.assertTrue(path.endswith('/state/com.jkali.imessage_health/'))
         self.assertEqual(set(body) - {'outbound', 'inbound_pending', 'inbound_refused_components', 'last_outbound_ts',
+                                      'inbound_retryable', 'inbound_source_unavailable', 'inbound_attachment_unavailable',
+                                      'inbound_deferred', 'poll_failed_chats',
                                       'last_inbound_ts', 'chats_mapped', 'poll_ok', 'poll_error', 'updated_at'}, set())
         flat = json.dumps(body)
         self.assertNotIn('!portal', flat); self.assertNotIn('@', flat); self.assertNotIn('hello', flat)

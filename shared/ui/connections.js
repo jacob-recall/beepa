@@ -226,6 +226,17 @@ function imsgHealthSummary(j, now) {
   parts.push('last send ' + rel(j.last_outbound_ts));
   parts.push('last inbound ' + rel(j.last_inbound_ts));
   if (typeof j.chats_mapped === 'number') parts.push(j.chats_mapped + ' chats');
+  const count = v => Number.isSafeInteger(v) && v >= 0 ? v : null;
+  const inbound = j.inbound && typeof j.inbound === 'object' ? j.inbound : null;
+  const total = count(j.inbound_pending) ?? (inbound ? Object.values(inbound).reduce((sum, v) => sum + (count(v) ?? 0), 0) : null);
+  const unavailable = count(j.inbound_source_unavailable) ?? (inbound ? count(inbound.source_unavailable) ?? 0 : null);
+  const retryable = count(j.inbound_retryable) ?? (total !== null && unavailable !== null ? total - unavailable : null);
+  if (total > 0 && retryable !== null && unavailable !== null && retryable + unavailable === total) {
+    if (retryable > 0) parts.push(retryable + ' imports waiting to retry');
+    if (unavailable > 0) parts.push(unavailable + ' source messages unavailable');
+  } else if (total > 0) parts.push(total + ' unresolved imports (reason unavailable)');
+  if (count(j.inbound_refused_components) > 0) parts.push(j.inbound_refused_components + ' attachment components skipped (not retrying)');
+  if (count(j.poll_failed_chats) > 0) parts.push(j.poll_failed_chats + ' conversation scans failed');
   return parts.join(' · ');
 }
 

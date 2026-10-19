@@ -119,6 +119,8 @@ EVENT_LOCK = threading.Lock()
 _EVENT_CONTEXT = threading.local()
 _tail_scan_success = {}
 _tail_scan_attempt = {}
+_tail_scan_marker = {}
+_poll_failed_chats = set()
 
 
 def initialize(config=None, state_dir=None, transport=None, runner=None):
@@ -175,6 +177,11 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
                "(event_id TEXT PRIMARY KEY, chat_id TEXT, target_msg TEXT, rkey TEXT)")
     DB.execute("CREATE TABLE IF NOT EXISTS inbound_pending (chat_id TEXT, msg_id TEXT, "
                "status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(chat_id,msg_id))")
+    # Retry scheduling is additive; never erase an unresolved source message or
+    # its component receipts. No bodies, paths or exception text are stored.
+    DB.execute("CREATE TABLE IF NOT EXISTS inbound_retry (chat_id TEXT, msg_id TEXT, "
+               "attempts INTEGER NOT NULL DEFAULT 0, last_attempt REAL NOT NULL DEFAULT 0, "
+               "next_attempt REAL NOT NULL DEFAULT 0, PRIMARY KEY(chat_id,msg_id))")
     DB.execute("CREATE TABLE IF NOT EXISTS inbound_component (room_id TEXT, msg_id TEXT, "
                "component TEXT, event_id TEXT, status TEXT, PRIMARY KEY(room_id,msg_id,component))")
     DB.execute("CREATE TABLE IF NOT EXISTS outbound_event (event_id TEXT PRIMARY KEY, room_id TEXT, "
@@ -209,6 +216,8 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
     _portal_create_hist.clear()
     _tail_scan_success.clear()
     _tail_scan_attempt.clear()
+    _tail_scan_marker.clear()
+    _poll_failed_chats.clear()
 
 
 def meta_get(k, default=None):
@@ -259,6 +268,7 @@ def inbound_complete(chat_id, msg_id):
     with DBLOCK:
         DB.execute("INSERT OR IGNORE INTO seen_msg VALUES (?,?)", (chat_id, msg_id))
         DB.execute("DELETE FROM inbound_pending WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+        DB.execute("DELETE FROM inbound_retry WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
         DB.commit()
 
 
@@ -271,6 +281,94 @@ def inbound_pending(chat_id, msg_id, status="pending"):
 def chat_pending(chat_id):
     with DBLOCK:
         return DB.execute("SELECT 1 FROM inbound_pending WHERE chat_id=? LIMIT 1", (chat_id,)).fetchone() is not None
+
+
+def inbound_due(chat_id):
+    with DBLOCK:
+        return DB.execute("SELECT 1 FROM inbound_pending p LEFT JOIN inbound_retry r "
+                          "USING(chat_id,msg_id) WHERE p.chat_id=? AND coalesce(r.next_attempt,0)<=? LIMIT 1",
+                          (chat_id, time.time())).fetchone() is not None
+
+
+def inbound_attempt(chat_id, mid):
+    """Persist backoff before I/O, so crashes and restarts cannot hot-loop a row."""
+    now = time.time()
+    with DBLOCK:
+        row = DB.execute("SELECT attempts FROM inbound_retry WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        delay = min(900, 15 * 2 ** min(attempts - 1, 6))
+        DB.execute("INSERT OR REPLACE INTO inbound_retry VALUES (?,?,?,?,?)",
+                   (chat_id, mid, attempts, now, now + delay))
+        DB.commit()
+
+
+def inbound_backoff(chat_id, mid):
+    # A slow failed operation must still get a cooldown after it finishes.
+    with DBLOCK:
+        row = DB.execute('SELECT attempts FROM inbound_retry WHERE chat_id=? AND msg_id=?', (chat_id, mid)).fetchone()
+        if row:
+            delay = min(900, 15 * 2 ** min(max(0, row[0] - 1), 6))
+            DB.execute('UPDATE inbound_retry SET next_attempt=max(next_attempt,?) WHERE chat_id=? AND msg_id=?',
+                       (time.time() + delay, chat_id, mid))
+            DB.commit()
+
+
+class InboundIncomplete(OSError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def import_message(chat_id, name, is_group, message, attempted=False):
+    mid = str(message['id'])
+    if not attempted:
+        inbound_attempt(chat_id, mid)
+    with DBLOCK:
+        seen = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
+    reason = 'delivery_failed'
+    try:
+        if not seen:
+            deliver_inbound(chat_id, name, is_group, message)
+            with DBLOCK:
+                DB.execute("INSERT OR IGNORE INTO seen_msg VALUES (?,?)", (chat_id, mid))
+                DB.commit()
+        reason = 'reconciliation_failed'
+        reconcile_edit(chat_id, message)
+        reconcile_reactions(chat_id, message)
+        inbound_complete(chat_id, mid)
+        return True
+    except Exception as e:
+        inbound_pending(chat_id, mid, e.reason if isinstance(e, InboundIncomplete) else reason)
+        inbound_backoff(chat_id, mid)
+        log.info("inbound pending chat=%s reason=%s error=%s", sha(chat_id)[:8],
+                 e.reason if isinstance(e, InboundIncomplete) else reason, type(e).__name__)
+        return False
+
+
+def recover_pending_sources():
+    """Bounded exact-ID reads recover pending rows outside the returned tail.
+
+    Never use a text match, another chat, native send, or a fabricated completion.
+    A genuinely missing row remains visible and is retried with durable backoff.
+    """
+    budget = max(1, min(16, int(CFG.get('inbound_source_lookup_budget', 4))))
+    with DBLOCK:
+        rows = DB.execute("SELECT p.chat_id,p.msg_id FROM inbound_pending p JOIN map m USING(chat_id) "
+                          "LEFT JOIN inbound_retry r USING(chat_id,msg_id) WHERE p.status='source_unavailable' "
+                          "AND coalesce(r.next_attempt,0)<=? ORDER BY coalesce(r.last_attempt,0),p.chat_id,p.msg_id LIMIT ?",
+                          (time.time(), budget)).fetchall()
+    for chat_id, mid in rows:
+        inbound_attempt(chat_id, mid)
+        try:
+            message = cli_json('message', chat_id, mid, timeout=5)
+            if (not isinstance(message, dict) or message.get('id') != mid
+                    or message.get('threadID', chat_id) != chat_id):
+                continue
+            import_message(chat_id, '', False, message, attempted=True)
+        except Exception as e:
+            log.info("source lookup pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
+        finally:
+            inbound_backoff(chat_id, mid)
 
 def event_map_put(chat_id, msg_id, event_id, sender, body_hash):
     with DBLOCK:
@@ -922,7 +1020,16 @@ def sync_portal_name(chat, chat_id):
 def poll_once():
     _backfill_posted[0] = 0  # throughput budget per pass, never a lifetime ceiling
     data = cli_json("chats")
-    items = data.get("items", []) if isinstance(data, dict) else []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError('invalid source chats')
+    present_chats = {str(c['id']) for c in items if isinstance(c, dict) and c.get('id')}
+    _poll_failed_chats.intersection_update(present_chats)
+    with DBLOCK:
+        for (chat_id,) in DB.execute('SELECT DISTINCT chat_id FROM inbound_pending').fetchall():
+            if chat_id not in present_chats:
+                DB.execute("UPDATE inbound_pending SET status='source_unavailable' WHERE chat_id=?", (chat_id,))
+        DB.commit()
     now = time.monotonic()
     interval = max(1.0, float(CFG.get("tail_rescan_seconds", 30)))
     budget = max(1, int(CFG.get("tail_rescan_chats_per_poll", 8)))
@@ -930,14 +1037,18 @@ def poll_once():
 
     def scan(chat, chat_id, marker):
         _tail_scan_attempt[chat_id] = time.monotonic()
+        _tail_scan_marker[chat_id] = marker
         try:
-            if handle_chat_delta(chat, chat_id):
+            complete = handle_chat_delta(chat, chat_id)
+            _poll_failed_chats.discard(chat_id)
+            if complete:
                 if marker:
                     meta_set("cursor:" + chat_id, marker)
                 # Advance only after the complete returned tail was handled.
                 # A restart intentionally makes each unchanged tail due again.
                 _tail_scan_success[chat_id] = time.monotonic()
         except Exception as e:
+            _poll_failed_chats.add(chat_id)
             log.info("chat pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
 
     for c in items if isinstance(items, list) else []:
@@ -948,6 +1059,12 @@ def poll_once():
             continue
         sync_portal_name(c, chat_id)
         marker = str(c.get("timestamp") or "")
+        # Incomplete history must not advance the durable cursor. Use a separate
+        # attempt marker to avoid repeatedly reading the same tail during backoff.
+        if (_tail_scan_marker.get(chat_id) == marker
+                and now - _tail_scan_attempt.get(chat_id, 0) < interval
+                and chat_pending(chat_id) and not inbound_due(chat_id)):
+            continue
         if marker and meta_get("cursor:" + chat_id) == marker and not chat_pending(chat_id):
             # Chat timestamps are hints, not complete change tokens: an inbound
             # self-chat row (or an edit/reaction) may arrive behind that marker.
@@ -961,6 +1078,7 @@ def poll_once():
     unchanged.sort(key=lambda item: _tail_scan_attempt.get(item[1], float("-inf")))
     for chat, chat_id, marker in unchanged[:budget]:
         scan(chat, chat_id, marker)
+    recover_pending_sources()
 
 def contacts_db_path():
     """Resolve mutable contacts independently of the active source release."""
@@ -1016,33 +1134,29 @@ def handle_chat_delta(chat, chat_id):
             if mid not in available:
                 DB.execute("UPDATE inbound_pending SET status='source_unavailable' WHERE chat_id=? AND msg_id=?", (chat_id, mid))
         DB.commit()
+        seen_ids = {r[0] for r in DB.execute("SELECT msg_id FROM seen_msg WHERE chat_id=?", (chat_id,))}
+        pending = dict(DB.execute("SELECT msg_id,status FROM inbound_pending WHERE chat_id=?", (chat_id,)))
+        retry = {r[0]: r[1:] for r in DB.execute(
+            "SELECT msg_id,last_attempt,next_attempt FROM inbound_retry WHERE chat_id=?", (chat_id,))}
+        for mid in available - seen_ids:
+            DB.execute("INSERT OR IGNORE INTO inbound_pending VALUES (?,?,'pending')", (chat_id, mid))
+        DB.commit()
     budget = max(1, int(CFG.get("poll_message_budget", 200)))
     processed = 0
-    for m in msgs:
-        if not isinstance(m, dict):
+    now = time.time()
+    # Stable source order for untouched messages; failed attempts rotate behind
+    # them and are skipped until due. Do not spend the budget on deferred work.
+    ordered = {str(m['id']): m for m in msgs if isinstance(m, dict) and m.get('id')}
+    for mid, m in sorted(ordered.items(), key=lambda item: retry.get(item[0], (0, 0))[0]):
+        work = mid not in seen_ids or mid in pending
+        if work and processed >= budget:
             continue
-        mid = str(m.get("id") or "")
-        if not mid:
+        if (work and pending.get(mid) != 'source_unavailable'
+                and retry.get(mid, (0, 0))[1] > now):
             continue
-        with DBLOCK:
-            seen = DB.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=?", (chat_id, mid)).fetchone()
-        inbound_pending(chat_id, mid)
-        if not seen and processed >= budget:
-            continue
-        if not seen:
+        if work:
             processed += 1
-        try:
-            if not seen:
-                deliver_inbound(chat_id, name, is_group, m)
-                # Component receipts make retries safe even if this commit fails.
-                with DBLOCK:
-                    DB.execute("INSERT OR IGNORE INTO seen_msg VALUES (?,?)", (chat_id, mid))
-                    DB.commit()
-            reconcile_edit(chat_id, m)
-            reconcile_reactions(chat_id, m)
-            inbound_complete(chat_id, mid)
-        except Exception as e:
-            log.info("inbound pending chat=%s error=%s", sha(chat_id)[:8], type(e).__name__)
+        import_message(chat_id, name, is_group, m)
     return not chat_pending(chat_id)
 
 
@@ -1138,7 +1252,8 @@ def _relay_message(chat_id, room, chat_name, is_group, m):
         event_map_put(chat_id, mid, primary_event, sender, relayed_text_hash)
     reconcile_native_receipt(chat_id, m)
     if failures:
-        raise OSError("source components still pending")
+        raise InboundIncomplete('attachment_unavailable' if all(f == 'attachment_unavailable' for f in failures)
+                                else 'delivery_failed')
     return primary_event
 
 
@@ -1242,8 +1357,15 @@ _health_pub = {"sig": None, "ts": 0.0, "poll_ok": None, "poll_err": None}
 
 def health_state():
     d = delivery_status()
+    pending = d.get('inbound') or {}
+    total = sum(int(v) for v in pending.values() if isinstance(v, int))
     state = {"outbound": {k: int(v) for k, v in (d.get("outbound") or {}).items() if isinstance(v, int)},
-             "inbound_pending": sum(int(v) for v in (d.get("inbound") or {}).values() if isinstance(v, int)),
+             "inbound_pending": total,
+             "inbound_retryable": total - pending.get('source_unavailable', 0),
+             "inbound_source_unavailable": pending.get('source_unavailable', 0),
+             "inbound_attachment_unavailable": pending.get('attachment_unavailable', 0),
+             "inbound_deferred": d['inbound_deferred'],
+             "poll_failed_chats": len(_poll_failed_chats),
              "inbound_refused_components": int(d.get("inbound_refused_components") or 0),
              "last_outbound_ts": d.get("last_outbound_ts"), "last_inbound_ts": d.get("last_inbound_ts"),
              "chats_mapped": int(d.get("chats_mapped") or 0),
@@ -1554,13 +1676,16 @@ TERMINAL_OUTCOMES = {"confirmed", "refused", "ambiguous", "ignored"}
 def delivery_status():
     with DBLOCK:
         pending = dict(DB.execute("SELECT status,COUNT(*) FROM inbound_pending GROUP BY status"))
+        deferred = DB.execute("SELECT count(*) FROM inbound_pending p JOIN inbound_retry r USING(chat_id,msg_id) "
+                              "WHERE r.next_attempt>?", (time.time(),)).fetchone()[0]
         outbound = dict(DB.execute("SELECT state,COUNT(*) FROM outbound_event GROUP BY state"))
         refused = DB.execute("SELECT COUNT(*) FROM inbound_component WHERE status LIKE 'refused%' ").fetchone()[0]
         last_out = DB.execute("SELECT max(updated) FROM outbound_event WHERE state='confirmed'").fetchone()[0]
         # Inbound: the newest per-chat cursor the poller advanced (engine ms timestamps).
         last_in = DB.execute("SELECT max(CAST(v AS INTEGER)) FROM meta WHERE k LIKE 'cursor:%'").fetchone()[0]
         chats = DB.execute("SELECT count(*) FROM map").fetchone()[0]
-    return {"inbound": pending, "inbound_refused_components": refused, "outbound": outbound,
+    return {"inbound": pending, "inbound_deferred": deferred,
+            "inbound_refused_components": refused, "outbound": outbound,
             "last_outbound_ts": int(last_out) if last_out else None,
             "last_inbound_ts": int(last_in / 1000) if last_in else None,
             "chats_mapped": chats,

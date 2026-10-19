@@ -82,6 +82,8 @@ class DurableSyncTests(unittest.TestCase):
         def event(kind, content, key='', sender=bot):
             return dict(type=kind, state_key=key, sender=sender, content=content)
         health = dict(updated_at=123456, poll_ok=True, inbound_pending=2,
+                      inbound_retryable=1, inbound_source_unavailable=1, inbound_attachment_unavailable=1,
+                      inbound_deferred=2, poll_failed_chats=3,
                       inbound_refused_components=0, poll_error='private error', body='secret', chats_mapped=50)
         state = [event('m.room.create', {}),
                  event('com.jkali.bridge.mgmt', {'bridge': 'imessage', 'role': 'management'}, 'imessage'),
@@ -105,7 +107,9 @@ class DurableSyncTests(unittest.TestCase):
         self.u.full_sync()
         self.assertEqual(self.u.meta_get('imessage_health_room'), '!mgmt:local', 'discover even if no new heartbeat arrives')
         result = self.u.imessage_health()
-        self.assertEqual(result, {k: health[k] for k in ('updated_at', 'poll_ok', 'inbound_pending', 'inbound_refused_components')})
+        keys = ('updated_at', 'poll_ok', 'inbound_pending', 'inbound_refused_components',
+                'inbound_retryable', 'inbound_source_unavailable', 'inbound_attachment_unavailable', 'inbound_deferred', 'poll_failed_chats')
+        self.assertEqual(result, {k: health[k] for k in keys})
         self.assertEqual(self.calls, [], 'native health cannot send upstream messages')
         self.u.publish_health_to_master(dict(connected=True, updated_at=123456, imessage=health))
         published = self.calls[-1][2]['imessage']

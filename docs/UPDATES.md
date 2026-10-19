@@ -1,7 +1,9 @@
 # Applying releases without disconnecting accounts
 
-For the current 0.3.0 candidate, bots updating Elliot's and David's installations
+For the current 0.3.1 release, bots updating Elliot's and David's installations
 should follow [the complete October 18 rollout](PEER-ROLLOUT-2026-10-18.md).
+For already-upgraded installations, also follow the
+[iMessage importer patch supplement](IMESSAGE-IMPORTER-ROLLOUT-2026-10-18.md).
 It covers all changes since the older UI, committed-tree packaging, source CRM
 opt-in, master-only services, verification, and state-version-2 rollback limits.
 The [October 12 receipt guide](PEER-ROLLOUT-2026-10-12.md) remains a reference for

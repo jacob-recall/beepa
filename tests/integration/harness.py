@@ -3216,6 +3216,67 @@ def scenario_29_crm_ordered_controls():
         worker.db.close()
 
 
+def scenario_30_importer_retry_recovery():
+    """Real Matrix transactions and uplink; synthetic native reads, no Apple sends."""
+    import importlib.util
+    from unittest.mock import patch
+    e = fresh_env('s30')
+    space = create_space(e['tuser_tok'], 'iMessage')
+    rid = make_convo(e, space, 'Importer recovery')
+    bot_id, bot_token = register_user('imessagebot')
+    room_path = '/_matrix/client/v3/rooms/' + urllib.parse.quote(rid, safe='')
+    local(e['tuser_tok'], 'POST', room_path + '/invite', {'user_id': bot_id})
+    join_room(bot_token, rid)
+    set_override(e['tuser_tok'], e['tuser_id'], rid, 'share')
+    spec = importlib.util.spec_from_file_location('importer_recovery', os.path.join(REPO, 'imessage/daemon.py'))
+    d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
+    state = os.path.join(os.path.dirname(e['db_path']), 'importer-recovery')
+    cfg = dict(port=29350, hs_url=TEST_HS, domain='localhost', user_id=e['tuser_id'], bot_id=bot_id,
+               as_token='synthetic', hs_token='synthetic', cli_path='/never-execute',
+               attachment_allow_prefixes=[], backfill_count=0, poll_message_budget=1)
+    def forbidden(*args, **kwargs): raise AssertionError('native mutation attempted')
+    d.initialize(cfg, state_dir=state, runner=forbidden)
+    d.map_add('chat', rid)
+    d.ensure_portal = lambda *args: rid
+    messages = [dict(id='native-'+str(i), threadID='chat', isSender=True, text='import-retry-'+str(i)) for i in range(3)]
+    recovered = dict(id='older', threadID='chat', isSender=True, text='import-recovered-older')
+    d.cli_json = lambda command, *args, **kwargs: {'items': messages} if command == 'messages' else recovered
+    attempts = []
+    def matrix(method, endpoint, content, **kwargs):
+        result = local(bot_token, method, endpoint, content)
+        attempts.append(endpoint)
+        if len(attempts) == 1: raise OSError('accepted by Matrix, response lost')
+        return result
+    d.mx = matrix
+    proc = None
+    try:
+        for _ in range(3): d.handle_chat_delta({}, 'chat')
+        assert len(attempts) == 3, 'failed head must not starve other messages'
+        d.initialize(cfg, state_dir=state, runner=forbidden)
+        d.handle_chat_delta({}, 'chat')
+        assert len(attempts) == 3, 'restart must preserve retry cooldown'
+        with patch.object(d.time, 'time', return_value=time.time()+16):
+            assert d.handle_chat_delta({}, 'chat')
+        assert attempts[0] == attempts[-1], 'lost response retry must reuse Matrix transaction'
+        d.inbound_pending('chat', 'older')
+        assert not d.handle_chat_delta({}, 'chat')
+        assert d.health_state()['inbound_source_unavailable'] == 1
+        d.recover_pending_sources()
+        assert d.health_state()['inbound_pending'] == 0
+        proc = start_uplink(e)
+        mr = wait_until(lambda: mirror_of(e['db_path'], rid), desc='importer recovery mirror')[0]
+        expected = [m['text'] for m in messages] + [recovered['text']]
+        def complete():
+            bodies = [m['body'] for m in master_messages(mr)]
+            return bodies if all(body in bodies for body in expected) else None
+        bodies = wait_until(complete, desc='recovered imports delivered to master')
+        assert all(bodies.count(body) == 1 for body in expected), 'no duplicated accepted components'
+        return True, 'failed head rotated; cooldown survives restart; exact-ID tail recovery; lost response dedup; four imports reach master once; no native sends'
+    finally:
+        if proc: stop_uplink(proc)
+        d.DB.close()
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -3246,6 +3307,7 @@ SCENARIOS = [
     ("27_native_imessage_receipts", scenario_27_native_imessage_receipts),
     ("28_crm_metadata", scenario_28_crm_metadata),
     ("29_crm_ordered_controls", scenario_29_crm_ordered_controls),
+    ("30_importer_retry_recovery", scenario_30_importer_retry_recovery),
 ]
 
 

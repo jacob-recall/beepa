@@ -1,5 +1,6 @@
 import { parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
 import { SOURCES } from '../../shared/model/source_catalog.js';
+import { NATIVE_READ_STATE, nativeReadFromRoom, canAutoRead } from '../../shared/model/native_read.js';
 // Exercise the app's real receipt writer/parser against the disposable homeserver.
 // Credentials arrive on stdin, never argv; sandbox.py owns the server lifecycle.
 import fs from 'node:fs';
@@ -11,7 +12,8 @@ const source = path => fs.readFileSync(new URL(path, import.meta.url), 'utf8')
   .replace(/^import .*;\n/gm, '').replace(/^export .*;\n/gm, '');
 const model = new Map([[input.roomId, { unread: 1 }]]);
 let writes = 0;
-const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE,
+const ctx = vm.createContext({ parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE, NATIVE_READ_STATE, nativeReadFromRoom, canAutoRead,
+  IMSG_BOT_MXID: SOURCES.find(s => s.id === 'imessage')?.botMxid,
   S: { openRoomId: input.roomId, joinedSet: new Set([input.roomId]) },
   ROOMID_RE: /^![^:]+:.+$/, feedModel: model, SOURCES, setTimeout,
   localStorage: { getItem: () => null }, scheduleFeedRender() {},

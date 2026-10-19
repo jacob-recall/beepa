@@ -1,4 +1,5 @@
 import { mergeReceipts } from '../model/message_receipts.js';
+import { nativeReadFromRoom, NATIVE_READ_STATE, canAutoRead } from '../model/native_read.js';
 // Relocated verbatim from hub/site/app.js (PLAN-MASTER-SYNC-IMPL P1.2).
 // Shared ES module. Logic unchanged; only import/export + shared-state (S) access added.
 
@@ -144,19 +145,36 @@ function receiptsEnabled() {
 }
 // Advance BOTH the fully-read marker and the public read receipt to eventId.
 // Only for a validated, OPEN room; failure is logged nowhere and changes nothing.
+const nativeReadAttempts = new Map();
 async function markRead(roomId, eventId) {
-  if (!receiptsEnabled()) return;
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
   if (typeof eventId !== 'string' || !eventId.startsWith('$')) return;
   if (!ROOMID_RE.test(roomId) || !S.joinedSet.has(roomId) || S.openRoomId !== roomId) return;
   const session = S.token;
   const reading = feedModel.get(roomId);
   const lastTs = reading && reading.lastTs;
   const unread = reading && reading.unread;
+  const native = reading?.nativeRead;
+  if (native && receiptsEnabled()) {
+    const latestVisible = Math.max(0, ...(cacheGet(roomId) || []).map(e => messageTimestamp(e, S.timestampCorrections?.get(roomId))));
+    const attempt = session + ':' + roomId + ':' + native.revision;
+    if (canAutoRead(native, latestVisible, true) && !nativeReadAttempts.has(attempt)) {
+      nativeReadAttempts.set(attempt, true);
+      while (nativeReadAttempts.size > 100) nativeReadAttempts.delete(nativeReadAttempts.keys().next().value);
+      const command = 'read_' + txn();
+      try {
+        await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId)
+          + '/send/com.jkali.imessage.read_request/' + command,
+          { schema: 1, command_id: command, action: 'read', expected_revision: native.revision, expires_at: Date.now() + 120000 });
+      } catch (e) { /* no automatic replay of an uncertain read */ }
+      if (S.token !== session || S.openRoomId !== roomId) return;
+    }
+  }
   try {
     await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/read_markers',
-      { 'm.fully_read': eventId, 'm.read': eventId });
+      { 'm.fully_read': eventId, [receiptsEnabled() ? 'm.read' : 'm.read.private']: eventId });
     const rec = feedModel.get(roomId);
-    if (S.token === session && rec === reading && rec && rec.lastTs === lastTs && rec.unread === unread && rec.unread) {
+    if (!native && S.token === session && rec === reading && rec && rec.lastTs === lastTs && rec.unread === unread && rec.unread) {
       rec.unread = 0; scheduleFeedRender();
     }
   } catch (e) { /* receipt failure never affects anything else */ }
@@ -277,7 +295,7 @@ async function startConvoWatch(roomId) {
   while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { rooms: [watchRoom], timeline: { limit: 20 }, state: { types: [] }, ephemeral: { types: ['m.receipt'] } },
+        room: { rooms: [watchRoom], timeline: { limit: 20 }, state: { types: [NATIVE_READ_STATE] }, ephemeral: { types: ['m.receipt'] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -288,6 +306,11 @@ async function startConvoWatch(roomId) {
       S.convoSince = owner.since;
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[watchRoom];                 // read ONLY the open room's timeline
+      const readRecord = feedModel.get(watchRoom);
+      if (readRecord?.sourceId === 'imessage') {
+        readRecord.nativeRead = nativeReadFromRoom(room, IMSG_BOT_MXID, readRecord.nativeRead);
+        if (readRecord.nativeRead) { readRecord.unread = readRecord.nativeRead.unread_count; scheduleFeedRender(); }
+      }
       if (room && room.timeline && Array.isArray(room.timeline.events) && S.openRoomId === watchRoom) {
         const corrections = timestampCorrections(room.timeline.events, IMSG_BOT_MXID);
         if (corrections.size) {

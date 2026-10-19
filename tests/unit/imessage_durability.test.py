@@ -762,6 +762,111 @@ class DaemonTest(unittest.TestCase):
         handler.do_PUT()
         self.assertEqual(replies, [400])
 
+    def read_chat(self, unread=2, marked=False, message='latest'):
+        return dict(id='chat', unreadCount=unread, isMarkedUnread=marked,
+                    isUnread=unread > 0 or marked, timestamp=1800000000000,
+                    lastReadMessageSortKey='previous', messages={'items': [dict(id=message, sortKey='1', timestamp=1800000000000)]})
+
+    def read_event(self, chat, action='read', eid='$read'):
+        return dict(event_id=eid, sender='@owner:test', room_id='!portal:test',
+                    type=self.d.NATIVE_READ_REQUEST, origin_server_ts=1800000000000,
+                    content=dict(schema=1, command_id=eid[1:], action=action,
+                                 expected_revision=self.d.native_read_snapshot(chat)['revision'], expires_at=1800000120000))
+
+    def test_native_poll_cannot_overwrite_a_newer_read_command(self):
+        def chats(*args, **kwargs):
+            self.d._native_read_generation[0] += 1  # command finished during read
+            return {'items': [self.read_chat(4)]}
+        self.d.cli_json = chats
+        self.d.sync_portal_name = lambda *a: None
+        self.d.handle_chat_delta = lambda *a: True
+        writes = []
+        self.d.publish_native_read_state = lambda *a: writes.append(a) or True
+        self.d.poll_once()
+        self.assertEqual(writes, [])
+
+    def test_native_read_cli_void_output_is_accepted_but_needs_observation(self):
+        self.d._runner = lambda *a, **k: subprocess.CompletedProcess(a, 0, b'[1] ok\nExiting...\n', b'')
+        self.assertIsNone(self.d.cli_read_change('read', 'chat'))
+        calls = []
+        self.d._runner = lambda *a, **k: calls.append(a[0]) or subprocess.CompletedProcess(a, 0, b'', b'')
+        self.d.cli_read_change('read', 'chat', marked_unread=True)
+        self.assertEqual(calls[-1][-2:], ['select-chat', 'chat'])
+        self.d.cli_read_change('unread', 'chat', marked_unread=True)
+        self.assertEqual(calls[-1][-2:], ['mark-unread', 'chat'])
+        with self.assertRaises(ValueError): self.d.cli_read_change('send', 'chat')
+
+    def test_native_unread_projection_and_manual_marker(self):
+        self.assertEqual(self.d.native_read_snapshot(self.read_chat())['unread_count'], 2)
+        self.assertEqual(self.d.native_read_snapshot(self.read_chat(0, True))['unread_count'], 1)
+        self.assertEqual(self.d.native_read_snapshot(self.read_chat(0))['unread_count'], 0)
+        for bad in [None, {}, dict(self.read_chat(), unreadCount=True), dict(self.read_chat(), isUnread=None)]:
+            self.assertIsNone(self.d.native_read_snapshot(bad))
+
+    def test_native_read_and_unread_confirm_without_outgoing_receipts(self):
+        chat = self.read_chat()
+        calls, writes = [], []
+        def cli(command, *args, **kw):
+            calls.append(command)
+            if command == 'mark-read': chat.update(unreadCount=0, isUnread=False, isMarkedUnread=False)
+            if command == 'mark-unread': chat.update(isUnread=True, isMarkedUnread=True)
+            return chat if command == 'chat' else True
+        self.d.cli_json = cli
+        self.d.cli_read_change = lambda action, chat, **kw: cli('mark-'+action, chat)
+        self.d.mx = lambda *a, **k: writes.append(a) or {}
+        for action in ['read', 'unread']:
+            ev = self.read_event(chat, action, '$'+action)
+            self.assertTrue(self.d.process_outbound_event(ev))
+            self.assertTrue(self.d.process_outbound_event(ev))
+            self.assertEqual(calls.count('mark-'+action), 1)
+            self.assertEqual(writes[-1][2]['last_command'], {'id': action, 'status': 'applied'})
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM native_receipt').fetchone()[0], 0)
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM outbound_event').fetchone()[0], 0)
+        self.assertTrue(writes[-1][2]['marked_unread'])
+
+    def test_native_read_stale_tail_and_expired_intents_do_not_mutate(self):
+        chat = self.read_chat()
+        ev = self.read_event(chat)
+        commands = []
+        self.d.cli_json = lambda cmd, *a, **k: commands.append(cmd) or self.read_chat(message='new-message')
+        self.d.mx = lambda *a, **k: {}
+        self.assertTrue(self.d.process_outbound_event(ev))
+        self.assertNotIn('mark-read', commands)
+        self.assertEqual(self.d.DB.execute('SELECT status FROM native_read_command').fetchone()[0], 'changed')
+        ev = self.read_event(chat, eid='$expired'); ev['content']['expires_at'] = 1
+        self.assertTrue(self.d.process_outbound_event(ev))
+        self.assertNotIn('mark-read', commands)
+
+    def test_native_read_auth_and_portal_gates(self):
+        for change in [{'sender': '@attacker:test'}, {'room_id': '!other:test'}, {'state_key': ''}]:
+            ev = dict(self.read_event(self.read_chat()), **change)
+            self.assertTrue(self.d.process_outbound_event(ev))
+        self.assertEqual(self.d.DB.execute('SELECT count(*) FROM native_read_command').fetchone()[0], 0)
+
+    def test_native_read_unknown_result_is_not_replayed(self):
+        chat = self.read_chat(); ev = self.read_event(chat)
+        commands = []
+        def cli(cmd, *a, **k):
+            commands.append(cmd)
+            if cmd == 'mark-read': raise TimeoutError('lost native response')
+            return chat
+        self.d.cli_json = cli; self.d.mx = lambda *a, **k: {}
+        self.d.cli_read_change = lambda action, chat, **kw: cli('mark-'+action, chat)
+        self.d.process_outbound_event(ev)
+        self.d.process_outbound_event(ev)
+        self.assertEqual(commands.count('mark-read'), 1)
+        self.assertEqual(self.d.DB.execute('SELECT status FROM native_read_command').fetchone()[0], 'unconfirmed')
+
+    def test_native_read_publication_failure_recovers_on_poll_without_mutation(self):
+        chat = self.read_chat(0)
+        self.d.mx = lambda *a, **k: (_ for _ in ()).throw(OSError('offline'))
+        with self.assertRaises(OSError): self.d.publish_native_read_state(chat)
+        writes = []; self.d.mx = lambda *a, **k: writes.append(a) or {}
+        self.d.publish_native_read_state(chat); self.d.publish_native_read_state(chat)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][2]['unread_count'], 0)
+
+
 
 if __name__ == '__main__':
     unittest.main()

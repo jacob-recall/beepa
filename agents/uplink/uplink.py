@@ -107,6 +107,7 @@ import invites            # noqa: E402  (bridge-invite predicate, pure leaf)
 import reconcile          # noqa: E402
 import durable_sync       # noqa: E402
 import crm_control        # noqa: E402  (ordered local policy + typed CRM control)
+import native_read
 
 # The durable address-book store (agents/contacts/contacts_store.py, Task 1) is
 # the SOURCE for the contact mirror. It is a sibling package; add its dir to the
@@ -1555,6 +1556,7 @@ class Uplink(durable_sync.DurableSync):
             if row and desired.get(rid) in ("share", "direct"):
                 state = read_state_from_room(join.get(rid),
                                              set(self.self_mxids) | {self.cfg.local_user}, SOURCE_BOT_MXIDS)
+                state = native_read.observe(self, rid, row[0], join.get(rid), state)
                 self._queue_read_state(rid, row[0], state)
                 self.queue_message_receipts(rid, row[0], join.get(rid))
 
@@ -2624,8 +2626,14 @@ class Uplink(durable_sync.DurableSync):
         for ev in events:
             if not self.active_link_for_dispatch():
                 return posted
+            if isinstance(ev, dict) and ev.get('type') == native_read.MASTER_REQUEST:
+                native_read.forward(self, master_room_id, ev,
+                                    suspended=suspended or not self.meta_get('proposal_sync_since'))
+                continue
             if not isinstance(ev, dict) or ev.get("type") != PROPOSAL_TYPE:
                 continue
+            if isinstance(ev.get('content'), dict) and native_read.KEY in ev['content']:
+                continue  # read controls never enter suggestions or sending
             if isinstance(ev.get("content"), dict) and "com.jkali.crm.item" in ev["content"]:
                 # Staged CRM proposals are inert until their source-owned child
                 # queue has verified the immutable review and granted one call.
@@ -3567,7 +3575,7 @@ class Uplink(durable_sync.DurableSync):
             return
         old_unread = self.db.execute('SELECT master_room_id,unread_count FROM room_unread WHERE local_room_id=?',
                                      (local_room_id,)).fetchone()
-        unread_changed = unread is not None and old_unread != (master_room_id, unread)
+        unread_changed = bool(state.get('_native_changed')) or (unread is not None and old_unread != (master_room_id, unread))
         if unread is not None:
             self.db.execute('INSERT OR REPLACE INTO room_unread VALUES (?,?,?)', (local_room_id, master_room_id, unread))
         self.db.execute('''INSERT INTO receipt_outbox (local_room_id,master_room_id,teammate_read_ts,remote_read_ts,dirty) VALUES (?,?,?,?,1)
@@ -3604,9 +3612,17 @@ class Uplink(durable_sync.DurableSync):
                        "updated_ts": int(time.time() * 1000)}
             if unread is not None:
                 payload["unread_count"] = unread
+            native = self.meta_get('native_read:' + master_room_id)
+            if native:
+                projected = native_read.validated(json.loads(native))
+                if projected:
+                    payload['native'] = projected
+                    payload['unread_count'] = projected['unread_count']
             # Failure leaves the row dirty; run_stage backs off (including 429).
             self.master("PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room_id, safe="")
                         + "/state/" + READ_STATE_TYPE + "/", payload, timeout=15)
+            if native and payload.get('native'):
+                self.meta_set('native_read_delivered:' + master_room_id, native)
             self.db.execute('UPDATE receipt_outbox SET dirty=0 WHERE local_room_id=? AND master_room_id=? '
                             'AND teammate_read_ts=? AND remote_read_ts=?',
                             (local_room_id, master_room_id, teammate, remote))
@@ -3667,6 +3683,7 @@ class Uplink(durable_sync.DurableSync):
             master_room_id = row[0]
             selfs = set(self.self_mxids) | {self.cfg.local_user}
             rs = read_state_from_room(room, selfs, SOURCE_BOT_MXIDS)
+            rs = native_read.observe(self, local_room_id, master_room_id, room, rs)
             # Local persistence only. A storage failure must prevent advancing
             # sync_since; remote failures cannot stall ingestion. Consent is
             # re-read immediately before the eventual master state write.

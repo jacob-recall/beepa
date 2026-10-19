@@ -14,8 +14,12 @@ const ctx = vm.createContext({ S, ROOMID_RE: /^![^:]+:.+$/, feedModel: new Map([
 });
 vm.runInContext(source, ctx);
 enabled = false;
-await ctx.markRead('!room:local', '$message');
-assert.equal(requests.length, 0, 'disabled receipts do not write');
+const privateRead = ctx.markRead('!room:local', '$message');
+assert.equal(requests[0].body['m.read.private'], '$message');
+assert.equal(requests[0].body['m.read'], undefined, 'disabled public receipts stay private');
+requests[0].resolve({}); await privateRead;
+assert.equal(rec.unread, 0, 'private receipt clears own badge');
+requests.length = 0; rec.unread = 2;
 enabled = true;
 await ctx.markRead('!other:local', '$message');
 await ctx.markRead('!room:local', 'bad');

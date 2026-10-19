@@ -24,6 +24,7 @@ import { mergeReceipts, paintReceipt, MESSAGE_RECEIPT_TYPE } from '../../shared/
 //
 // NO composer, NO send call, anywhere in this file.
 
+import { nativeReadState, canAutoRead } from '../../shared/model/native_read.js';
 import { PROPOSAL_STATUS, proposalLabel, proposalHistory } from '../../shared/model/proposal-lifecycle.js';
 import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE, MXC_RE } from '../../shared/matrix/client.js';
 import { $, el, sanitize, sanitizeLine, appendLinkified } from '../../shared/ui/el.js';
@@ -507,7 +508,7 @@ function applyRoom(info, r) {
         && typeof c.journal_epoch === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(c.journal_epoch)
         ? { schema: 1, owner_mxid: c.owner_mxid, generation: c.generation,
           journal_epoch: c.journal_epoch, ordered_policy: true, direct_prepare_commit: true,
-          direct_cancel: c.direct_cancel === true, batch: c.batch === true, batch_cancel: c.batch_cancel === true } : null;
+          direct_cancel: c.direct_cancel === true, batch: c.batch === true, batch_cancel: c.batch_cancel === true, native_read: c.native_read === true } : null;
     }
     if (e.type === 'com.jkali.crm.direct_result' && e.sender === info.createSender && typeof e.state_key === 'string' && e.state_key) {
       const c = e.content;
@@ -539,10 +540,12 @@ function applyRoom(info, r) {
       info.shareLevelContent = (e.content && typeof e.content === 'object') ? e.content : null;
     }
     // Uplink-owned read state ({teammate_read_ts, remote_read_ts}); read-only.
-    if (e.type === 'com.jkali.read_state' && e.state_key === '' && e.content && typeof e.content === 'object') {
+    if (e.type === 'com.jkali.read_state' && e.sender === info.createSender && e.state_key === '' && e.content && typeof e.content === 'object') {
       info.readState = { teammate_read_ts: Number(e.content.teammate_read_ts) || 0,
                          remote_read_ts: Number(e.content.remote_read_ts) || 0 };
       if (Number.isInteger(e.content.unread_count) && e.content.unread_count >= 0) info.readState.unread_count = e.content.unread_count;
+      info.nativeRead = nativeReadState(e.content.native);
+      if (info.nativeRead) info.readState.unread_count = info.nativeRead.unread_count;
     }
     if (e.type === MESSAGE_RECEIPT_TYPE && e.sender === info.createSender && typeof e.state_key === 'string') {
       info.receipts = mergeReceipts(info.receipts, [[e.state_key, e.content || {}]]);
@@ -1544,16 +1547,81 @@ function shortTime(ts) {
 // Two read-state lines under the room header, from the uplink's read-only
 // com.jkali.read_state stamp (parseSnapshot). Fail closed: an unknown read
 // state (room has never carried the stamp) says so instead of guessing.
+// A read control uses the same allowlisted proposal transport; the source
+// validates it independently and never treats it as a message or suggestion.
+let nativeReadIntent = null;
+let nativeReadSuppressed = false;
+let nativeReadAttempt = null;
+function renderNativeReadControls(rec) {
+  const ready = rec?.sourceId === 'imessage' && rec.nativeRead?.supported === true && MS.crmCapabilities.get(rec.createSender)?.native_read === true;
+  for (const [id, action] of [['room-mark-read', 'read'], ['room-mark-unread', 'unread']]) {
+    const button = $(id);
+    if (!button) continue;
+    button.classList.toggle('hidden', !ready);
+    button.disabled = !!nativeReadIntent && rec?.nativeRead?.last_command?.id !== nativeReadIntent.id && Date.now() < nativeReadIntent.expires;
+    button.onclick = () => requestNativeRead(action, true);
+  }
+}
+async function requestNativeRead(action, explicit = false) {
+  const roomId = MS.openRoomId, rec = MS.rooms[roomId], pinned = MS.openProposalCtx;
+  const native = rec?.nativeRead;
+  if (!rec || rec.sourceId !== 'imessage' || !native || !pinned || pinned.mirrorRoomId !== roomId
+    || rec.mirrorOf !== pinned.targetRoom || rec.userLabel !== pinned.label
+    || !ROOM_SHAPE_RE.test(pinned.targetRoom || '') || !MS.proposalsRoomSet.has(pinned.proposalsRoomId)
+    || MS.proposalsByUser.get(pinned.label) !== pinned.proposalsRoomId) return;
+  const capability = MS.crmCapabilities.get(rec.createSender);
+  if (!capability?.generation || capability.native_read !== true) return;
+  const latestVisible = Math.max(0, ...[...MS.roomEvents.values()].map(mirrorTs));
+  const visible = document.visibilityState !== 'hidden';
+  if (!explicit && !canAutoRead(native, latestVisible, visible, nativeReadSuppressed)) return;
+  if (nativeReadIntent && native.last_command?.id !== nativeReadIntent.id && Date.now() < nativeReadIntent.expires) return;
+  const attempt = roomId + ':' + native.revision;
+  if (!explicit && nativeReadAttempt === attempt) return;
+  if (explicit) nativeReadSuppressed = action === 'unread';
+  nativeReadAttempt = attempt;
+  const id = 'read_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  const txn = 'prop_' + id;
+  const token = S.token, epoch = roomEpoch;
+  const intent = nativeReadIntent = { id, action, expires: Date.now() + 120000 };
+  setTimeout(() => {
+    if (S.token === token && roomEpoch === epoch && MS.openRoomId === roomId && nativeReadIntent === intent) {
+      renderRoomReadLine(MS.rooms[roomId]);
+    }
+  }, 120100);
+  renderRoomReadLine(rec);
+  try {
+    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(pinned.proposalsRoomId)
+      + '/send/com.jkali.read_request/' + txn,
+      { target_room: pinned.targetRoom, 'com.jkali.read_action': {
+        schema: 1, command_id: id, action, expected_revision: native.revision,
+        expires_at: intent.expires, generation: capability.generation, mirror_room: roomId } });
+  } catch (error) {
+    // Keep the original request identity through an ambiguous HTTP result.
+    if (token === S.token && epoch === roomEpoch && MS.openRoomId === roomId) {
+      roomStatus('Read-state request not confirmed. Waiting for the user’s Mac; check again before retrying.');
+    }
+  }
+}
+
 function renderRoomReadLine(rec) {
   const line = $('room-read');
   if (!line) return;
   if (!rec) { line.textContent = 'Read state unknown'; return; }
   const receipt = rec.receipts?.get(rec.lastEventId);
   const teammateLabel = rec.userLabel ? nameFor(rec.userLabel) : 'Teammate';
+  renderNativeReadControls(rec);
   const parts = [];
+  if (rec.nativeRead) {
+    parts.push(rec.nativeRead.unread_count ? 'Unread in Apple Messages (' + rec.nativeRead.unread_count + ')' : 'Read in Apple Messages');
+    const outcome = rec.nativeRead.last_command;
+    if (nativeReadIntent) {
+      if (outcome?.id === nativeReadIntent.id) parts.push(outcome.status === 'applied' ? 'Change confirmed' : 'Read-state change ' + outcome.status + ' — check again');
+      else parts.push(Date.now() < nativeReadIntent.expires ? 'Updating on user’s Mac…' : 'Read-state update not confirmed');
+    }
+  }
   if (receipt?.read) parts.push('Latest message read by recipient');
   else if (receipt?.delivered) parts.push('Latest message delivered to recipient');
-  parts.push(receipt?.teammate_read ? teammateLabel + ' read the latest message' : 'Teammate read state unconfirmed');
+  if (!rec.nativeRead) parts.push(receipt?.teammate_read ? teammateLabel + ' read the latest message' : 'Teammate read state unconfirmed');
   if (typeof rec.lastLagMs === 'number') parts.push('mirror lag ' + (rec.lastLagMs < 1000 ? rec.lastLagMs + 'ms' : (rec.lastLagMs / 1000).toFixed(1) + 's'));
   line.textContent = parts.join(' · ');
 }
@@ -1728,6 +1796,7 @@ async function openRoom(roomId, { eventId = null } = {}) {
   const session = S.token;
   const current = () => epoch === roomEpoch && S.token === session && MS.openRoomId === roomId;
   MS.openRoomId = roomId;
+  nativeReadIntent = null; nativeReadSuppressed = false; nativeReadAttempt = null;
   MS.roomSeen.clear();
   MS.roomEvents.clear();
   MS.roomRows.clear();
@@ -1781,6 +1850,7 @@ async function openRoom(roomId, { eventId = null } = {}) {
     const sorted = chunk.slice().sort((a, c2) => mirrorTs(a) - mirrorTs(c2));
     for (const ev of sorted) renderBubble(ev);
     reconcileNativeEchoes();
+    if (!eventId) requestNativeRead('read');
   } catch (e) {
     if (current()) roomStatus('Could not load messages: ' + String(e.message || e));
   }
@@ -1808,7 +1878,7 @@ async function startTail(roomId) {
   while (current()) {
     try {
       const filter = encodeURIComponent(JSON.stringify({
-        room: { rooms: [roomId], timeline: { limit: 20 }, state: { types: [MESSAGE_RECEIPT_TYPE] } },
+        room: { rooms: [roomId], timeline: { limit: 20 }, state: { types: [MESSAGE_RECEIPT_TYPE, 'com.jkali.read_state'] } },
         presence: { types: [] }, account_data: { types: [] },
       }));
       const q = '/_matrix/client/v3/sync?timeout=25000&filter=' + filter +
@@ -1820,7 +1890,7 @@ async function startTail(roomId) {
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[roomId];
       if (room && MS.rooms[roomId]) {
-        const stateOnly = (room.state?.events || []).concat(room.timeline?.events || []).filter(e => e.type === MESSAGE_RECEIPT_TYPE);
+        const stateOnly = (room.state?.events || []).concat(room.timeline?.events || []).filter(e => e.type === MESSAGE_RECEIPT_TYPE || e.type === 'com.jkali.read_state');
         applyRoom(MS.rooms[roomId], { state: { events: stateOnly } });
       }
       if (room && room.timeline && Array.isArray(room.timeline.events) && MS.openRoomId === roomId) {
@@ -1843,6 +1913,7 @@ async function startTail(roomId) {
           if (checks) paintReceipt(checks, rec?.receipts?.get(id));
         }
         renderRoomReadLine(rec);
+        requestNativeRead('read');
         reconcileNativeEchoes();
         renderSuggestionStack();
         const box = $('room-messages');
@@ -2799,6 +2870,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   });
   $('in-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-signin').click(); });
   $('signout').addEventListener('click', signOut);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestNativeRead('read'); });
   const notificationError = error => { $('notification-status').textContent = error.message; };
   $('nav-telegram')?.addEventListener('click', () => getControl().open());
   $('nav-notifications')?.addEventListener('click', () => notifications?.open().catch(notificationError));

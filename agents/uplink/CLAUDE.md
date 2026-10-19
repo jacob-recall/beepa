@@ -702,3 +702,12 @@ See `tests/CLAUDE.md`.
   operator's OWN iMessage handle and times app→daemon→Messages, Messages→
   daemon→local hs (checks the echo renders as sent) and local→uplink→master.
   On demand only (`--i-am-sending-real-imessages`); never in `tests/run.py`.
+
+## Native read controls (2026-10-19)
+
+See [the native unread contract](../../docs/IMESSAGE-UNREAD-ROLLOUT-2026-10-19.md).
+Own iMessage unread state is source-authenticated, separate from outgoing recipient
+receipts. Read/unread metadata uses the existing proposal transport, never a message
+or suggestion; preserve exact owner/mirror/generation, live sharing and expiry gates.
+Only native observation confirms a change. An open master viewer must preserve an
+explicit Mark unread until it is reopened or the manager explicitly marks read.

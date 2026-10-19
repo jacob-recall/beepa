@@ -121,6 +121,7 @@ _tail_scan_success = {}
 _tail_scan_attempt = {}
 _tail_scan_marker = {}
 _poll_failed_chats = set()
+_native_read_generation = [0]
 
 
 def initialize(config=None, state_dir=None, transport=None, runner=None):
@@ -199,6 +200,9 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
                "PRIMARY KEY(event_id,native_id))")
     DB.execute("CREATE INDEX IF NOT EXISTS native_receipt_source ON native_receipt(chat_id,native_id)")
     DB.execute("CREATE TABLE IF NOT EXISTS published_native_receipt (event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
+    DB.execute("CREATE TABLE IF NOT EXISTS native_read_command (event_id TEXT PRIMARY KEY, "
+               "room_id TEXT NOT NULL, command_id TEXT NOT NULL, status TEXT NOT NULL)")
+    DB.execute("UPDATE native_read_command SET status='unconfirmed' WHERE status='attempted'")
     DB.execute("CREATE TABLE IF NOT EXISTS dispatch_rate (chat_hash TEXT, ts REAL)")
     # The only safe recovery after an interrupted native invocation is ambiguity.
     # A queued/preflight failure is replayable; a dispatch may already have sent.
@@ -1017,8 +1021,141 @@ def sync_portal_name(chat, chat_id):
     except Exception:
         log.info("portal rename failed chat=%s", sha(chat_id)[:8])
 
+NATIVE_READ_STATE = 'com.jkali.imessage_read_state'
+NATIVE_READ_REQUEST = 'com.jkali.imessage.read_request'
+
+
+def native_read_snapshot(chat):
+    """Own unread state, never evidence that a recipient read an outgoing message."""
+    if not isinstance(chat, dict) or not isinstance(chat.get('id'), str):
+        return None
+    count = chat.get('unreadCount')
+    if type(count) is not int or not 0 <= count <= 9007199254740991:
+        return None
+    if type(chat.get('isMarkedUnread')) is not bool or type(chat.get('isUnread')) is not bool:
+        return None
+    messages = (chat.get('messages') or {}).get('items')
+    if not isinstance(messages, list):
+        return None
+    latest_ts = max([native_metadata(m).get('com.jkali.origin_ts', 0)
+                     for m in messages if isinstance(m, dict)] or [0])
+    # Include exact native IDs/read position. A changed tail must invalidate a
+    # delayed whole-chat mark-read request, even if unreadCount did not change.
+    identity = [chat['id'], chat.get('timestamp'), chat.get('lastReadMessageSortKey'),
+                count, chat['isMarkedUnread'], chat['isUnread'],
+                [[m.get('id'), m.get('sortKey')] for m in messages if isinstance(m, dict)]]
+    return {'schema': 1, 'unread_count': max(count, int(chat['isMarkedUnread'] or chat['isUnread'])),
+            'marked_unread': chat['isMarkedUnread'], 'latest_ts': latest_ts,
+            'revision': sha(json.dumps(identity, sort_keys=True)), 'supported': True}
+
+
+def publish_native_read_state(chat):
+    state = native_read_snapshot(chat)
+    room = room_for_chat(chat.get('id')) if isinstance(chat, dict) else None
+    if state is None or not room:
+        return False
+    with DBLOCK:
+        result = DB.execute('SELECT command_id,status FROM native_read_command WHERE room_id=? ORDER BY rowid DESC LIMIT 1', (room,)).fetchone()
+    if result:
+        state['last_command'] = {'id': result[0], 'status': result[1]}
+    signature = json.dumps(state, sort_keys=True)
+    key = 'native_read_published:' + room
+    if meta_get(key) == signature:
+        return False
+    state['observed_ts'] = int(time.time() * 1000)
+    mx('PUT', '/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='') +
+       '/state/' + NATIVE_READ_STATE + '/', state, user=BOT_ID)
+    meta_set(key, signature)
+    return True
+
+
+def process_native_read_request(ev):
+    """At most one native attempt per event. Lost responses never replay a read.
+
+    The exact owner and existing portal map are mandatory. No message sending,
+    new-chat resolution, public receipt inference, or account impersonation.
+    """
+    if not isinstance(ev, dict) or ev.get('sender') != USER_ID or 'state_key' in ev:
+        return True
+    room, eid = ev.get('room_id'), ev.get('event_id')
+    chat_id = chat_for_room(room) if isinstance(room, str) else None
+    c = ev.get('content')
+    if not chat_id or not isinstance(eid, str) or not eid.startswith('$') or not isinstance(c, dict):
+        return True
+    command_id, action = c.get('command_id'), c.get('action')
+    if (c.get('schema') != 1 or not isinstance(command_id, str)
+            or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', command_id)
+            or action not in ('read', 'unread') or not isinstance(c.get('expected_revision'), str)):
+        return True
+    if not EVENT_LOCK.acquire(blocking=False):
+        return False
+    try:
+        with DBLOCK:
+            if DB.execute('SELECT 1 FROM native_read_command WHERE event_id=?', (eid,)).fetchone():
+                return True
+        now = int(time.time() * 1000)
+        expires, origin = c.get('expires_at'), ev.get('origin_server_ts')
+        status = 'expired'
+        if (type(expires) is int and type(origin) is int and now - 120000 <= origin <= now + 10000
+                and now < expires <= now + 120000):
+            # Preflight errors are safe to retry: there has been no mutation.
+            chat = cli_json('chat', chat_id, timeout=15)
+            snapshot = native_read_snapshot(chat)
+            status = 'changed'
+            if isinstance(chat, dict) and chat.get('id') == chat_id and snapshot and snapshot['revision'] == c['expected_revision']:
+                status = 'attempted'
+        with DBLOCK:
+            DB.execute('INSERT INTO native_read_command VALUES (?,?,?,?)', (eid, room, command_id, status))
+            DB.commit()  # fence BEFORE the native mutation
+        if status == 'attempted':
+            status = 'unconfirmed'
+            try:
+                cli_read_change(action, chat_id, marked_unread=snapshot['marked_unread'])
+            except Exception:
+                pass  # outcome comes from the subsequent read, never CLI stdout
+            try:
+                chat = cli_json('chat', chat_id, timeout=15)
+                after = native_read_snapshot(chat)
+                if after and chat.get('id') == chat_id:
+                    if (action == 'read' and after['unread_count'] == 0) or (action == 'unread' and after['marked_unread']):
+                        status = 'applied'
+            except Exception:
+                pass  # native outcome unknown; do not repeat it on txn replay
+            with DBLOCK:
+                DB.execute('UPDATE native_read_command SET status=? WHERE event_id=?', (status, eid))
+                DB.commit()
+        # Polling publishes the current state plus the durable outcome even if
+        # this immediate read/publication fails. Never manufacture a zero count.
+        try:
+            chat = cli_json('chat', chat_id, timeout=15)
+            if isinstance(chat, dict) and chat.get('id') == chat_id:
+                publish_native_read_state(chat)
+        except Exception:
+            pass
+        return True
+    finally:
+        _native_read_generation[0] += 1
+        EVENT_LOCK.release()
+
+
+def cli_read_change(action, chat_id, marked_unread=False):
+    # Pinned v0.24.4 returns Void for both commands, not a JSON value. A zero
+    # exit is only acceptance; process_native_read_request verifies the chat.
+    if action not in ('read', 'unread') or not chat_id:
+        raise ValueError('invalid read command')
+    # v0.24.4 sendReadReceipt may short-circuit on the message read flag even
+    # when the chat has a manual unread marker. Selecting that exact chat uses
+    # the supported native viewer operation; still require observed clearing.
+    command = 'select-chat' if action == 'read' and marked_unread else 'mark-' + action
+    result = _runner([CLI, '--no-events', '--json', command, chat_id],
+                     capture_output=True, timeout=15, shell=False)
+    if result.returncode:
+        raise RuntimeError('native read command failed')
+
+
 def poll_once():
     _backfill_posted[0] = 0  # throughput budget per pass, never a lifetime ceiling
+    read_generation = _native_read_generation[0]
     data = cli_json("chats")
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
@@ -1034,6 +1171,8 @@ def poll_once():
     interval = max(1.0, float(CFG.get("tail_rescan_seconds", 30)))
     budget = max(1, int(CFG.get("tail_rescan_chats_per_poll", 8)))
     unchanged = []
+    read_writes = 0
+    read_seconds = 0.0
 
     def scan(chat, chat_id, marker):
         _tail_scan_attempt[chat_id] = time.monotonic()
@@ -1058,6 +1197,20 @@ def poll_once():
         if not chat_id:
             continue
         sync_portal_name(c, chat_id)
+        if read_writes < 16 and read_seconds < 5 and EVENT_LOCK.acquire(blocking=False):
+            read_started = time.monotonic()
+            try:
+                # A native read command may have completed since this chats
+                # snapshot was fetched. Never publish its obsolete unread flag
+                # after the command's newer confirmed result.
+                if read_generation == _native_read_generation[0]:
+                    read_writes += int(publish_native_read_state(c))
+            except Exception as e:
+                read_writes += 1
+                log.info('native read state pending error=%s', type(e).__name__)
+            finally:
+                read_seconds += time.monotonic() - read_started
+                EVENT_LOCK.release()
         marker = str(c.get("timestamp") or "")
         # Incomplete history must not advance the durable cursor. Use a separate
         # attempt marker to avoid repeatedly reading the same tail during backoff.
@@ -1803,6 +1956,8 @@ def process_outbound_event(ev):
     """True permits txn ACK; retryable events stay with the homeserver for replay."""
     if not isinstance(ev, dict):
         return True
+    if ev.get('type') == NATIVE_READ_REQUEST:
+        return process_native_read_request(ev)
     event_id = ev.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return True  # malformed events must never invoke the CLI

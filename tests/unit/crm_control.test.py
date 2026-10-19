@@ -217,6 +217,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(levels["events_default"], 100)
         self.assertEqual(levels["events"][control.DIRECT_REQUEST], 50)
         self.assertEqual(levels["events"]["com.jkali.monitoring_scope"], 50)
+        self.assertEqual(levels["events"]["com.jkali.read_request"], 50)
         self.assertTrue(self.control.capability()["conversation_tracking"])
         self.assertNotIn("m.room.message", levels["events"])
         cap = self.master.rooms["!space:master"]["state"][(control.MASTER_CAPABILITY, "")]

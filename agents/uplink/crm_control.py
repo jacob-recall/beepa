@@ -19,6 +19,7 @@ from crm_policy import ConsentJournal, PolicyRefused, PolicyRetryable
 from crm_batch import CRMBatch, BATCH_REQUEST
 from crm_approval import CRMApproval, APPROVAL_REQUEST
 from crm_tracking import CRMTracking
+from native_read import MASTER_REQUEST as READ_REQUEST
 
 LOCAL_CAPABILITY = "com.jkali.crm_control"
 MASTER_CAPABILITY = "com.jkali.crm.capability"
@@ -253,7 +254,7 @@ class CRMControl:
         return {"schema": 1, "owner_mxid": self.uplink.cfg.master_user,
                 "generation": self.generation, "journal_epoch": self.epoch,
                 "ordered_policy": True, "direct_prepare_commit": True, "direct_cancel": True, "batch": self.batch_enabled, "batch_cancel": True,
-                "conversation_tracking": True}
+                "conversation_tracking": True, "native_read": True}
 
     def _verify_master_room(self, room, migrate_guest=False):
         _require(self.connected and room == self.uplink.meta_get("master_proposals_room"), "inactive-master-room")
@@ -300,12 +301,13 @@ class CRMControl:
                  and type(levels.get("state_default")) is int and levels["state_default"] >= 100,
                  "unsafe-proposal-power")
         events = dict(levels.get("events", {}))
-        _require(all(type(level) is int and (kind in {"com.jkali.proposal", DIRECT_REQUEST, BATCH_REQUEST, "com.jkali.monitoring_scope"} or level >= 100)
+        _require(all(type(level) is int and (kind in {"com.jkali.proposal", DIRECT_REQUEST, BATCH_REQUEST, READ_REQUEST, "com.jkali.monitoring_scope"} or level >= 100)
                      for kind, level in events.items()), "unsafe-proposal-event-power")
-        if events.get(DIRECT_REQUEST) != 50 or events.get(BATCH_REQUEST) != 50 or events.get("com.jkali.monitoring_scope") != 50:
+        if events.get(DIRECT_REQUEST) != 50 or events.get(BATCH_REQUEST) != 50 or events.get(READ_REQUEST) != 50 or events.get("com.jkali.monitoring_scope") != 50:
             events[DIRECT_REQUEST] = 50
             events[BATCH_REQUEST] = 50
             events["com.jkali.monitoring_scope"] = 50
+            events[READ_REQUEST] = 50
             self.uplink.master("PUT", path, {**levels, "events": events}, timeout=15)
         cap = self.capability()
         for target in (room, self.uplink.cfg.master_space):

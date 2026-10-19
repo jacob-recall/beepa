@@ -1,4 +1,5 @@
 import { parseMessageReceipts, mergeReceipts, NATIVE_RECEIPT_TYPE } from '../model/message_receipts.js';
+import { nativeReadFromRoom } from '../model/native_read.js';
 import { feedPreviewFromEvent } from '../model/message_preview.js';
 import { sourceRoomIds } from '../model/source_rooms.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../model/message_timestamps.js';
@@ -135,11 +136,15 @@ function feedLastPreview(room, corrections) {
 // m.receipt timestamp from a sender that is NOT us, NOT one of our own bridge
 // ghosts and NOT a bridge bot — i.e. the other party actually read. Missing or
 // malformed => 0. remoteReadTs is legacy metadata; checks use exact receipts. Pure; no DOM.
-function parseReadState(room, selfIds, sourceId) {
+function parseReadState(room, selfIds, sourceId, previousNative = null) {
   const out = { unread: 0, remoteReadTs: 0, receipts: parseMessageReceipts(room, selfIds, new Set(SOURCES.map(s => s.botMxid).filter(Boolean)), SOURCES.find(s => s.id === sourceId)?.botMxid) };
   if (!room || typeof room !== 'object') return out;
   const n = room.unread_notifications && room.unread_notifications.notification_count;
   if (typeof n === 'number' && isFinite(n) && n > 0) out.unread = n;
+  if (sourceId === 'imessage') {
+    out.nativeRead = nativeReadFromRoom(room, IMSG_BOT_MXID, previousNative);
+    if (out.nativeRead) out.unread = out.nativeRead.unread_count;
+  }
   const bots = new Set(SOURCES.map(s => s.botMxid).filter(Boolean));
   const evs = (room.ephemeral && Array.isArray(room.ephemeral.events)) ? room.ephemeral.events : [];
   for (const e of evs) {
@@ -274,6 +279,7 @@ async function seedFeed() {
         existing.name = c.title;                    // refresh name; keep original attribution
         if (p && (p.ts > existing.lastTs || corrections?.size)) { existing.lastBody = p.body; existing.lastTs = p.ts; }
         existing.unread = rs.unread;
+        existing.nativeRead = rs.nativeRead;
         existing.receipts = mergeReceipts(existing.receipts, rs.receipts);
         if (rs.remoteReadTs > (existing.remoteReadTs || 0)) existing.remoteReadTs = rs.remoteReadTs;
         if (!Array.isArray(existing.drafts)) existing.drafts = [];
@@ -281,7 +287,7 @@ async function seedFeed() {
         feedModel.set(c.id, {
           id: c.id, name: c.title,                  // c.title already sanitizeLine'd by buildConvos
           lastBody: p ? p.body : '', lastTs: p ? p.ts : 0, sourceId: s.id,
-          receipts: rs.receipts, unread: rs.unread, remoteReadTs: rs.remoteReadTs, drafts: [],
+          receipts: rs.receipts, unread: rs.unread, nativeRead: rs.nativeRead, remoteReadTs: rs.remoteReadTs, drafts: [],
         });
       }
     }
@@ -366,8 +372,9 @@ function feedIngest(data) {
   for (const rid of Object.keys(join)) {
     if (!feedModel.has(rid)) { sawUnknown = true; continue; }  // HF-3: ignore unknown room ids
     const rec0 = feedModel.get(rid);
-    const rs = parseReadState(join[rid], selfIdSet(), rec0.sourceId);
-    if (join[rid] && join[rid].unread_notifications && rs.unread !== rec0.unread) { rec0.unread = rs.unread; changed = true; }
+    const rs = parseReadState(join[rid], selfIdSet(), rec0.sourceId, rec0.nativeRead);
+    rec0.nativeRead = rs.nativeRead;
+    if ((rs.nativeRead || join[rid]?.unread_notifications) && rs.unread !== rec0.unread) { rec0.unread = rs.unread; changed = true; }
     rec0.receipts = mergeReceipts(rec0.receipts, rs.receipts);
     if (S.openRoomId === rid) { S.convoReceipts = rec0.receipts; applyReadCaption(); }
     if (rs.remoteReadTs > (rec0.remoteReadTs || 0)) {

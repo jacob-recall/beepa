@@ -13,6 +13,7 @@ export async function readCRMAccount({ api, account, ownerMxid, managerMxid, isC
   const commandTypes = ['com.jkali.proposal', 'com.jkali.crm.direct_request'];
   if (cap?.batch === true || cap?.batch_cancel === true) commandTypes.push('com.jkali.crm.batch_request');
   if (cap?.conversation_tracking === true) commandTypes.push('com.jkali.monitoring_scope');
+  if (cap?.native_read === true) commandTypes.push('com.jkali.read_request');
   if (create?.sender !== ownerMxid || marker?.sender !== ownerMxid
       || create.content?.type === 'm.space' || Object.hasOwn(create.content || {}, 'com.jkali.mirror_of')
       || state.some(e => ['uk.half-shot.bridge', 'm.bridge', 'm.room.encryption', 'm.room.tombstone', 'com.jkali.mirror_of'].includes(e.type))

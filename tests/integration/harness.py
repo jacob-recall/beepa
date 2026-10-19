@@ -975,7 +975,7 @@ MASTER_FILE_WRITE_ALLOWLIST = {
     "control.js": {"POST": [r"^/admin/control$"]},
     "notifications.js": {"POST": [r"^/admin/notifications$"]},
     "notification-sw.js": {"POST": [r"^/admin/notifications/receipt$"]},
-    "main.js": {"POST": [r"^/admin/crm-room$"]},
+    "main.js": {"POST": [r"^/admin/crm-room$"], "PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.read_request/$"]},
     "crm-store.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.operation/crm_$"]},
     "crm-members.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.direct_request/crm_direct__$"]},
     "crm-batches.js": {"PUT": [
@@ -1229,7 +1229,7 @@ def scenario_7_read_only():
     # match the write-surface allowlist above. Comments are stripped first (the
     # files document the ABSENCE of an m.room.message path in prose).
     scanned, has_msg_send, send_types, write_violations = scan_apps_master_write_surface()
-    non_proposal_sends = send_types - {"com.jkali.proposal", "com.jkali.crm.operation", "com.jkali.crm.direct_request", "com.jkali.crm.batch_request"}
+    non_proposal_sends = send_types - {"com.jkali.proposal", "com.jkali.crm.operation", "com.jkali.crm.direct_request", "com.jkali.crm.batch_request", "com.jkali.read_request"}
     if not scanned or has_msg_send or non_proposal_sends or write_violations:
         ok = False
     ev.append("apps_master_scanned=%s msg_send=%s send_types=%s write_violations=%s"
@@ -3277,6 +3277,93 @@ def scenario_30_importer_retry_recovery():
         d.DB.close()
 
 
+def scenario_31_native_unread_roundtrip():
+    """Two real homeservers, real source agent/daemon handlers; synthetic Apple CLI."""
+    import importlib.util
+    e = fresh_env('s31')
+    space = create_space(e['tuser_tok'], 'iMessage')
+    rid = make_convo(e, space, 'Native unread roundtrip')
+    bot_id, bot_token = register_user('imessagebot')
+    path = '/_matrix/client/v3/rooms/' + urllib.parse.quote(rid, safe='')
+    local(e['tuser_tok'], 'POST', path + '/invite', {'user_id':bot_id}); join_room(bot_token,rid)
+    power = local(e['tuser_tok'],'GET',path+'/state/m.room.power_levels')
+    power.setdefault('users',{})[bot_id] = 100
+    local(e['tuser_tok'],'PUT',path+'/state/m.room.power_levels',power)
+    set_override(e['tuser_tok'],e['tuser_id'],rid,'share')
+    post_msg(e['contact_tok'],rid,'Synthetic unread source message')
+    spec=importlib.util.spec_from_file_location('unread_daemon',os.path.join(REPO,'imessage/daemon.py'))
+    d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
+    def forbidden(*a,**k): raise AssertionError('real native executable forbidden')
+    d.initialize(dict(port=29350,hs_url=TEST_HS,domain='localhost',user_id=e['tuser_id'],bot_id=bot_id,
+        as_token='synthetic',hs_token='synthetic',cli_path='/never-execute',attachment_allow_prefixes=[],backfill_count=0),
+        state_dir=os.path.join(os.path.dirname(e['db_path']),'native-unread'),runner=forbidden)
+    d.map_add('chat',rid)
+    chat=dict(id='chat',unreadCount=0,isUnread=False,isMarkedUnread=False,timestamp=1000,lastReadMessageSortKey='1000',
+              messages={'items':[dict(id='latest',sortKey='1000',timestamp=1000)]})
+    mutations=[]
+    def cli(command,*args,**kwargs):
+        assert args == ('chat',)
+        if command=='mark-read': mutations.append(command);chat.update(unreadCount=0,isUnread=False,isMarkedUnread=False)
+        elif command=='mark-unread': mutations.append(command);chat.update(isUnread=True,isMarkedUnread=True)
+        else: assert command=='chat'
+        return dict(chat) if command=='chat' else True
+    d.cli_json=cli
+    d.cli_read_change=lambda action,chat_id,**kw:cli('mark-'+action,chat_id)
+    d.mx=lambda method,endpoint,content,**kw:local(bot_token,method,endpoint,content)
+    d.publish_native_read_state(chat)
+    proc=start_uplink(e)
+    try:
+        mr=wait_until(lambda:mirror_of(e['db_path'],rid),desc='native unread mirror')[0]
+        def meta(key):
+            with sqlite3.connect(e['db_path']) as db:
+                row=db.execute('SELECT v FROM meta WHERE k=?',(key,)).fetchone()
+                return row[0] if row else None
+        pr=wait_until(lambda:meta('master_proposals_room'),desc='read control channel')
+        wait_until(lambda:meta('proposal_sync_since'),desc='read control initial sync')
+        prpath='/_matrix/client/v3/rooms/'+urllib.parse.quote(pr,safe='')
+        master(MASTER_MANAGER_TOKEN,'POST',prpath+'/join',{})
+        statepath='/_matrix/client/v3/rooms/'+urllib.parse.quote(mr,safe='')+'/state/com.jkali.read_state/'
+        def state():
+            try:return master(MASTER_ALICE_TOKEN,'GET',statepath)
+            except MxError as exc:
+                if exc.code==404:return {}
+                raise
+        wait_until(lambda:state().get('native'),desc='native own-read projection')
+        assert state()['unread_count']==0, 'Apple-read replaces Matrix unread backlog'
+        def ready_capability():
+            try:
+                cap=master(MASTER_ALICE_TOKEN,'GET',prpath+'/state/com.jkali.crm.capability/')
+                return cap if cap.get('native_read') is True else None
+            except MxError as exc:
+                if exc.code==404:return None
+                raise
+        capability=wait_until(ready_capability,desc='native read capability published')
+        for action in ['unread','read']:
+            command_id='native-'+action
+            payload={'target_room':rid,'com.jkali.read_action':dict(schema=1,command_id=command_id,action=action,
+                expected_revision=state()['native']['revision'],expires_at=int(time.time()*1000)+120000,
+                generation=capability['generation'],mirror_room=mr)}
+            master(MASTER_MANAGER_TOKEN,'PUT',prpath+'/send/com.jkali.read_request/'+command_id,payload)
+            def command_event():
+                events=local(e['tuser_tok'],'GET',path+'/messages',query={'dir':'b','limit':'30'})['chunk']
+                return next((ev for ev in events if ev.get('type')==d.NATIVE_READ_REQUEST and ev.get('content',{}).get('command_id')==command_id),None)
+            ev=wait_until(command_event,desc='manager metadata forwarded '+action)
+            ev['room_id']=rid
+            assert d.process_outbound_event(ev)
+            assert d.process_outbound_event(ev)
+            wait_until(lambda:state().get('native',{}).get('last_command',{}).get('id')==command_id,desc='native confirmation returned '+action)
+            assert state()['native']['last_command']['status']=='applied'
+            assert state()['unread_count']==(1 if action=='unread' else 0)
+        assert mutations==['mark-unread','mark-read'], 'no native replay'
+        stop_uplink(proc);proc=start_uplink(e)
+        post_msg(e['contact_tok'],rid,'Synthetic late imported history')
+        wait_until(lambda:any(m['body']=='Synthetic late imported history' for m in master_messages(mr)),desc='late history delivered')
+        assert state()['unread_count']==0, 'Matrix import cannot resurrect native unread after restart'
+        return True,'Apple-read overrides imported backlog; manager unread/read round trip; native confirmation; replay protection; restart retains native authority; no native sends'
+    finally:
+        stop_uplink(proc);d.DB.close()
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -3308,6 +3395,7 @@ SCENARIOS = [
     ("28_crm_metadata", scenario_28_crm_metadata),
     ("29_crm_ordered_controls", scenario_29_crm_ordered_controls),
     ("30_importer_retry_recovery", scenario_30_importer_retry_recovery),
+    ("31_native_unread_roundtrip", scenario_31_native_unread_roundtrip),
 ]
 
 

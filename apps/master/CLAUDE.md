@@ -175,7 +175,8 @@ now a deliberate, documented duplication, not an oversight.
   /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn},
   PUT /rooms/{verified CRM id}/send/com.jkali.crm.operation/{txn},
   PUT /rooms/{verified proposals id}/send/com.jkali.crm.direct_request/{txn},
-  PUT /rooms/{verified proposals id}/send/com.jkali.crm.batch_request/{txn}, POST
+  PUT /rooms/{verified proposals id}/send/com.jkali.crm.batch_request/{txn},
+  PUT /rooms/{verified proposals id}/send/com.jkali.read_request/{txn}, POST
   ENROLL_BASE/admin/crm-room, POST
   ENROLL_BASE/admin/add-teammate, POST ENROLL_BASE/admin/delete-teammate}`** — asserted at build time by
   `harness.py`'s scenario 7, which scans **every `*.js` in this directory**
@@ -466,3 +467,12 @@ the same request ID/text/session on retry. Show processing and Telegram delivery
 separately; neither means a native message was sent/read. Closing the panel leaves
 the server job intact. Cancel only queued commands; sending still uses the existing
 exact review and confirmation boundaries.
+
+## Native read controls (2026-10-19)
+
+See [the native unread contract](../../docs/IMESSAGE-UNREAD-ROLLOUT-2026-10-19.md).
+Own iMessage unread state is source-authenticated, separate from outgoing recipient
+receipts. Read/unread metadata uses the existing proposal transport, never a message
+or suggestion; preserve exact owner/mirror/generation, live sharing and expiry gates.
+Only native observation confirms a change. An open master viewer must preserve an
+explicit Mark unread until it is reopened or the manager explicitly marks read.

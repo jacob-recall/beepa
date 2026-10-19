@@ -13,7 +13,7 @@ const full = { rooms: { join: {
     create,
     { type: 'm.room.name', state_key: '', content: { name: 'Maya' } },
     { type: 'com.jkali.source', state_key: '', content: { source: 'whatsapp' } },
-    { type: 'com.jkali.read_state', state_key: '', content: { teammate_read_ts: 10, remote_read_ts: 5 } },
+    { type: 'com.jkali.read_state', sender: '@david:master', state_key: '', content: { teammate_read_ts: 10, remote_read_ts: 5 } },
   ] }, timeline: { events: [
     { type: 'm.room.message', event_id: '$1', origin_server_ts: 100, content: { msgtype: 'm.text', body: 'first' } },
   ] } },
@@ -44,7 +44,7 @@ assert.equal(base['!contacts:master'].contacts.length, 2);
 const delta = { rooms: { join: {
   '!a:master': { state: { events: [] }, timeline: { events: [
     { type: 'm.room.name', state_key: '', content: { name: 'Maya Rodriguez' } },
-    { type: 'com.jkali.read_state', state_key: '', content: { teammate_read_ts: 300, remote_read_ts: 5 } },
+    { type: 'com.jkali.read_state', sender: '@david:master', state_key: '', content: { teammate_read_ts: 300, remote_read_ts: 5 } },
     { type: 'm.room.message', event_id: '$2', origin_server_ts: 200, content: { msgtype: 'm.text', body: 'second' } },
   ] } },
   '!space:master': { timeline: { events: [

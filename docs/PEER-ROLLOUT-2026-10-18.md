@@ -1,10 +1,11 @@
 # Upgrade David and Elliot from the older UI to the current Beepa release
 
 This is the deployment handoff for the bots operating the **existing** Macs.
-Target: **0.3.1**, state version **2**, readers **1 and 2**, wire **1**.
+Target: **0.3.2**, state version **2**, readers **1 and 2**, wire **1**.
 Use the exact published commit supplied by Jacob; do not assume a version tag exists.
 Already-upgraded Macs should also read the
 [iMessage importer patch instructions](IMESSAGE-IMPORTER-ROLLOUT-2026-10-18.md).
+Also apply [native unread-state and master controls](IMESSAGE-UNREAD-ROLLOUT-2026-10-19.md), including its source-Mac acceptance gate.
 Upgrade the central master first, then Elliot, verify, then David and verify.
 Do not run the master-only steps on a teammate-only installation.
 

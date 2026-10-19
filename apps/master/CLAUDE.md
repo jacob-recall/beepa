@@ -476,3 +476,10 @@ receipts. Read/unread metadata uses the existing proposal transport, never a mes
 or suggestion; preserve exact owner/mirror/generation, live sharing and expiry gates.
 Only native observation confirms a change. An open master viewer must preserve an
 explicit Mark unread until it is reopened or the manager explicitly marks read.
+
+Master list badges use manager `unread_notifications.notification_count`, never
+source-user counts. The visible latest viewer writes only private `m.read.private`
+and `m.fully_read` via `/read_markers`. Persist on the master homeserver; preserve
+room/session/newer-message fences. Native Apple confirmation stays in the header
+and cannot prevent clearing the manager's own badge. Mark unread for user does
+not undo the manager's private read. See the 0.3.4 section of the native read guide.

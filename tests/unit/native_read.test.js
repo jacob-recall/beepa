@@ -32,9 +32,9 @@ const rec = {sourceId:'imessage',nativeRead:{...native,unread_count:1},mirrorOf:
 const MS = {openRoomId:'!mirror:master',rooms:{'!mirror:master':rec},openProposalCtx:{mirrorRoomId:'!mirror:master',targetRoom:'!local:localhost',label:'peer',proposalsRoomId:'!proposals:master'},
  proposalsRoomSet:new Set(['!proposals:master']),proposalsByUser:new Map([['peer','!proposals:master']]),crmCapabilities:new Map([['@peer:master',{generation:'current',native_read:true}]]),roomEvents:new Map([['$older',{event_id:'$older',origin_server_ts:50}],['$latest',{event_id:'$latest',origin_server_ts:90}]])};
 const writes=[];
-const m = vm.createContext({MS,S:{token:'session'},roomEpoch:1,canAutoRead,document:{visibilityState:'visible'}, ROOM_SHAPE_RE:/^![^:]+:.+$/, messageTimestamp,
+const m = vm.createContext({MS,S:{token:'session'},roomEpoch:1,canAutoRead,nativeReadState,document:{visibilityState:'visible'}, ROOM_SHAPE_RE:/^![^:]+:.+$/, messageTimestamp,
  setTimeout(){}, $:()=>null,renderRoomReadLine(){},roomStatus(){},api:async(...args)=>{writes.push(args);return {};}});
-vm.runInContext(master.slice(master.indexOf('function mirrorTs('),master.indexOf('// Display-only name for an mxid.')) + block,m);
+vm.runInContext(master.slice(master.indexOf('function masterUnreadForRoom('),master.indexOf('function freshRoomInfo(')) + master.slice(master.indexOf('function mirrorTs('),master.indexOf('// Display-only name for an mxid.')) + block,m);
 await m.requestNativeRead('read');
 assert.equal(writes.length,1);assert.ok(writes[0][1].includes('/send/com.jkali.read_request/'));
 assert.equal(writes[0][2]['com.jkali.read_action'].action,'read');assert.equal(writes[0][2].body,undefined);
@@ -51,11 +51,37 @@ console.log('native_read: source authority, native count precedence, visibility/
 // A state-only native confirmation must repaint the existing sidebar/feed rows.
 const row = {id:'!mirror:master',unread:8,drafts:[{body:'retained'}]};
 MS.byUser = new Map([['peer',[row]]]); MS.feed = [row];
-rec.readState = {unread_count:0}; let repaints=0;
+rec.readState = {unread_count:9000};rec.masterUnread=0; let repaints=0;
 m.rerenderActiveList=()=>{repaints++;};
 m.refreshRoomUnread('!mirror:master');
 assert.equal(row.unread,0);assert.equal(MS.feed[0].unread,0);
 assert.equal(row.drafts.length,1);assert.equal(repaints,1);
 m.refreshRoomUnread('!mirror:master');assert.equal(repaints,1);
-rec.readState={unread_count:1};m.refreshRoomUnread('!mirror:master');
+rec.masterUnread=1;m.refreshRoomUnread('!mirror:master');
 assert.equal(row.unread,1);assert.equal(repaints,2);
+
+// Master unread is independent of a source backlog or missing native support.
+assert.equal(m.masterUnreadForRoom({sourceId:'gmessages',masterUnread:0,readState:{unread_count:500}}),0);
+assert.equal(m.masterUnreadForRoom({masterUnread:5,readState:{unread_count:0}}),5);
+assert.equal(m.masterUnreadForRoom({masterUnread:5,masterReadThrough:'$latest',lastEventId:'$latest'}),0);
+assert.equal(m.masterUnreadForRoom({masterUnread:1,masterReadThrough:'$older',lastEventId:'$new'}),1);
+assert.equal(m.masterUnreadForRoom({sourceId:'imessage',masterUnread:5,nativeRead:{...native,latest_ts:100},lastTs:100}),0);
+// The private read path works on an account without native read support.
+rec.nativeRead=null;rec.lastEventId='$latest';rec.masterUnread=9;
+MS.roomEvents=new Map([['$latest',{event_id:'$latest',sender:rec.createSender,origin_server_ts:100}]]);
+m.ROOMID_RE=/^![^:]+:.+$/;m.snapshotCacheSave=async()=>{};
+await m.markMasterRead();
+const marker=writes.at(-1);assert.equal(marker[0],'POST');assert.ok(marker[1].endsWith('/read_markers'));
+assert.equal(marker[2]['m.read.private'],'$latest');assert.equal(marker[2]['m.read'],undefined);
+assert.equal(row.unread,0);assert.equal(rec.masterReadThrough,'$latest');
+
+rec.lastEventId='$next';rec.masterUnread=3;
+MS.roomEvents=new Map([['$next',{event_id:'$next',sender:rec.createSender,origin_server_ts:200}]]);
+m.api=async()=>{throw Error('offline');};
+await m.markMasterRead();assert.equal(rec.masterUnread,3,'failed master marker does not erase count');
+let calls=0, finish;
+m.api=async()=>{calls++;await new Promise(resolve=>{finish=resolve;});return {};};
+m.document.visibilityState='hidden';await m.markMasterRead();assert.equal(calls,0);
+m.document.visibilityState='visible';const inflight=m.markMasterRead();
+rec.lastEventId='$newer';finish();await inflight;
+assert.equal(rec.masterUnread,3,'late receipt completion cannot clear a newer message');

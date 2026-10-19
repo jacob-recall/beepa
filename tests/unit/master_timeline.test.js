@@ -1,3 +1,4 @@
+import { nativeReadState, canAutoRead } from '../../shared/model/native_read.js';
 import { proposalLabel } from '../../shared/model/proposal-lifecycle.js';
 import { paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
 import fs from 'node:fs';
@@ -44,7 +45,7 @@ const elements = new Map([
   'proposal-stack', 'room-read', 'nav-teammates-rail',
 ].map(id => [id, new Element()]));
 const S = { token: 'session-1' };
-const ctx = vm.createContext({ proposalLabel, paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE, S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
+const ctx = vm.createContext({ nativeReadState, canAutoRead, document:{visibilityState:'hidden',addEventListener(){}}, proposalLabel, paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE, S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
   displayName, parseNames, dumpNames, rename, sharingUsers, visibleUsers, visibleFeed,
   messageTimestamp, timestampCorrections, CORRECTION_TYPE,
   initials, indicatorsFor, pendingDrafts, clusterFeed,

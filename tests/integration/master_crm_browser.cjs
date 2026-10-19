@@ -143,6 +143,13 @@ const root = path.resolve(__dirname, '../..');
         }
         return reply({event_id});
       }
+      const readMarker = name.match(/^\/_matrix\/client\/v3\/rooms\/([^/]+)\/read_markers$/);
+      if (readMarker && req.method()==='POST') {
+        assert.ok(rooms[readMarker[1]]);const data=req.postDataJSON();
+        assert.equal(data['m.read'],undefined);assert.equal(data['m.fully_read'],data['m.read.private']);
+        assert.ok(rooms[readMarker[1]].timeline.events.some(e=>e.event_id===data['m.read.private']));
+        return reply({});
+      }
       if (name === '/_matrix/client/v3/logout') return reply({});
       if (name === '/apps/master/config.js') return route.fulfill({ contentType: 'text/javascript', body: '' });
       // Static allowlist deliberately excludes every session/config/secret file.

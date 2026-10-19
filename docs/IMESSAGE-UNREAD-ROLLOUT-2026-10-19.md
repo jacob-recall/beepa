@@ -1,8 +1,41 @@
-# Native unread state and master read controls — 0.3.3
+# Native unread state and master read controls — 0.3.4
 
-This fixes stale blue dots, red badges and large unread counts caused by importing
+This corrects unread-state handling affected by importing
 Apple history into Matrix. Previously the UI displayed Matrix notification counts;
 reading the originals in Apple Messages did not change those counts.
+
+## Master unread counts in 0.3.4
+
+The master conversation badge now tracks the manager's own unread count from
+Matrix sync. Opening the latest conversation in a visible tab posts a private
+`m.read.private` receipt and `m.fully_read` marker as the manager. This works for
+all accounts and providers, including older sources with no native read capability.
+The marker is stored on the master homeserver and survives browser refreshes.
+The count clears after the server accepts this private marker; it does not wait
+for the user's Mac. Failed requests retain the count. A late response cannot clear
+a newer message or another account/session; older context views and hidden tabs
+cannot acknowledge undisplayed latest activity.
+
+Native Apple state remains separate in the conversation header. Opening a current
+iMessage conversation still requests native read where supported, with the existing
+source-confirmation and replay guards. **Mark unread for user** changes Apple's
+state; it does not undo the master's own private read marker. A current native
+read snapshot may clear already-read imported Apple history, but an older native
+zero must not hide a newer message. Source-user counters are never substituted
+for the manager's count. The master has no direct native message-send permission.
+
+Earlier releases saved no master read markers and reused source-user counters,
+so master reads could leave numbers unchanged across every provider. Browser tests
+now cover an upgraded iMessage source, a legacy iMessage source and Google Messages;
+private read before native confirmation, new unread activity while hidden, and
+clearing on return. The real authorized self-chat retained its native read state
+while a private master marker persisted and a fresh server sync returned zero.
+The disposable homeserver test verifies private manager receipts are permitted
+while manager message sends remain forbidden.
+
+This is a central UI update; refresh the master browser. Native Apple changes still
+require the source-side rollout below. Do not re-enroll or restart a source merely
+to enable the master's private read markers.
 
 ## Master UI fix in 0.3.3
 
@@ -27,7 +60,7 @@ refresh the master browser. No account, state, token or service migration is nee
 
 ## Behavior
 
-- iMessage badges use the signed connector's own `unreadCount`, `isUnread` and
+- Source-user iMessage badges use the signed connector's own `unreadCount`, `isUnread` and
   `isMarkedUnread` evidence. A manually unread conversation has a badge of at
   least one. Other messaging providers retain their current unread behavior.
 - Reading a conversation in Apple Messages updates both Beepa views on the next
@@ -37,9 +70,10 @@ refresh the master browser. No account, state, token or service migration is nee
   A hidden tab or an older context window alone cannot authorize clearing newer
   messages. Returning to a visible tab rechecks the latest displayed evidence.
 - The header has **Mark unread for user** and **Mark read for user**. Mark unread
-  suppresses automatic clearing until the master closes/reopens the conversation
+  suppresses automatic native clearing until the master closes/reopens the conversation
   or explicitly chooses Mark read. Buttons appear only with native capability.
-- Counts change after source observation, not optimistically after a request PUT.
+- Native counts in the header change after source observation, not after a request PUT.
+  The master list count follows the independent private marker described above.
   The header distinguishes pending, confirmed, expired/changed and unconfirmed.
   An offline source does not silently apply old requests when it reconnects.
 - The user app requests the same native mark-read when its existing phone-read
@@ -68,8 +102,9 @@ on current iMessage mirrors. It persists that authority across incremental syncs
 and restart, preventing later Matrix notification counts from resurrecting stale
 badges. The existing durable read-state outbox publishes the projection as
 `com.jkali.read_state.native`; publication failure retains a retryable projection.
-The master accepts it only from the mirror creator. Unknown source state retains
-legacy behavior until real native evidence arrives; it is never fabricated as zero.
+The master accepts it only from the mirror creator. Unknown native source state
+stays unknown; the master list uses the manager's own counter, not legacy source
+counts. A private manager read is not native Apple confirmation.
 
 Master actions are a metadata-only `com.jkali.read_action` envelope in a fixed
 `com.jkali.read_request` event in the existing allowlisted proposals room. The source
@@ -101,7 +136,7 @@ an unavoidable remaining race in this CLI API. Do not describe it as atomic.
 ## Upgrade existing Macs
 
 Follow [the peer rollout guide](PEER-ROLLOUT-2026-10-18.md). Use the exact published
-0.3.3 SHA supplied with this change. Pulling files is insufficient when services
+0.3.4 SHA supplied with this change. Pulling files is insufficient when services
 run staged releases: use the existing supported `./update.sh --apply` workflow.
 Do not re-enroll Elliot (`@notelliot:master`) or David, rotate tokens, replace the
 signed CLI, reset TCC, empty databases, change sharing, or replay uncertain sends.
@@ -125,10 +160,11 @@ the user UI. New tables/metadata are additive; state version stays 2, wire versi
    Inspect only its bot-authored native snapshot: unread count zero should reach
    both Beepa views without a new message or a blanket mark-all-read.
 3. In the master, press Mark unread for user. Confirm the native manual unread
-   marker, user badge and master badge. Leave the master viewer open: it must not
+   marker and user badge. The master list remains independently read. Leave the master viewer open: it must not
    immediately clear the marker it just requested.
 4. Press Mark read for user (or reopen the latest conversation). Confirm Apple's
-   native unread count zero, then both Beepa badges. Record source confirmation,
+   native unread count zero and the user badge; the master private marker should
+   already clear its own badge. Record source confirmation,
    not just HTTP acceptance. Restore the chosen conversation's original state.
 5. Check a hidden tab, a newer native message beyond displayed history, revoked
    sharing, an expired command and an offline source. None should falsely show

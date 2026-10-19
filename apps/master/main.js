@@ -421,12 +421,22 @@ function displayNameForMxid(mxid) {
   return sanitizeLine(localpart(mxid) || (typeof mxid === 'string' ? mxid : ''));
 }
 
+function masterUnreadForRoom(rec) {
+  if (rec.masterReadThrough && rec.masterReadThrough === rec.lastEventId) return 0;
+  const count = rec.masterUnread;
+  const native = rec.sourceId === 'imessage' ? nativeReadState(rec.nativeRead) : null;
+  // Apple can clear its own already-read history, but it cannot keep a master
+  // badge unread after the manager has acknowledged it. Ignore older snapshots.
+  if (native && native.latest_ts >= rec.lastTs) return Math.min(count ?? native.unread_count, native.unread_count);
+  return count ?? 0;
+}
+
 function freshRoomInfo(rid) {
   return { id: rid, name: null, isSpace: false, children: [], childSet: {}, sourceId: null,
            lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
            profileId: null, profileDisplayName: null, createSender: null,
            isContacts: false, contacts: [], contactsByKey: {}, shareLevelContent: null,
-           readState: null, receipts: new Map(), lastEventId: null, avatarByEvent: null, timestampCorrections: new Map(), crmDirectResults: new Map(),
+           readState: null, masterUnread: null, masterReadThrough: null, receipts: new Map(), lastEventId: null, avatarByEvent: null, timestampCorrections: new Map(), crmDirectResults: new Map(),
            uplinkHealth: null, lastLagMs: null };
 }
 
@@ -479,6 +489,8 @@ function hopLagMs(ev) {
 // block and `timeline` (a newer space's create/name/child events can still be
 // in the timeline window; in a delta, all new state rides in the timeline).
 function applyRoom(info, r) {
+  const count = r.unread_notifications?.notification_count;
+  if (Number.isSafeInteger(count) && count >= 0) info.masterUnread = count;
   const stateEvents = ((r.state && r.state.events) || []).concat((r.timeline && r.timeline.events) || []);
   if (!info.createSender) info.createSender = stateEvents.find(e => e?.type === 'm.room.create' && e.state_key === '')?.sender || null;
   for (const e of stateEvents) {
@@ -792,7 +804,7 @@ function buildByUser(rooms) {
         profileId: r.profileId || null,
         profileDisplayName: r.profileDisplayName || null,
         mirrorOf: r.mirrorOf || null,
-        unread: r.readState?.unread_count || 0,
+        unread: masterUnreadForRoom(r),
         readState: r.readState,
         drafts: [],  // filled in refreshAll once loadProposalsIndex() has run
       });
@@ -1028,7 +1040,11 @@ function buildStripe(flags) {
 function buildSide(rec, flags, unreadCount, draftCount) {
   const side = el('div', 'side');
   if (rec.lastTs) side.appendChild(el('span', 'when', relTime(rec.lastTs)));
-  if (flags.includes('unread')) side.appendChild(el('span', 'pill unread', String(unreadCount)));
+  if (flags.includes('unread')) {
+    const count = el('span', 'pill unread', String(unreadCount));
+    count.title = 'Unread for you in master';
+    side.appendChild(count);
+  }
   if (flags.includes('draft')) side.appendChild(el('span', 'pill draft', String(draftCount)));
   return side;
 }
@@ -1557,7 +1573,7 @@ let nativeReadAttempt = null;
 function refreshRoomUnread(roomId) {
   const rec = MS.rooms[roomId];
   if (!rec) return;
-  const unread = rec.readState?.unread_count || 0;
+  const unread = masterUnreadForRoom(rec);
   let changed = false;
   for (const rows of MS.byUser.values()) {
     for (const row of rows) {
@@ -1569,6 +1585,37 @@ function refreshRoomUnread(roomId) {
   }
   if (changed) rerenderActiveList();
 }
+// Private master receipt: acknowledges this viewer only. Native Apple changes
+// remain a separate, source-confirmed request and never gate clearing our badge.
+const masterReadAttempts = new Map();
+async function markMasterRead() {
+  const roomId = MS.openRoomId, rec = MS.rooms[roomId];
+  if (document.visibilityState === 'hidden' || !rec || !ROOMID_RE.test(roomId)
+      || !rec.mirrorOf || !MS.roomEvents.has(rec.lastEventId)) return;
+  const events = [...MS.roomEvents.values()].filter(ev => ev.sender === rec.createSender && /^\$[^\s]+$/.test(ev.event_id || ''));
+  const latest = events.sort((a, b) => (b.origin_server_ts || 0) - (a.origin_server_ts || 0))[0];
+  if (!latest) return;
+  const token = S.token, epoch = roomEpoch, lastEventId = rec.lastEventId;
+  const attempt = token + ':' + roomId + ':' + latest.event_id;
+  if (masterReadAttempts.has(attempt)) return;
+  masterReadAttempts.set(attempt, true);
+  while (masterReadAttempts.size > 500) masterReadAttempts.delete(masterReadAttempts.keys().next().value);
+  try {
+    await api('POST', '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/read_markers',
+      { 'm.fully_read': latest.event_id, 'm.read.private': latest.event_id });
+    if (S.token !== token || roomEpoch !== epoch || MS.openRoomId !== roomId) return;
+    const current = MS.rooms[roomId];
+    if (!current || current.lastEventId !== lastEventId) return;
+    current.masterReadThrough = lastEventId;
+    current.masterUnread = 0;
+    refreshRoomUnread(roomId);
+    snapshotCacheSave().catch(() => {});
+  } catch (error) {
+    masterReadAttempts.delete(attempt);
+    if (S.token === token && roomEpoch === epoch && MS.openRoomId === roomId) roomStatus('Could not mark this conversation read for you. Reopen it to retry.');
+  }
+}
+
 function renderNativeReadControls(rec) {
   const ready = rec?.sourceId === 'imessage' && rec.nativeRead?.supported === true && MS.crmCapabilities.get(rec.createSender)?.native_read === true;
   for (const [id, action] of [['room-mark-read', 'read'], ['room-mark-unread', 'unread']]) {
@@ -1636,6 +1683,10 @@ function renderRoomReadLine(rec) {
       else parts.push(Date.now() < nativeReadIntent.expires ? 'Updating on user’s Mac…' : 'Read-state update not confirmed');
     }
   }
+  if (rec.sourceId === 'imessage' && !rec.nativeRead) parts.push(
+    MS.crmCapabilities.get(rec.createSender)?.native_read === true
+      ? 'Waiting for Apple read state from the user’s Mac'
+      : 'Apple read state unavailable — source connector update needed');
   if (receipt?.read) parts.push('Latest message read by recipient');
   else if (receipt?.delivered) parts.push('Latest message delivered to recipient');
   if (!rec.nativeRead) parts.push(receipt?.teammate_read ? teammateLabel + ' read the latest message' : 'Teammate read state unconfirmed');
@@ -1867,7 +1918,12 @@ async function openRoom(roomId, { eventId = null } = {}) {
     const sorted = chunk.slice().sort((a, c2) => mirrorTs(a) - mirrorTs(c2));
     for (const ev of sorted) renderBubble(ev);
     reconcileNativeEchoes();
-    if (!eventId) requestNativeRead('read');
+    if (!eventId) {
+      // The initial five-event sync window can contain only state/receipts.
+      // Seed the latest message evidence from the history actually displayed.
+      applyRoom(MS.rooms[roomId], { timeline: { events: chunk } });
+      markMasterRead(); requestNativeRead('read');
+    }
   } catch (e) {
     if (current()) roomStatus('Could not load messages: ' + String(e.message || e));
   }
@@ -1907,8 +1963,7 @@ async function startTail(roomId) {
       const join = (data.rooms && data.rooms.join) || {};
       const room = join[roomId];
       if (room && MS.rooms[roomId]) {
-        const stateOnly = (room.state?.events || []).concat(room.timeline?.events || []).filter(e => e.type === MESSAGE_RECEIPT_TYPE || e.type === 'com.jkali.read_state');
-        applyRoom(MS.rooms[roomId], { state: { events: stateOnly } });
+        applyRoom(MS.rooms[roomId], room);
         refreshRoomUnread(roomId);
         renderRoomReadLine(MS.rooms[roomId]);
       }
@@ -1932,6 +1987,7 @@ async function startTail(roomId) {
           if (checks) paintReceipt(checks, rec?.receipts?.get(id));
         }
         renderRoomReadLine(rec);
+        markMasterRead();
         requestNativeRead('read');
         reconcileNativeEchoes();
         renderSuggestionStack();
@@ -2889,7 +2945,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   });
   $('in-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-signin').click(); });
   $('signout').addEventListener('click', signOut);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestNativeRead('read'); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { markMasterRead(); requestNativeRead('read'); } });
   const notificationError = error => { $('notification-status').textContent = error.message; };
   $('nav-telegram')?.addEventListener('click', () => getControl().open());
   $('nav-notifications')?.addEventListener('click', () => notifications?.open().catch(notificationError));

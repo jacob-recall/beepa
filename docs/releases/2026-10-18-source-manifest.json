@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "release": "0.3.3",
+  "release": "0.3.4",
   "audited_base_commit": "b73bb5ffa5a95b36d2090ee0229c7583505f8e1f",
   "purpose": "Required changed runtime files for the 2026-10-18 rollout. Not a signature, deployment record, or complete repository file list. Publish the entire committed repository including tests and dependencies. Regenerate after any intentional runtime changes.",
   "sha256": {
@@ -25,7 +25,7 @@
     "apps/master/crm-store.js": "247138753741301eead04bb58cdac83e9156746b12900194cbfcfcd888b57be3",
     "apps/master/crm-view.js": "13813a390667ff96a40a81919b9314738888651d7aea05d2502698bb9968e060",
     "apps/master/index.html": "9e3d8e0b126216de9cc8661291fd2e127c03d9373c8eaac5796bbcce8f5e61fc",
-    "apps/master/main.js": "786de4c9894bb24efba0da22b3b7d3796fadccf9eb8cddc3fd98ea859bf454c5",
+    "apps/master/main.js": "955ebfaedce0bf59d652b1667ef18fccc5ff750fa6c7457c6d1b7b343ee1c89e",
     "apps/master/notification-sw.js": "a9065804bd9434b9a6d26917007e0c8dc10703003affe5d6446f00607c1ab240",
     "apps/master/notifications.js": "e9fa3bcf0d9b0c2635e562433a86979ad9468b4fd12df27f4112d02697e83492",
     "apps/master/style.css": "e0c7310278d8a0b839d58bfdef48126747c396eb5ce14aa5aba2027def27c0c2",
@@ -55,7 +55,7 @@
     "master/setup-control.py": "32853a3d5f63bb3fb0612af26e8ef0c4fead137b4865a205d9e652d52edf2180",
     "master/setup-notifications.sh": "515ffec0437a96d87c41c84a7145280ac5c2f09529567548e6e338d2123e3f7f",
     "master/telegram-service.mjs": "3a5d14205741d2f3bf1ab8cbe8aec27f5ec753603c8b544dfc76f89bfc8c94e5",
-    "release.json": "0327405384c8449c324e300a1f94ac411cd62a551a3f74222cb527c7182808bb",
+    "release.json": "35c54a9e51a8018feaaa3b3c2e9d27781469de84b35fd5df61b0986d71f34cf8",
     "requirements-notifications.txt": "82cf6b2409b807d61ad73d1f460ab87b7e8def9a7694940ec4e2ba94dcefe2ad",
     "shared/matrix/client.js": "13437baee4d6fcd145b5f3c3b701639de5c94105ce704b2e5689832253ab0128",
     "shared/model/attention.js": "4c5d165affc496b5cfc97f39a4b09a7fd43918f8369d79d0d6aa41294070fc9b",

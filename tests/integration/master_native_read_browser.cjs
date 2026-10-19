@@ -5,7 +5,7 @@ const root = path.resolve(__dirname, '../..');
 (async () => {
   const browser = await chromium.launch({executablePath:process.env.CHROMIUM_PATH || '/usr/bin/chromium',headless:true,args:['--no-sandbox']});
   try {
-    const page = await browser.newPage(), errors=[], unknown=[], commands=[];
+    const page = await browser.newPage(), errors=[], unknown=[], commands=[], markers=[];
     page.setDefaultTimeout(10000);
     const owner='@elliot:master', manager='@manager:master', room='!chat:master', proposals='!proposals:master';
     const state=(type,content,state_key='')=>({type,content,state_key,sender:owner});
@@ -18,9 +18,13 @@ const root = path.resolve(__dirname, '../..');
         ...[room,proposals].map(id=>state('m.space.child',{via:['master']},id))]}},
       [proposals]:{state:{events:[state('m.room.create',{}),state('com.jkali.proposals',{}),state('com.jkali.crm.capability',{
         schema:1,owner_mxid:owner,generation:'generation',journal_epoch:'journal',ordered_policy:true,direct_prepare_commit:true,native_read:true})]},timeline:{events:[]}},
-      [room]:{state:{events:[state('m.room.create',{'com.jkali.mirror_of':'!native:local'}),state('m.room.name',{name:'Unread fixture'}),
-        state('com.jkali.source',{source:'imessage'}),state('com.jkali.share_level',{level:'share'}),read()]},timeline:{events:messages}},
+      [room]:{unread_notifications:{notification_count:3},state:{events:[state('m.room.create',{'com.jkali.mirror_of':'!native:local'}),state('m.room.name',{name:'Unread fixture'}),
+        state('com.jkali.source',{source:'imessage'}),state('com.jkali.share_level',{level:'share'}),read()]},timeline:{events:[]}},
     };
+    for(const [id,name,source] of [['!legacy:master','Older iMessage account','imessage'],['!android:master','Android conversation','gmessages']]){
+      rooms['!space:master'].state.events.push(state('m.space.child',{via:['master']},id));
+      rooms[id]={unread_notifications:{notification_count:4},state:{events:[state('m.room.create',{'com.jkali.mirror_of':'!source-'+source+':local'}),state('m.room.name',{name}),state('com.jkali.source',{source}),state('com.jkali.read_state',{unread_count:9731})]},timeline:{events:messages}};
+    }
     let tail=null, sync=0;
     page.on('pageerror',e=>errors.push(e.message));
     await page.route('**/*',async route=>{
@@ -31,8 +35,17 @@ const root = path.resolve(__dirname, '../..');
       if(name==='/admin/notifications')return reply({follows:[],history:[],devices:0});
       if(name==='/_matrix/client/v3/sync'){
         const filter=JSON.parse(url.searchParams.get('filter') || '{}');
-        if(filter.room?.rooms?.length===1 && filter.room.rooms[0]===room){tail=route;return;}
+        if(filter.room?.rooms?.length===1){if(filter.room.rooms[0]===room)tail=route;return;}
         return reply({next_batch:'global-'+(++sync),rooms:{join:rooms}});
+      }
+      const other=name.match(/^\/_matrix\/client\/v3\/rooms\/(!legacy:master|!android:master)\/(messages|read_markers)$/);
+      if(other){
+        if(other[2]==='messages')return reply({chunk:messages});
+        const data=req.postDataJSON();assert.equal(data['m.read.private'],'$message3');assert.equal(data['m.read'],undefined);
+        rooms[other[1]].unread_notifications.notification_count=0;return reply({});
+      }
+      if(name===`/_matrix/client/v3/rooms/${room}/read_markers` && req.method()==='POST'){
+        markers.push(req.postDataJSON());rooms[room].unread_notifications.notification_count=0;return reply({});
       }
       if(name===`/_matrix/client/v3/rooms/${room}/messages`)return reply({chunk:messages});
       if(name===`/_matrix/client/v3/rooms/${proposals}/state`)return reply(rooms[proposals].state.events);
@@ -55,22 +68,45 @@ const root = path.resolve(__dirname, '../..');
       rooms[room].state.events=rooms[room].state.events.filter(e=>e.type!=='com.jkali.read_state').concat(read());
       const route=tail;tail=null;
       // State-only response: sidebar must update without the 20-second refresh.
-      await route.fulfill({contentType:'application/json',body:JSON.stringify({next_batch:'tail-'+native.observed_ts,rooms:{join:{[room]:{state:{events:[read()]}}}}})});
+      await route.fulfill({contentType:'application/json',body:JSON.stringify({next_batch:'tail-'+native.observed_ts,rooms:{join:{[room]:{unread_notifications:{notification_count:3},state:{events:[read()]}}}}})});
     }
     await page.goto('http://127.0.0.1:9876/apps/master/index.html');
     await page.locator('#in-user').fill('manager');await page.locator('#in-pass').fill('synthetic-password');await page.locator('#btn-signin').click();
+    for(const name of ['Older iMessage account','Android conversation']){
+      const row=page.locator('.convo').filter({has:page.locator('.title').filter({hasText:name})});
+      await row.waitFor();assert.equal(await row.locator('.pill.unread').textContent(),'4');
+      await row.click();await row.locator('.pill.unread').waitFor({state:'detached',timeout:3000});
+      assert.equal(commands.length,0,'master read works without a native read command');
+    }
     const row=page.locator('.convo').filter({has:page.locator('.title').filter({hasText:'Unread fixture'})});
     await row.waitFor();assert.equal(await row.locator('.pill.unread').textContent(),'3');
-    await row.click();await page.getByText('Synthetic message 3',{exact:true}).waitFor();await until(()=>commands.length===1);
+    await row.click();await page.locator('#room-messages').getByText('Synthetic message 3',{exact:true}).waitFor();await until(()=>commands.length===1);
     assert.equal(commands[0].target_room,'!native:local');assert.equal(commands[0]['com.jkali.read_action'].generation,'generation');
-    assert.equal(await row.locator('.pill.unread').textContent(),'3','HTTP acceptance alone must not clear native unread');
+    await until(()=>markers.length===1);
+    assert.equal(markers[0]['m.read.private'],'$message3');assert.equal(markers[0]['m.read'],undefined);
+    await row.locator('.pill.unread').waitFor({state:'detached',timeout:3000});
+    await page.locator('#room-read').filter({hasText:'Unread in Apple Messages (3)'}).waitFor();
     await confirm('read',0);await row.locator('.pill.unread').waitFor({state:'detached',timeout:3000});
     await page.locator('#room-mark-unread').click();await until(()=>commands.length===2);await confirm('unread',1);
-    await row.locator('.pill.unread').waitFor({timeout:3000});assert.equal(await row.locator('.pill.unread').textContent(),'1');
+    await page.locator('#room-read').filter({hasText:'Unread in Apple Messages (1)'}).waitFor();
+    assert.equal(await row.locator('.pill.unread').count(),0,'user unread is distinct from master unread');
     await until(()=>!!tail);assert.equal(commands.length,2,'manual unread must survive the open viewer');
     await page.locator('#room-mark-read').click();await until(()=>commands.length===3);await confirm('read',0);
     await row.locator('.pill.unread').waitFor({state:'detached',timeout:3000});
+    // New activity while hidden is unread; returning to the visible viewer
+    // acknowledges it. A stale native zero must not erase the newer message.
+    await until(()=>!!tail);
+    await page.evaluate(()=>Object.defineProperty(document,'visibilityState',{value:'hidden',configurable:true}));
+    const incoming={...messages[2],event_id:'$message4',origin_server_ts:5000,content:{msgtype:'m.text',body:'New while hidden','com.jkali.origin_ts':5000}};
+    rooms[room].timeline.events.push(incoming);rooms[room].unread_notifications.notification_count=1;
+    const pending=tail;tail=null;
+    await pending.fulfill({contentType:'application/json',body:JSON.stringify({next_batch:'new-message',rooms:{join:{[room]:{unread_notifications:{notification_count:1},timeline:{events:[incoming]}}}}})});
+    await row.locator('.pill.unread').waitFor({timeout:3000});assert.equal(await row.locator('.pill.unread').textContent(),'1');
+    assert.equal(markers.length,1);
+    await page.evaluate(()=>{Object.defineProperty(document,'visibilityState',{value:'visible',configurable:true});document.dispatchEvent(new Event('visibilitychange'));});
+    await until(()=>markers.length===2);assert.equal(markers[1]['m.read.private'],'$message4');
+    await row.locator('.pill.unread').waitFor({state:'detached',timeout:3000});
     assert.deepEqual(errors,[]);assert.deepEqual(unknown,[]);
-    console.log('PASS actual master Chromium UI: multi-message open requests native read, confirmed state repaints badge immediately, unread hold and explicit read work, no unexpected writes or JS errors');
+    console.log('PASS actual master Chromium UI: all-provider master reads, multi-message open requests native read, private master receipt clears badge before native confirmation, unread hold and explicit read work, no unexpected writes or JS errors');
   } finally {await browser.close();}
 })().catch(e=>{console.error(e);process.exit(1);});

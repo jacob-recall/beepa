@@ -975,7 +975,7 @@ MASTER_FILE_WRITE_ALLOWLIST = {
     "control.js": {"POST": [r"^/admin/control$"]},
     "notifications.js": {"POST": [r"^/admin/notifications$"]},
     "notification-sw.js": {"POST": [r"^/admin/notifications/receipt$"]},
-    "main.js": {"POST": [r"^/admin/crm-room$"], "PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.read_request/$"]},
+    "main.js": {"POST": [r"^/admin/crm-room$", r"^/_matrix/client/v3/rooms//read_markers$"], "PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.read_request/$"]},
     "crm-store.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.operation/crm_$"]},
     "crm-members.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.direct_request/crm_direct__$"]},
     "crm-batches.js": {"PUT": [
@@ -1219,6 +1219,14 @@ def scenario_7_read_only():
     if send_code != 403:
         ok = False
     ev.append("manager_send_status=%s(want 403)" % send_code)
+
+    # A private manager receipt is allowed and durable without message-send power.
+    read_path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(master_room, safe="")
+    latest = master(MASTER_MANAGER_TOKEN, "GET", read_path + "/messages", query={"dir":"b","limit":"1"})["chunk"][0]["event_id"]
+    master(MASTER_MANAGER_TOKEN, "POST", read_path + "/read_markers", {"m.fully_read": latest, "m.read.private": latest})
+    marker = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/user/" + urllib.parse.quote(MASTER_MANAGER_USER, safe="") + "/rooms/" + urllib.parse.quote(master_room, safe="") + "/account_data/m.fully_read")
+    assert marker.get("event_id") == latest
+    ev.append("private_manager_read_marker=durable")
 
     # Build-time invariant. V1 shipped "no composer at all". V2 intentionally adds
     # ONE write path — the compose-PROPOSAL panel — and the invite fix adds POST

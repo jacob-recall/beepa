@@ -154,6 +154,40 @@ Regression coverage: `tests/unit/telegram_reactions.test.js` checks ordering,
 exact-message targeting, deduplication, authorization, callback exclusion,
 reaction failures and a pairing change during acknowledgement.
 
+Combined requests such as “send this and notify me when they reply” prepare
+separate reviews for each action, even when the model produces those actions in
+separate rounds. Each review has its own Confirm/Cancel buttons; confirming the
+message does not confirm notifications. No action runs during preparation. Up to
+four reviews can be prepared in one request. Repeated identical preparation calls
+reuse their draft, and repeated confirmation never resubmits an executed send.
+
+The assistant must finish by accounting for unprepared actions with
+`finish_request`. Tool errors, provider failures and preparation limits produce
+explicit incomplete-step notices. If the model skips the checklist, the runtime
+requests it once and otherwise reports that only the shown reviews are ready.
+
+`prepare_notifications` prepares incoming alerts on the exact account/conversation
+through canonical lists. It reuses the enabled Followed conversations list or
+prepares its creation, policy and watch in one review. If that shared list is
+archived or disabled, it uses a conversation-specific reply list so unrelated
+watches stay disabled. The review names the list, route and delivery policy.
+Defaults are immediate browser and Telegram alerts at any time; no new deadlines
+or repeats. Existing reminder deadlines and list preview settings are preserved. The reviewed
+watch channels, routing and delivery hours also apply to reminders on that watch.
+Global alerts must already be enabled; disabling them invalidates pending setup.
+
+Confirmation revalidates source sharing, account access and all planned revisions.
+The operations retain their individual durable IDs. A mid-plan failure leaves the
+draft unknown: some metadata may have been saved, but the bot does not claim setup
+succeeded or replay the plan. Verify canonical state before preparing a new review.
+Restart preserves pending reviews and quarantines executing drafts as unknown.
+Both reviews remain attached to an API command's durable status.
+
+Regression: `telegram_combined_requests.test.js` covers sequential/parallel actions,
+independent confirmations, duplicate preparation, partial failures, current access,
+stale revisions, disabled lists and restart/API tracking. The opt-in hosted-model
+qualification includes a combined send/notification request using synthetic data.
+
 Ask “Show my lists”, “What needs a reply?”, “Show the last 15 messages with Ada
 from David’s account”, or “From David, tell Ada …”. Reply to a notification to
 identify its exact account and conversation. Earlier 15 paginates the same

@@ -29,6 +29,16 @@ await run('ambiguous account and short followup',async h=>{
 await run('exact Direct review without sending',async h=>{
  await h.ask('From David’s account, draft exactly “Tuesday at 2 works.” to Ada.','draft');const d=latestDraft(h);assert(d);assert.equal(d.kind,'send');assert.equal(d.owner,'@david:fixture');assert.equal(d.body,'Tuesday at 2 works.');assert.equal(d.content['com.jkali.send_mode'],'direct');
 });
+await run('combined send and reply notifications',async h=>{
+ await h.ask('From David’s account, text Ada exactly “Tuesday at 2 works.” and notify me in Telegram and my browser when Ada replies.','combined');
+ const drafts=h.core.db.prepare('SELECT payload,state FROM drafts ORDER BY rowid').all().map(r=>({...JSON.parse(r.payload),state:r.state}));
+ assert.equal(drafts.length,2);assert(drafts.every(d=>d.state==='pending'));
+ const send=drafts.find(d=>d.kind==='send'),notifications=drafts.find(d=>d.operations);
+ assert(send&&notifications);assert.equal(send.owner,'@david:fixture');assert.equal(send.body,'Tuesday at 2 works.');assert.equal(notifications.room_id,send.room_id);
+ assert(notifications.operations.some(o=>o.type==='list.watch'&&o.payload.enabled&&o.payload.all_messages===false));
+ assert.equal(h.sent.filter(p=>p.reply_markup).length,2);assert(!h.state().lists['browser-followed-conversations']);
+ assert(observed.some(c=>c.name==='finish_request'&&c.args.remaining.length===0));
+});
 await run('outreach list creation',async h=>{
  await h.ask('Create an outreach list called Recruiters.','outreach');const d=latestDraft(h);assert(d);assert.equal(d.operation.type,'list.create');assert.equal(d.operation.payload.purpose,'outreach');assert.equal(d.operation.payload.name,'Recruiters');assert(!Object.values(h.state().lists).some(l=>l.name==='Recruiters'));
 });
@@ -41,5 +51,5 @@ await run('independent activity and reminder settings',async h=>{
 await run('cross-account waiting query',async h=>{
  await h.ask('Across Follow-ups, who is waiting on me and who am I waiting on? Include the sending account and app.','waiting');assert(observed.some(c=>c.name==='updates'));assert.equal(latestDraft(h),null);const text=h.sent.map(p=>p.text).join('\n').toLowerCase();assert(text.includes('david'));assert(text.includes('elliot'));assert(text.includes('imessage'));assert(text.includes('whatsapp'));assert(!/@[a-z0-9_-]+:fixture|![a-z0-9_-]+:fixture|\$[a-z0-9_-]+/.test(text),'User-facing answer must not expose protocol IDs');assert(!text.includes('ai-generated answer'));
 });
-assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,6);
+assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,7);
 console.log(JSON.stringify({model,passed:true,cases:completedCases,filter:process.argv[4]||null,provider_calls:calls,fixture:'synthetic only',real_messages_sent:0}));

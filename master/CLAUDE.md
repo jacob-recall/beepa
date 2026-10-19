@@ -266,6 +266,15 @@ Paired operator text messages receive a best-effort 👀 reaction after their du
 inbox processing claim and before command work. Keep reaction errors nonfatal and
 bounded to three seconds; reactions never approve sends or establish delivery.
 Recheck the operator/bot binding after the reaction await.
+Combined commands continue after each prepare tool, with unique review keys and
+independent confirmations (up to four reviews per command). Deduplicate identical
+preparations within a command. `finish_request` reports missing actions; provider
+failure/limits must explicitly report partial preparation. Never auto-confirm a
+remaining step after a send. `prepare_notifications` stores a reviewed sequence
+of canonical list operations in the existing draft ledger; validate the whole
+plan against current state and source access before applying. Partial or interrupted
+application stays unknown and must never be replayed automatically. Do not enable
+a disabled shared list's other watches or global alerts implicitly.
 `lifecycle.py` and `control_recovery.py` back up the exact private control/browser
 files using SQLite snapshots after stopping their writers. Preserve newer local
 operational evidence on restore; quarantine old pending/uncertain work and require

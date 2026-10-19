@@ -22,7 +22,7 @@ const h=acceptanceFixture();try{
  }
  assert.equal(h.writes.length,0,'read and prepare operations never submit');
  // Internal history reads must continue into a reviewed message obligation.
- const calls=[{name:'history',args:{room_id:david.id,display:false}},{name:'prepare_obligation',args:{list_id:'followups',room_id:david.id,event_id:'$david-19',due_at:'2026-10-19T12:00:00Z'}}];
+ const calls=[{name:'history',args:{room_id:david.id,display:false}},{name:'prepare_obligation',args:{list_id:'followups',room_id:david.id,event_id:'$david-19',due_at:'2026-10-19T12:00:00Z'}},{name:'finish_request',args:{remaining:[]}}];
  h.core.model=async messages=>{const call=calls.shift();assert(call);return {tool_calls:[{id:'internal-'+calls.length,type:'function',function:{name:call.name,arguments:JSON.stringify(call.args)}}]};};
  await h.ask('Remind me tomorrow to answer the latest message on David’s account.','internal-context');
  const latest=JSON.parse(h.core.db.prepare('SELECT payload FROM drafts ORDER BY rowid DESC LIMIT 1').get().payload);

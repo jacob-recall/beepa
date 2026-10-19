@@ -281,6 +281,11 @@ export class ControlDomain {
       return this.batches.validate(d.manifest);
     }
     if(d.kind==='list'){
+      if(d.operations){
+        assert(this.settings().notifications_enabled,'Automatic notifications are off. Enable them first.');
+        const room=await this.liveRoom(d.room_id);assert(room.owner===d.owner&&this.allowedOwner(room.owner),'Conversation account changed. Review again.');
+        return this.validateOperationPlan(d.operations);
+      }
       if(d.operation.type==='member.remove'){
         const scope=d.member_scope,binding=this.state().bindings[scope?.binding_id];
         const member=Object.values(this.state().memberships).find(m=>m.membership_id===d.operation.entity_id);
@@ -330,6 +335,39 @@ export class ControlDomain {
     return {owner:binding.owner_mxid,operation:this.operation('member.remove',member.membership_id,member.revision,{list_id,person_id:member.person_id}),
       member_scope:{binding_id,binding_hash:hash(binding),operation_id:member.operation_id,list_revision:list.revision},
       description:`Remove ${this.state().persons[member.person_id]?.label||binding.contact.network_id} from ${list.name}\n${binding.owner_mxid} · ${binding.contact.source} · ${binding.contact.network_id}\nCancel pending list Direct setup through the source account. Existing Direct stays enabled. Other lists and sent messages stay unchanged.`};
+  }
+  async validateOperationPlan(operations){
+    assert(Array.isArray(operations)&&operations.length>0&&operations.length<=3,'Invalid notification setup');
+    let state=this.state();
+    for(const op of operations){
+      assert(['list.create','list.monitoring','list.watch'].includes(op.type),'Invalid notification operation');
+      const next=await applyVerifiedCRMOperation(state,op);
+      assert(next.outcome.accepted,'List change refused: '+next.outcome.code);state=next.state;
+    }
+  }
+  async prepareNotifications({room_id,channels=['browser','telegram']}){
+    assert(this.settings().notifications_enabled,'Automatic notifications are off. Enable them first.');
+    const room=await this.liveRoom(room_id);assert(this.allowedOwner(room.owner),'This source account is excluded by control access settings');
+    const state=this.state(),common=state.lists['browser-followed-conversations'];
+    // A disabled/archived shared list must not be re-enabled for other watches.
+    const list_id=!common||(!common.archived&&common.monitoring?.enabled)?'browser-followed-conversations':'reply-alerts-'+hash(room_id).slice(0,24);
+    const list=state.lists[list_id];assert(!list?.archived,'This reply-alert list is archived. Restore it first.');
+    assert(!list||list.monitoring?.enabled||Object.values(list.watches||{}).every(w=>!w.enabled||w.room_id===room_id),'This list has other disabled alerts. Choose a separate list or review enabling it first.');
+    const operations=[],name=list?.name||(list_id==='browser-followed-conversations'?'Followed conversations':'Replies · '+room.title);
+    let revision=list?.revision||0;
+    if(!list)operations.push(this.operation('list.create',list_id,revision++,{name,purpose:'monitoring'}));
+    if(!list?.monitoring?.enabled)operations.push(this.operation('list.monitoring',list_id,revision++,{...defaultMonitoring(),enabled:true}));
+    const policy={enabled:true,all_messages:false,channels,activity_enabled:true,schedule:null,presentation:null,routing:null};
+    operations.push(this.operation('list.watch',list_id,revision,{...list?.watches?.[room_id],room_id,owner_mxid:room.owner,due_at:list?.watches?.[room_id]?.due_at??null,snooze_until:list?.watches?.[room_id]?.snooze_until??null,resolved_event:list?.watches?.[room_id]?.resolved_event??null,...policy}));
+    await this.validateOperationPlan(operations);
+    return {operations,room_id,owner:room.owner,list_name:name,policy:{...policy,preview:list?.monitoring?.preview??false}};
+  }
+  async applyNotificationPlan(d){
+    await this.validateReviewScope(d);
+    // Each operation has its own durable ID. An interrupted/partial execution
+    // stays unknown in the draft ledger and is never automatically replayed.
+    for(const op of d.operations){await this.liveRoom(d.room_id);await this.apply(op);}
+    return {notifications_enabled:true,room_id:d.room_id};
   }
   preparePolicy({list_id,...changes}){const l=this.list(list_id);return this.operation('list.monitoring',list_id,l.revision,{...defaultMonitoring(),...l.monitoring,...changes});}
   prepareWatch({list_id,room_id,inherit_monitoring,...changes}){

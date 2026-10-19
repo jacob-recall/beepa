@@ -12,7 +12,7 @@ const provider=async(messages,tools)=>{
  assert(++calls<=30,'Qualification request budget exhausted');
  const began=Date.now();console.log(JSON.stringify({provider_request:calls,started:true}));
  const response=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',redirect:'error',signal:AbortSignal.timeout(60000),
-  headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({model,messages,tools,tool_choice:'auto',max_tokens:1800,provider:{require_parameters:true,allow_fallbacks:false}})});
+  headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({model,messages,...(tools.length?{tools,tool_choice:'auto'}:{}),max_tokens:1800,provider:{require_parameters:true,allow_fallbacks:false}})});
  assert(response.ok,'Provider request failed: HTTP '+response.status);
  const data=await response.json(),message=data.choices?.[0]?.message;assert(message,'Provider returned no message');
  console.log(JSON.stringify({provider_request:calls,elapsed_ms:Date.now()-began,finish_reason:data.choices?.[0]?.finish_reason,tokens:data.usage?.total_tokens,reasoning_tokens:data.usage?.completion_tokens_details?.reasoning_tokens}));
@@ -39,6 +39,19 @@ await run('combined send and reply notifications',async h=>{
  assert.equal(h.sent.filter(p=>p.reply_markup).length,2);assert(!h.state().lists['browser-followed-conversations']);
  assert(observed.some(c=>c.name==='finish_request'&&c.args.remaining.length===0));
 });
+await run('reading corrected names and older topics',async h=>{
+ const owner='@david:fixture',room='!ada-david:fixture';h.domain.accountNames[owner]='Jacob';
+ const original=h.domain.room(room);original.title='Daniel McCormmick';original.source='gmessages';
+ const karina='!karina:fixture';h.domain.rooms.set(karina,{...original,id:karina,title:'Karina',native:'!native-karina:fixture',state:original.state.map(e=>e.type==='m.room.create'?{...e,content:{'com.jkali.mirror_of':'!native-karina:fixture'}}:e)});
+ const event=(id,body,from_me=false)=>({event_id:id,sender:owner,type:'m.room.message',origin_server_ts:h.now-86400000,content:{msgtype:'m.text',body,'com.jkali.from_me':from_me}});
+ h.events.get(room).unshift(event('$old-interview','My TML interview is Thursday at 10 am.'));
+ h.events.set(karina,[event('$old-residency','I want to talk to the founder of the Residency about hosting a robotics workshop.',true),...h.events.get(room).filter(e=>e.event_id!=='$old-interview')]);
+ await h.ask('Read my texts with Daniel McCormick. When did he say his interview with TML was? I am Jacob. It is in Google Messages.','reading-interview');
+ assert.match(h.sent.map(p=>p.text).join('\n'),/Thursday/);assert(observed.some(c=>c.name==='search_history'));assert.equal(latestDraft(h),null);
+ h.sent.length=0;
+ await h.ask('Also read my messages with Karina. What did I want to talk to the founder of the Residency about?','reading-residency');
+ assert.match(h.sent.map(p=>p.text).join('\n'),/robotics workshop/i);assert.equal(latestDraft(h),null);assert(!observed.some(c=>c.name==='finish_request'||c.name.startsWith('prepare_')));
+});
 await run('outreach list creation',async h=>{
  await h.ask('Create an outreach list called Recruiters.','outreach');const d=latestDraft(h);assert(d);assert.equal(d.operation.type,'list.create');assert.equal(d.operation.payload.purpose,'outreach');assert.equal(d.operation.payload.name,'Recruiters');assert(!Object.values(h.state().lists).some(l=>l.name==='Recruiters'));
 });
@@ -51,5 +64,5 @@ await run('independent activity and reminder settings',async h=>{
 await run('cross-account waiting query',async h=>{
  await h.ask('Across Follow-ups, who is waiting on me and who am I waiting on? Include the sending account and app.','waiting');assert(observed.some(c=>c.name==='updates'));assert.equal(latestDraft(h),null);const text=h.sent.map(p=>p.text).join('\n').toLowerCase();assert(text.includes('david'));assert(text.includes('elliot'));assert(text.includes('imessage'));assert(text.includes('whatsapp'));assert(!/@[a-z0-9_-]+:fixture|![a-z0-9_-]+:fixture|\$[a-z0-9_-]+/.test(text),'User-facing answer must not expose protocol IDs');assert(!text.includes('ai-generated answer'));
 });
-assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,7);
+assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,8);
 console.log(JSON.stringify({model,passed:true,cases:completedCases,filter:process.argv[4]||null,provider_calls:calls,fixture:'synthetic only',real_messages_sent:0}));

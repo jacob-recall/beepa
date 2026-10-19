@@ -73,3 +73,20 @@ console.log('control discovery: incremental invalidation, full-state authority, 
  changes={join:{'!old:test':{}}};refused=false;await c.refresh();assert.deepEqual(await c.state('!old:test'),[]);assert.equal(reads,2,'new membership invalidates a cached refusal immediately');
  changes={leave:{'!old:test':{}}};refused=true;await c.refresh();await assert.rejects(c.state('!old:test'));now+=60001;await c.refresh();await assert.rejects(c.state('!old:test'));assert.equal(reads,4,'negative cache expires even without another room delta');
 }
+// Headless invite acceptance requires a current roster-owned parent link and
+// the invite's own creator/inviter identity. It does not trust room names.
+for(const attack of [null,'creator','inviter','unlinked','excluded']){
+ const h=fixture(),manager='@manager:test',room='!room:test';let joins=0,joined=false;
+ h.changes={invite:{[room]:{invite_state:{events:[event('m.room.create',{'com.jkali.mirror_of':'!native:test'},attack==='creator'?'@attacker:test':'@source:test'),event('m.room.member',{membership:'invite'},attack==='inviter'?'@attacker:test':'@source:test',manager)]}}}};
+ if(attack==='unlinked')h.states.get('!space:test').splice(1);
+ if(attack==='excluded')h.setSettings({allowed_accounts:[]});
+ const original=h.api;h.domain.api=async(method,path)=>{
+  if(method==='POST'){assert(path.endsWith('/join'));joins++;joined=true;return {room_id:room};}
+  if(path.includes(encodeURIComponent(room))&&!joined)throw Object.assign(Error('Invited, not joined'),{status:403});
+  return original(method,path);
+ };
+ h.domain.discoveryCache.api=h.domain.api;
+ await h.domain.refresh();assert.equal(joins,attack?0:1,attack);assert.equal(h.domain.rooms.has(room),!attack);
+ await h.domain.refresh();assert.equal(joins,attack?0:1,'no duplicate join');
+}
+console.log('Headless invites: current parent, creator, inviter, account scope and post-join full state verified.');

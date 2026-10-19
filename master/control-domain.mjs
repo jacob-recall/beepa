@@ -34,12 +34,13 @@ export function message(event,owner,corrections) {
 // endpoint before discovery uses it. Tokens/cache are process-local and discarded
 // together on errors or restart. No stale-on-error behavior is permitted.
 export class DiscoveryStateCache {
-  constructor(api,clock=Date.now){this.api=api;this.clock=clock;this.states=new Map();this.unavailable=new Map();this.since=null;this.stats={};}
+  constructor(api,clock=Date.now){this.api=api;this.clock=clock;this.states=new Map();this.unavailable=new Map();this.since=null;this.stats={};this.invites=new Map();this.joinRetry=new Map();}
   async refresh(){
     // Keep timeline event types unfiltered: even a state-only change must name
     // its room in the delta. Full state payloads here would be redundant.
     const filter={presence:{not_types:['*']},account_data:{not_types:['*']},room:{state:{not_types:['*']},timeline:{limit:1},ephemeral:{not_types:['*']},account_data:{not_types:['*']}}};
-    // Bootstrap only a stream position, then fetch roster-authorized full state.
+    // Bootstrap a position without joined-room payloads; Synapse still supplies
+    // stripped invitations, retained for identity-checked headless joins.
     // Fetching an unused initial snapshot for every joined room costs seconds.
     // The next delta is unfiltered by room and includes changes during discovery.
     if(!this.since)filter.room.rooms=[];
@@ -54,8 +55,10 @@ export class DiscoveryStateCache {
         for(const id of Object.keys(rooms||{}))changed.add(id);
       }
       for(const id of changed){this.states.delete(id);this.unavailable.delete(id);}
+      for(const section of ['join','leave'])for(const id of Object.keys(data.rooms?.[section]||{})){this.invites.delete(id);this.joinRetry.delete(id);}
+      for(const [id,invite] of Object.entries(data.rooms?.invite||{}))this.invites.set(id,invite);
       this.stats={initial:!this.since,changed_rooms:changed.size,state_reads:0,cache_hits:0,unavailable_hits:0};this.since=data.next_batch;this.used=new Set();
-    }catch(error){this.states.clear();this.unavailable.clear();this.since=null;throw error;}
+    }catch(error){this.states.clear();this.unavailable.clear();this.since=null;this.invites.clear();this.joinRetry.clear();throw error;}
   }
   async state(id){
     assert(this.since,'Discovery sync required');this.used.add(id);
@@ -92,7 +95,7 @@ export class ControlDomain {
     await this.store.refresh(); assert(this.store.snapshot().ready,'Lists are still loading');
     await this.discoveryCache?.refresh();
     const stateFor=id=>this.discoveryCache?this.discoveryCache.state(id):this.api('GET',roomPath(id)+'/state');
-    const rooms=new Map(), accounts=new Map(), contacts=[], health=new Map(), contactRooms=new Map(), ownerNames=new Map();
+    const rooms=new Map(), accounts=new Map(), contacts=[], health=new Map(), contactRooms=new Map(), ownerNames=new Map();let joinBudget=20;
     const roster=await this.roster();
     for(const [owner,space] of Object.entries(roster)) {
       if(this.settings().allowed_accounts!==null&&!this.settings().allowed_accounts.includes(owner))continue;
@@ -103,6 +106,17 @@ export class ControlDomain {
       const member=state.find(e=>e.type==='m.room.member'&&e.state_key===owner&&e.sender===owner);
       if(typeof member?.content?.displayname==='string')ownerNames.set(owner,member.content.displayname);
       const children=state.filter(e=>e.type==='m.space.child' && e.sender===owner && Object.keys(e.content||{}).length).map(e=>e.state_key).sort();
+      // The browser is not required to accept already-shared room invitations.
+      // Both the current roster space and this invite must prove the same owner.
+      if(this.discoveryCache&&get(state,'m.room.create')?.content?.type==='m.space')for(const id of children){
+        const cache=this.discoveryCache,invite=cache.invites.get(id),events=invite?.invite_state?.events;
+        if(!joinBudget||!Array.isArray(events)||(cache.joinRetry.get(id)||0)>this.clock())continue;
+        const create=get(events,'m.room.create'),member=events.find(e=>e.type==='m.room.member'&&e.state_key===this.manager);
+        if(!/^![^\s:]+:[^\s]+$/.test(id)||create?.sender!==owner||create.content?.type==='m.space'||member?.sender!==owner||member.content?.membership!=='invite')continue;
+        joinBudget--;
+        try{await this.api('POST',roomPath(id)+'/join',{});cache.invites.delete(id);cache.joinRetry.delete(id);cache.states.delete(id);cache.unavailable.delete(id);}
+        catch{cache.joinRetry.set(id,this.clock()+60000);}
+      }
       for(let i=0;i<children.length;i+=8) await Promise.all(children.slice(i,i+8).map(async id=>{
         let s;try{s=await stateFor(id);}catch{return;}
         const create=get(s,'m.room.create'); if(create?.sender!==owner || create.content?.type==='m.space' || s.some(e=>['m.room.tombstone','m.room.encryption'].includes(e.type))) return;
@@ -231,6 +245,7 @@ export class ControlDomain {
       const edit=editContent(latestEdits.get(e.event_id)?.content);
       return message(edit?{...e,unsigned:{...e.unsigned,'m.relations':{'m.replace':{sender:r.owner,content:{'m.new_content':edit}}}}}:e,r.owner,corrections);
     }).filter(Boolean).sort((a,b)=>a.ts-b.ts||a.id.localeCompare(b.id));
+    index.messages=messages;
     let end=messages.length;
     if(cursor){let anchor;try{anchor=JSON.parse(Buffer.from(cursor,'base64url').toString());}catch{throw new Error('Invalid history cursor');}
       assert(anchor.room===id,'History cursor belongs to another conversation');end=messages.findIndex(m=>m.id===anchor.before);
@@ -240,6 +255,16 @@ export class ControlDomain {
     return {conversation:this.summary(r),messages:slice,version:hash(messages.map(m=>[m.id,m.version])),cursor:begin?Buffer.from(JSON.stringify({room:id,before:slice[0].id})).toString('base64url'):null,start:index.cursor,complete:begin===0,
       availability:{...source,checked_at:this.clock(),mirror_caught_up:true,native_history_complete:source.fresh&&tracking.fresh&&tracking.complete&&tracking.all_messages_included&&tracking.messages.length===messages.length,
         coverage:tracking.coverage,available_count:messages.length,oldest_at:messages[0]?.ts??null,newest_at:messages.at(-1)?.ts??null}};
+  }
+  async searchHistory(id,query){
+    assert(typeof query==='string'&&query.trim()&&query.length<=200,'Use a short history search query');
+    const base=await this.history(id,1),messages=this.histories.get(id).messages;
+    const normalize=text=>String(text).normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase();
+    const terms=[...new Set(normalize(query).match(/[\p{L}\p{N}]+/gu)||[])];
+    assert(terms.length>0&&terms.length<=12,'Use a few distinctive topic words');
+    const hits=messages.map((m,i)=>{const text=normalize(m.text);return {i,score:terms.filter(t=>text.includes(t)).length};}).filter(h=>h.score>0).sort((a,b)=>b.score-a.score||b.i-a.i);
+    const selected=new Set();for(const {i} of hits.slice(0,12))for(let n=Math.max(0,i-2);n<=Math.min(messages.length-1,i+2);n++)selected.add(n);
+    return {...base,messages:[...selected].sort((a,b)=>a-b).map(i=>messages[i]),cursor:null,search:{query,matched_messages:hits.length,returned_matches:Math.min(hits.length,12),truncated:hits.length>12,scanned_messages:messages.length},complete:base.availability.native_history_complete};
   }
   async prepareSend({room_id,body}){
     const r=await this.liveRoom(room_id);assert(typeof body==='string'&&body.trim()&&body.length<=8000&&sanitize(body.slice(0,4000))+sanitize(body.slice(4000))===body&&!body.startsWith('!'),'Use visible message text, up to 8000 characters');

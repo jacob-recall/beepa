@@ -188,7 +188,7 @@ const telegram=async(method,data={})=>{
 let core;
 const model=async(messages,tools)=>{
   try{
-  const result=await json('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+config.openrouter_key,'Content-Type':'application/json'},body:JSON.stringify({model:config.model,messages,tools,tool_choice:'auto',max_tokens:1800,provider:{require_parameters:true,allow_fallbacks:false}}),timeout:60000});
+  const result=await json('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+config.openrouter_key,'Content-Type':'application/json'},body:JSON.stringify({model:config.model,messages,...(tools.length?{tools,tool_choice:'auto'}:{}),max_tokens:1800,provider:{require_parameters:true,allow_fallbacks:false}}),timeout:60000});
   const m=result.choices?.[0]?.message;if(!m)throw new Error('Model response unavailable');core.setHealth('model');return m;
   }catch(error){core.setHealth('model','Language model request failed. Text controls remain available.');throw error;}
 };

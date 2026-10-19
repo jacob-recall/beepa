@@ -11,6 +11,15 @@ Never infer failure from a missing
 adapter response or replay an unknown attempt. Preserve existing channel IDs,
 retired Telegram outcomes, and source-access/deadline validation at delivery.
 
+Headless discovery retains stripped invitations from `/sync`. Before joining,
+require a current allowed roster-owned space, its source-authored child link,
+and the invite’s own creator and manager-invitation sender to match that exact
+source owner. Cap joins at 20 per refresh, back off failures, and fetch fresh full
+state after joining; a successful join is never sharing or send authority.
+Reading questions must not receive the change-review `finish_request` tool.
+Use `search_history` for older topic evidence, preserve exact account/app scope
+across fuzzy name matches, and reserve a final answer round before tool exhaustion.
+
 Production `ControlDomain` enables incremental discovery. A fresh `/sync` barrier
 invalidates changed room caches; only full `/state` reads supply authorization.
 Initial sync requests a position without room payloads, then normal discovery

@@ -188,6 +188,22 @@ independent confirmations, duplicate preparation, partial failures, current acce
 stale revisions, disabled lists and restart/API tracking. The opt-in hosted-model
 qualification includes a combined send/notification request using synthetic data.
 
+Questions about messages are read-only and finish with an answer, not an action
+review. Conversation lookup accepts display names for owners and friendly app
+names; conservative spelling matches stay within that scope and are labeled as
+approximate candidates. `search_history` searches the available shared mirror,
+returns matching verbatim text with nearby timestamps/context, and states when
+results are truncated. It does not establish native completeness. The bounded
+model loop reserves its last reading round for an answer or a specific evidence
+gap rather than discarding all work with a generic narrowing error.
+
+The control worker now accepts existing room invitations without an open browser,
+using the current roster space/child and exact creator/inviter identity checks.
+It never changes the source sharing choice. Rejected or inaccessible threads must
+be described as unavailable to the master, not nonexistent in the native app.
+Regression coverage: `telegram_reading.test.js`, `control_discovery.test.js`, and
+the synthetic hosted-model corrected-name/older-topic qualification.
+
 Ask “Show my lists”, “What needs a reply?”, “Show the last 15 messages with Ada
 from David’s account”, or “From David, tell Ada …”. Reply to a notification to
 identify its exact account and conversation. Earlier 15 paginates the same

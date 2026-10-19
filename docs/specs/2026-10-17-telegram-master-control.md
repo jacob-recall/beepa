@@ -142,6 +142,18 @@ Open the master console → Settings → Telegram. Connect through the short-liv
 private link and press Start. Only the paired Telegram user in that private chat
 can read data or operate Beepa. The bot is `@beepa_central_bot` on this installation.
 
+When the worker starts processing your text message, it adds a 👀 reaction to
+that exact message. This acknowledges receipt and work starting; it does not
+mean the command succeeded or approve a send. Only the paired operator’s private
+text messages receive this reaction, after the durable inbox claim. Duplicate
+updates do not react or execute again. Buttons keep their existing callback
+acknowledgement. Reaction errors are nonfatal, with a three-second request timeout,
+so an unavailable reaction does not prevent the command from running.
+
+Regression coverage: `tests/unit/telegram_reactions.test.js` checks ordering,
+exact-message targeting, deduplication, authorization, callback exclusion,
+reaction failures and a pairing change during acknowledgement.
+
 Ask “Show my lists”, “What needs a reply?”, “Show the last 15 messages with Ada
 from David’s account”, or “From David, tell Ada …”. Reply to a notification to
 identify its exact account and conversation. Earlier 15 paginates the same

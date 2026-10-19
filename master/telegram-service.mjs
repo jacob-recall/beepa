@@ -181,8 +181,8 @@ const json=async(url,options={})=>{
 const matrix=(method,path,data)=>json(config.matrix+path,{method,timeout:path.startsWith('/_matrix/client/v3/sync?')?90000:20000,headers:{Authorization:'Bearer '+config.manager_token,'Content-Type':'application/json'},...(data===undefined?{}:{body:JSON.stringify(data)})});
 const admin=data=>json(config.enroll+'/admin/crm-room',{method:'POST',headers:{Authorization:'Bearer '+config.manager_token,'Content-Type':'application/json'},body:JSON.stringify(data)});
 const telegram=async(method,data={})=>{
-  if(!['getMe','getUpdates','sendMessage','answerCallbackQuery','getWebhookInfo','setMyCommands'].includes(method))throw new Error('Unsupported Telegram operation');
-  const result=await json('https://api.telegram.org/bot'+config.telegram_token+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),timeout:35000});
+  if(!['getMe','getUpdates','sendMessage','answerCallbackQuery','getWebhookInfo','setMyCommands','setMessageReaction'].includes(method))throw new Error('Unsupported Telegram operation');
+  const result=await json('https://api.telegram.org/bot'+config.telegram_token+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),timeout:method==='setMessageReaction'?3000:35000});
   if(!result.ok){const error=new Error('Telegram request failed');error.status=result.error_code;throw error;}return result.result;
 };
 let core;

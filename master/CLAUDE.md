@@ -262,6 +262,10 @@ Enrollment mutations stay serialized even though control callbacks require a
 threaded HTTP server. Every native send stays in the existing source dispatcher;
 the worker can only submit typed proposals after an exact operator review.
 See `docs/specs/2026-10-17-telegram-master-control.md` for setup, APIs and tests.
+Paired operator text messages receive a best-effort 👀 reaction after their durable
+inbox processing claim and before command work. Keep reaction errors nonfatal and
+bounded to three seconds; reactions never approve sends or establish delivery.
+Recheck the operator/bot binding after the reaction await.
 `lifecycle.py` and `control_recovery.py` back up the exact private control/browser
 files using SQLite snapshots after stopping their writers. Preserve newer local
 operational evidence on restore; quarantine old pending/uncertain work and require

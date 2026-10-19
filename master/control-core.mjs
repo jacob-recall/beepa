@@ -1026,7 +1026,15 @@ export class ControlCore {
           else if(data.startsWith('earlier:')&&ref?.room&&ref.cursor){await this.domain.refresh();this.enqueueHistory(key,await this.domain.history(ref.room,15,ref.cursor));}
           else if(/^context:\d+$/.test(data)){const item=ref?.bundle?.[Number(data.slice(8))];if(!item)throw Error('This conversation choice is no longer available.');await this.domain.refresh();this.enqueueHistory(key,await this.domain.history(item.room,15));}
           await this.telegram('answerCallbackQuery',{callback_query_id:u.callback_query.id});
-        }else if(typeof m.text==='string')await this.command(m.text,ref,key);
+        }else if(typeof m.text==='string'){
+          // The durable processing claim and operator checks precede this ack.
+          // Reactions are best effort, never command approval or send evidence.
+          if(Number.isSafeInteger(m.message_id)&&m.message_id>0){
+            try{await this.telegram('setMessageReaction',{chat_id:m.chat.id,message_id:m.message_id,reaction:[{type:'emoji',emoji:'👀'}],is_big:false});}catch{}
+          }
+          if(binding!==this.commandBinding()||bot!==this.value('transport_identity')?.id)continue;
+          await this.command(m.text,ref,key);
+        }
       }catch(e){if(binding===this.commandBinding())this.enqueue(key,'Could not complete that request: '+e.message);}
       finally{if(bot===this.value('transport_identity')?.id)this.db.prepare("UPDATE inbox SET state='done' WHERE id=?").run(row.id);}
     }

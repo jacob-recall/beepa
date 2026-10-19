@@ -3,7 +3,7 @@
 For native unread badges and master read/unread controls, follow
 [the 0.3.2 acceptance instructions](IMESSAGE-UNREAD-ROLLOUT-2026-10-19.md).
 
-For the current 0.3.4 release, bots updating Elliot's and David's installations
+For the current 0.3.5 release, bots updating Elliot's and David's installations
 should follow [the complete October 18 rollout](PEER-ROLLOUT-2026-10-18.md).
 For already-upgraded installations, also follow the
 [iMessage importer patch supplement](IMESSAGE-IMPORTER-ROLLOUT-2026-10-18.md).
@@ -17,6 +17,12 @@ The current candidate reads state versions 1 and 2 and writes version 2. A
 For a master with the standalone Telegram worker, follow the explicit worker
 quiescence and runtime-path steps in the October 18 guide before `--apply`;
 the general updater's Compose/launch-agent stop does not cover that worker.
+
+Release 0.3.5 adds 👀 acknowledgement when the existing Telegram worker starts
+processing an operator message. For an installation already on 0.3.4, only the
+central control worker needs to load the changed modules after active work settles;
+retain its existing state and pairing. David and Elliot need no source-side change
+for this feature, and no additional poller should be started.
 
 Keep a canonical upstream repository and a `stable` deployment branch. Each
 person's repository should preserve that Git history; deployment values and

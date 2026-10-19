@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "release": "0.3.4",
+  "release": "0.3.5",
   "audited_base_commit": "b73bb5ffa5a95b36d2090ee0229c7583505f8e1f",
   "purpose": "Required changed runtime files for the 2026-10-18 rollout. Not a signature, deployment record, or complete repository file list. Publish the entire committed repository including tests and dependencies. Regenerate after any intentional runtime changes.",
   "sha256": {
@@ -40,7 +40,7 @@
     "imessage/daemon.py": "3d9f4b59d6769604e43e442865ab93b302e4ad5f2eb7503ff952deb4d916c2b2",
     "imessage/diagnose-importer.py": "e23d362fa1272c60b834ac33b344ef62bd010e7836f5afe507a3787b6392ce4b",
     "install_config.py": "cf528a4a207eb9eca1b72755f68000aae590329013ab4259ecc0b3fdcaf84c55",
-    "master/control-core.mjs": "f5c5677806e3b2e0f55cd4ebb1281666e6e76db919e6d5808277505ba12b97a8",
+    "master/control-core.mjs": "edc098eadf518cf4701e5b22782fe9f701645c06aecdc3165ce5cded8f9cde68",
     "master/control-domain.mjs": "7380523d52a82c78186ade519e12f81513a83993650c41c2847fcf476538fdee",
     "master/control_recovery.py": "e6fcced39a0c621b6638a81e69b3523c59db61fb3824b528cf6260498aaa6ed1",
     "master/crm.py": "2bd3f2ec44da58b8bb59cd536e9db2800e3039ffdcd502e16bcd48b0e7def854",
@@ -54,8 +54,8 @@
     "master/notify.py": "f3641c40dc787de7c6c5d341944487c52773670642f3f4a220140dd2b6462337",
     "master/setup-control.py": "32853a3d5f63bb3fb0612af26e8ef0c4fead137b4865a205d9e652d52edf2180",
     "master/setup-notifications.sh": "515ffec0437a96d87c41c84a7145280ac5c2f09529567548e6e338d2123e3f7f",
-    "master/telegram-service.mjs": "3a5d14205741d2f3bf1ab8cbe8aec27f5ec753603c8b544dfc76f89bfc8c94e5",
-    "release.json": "35c54a9e51a8018feaaa3b3c2e9d27781469de84b35fd5df61b0986d71f34cf8",
+    "master/telegram-service.mjs": "23a3dd7c37bbf1cedc6921a1672d6667ad6fd9d69660701ca109e584b5a52a33",
+    "release.json": "7719a0dd380d00f80ae56304dd576638a08ff240abd5ace6b7dffe3bd96cdc9a",
     "requirements-notifications.txt": "82cf6b2409b807d61ad73d1f460ab87b7e8def9a7694940ec4e2ba94dcefe2ad",
     "shared/matrix/client.js": "13437baee4d6fcd145b5f3c3b701639de5c94105ce704b2e5689832253ab0128",
     "shared/model/attention.js": "4c5d165affc496b5cfc97f39a4b09a7fd43918f8369d79d0d6aa41294070fc9b",

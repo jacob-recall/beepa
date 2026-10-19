@@ -24,6 +24,7 @@ import { mergeReceipts, paintReceipt, MESSAGE_RECEIPT_TYPE } from '../../shared/
 //
 // NO composer, NO send call, anywhere in this file.
 
+import { PROPOSAL_STATUS, proposalLabel, proposalHistory } from '../../shared/model/proposal-lifecycle.js';
 import { api, configureMatrixBase, setOnUnauthorized, ROOMID_RE, MXC_RE } from '../../shared/matrix/client.js';
 import { $, el, sanitize, sanitizeLine, appendLinkified } from '../../shared/ui/el.js';
 import { S } from '../../shared/state.js';
@@ -33,6 +34,12 @@ import {
 import { parseHidden, dumpHidden, hide, unhide, visibleFeed, visibleContacts, visibleUsers,
   parseNames, dumpNames, rename, displayName, sharingUsers } from './hidden.js';
 import { masterTransport } from './transport.js';
+import { createNotifications } from './notifications.js';
+import { createControl } from './control.js';
+import { createCRMStore } from './crm-store.js';
+import { createCRMView } from './crm-view.js';
+import { createCRMMembers } from './crm-members.js';
+import { createCRMBatches } from './crm-batches.js';
 import { PLATFORM_ICON, PLATFORM_LABEL } from '../../shared/model/source_catalog.js';
 import { messageTimestamp, timestampCorrections, CORRECTION_TYPE } from '../../shared/model/message_timestamps.js';
 // shared/model/attention.js is a zero-import leaf (no shared/ui/* import
@@ -58,6 +65,156 @@ const MASTER_BASE = MASTER_TRANSPORT.csBase;
 // send path nor a proposal. The service verifies the caller is @manager:master
 // before doing anything. CSP connect-src is extended by exactly this origin.
 const ENROLL_BASE = MASTER_TRANSPORT.enrollBase;
+let notifications = null;
+let control = null;
+function getControl() {
+  if (!control) { const token = S.token; control = createControl({base:ENROLL_BASE,token,current:()=>S.token===token,openRoom}); }
+  return control;
+}
+
+// CRM metadata is bound to one signed-in manager session. The existing Matrix
+// transport remains the only CS client; the store never receives user-account
+// credentials or a native conversation send callback.
+let crmView = null;
+let crmStore = null;
+let crmSession = null;
+function getCRMStore() {
+  if (!S.token || !S.userId) throw new Error('Sign in to manage contact lists');
+  if (crmStore && crmSession?.token === S.token && crmSession?.user === S.userId) return crmStore;
+  if (crmStore) crmStore.close();
+  const captured = { token: S.token, user: S.userId };
+  crmSession = captured;
+  const current = () => crmSession === captured && S.token === captured.token && S.userId === captured.user;
+  const check = () => { if (!current()) throw new Error('CRM session changed'); };
+  crmStore = createCRMStore({
+    managerMxid: captured.user,
+    isCurrent: current,
+    // Store checks current() immediately before dispatch and after completion;
+    // api captures the same token synchronously before its first await.
+    api,
+    bootstrap: async () => {
+      check();
+      const response = await fetch(ENROLL_BASE + '/admin/crm-room', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + captured.token },
+        body: JSON.stringify({}),
+      });
+      check();
+      if (response.status === 401) { forgetSession(); throw new Error('Sign in again to manage contact lists'); }
+      if (response.status === 404) throw new Error('Contact lists require the updated master service. Restart the master admin service, then refresh.');
+      const value = await response.json().catch(() => ({}));
+      check();
+      if (!response.ok) throw new Error(sanitize(value?.error || 'Contact lists unavailable (HTTP ' + response.status + ')'));
+      return value;
+    },
+  });
+  return crmStore;
+}
+
+// Lists stay in the existing workspace. Opening a member enters the same
+// viewer/composer as Contacts; no CRM-specific chat renderer or send path.
+function crmBindingContact(binding) {
+  if (!binding || binding.availability !== 'shared') return null;
+  return MS.contacts.find(ct => ct.owner_mxid === binding.owner_mxid && (
+    binding.contact.profile_id ? ct.person_id === binding.contact.profile_id
+      : ct.source === binding.contact.source && ct.network_id === binding.contact.network_id
+  )) || null;
+}
+function crmBindingRooms(binding) {
+  const ct = crmBindingContact(binding);
+  if (!ct) return [];
+  const account = MS.crmCapabilities.get(binding.owner_mxid), localRooms = new Set();
+  const grants = account && MS.rooms[account.proposal_room_id]?.crmDirectResults;
+  const state = crmStore?.snapshot()?.state;
+  for (const member of Object.values(state?.memberships || {})) {
+    const request = member.direct_request;
+    if (!request || request.binding_id !== binding.binding_id || request.owner_mxid !== binding.owner_mxid
+      || request.generation !== account?.generation || request.journal_epoch !== account?.journal_epoch) continue;
+    const result = grants?.get(request.command_id);
+    if (!result || result.generation !== request.generation || result.journal_epoch !== request.journal_epoch) continue;
+    for (const room of result.rooms || []) if (room.state === 'applied' && ROOM_SHAPE_RE.test(room.room_id || '')) localRooms.add(room.room_id);
+  }
+  // Profile stamps and source grant room IDs are exact identity evidence.
+  // Names, handles in room titles and message bodies are never route matching.
+  return MS.feed.filter(room => MS.rooms[room.id]?.createSender === binding.owner_mxid
+    && ((ct.person_id && room.profileId === ct.person_id)
+      || (room.sourceId === binding.contact.source && localRooms.has(room.mirrorOf))));
+}
+function openCRMMessage(item, outcome, target) {
+  const binding = crmStore?.snapshot()?.state?.bindings[item.binding_id];
+  const account = MS.crmCapabilities.get(item.owner_mxid);
+  const reference = outcome.tracking?.[target], delivery = outcome.tracking?.delivery;
+  if (!['delivery', 'response'].includes(target) || !crmBindingContact(binding)
+    || binding.owner_mxid !== item.owner_mxid || account?.generation !== item.generation
+    || !/^\$[^\s]{1,255}$/.test(outcome.sent_event_id || '') || !ROOM_SHAPE_RE.test(outcome.sent_room_id || '')
+    || delivery?.sent_event_id !== outcome.sent_event_id || !/^\$[^\s]{1,255}$/.test(reference?.mirror_event_id || '')
+    || (target === 'response' && !/^\$[^\s]{1,255}$/.test(reference.incoming_event_id || ''))) return;
+  const rec = MS.rooms[reference.mirror_room_id];
+  if (!rec || rec.createSender !== item.owner_mxid || rec.mirrorOf !== outcome.sent_room_id
+    || rec.sourceId !== item.route.source || !MS.feed.some(room => room.id === rec.id)) return;
+  return openRoom(rec.id, { eventId: reference.mirror_event_id });
+}
+function crmBindingStatus(binding) {
+  if (!crmBindingContact(binding)) return 'Contact no longer shared';
+  const account = MS.crmCapabilities.get(binding.owner_mxid);
+  if (!account || account.generation !== binding.generation) return 'Account sync update needed';
+  const rooms = crmBindingRooms(binding);
+  const direct = rooms.filter(room => isDirectRoom(MS.rooms[room.id])).length;
+  if (direct) return direct === rooms.length ? 'Direct conversation' : 'Mixed sharing settings';
+  if (rooms.length) return 'Direct not enabled';
+  const results = MS.rooms[account.proposal_room_id]?.crmDirectResults;
+  const members = Object.values(crmStore?.snapshot()?.state?.memberships || {}).filter(m => !m.removed && m.binding_id === binding.binding_id);
+  const grants = members.map(m => results?.get(m.direct_request?.command_id)).filter(r => r
+    && r.generation === account.generation && r.journal_epoch === account.journal_epoch);
+  if (grants.some(r => r.phase !== 'cancel' && r.state === 'approval_required')) return 'New chat approval required';
+  if (grants.length && grants.every(r => r.phase === 'cancel')) return 'List Direct setup canceled';
+  return 'Direct conversation not confirmed';
+}
+function getCRMView() {
+  if (!crmView) crmView = createCRMView({
+    getStore: getCRMStore,
+    renderMonitoring: (...args) => getControl().renderMonitoring(...args),
+    getMembers: getCRMMembers,
+    getBatches: getCRMBatches,
+    openMessage: openCRMMessage,
+    getContacts: () => MS.contacts.map(ct => ({ ...ct, ownerLabel: nameFor(ct.label), generation: MS.crmCapabilities.get(ct.owner_mxid)?.generation,
+      crmReady: !!ct.contact_version && MS.crmCapabilities.get(ct.owner_mxid)?.direct_cancel === true })),
+    listHost: $('list-body'), detailHost: $('detail-crm'),
+    isVisible: () => MS.activeView === 'lists',
+    showDetail: () => { stopTail(); setDetailMode('crm'); },
+    describeBinding: binding => {
+      const ct = crmBindingContact(binding);
+      return { owner: ct ? nameFor(ct.label) : binding?.owner_mxid || 'Unavailable account',
+        available: !!ct, status: crmBindingStatus(binding) };
+    },
+    openPerson: (person, binding) => {
+      const ct = crmBindingContact(binding);
+      if (!ct) return;
+      const rooms = crmBindingRooms(binding);
+      if (rooms.length === 1) openRoom(rooms[0].id);
+      else selectContact(ct, rooms);
+    },
+  });
+  return crmView;
+}
+
+function getCRMMembers() {
+  const store = getCRMStore(), captured = crmSession;
+  return createCRMMembers({ store, api, managerMxid: captured.user,
+    accountFor: owner => MS.crmCapabilities.get(owner), contacts: () => MS.contacts,
+    isCurrent: () => crmSession === captured && S.token === captured.token && S.userId === captured.user });
+}
+
+function getCRMBatches() {
+  const store = getCRMStore(), captured = crmSession;
+  return createCRMBatches({ store, api, managerMxid: captured.user,
+    accountFor: owner => MS.crmCapabilities.get(owner), contacts: () => MS.contacts,
+    roomFor: (binding, nativeId) => {
+      const rec = MS.feed.find(r => r.mirrorOf === nativeId && MS.rooms[r.id]?.createSender === binding.owner_mxid);
+      return rec ? { sourceId: rec.sourceId, label: rec.title + ' · ' + rec.sourceId, direct: isDirectRoom(MS.rooms[rec.id]) } : null;
+    },
+    isCurrent: () => crmSession === captured && S.token === captured.token && S.userId === captured.user });
+}
 
 // The two custom room-state types the uplink stamps on a teammate's dedicated
 // "Contacts" room (agents/uplink/uplink.py): CONTACTS_MARKER on the room itself
@@ -99,6 +256,7 @@ const MS = {
   feed: [],            // flattened rows across all teammates, recency-sorted
   proposalsByUser: new Map(),  // teammate label -> their proposals room id (write target)
   proposalsRoomSet: new Set(), // every discovered proposals room id (send-guard allowlist)
+  crmCapabilities: new Map(), // exact owner MXID -> capability in its verified proposals room
   contacts: [],        // flattened shared address-book handles across every teammate
   openContact: null,   // the contact whose person-targeted composer is currently open
   activeView: 'recent',
@@ -267,7 +425,7 @@ function freshRoomInfo(rid) {
            lastBody: '', lastTs: 0, mirrorOf: null, isProposals: false,
            profileId: null, profileDisplayName: null, createSender: null,
            isContacts: false, contacts: [], contactsByKey: {}, shareLevelContent: null,
-           readState: null, receipts: new Map(), lastEventId: null, avatarByEvent: null, timestampCorrections: new Map(),
+           readState: null, receipts: new Map(), lastEventId: null, avatarByEvent: null, timestampCorrections: new Map(), crmDirectResults: new Map(),
            uplinkHealth: null, lastLagMs: null };
 }
 
@@ -341,6 +499,22 @@ function applyRoom(info, r) {
     // com.jkali.proposals marks the teammate's dedicated proposal room — the
     // ONLY room this app ever writes into (submitProposal). Never a mirror.
     if (e.type === 'com.jkali.proposals' && e.state_key === '') info.isProposals = true;
+    if (e.type === 'com.jkali.crm.capability' && e.state_key === '' && e.sender === info.createSender) {
+      const c = e.content;
+      info.crmCapability = c && c.schema === 1 && c.owner_mxid === info.createSender
+        && c.ordered_policy === true && c.direct_prepare_commit === true
+        && typeof c.generation === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(c.generation)
+        && typeof c.journal_epoch === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(c.journal_epoch)
+        ? { schema: 1, owner_mxid: c.owner_mxid, generation: c.generation,
+          journal_epoch: c.journal_epoch, ordered_policy: true, direct_prepare_commit: true,
+          direct_cancel: c.direct_cancel === true, batch: c.batch === true, batch_cancel: c.batch_cancel === true } : null;
+    }
+    if (e.type === 'com.jkali.crm.direct_result' && e.sender === info.createSender && typeof e.state_key === 'string' && e.state_key) {
+      const c = e.content;
+      if (c?.schema === 1 && c.command_id === e.state_key && c.owner_mxid === info.createSender
+        && Array.isArray(c.rooms)) info.crmDirectResults.set(e.state_key, c);
+      else info.crmDirectResults.delete(e.state_key);
+    }
     // com.jkali.contacts marks the shared address-book room (read-only here).
     if (e.type === CONTACTS_MARKER && e.state_key === '') info.isContacts = true;
     // One com.jkali.contact STATE event per shared handle (state_key =
@@ -546,6 +720,8 @@ function parseContact(content, label) {
     person_id: (typeof content.person_id === 'string' && content.person_id) ? content.person_id : null,
     person_display: (typeof content.person_display === 'string' && content.person_display)
       ? content.person_display : '',
+    contact_version: typeof content.contact_version === 'string' && /^[0-9]{1,32}$/.test(content.contact_version)
+      ? content.contact_version : null,
   };
 }
 
@@ -598,7 +774,7 @@ function buildByUser(rooms) {
       if (r.isContacts && !r.mirrorOf) {
         for (const cc of r.contacts) {
           const parsed = parseContact(cc, label);
-          if (parsed) allContacts.push(parsed);
+          if (parsed) allContacts.push({ ...parsed, owner_mxid: r.createSender });
         }
         continue;
       }
@@ -628,6 +804,11 @@ function buildByUser(rooms) {
   }
   MS.proposalsByUser = proposalsByUser;
   MS.proposalsRoomSet = proposalsRoomSet;
+  MS.crmCapabilities = new Map();
+  for (const roomId of proposalsByUser.values()) {
+    const room = rooms[roomId];
+    if (room?.crmCapability) MS.crmCapabilities.set(room.createSender, { ...room.crmCapability, proposal_room_id: roomId });
+  }
   MS.healthByUser = healthByUser;
   MS.contacts = allContacts;
   MS.skippedUnverified = skipped;
@@ -702,8 +883,9 @@ async function refreshAll() {
   await loadProposalsIndex();
   for (const convos of MS.byUser.values()) {
     for (const c of convos) {
-      c.drafts = (MS.proposalsByRoom.get(c.mirrorOf) || [])
-        .map(p => ({ eventId: p.eventId, body: p.body, ts: p.ts }));
+      c.drafts = (MS.proposalsByRoom.get(MS.proposalsByUser.get(c.userLabel) + '\0' + c.mirrorOf) || [])
+        .filter(p => !p.direct && !p.status?.decision && (!p.status || p.status.state === 'pending'))
+        .map(p => ({ eventId: p.eventId, body: p.body, ts: p.ts, queued: true }));
     }
   }
   MS.feed = [].concat(...[...MS.byUser.values()]).sort((a, b) => b.lastTs - a.lastTs);
@@ -723,6 +905,7 @@ async function refreshAll() {
   }
   if (MS.activeView === 'recent') renderRecent();
   else if (MS.activeView === 'contacts') renderContacts();
+  else if (MS.activeView === 'lists') crmView?.render();
   else if (MS.activeView === 'teammates') renderTeammatesList();
   else if (typeof MS.activeView === 'string' && MS.activeView.indexOf('teammate:') === 0) {
     const label = MS.activeView.slice('teammate:'.length);
@@ -1220,6 +1403,7 @@ function applyHidden() {
   }
   if (MS.activeView === 'recent') renderRecent();
   else if (MS.activeView === 'contacts') renderContacts();
+  else if (MS.activeView === 'lists') crmView?.render();
   else if (MS.activeView === 'teammates') renderTeammatesList();
   renderListTitle();
   renderTeammateRail();
@@ -1263,7 +1447,7 @@ function renderListTitle() {
     if (search) search.placeholder = 'Search everyone’s shared chats';
     return;
   }
-  if (!inSingleTeammateView()) { host.appendChild(el('span', 'list-title-name', view === 'contacts' ? 'Contacts' : view === 'teammates' ? 'Teammates' : '')); return; }
+  if (!inSingleTeammateView()) { host.appendChild(el('span', 'list-title-name', view === 'lists' ? 'Contact lists' : view === 'contacts' ? 'Contacts' : view === 'teammates' ? 'Teammates' : '')); return; }
   const label = view.slice('teammate:'.length);
   const convos = MS.byUser.get(label) || [];
   host.appendChild(el('span', 'avatar avatar-sm', initials(nameFor(label))));
@@ -1535,10 +1719,10 @@ function renderBubble(ev) {
   }
 }
 
-async function openRoom(roomId) {
+async function openRoom(roomId, { eventId = null } = {}) {
   // Re-validate against the current snapshot every time — never trust a
   // stale/typed id (same discipline as apps/user's openConversation).
-  if (!ROOMID_RE.test(roomId) || !MS.rooms[roomId]) return;
+  if (!ROOMID_RE.test(roomId) || !MS.rooms[roomId] || (eventId !== null && !/^\$[^\s]{1,255}$/.test(eventId))) return;
   stopTail();
   const epoch = roomEpoch;
   const session = S.token;
@@ -1573,6 +1757,7 @@ async function openRoom(roomId) {
   badge.textContent = b.textContent;
   $('room-source-label').textContent = platformLabel(rec.sourceId);
   renderRoomReadLine(rec);
+  notifications?.renderFollow();
   const box = $('room-messages');
   if (box) box.replaceChildren();
   roomStatus('');
@@ -1580,10 +1765,17 @@ async function openRoom(roomId) {
   setDetailMode('room');
 
   try {
-    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId) + '/messages?dir=b&limit=100&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
+    const q = '/_matrix/client/v3/rooms/' + encodeURIComponent(roomId)
+      + (eventId ? '/context/' + encodeURIComponent(eventId) + '?limit=50' : '/messages?dir=b&limit=100')
+      + '&filter=' + encodeURIComponent(JSON.stringify({ types: ['m.room.message'] }));
     const data = await api('GET', q);
     if (!current()) return;                         // includes reopening the same room
-    const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+    if (eventId && (data.event?.event_id !== eventId || data.event?.sender !== rec.createSender
+      || (data.event.room_id !== undefined && data.event.room_id !== roomId))) throw new Error('The referenced message is not available in this conversation.');
+    const chunk = eventId ? [...(Array.isArray(data.events_before) ? data.events_before : []), data.event,
+      ...(Array.isArray(data.events_after) ? data.events_after : [])]
+      .filter(ev => ev.sender === rec.createSender && (ev.room_id === undefined || ev.room_id === roomId))
+      : Array.isArray(data.chunk) ? data.chunk : [];
     // §8.2/§11: sort by com.jkali.origin_ts — backfill can arrive out of
     // chronological order, so timeline/arrival order is not display order.
     const sorted = chunk.slice().sort((a, c2) => mirrorTs(a) - mirrorTs(c2));
@@ -1594,7 +1786,8 @@ async function openRoom(roomId) {
   }
   if (!current()) return;
   renderSuggestionStack();
-  if (box) box.scrollTop = box.scrollHeight;
+  if (eventId) MS.roomRows.get(eventId)?.scrollIntoView({ block: 'center' });
+  else if (box) box.scrollTop = box.scrollHeight;
   startTail(roomId);
 }
 
@@ -1768,7 +1961,7 @@ function roomProposals(events, targetRoom) {
     // F7 manager-timed: the instant this suggestion was asked to go out.
     const sa = e.content.send_at;
     const sendAt = (typeof sa === 'number' && isFinite(sa) && Math.floor(sa) === sa) ? sa : 0;
-    out.push({ body, eventId: e.event_id, ts, sendAt });
+    out.push({ body, eventId: e.event_id, ts, sendAt, direct: e.content['com.jkali.send_mode'] === 'direct' || !!e.content['com.jkali.crm.item'], queued: true });
   }
   return out.sort((a, b) => b.ts - a.ts);
 }
@@ -1788,11 +1981,11 @@ function suggestionStates(proposals, messages, readState, now) {
   const own = msgs.filter(m => m.content && m.content['com.jkali.from_me'] === true);
   const readTs = readState && typeof readState.teammate_read_ts === 'number' ? readState.teammate_read_ts : 0;
   return (Array.isArray(proposals) ? proposals : []).map(p => {
-    let state = 'pending';
+    let state = p.status?.decision || p.status?.state || (p.direct ? 'sending' : 'pending');
     if (own.some(m => m.content['com.jkali.from_proposal'] === p.eventId)) state = 'sent';
     else if (own.some(m => m.content['com.jkali.auto_sent_from_proposal'] === p.eventId)) state = 'auto';
-    else if (msgs.some(m => typeof m.ts === 'number' && m.ts > p.ts)) state = 'retired';
-    else if (readTs >= p.ts && p.ts > 0) state = 'seen';
+    else if (!p.queued && msgs.some(m => typeof m.ts === 'number' && m.ts > p.ts)) state = 'retired';
+    else if (!p.status && !p.direct && readTs >= p.ts && p.ts > 0) state = 'seen';
     return Object.assign({}, p, { state });
   });
 }
@@ -1817,48 +2010,29 @@ function renderSuggestionStack() {
   if (old) old.remove();
   if (!ctx || !ctx.targetRoom || MS.openRoomId !== ctx.mirrorRoomId) return;
   const rec = MS.rooms[ctx.mirrorRoomId];
-  const props = MS.proposalsByRoom.get(ctx.targetRoom) || [];
+  const props = MS.proposalsByRoom.get(ctx.proposalsRoomId + '\0' + ctx.targetRoom) || [];
   if (!props.length) return;
   const msgs = [...MS.roomEvents.values()].map(ev => ({ type: ev.type, ts: mirrorTs(ev), content: ev.content }));
-  const direct = isDirectRoom(rec);
-  let states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse(); // oldest at top
-  // In a Direct room the sent message itself is in the thread (auto_sent
-  // provenance on the bubble), so a 'sent'/'auto' ghost would be a duplicate.
-  if (direct) states = states.filter(s => s.state !== 'auto' && s.state !== 'sent');
-  const who = nameFor(ctx.label || '') || 'teammate';
-  if (!states.length) return;
+  const states = suggestionStates(props, msgs, rec && rec.readState, Date.now()).reverse();
   const wrap = el('div', 'ghosts');
-  const pendingN = states.filter(s => s.state === 'pending' || s.state === 'seen').length;
-  const cap = el('div', 'ghosts-cap');
-  cap.appendChild(el('span', '', direct ? 'Sending as ' + who + ' · ' + (pendingN ? pendingN + ' in flight' : 'nothing in flight')
-    : 'Your suggestions · ' + (pendingN ? pendingN + ' pending' : 'none pending')));
-  wrap.appendChild(cap);
-  for (const s of states.slice(-8)) {
-    const g = el('div', 'ghost ' + s.state);
-    g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
-    const bar = el('div', 'ghost-bar');
-    // Direct rooms: a pending ghost is "in flight" to the teammate's uplink;
-    // one that stays pending past ~2 minutes was refused by a gate (superseded,
-    // cap, suspended…) and is now an ordinary draft for the teammate — say so.
-    const stale = direct && !s.sending && (s.state === 'pending' || s.state === 'seen') && !s.sendAt && (Date.now() - s.ts > 120000);
-    const label = s.sending ? (direct ? 'sending as ' + who + '…' : 'sending…')
-      : stale ? 'not sent automatically — now a draft for ' + who + ' (' + shortTime(s.ts) + ')'
-      : direct && (s.state === 'pending' || s.state === 'seen') ? (s.sendAt ? 'scheduled · sends as ' + who + ' at ' + shortTime(s.sendAt) : 'in flight as ' + who + '…')
-      : { sent: '✓ sent by ' + who + ' · ' + shortTime(s.ts), auto: '⚡ sent as ' + who + ' automatically · ' + shortTime(s.ts),
-          retired: 'retired · the thread moved on', seen: 'seen by ' + who + ' · pending', pending: 'handed off to ' + who + ' · pending' }[s.state];
-    bar.appendChild(el('span', 'ghost-st', label));
-    if (!direct && s.sendAt && (s.state === 'pending' || s.state === 'seen')) {
-      bar.appendChild(el('span', 'ghost-st', '· for ' + shortTime(s.sendAt) + ' (' + who + ' confirms)'));
+  const queued = states.filter(s => !s.direct && !s.status?.decision && ['pending', 'seen'].includes(s.state));
+  const history = states.filter(s => !queued.includes(s));
+  for (const [title, list, className] of [['Queued suggestions', queued, 'proposal-queue'], ['Message history', history, 'proposal-history']]) {
+    if (!list.length) continue;
+    const disclosure = el('details', className);
+    disclosure.open = MS.proposalDisclosure?.[ctx.mirrorRoomId + className] === true;
+    disclosure.addEventListener('toggle', () => { MS.proposalDisclosure ||= {}; MS.proposalDisclosure[ctx.mirrorRoomId + className] = disclosure.open; });
+    disclosure.appendChild(el('summary', '', title + ' · ' + list.length));
+    for (const s of list) {
+      const g = el('div', 'ghost ' + s.state);
+      g.appendChild(el('div', 'ghost-text', sanitize(s.body)));
+      const label = s.direct && ['pending', 'seen', 'sending'].includes(s.state)
+        ? (s.sendAt ? 'Scheduled direct send' : 'Sending through ' + nameFor(ctx.label) + ' · awaiting account confirmation')
+        : s.state === 'sent' && !s.direct ? 'Accepted · sent' : proposalLabel(s);
+      g.appendChild(el('div', 'ghost-bar', label + ' · ' + shortTime(s.ts)));
+      disclosure.appendChild(g);
     }
-    if (s.state === 'pending' || s.state === 'seen') {
-      const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';
-      edit.title = 'Edit in the bar; Enter files a new suggestion';
-      edit.addEventListener('click', (e) => { e.stopPropagation(); const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
-      bar.appendChild(edit);
-      g.addEventListener('dblclick', () => { const input = $('proposal-input'); if (input) { input.value = s.body; input.focus(); } });
-    }
-    g.appendChild(bar);
-    wrap.appendChild(g);
+    wrap.appendChild(disclosure);
   }
   box.appendChild(wrap);
   box.scrollTop = box.scrollHeight;
@@ -1868,15 +2042,18 @@ function renderSuggestionStack() {
 // it by target_room, so rows can show pending drafts and the open room's
 // suggestion stack never needs its own separate /messages read (see openRoom).
 async function loadProposalsIndex() {
-  const byRoom = new Map();
+  const byRoom = new Map(MS.proposalsByRoom);
   for (const [label, prid] of MS.proposalsByUser) {
     if (!ROOMID_RE.test(prid) || !MS.proposalsRoomSet.has(prid)) continue;
     try {
-      const data = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(prid) + '/messages?dir=b&limit=100');
-      const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+      const chunk = await proposalHistory(api, prid);
+      const state = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(prid) + '/state');
+      const owner = MS.rooms[prid]?.createSender;
+      const statuses = new Map((Array.isArray(state) ? state : []).filter(e => e.type === PROPOSAL_STATUS && e.sender === owner && e.content?.schema === 1 && e.content.proposal_event_id === e.state_key).map(e => [e.state_key, e.content]));
+      for (const key of byRoom.keys()) if (key.startsWith(prid + '\0')) byRoom.delete(key);
       const targets = new Set(chunk.map(e => e && e.content && e.content.target_room).filter(t => typeof t === 'string'));
-      for (const t of targets) byRoom.set(t, roomProposals(chunk, t));
-    } catch (e) { /* keep whatever we had for this teammate */ }
+      for (const t of targets) byRoom.set(prid + '\0' + t, roomProposals(chunk, t).map(p => ({ ...p, status: statuses.get(p.eventId) })));
+    } catch (e) { proposalStatus('Suggestion history is unavailable: ' + String(e.message || e), true); }
   }
   MS.proposalsByRoom = byRoom;
 }
@@ -2023,6 +2200,7 @@ async function submitProposal(opts) {
   if (!body) { proposalStatus('Type a suggestion first.', true); return; }
   const content = {
     target_room: target,
+    'com.jkali.send_mode': isDirectRoom(rec) ? 'direct' : 'suggest',
     body,
     created_by: S.userId,
     origin_ts: Date.now(),
@@ -2040,8 +2218,9 @@ async function submitProposal(opts) {
   // it is removed and the text returns to the bar.
   if (input && !(opts && typeof opts.body === 'string')) input.value = '';
   proposalStatus('');
-  const optimistic = { body, eventId: 'txn:' + txn, ts: content.origin_ts, sending: true };
-  MS.proposalsByRoom.set(target, [optimistic, ...(MS.proposalsByRoom.get(target) || [])]);
+  const optimistic = { body, eventId: 'txn:' + txn, ts: content.origin_ts, sending: true, direct: isDirectRoom(rec), queued: true };
+  const proposalKey = proposalsRoom + '\0' + target;
+  MS.proposalsByRoom.set(proposalKey, [optimistic, ...(MS.proposalsByRoom.get(proposalKey) || [])]);
   renderSuggestionStack();
   try {
     // NOTE: event type is the literal 'com.jkali.proposal'. This is the only
@@ -2052,7 +2231,7 @@ async function submitProposal(opts) {
     optimistic.sending = false;
     if (MS.openProposalCtx === ctx) renderSuggestionStack();
   } catch (e) {
-    MS.proposalsByRoom.set(target, (MS.proposalsByRoom.get(target) || []).filter(p => p !== optimistic));
+    MS.proposalsByRoom.set(proposalKey, (MS.proposalsByRoom.get(proposalKey) || []).filter(p => p !== optimistic));
     if (MS.openProposalCtx === ctx) {
       renderSuggestionStack();
       if (input && !input.value) input.value = body;      // give the text back
@@ -2332,7 +2511,7 @@ function contactProposalStatus(text, isError) {
 // Open the person-targeted composer for one handle. The composer's ONLY write
 // is submitProposal({kind:'identifier', ...}) — a com.jkali.proposal, never a
 // send. The identifier shown is the contact's own network_id (inert data).
-function selectContact(ct) {
+function selectContact(ct, verifiedRooms = null) {
   if (!ct) return;
   MS.openContact = ct;
   const name = ct.person_display || ct.display_name || ct.network_id;
@@ -2345,8 +2524,8 @@ function selectContact(ct) {
   const roomsBox = $('contact-rooms');
   if (roomsBox) {
     roomsBox.replaceChildren();
-    const rooms = ct.person_id
-      ? MS.feed.filter(c => c.profileId === ct.person_id && c.userLabel === ct.label) : [];
+    const rooms = verifiedRooms || (ct.person_id
+      ? MS.feed.filter(c => c.profileId === ct.person_id && c.userLabel === ct.label) : []);
     for (const c of rooms) roomsBox.appendChild(buildFeedRow(c));
   }
   const input = $('contact-proposal-input');
@@ -2392,10 +2571,13 @@ function showWorkspace(twoPane) {
   if (ws) ws.classList.toggle('admin-only', !twoPane);
 }
 function setDetailMode(mode) {
+  $('workspace')?.classList.toggle('crm-list-mode', mode === 'crm');
   const pane = $('msgr-convo');
   const room = $('detail-room');
   const admin = $('detail-admin');
   const contact = $('detail-contact');
+  const crm = $('detail-crm');
+  if (crm) crm.classList.toggle('hidden', mode !== 'crm');
   if (room) room.classList.toggle('hidden', mode !== 'room');
   if (admin) admin.classList.toggle('hidden', mode !== 'admin');
   if (contact) contact.classList.toggle('hidden', mode !== 'contact');
@@ -2443,6 +2625,10 @@ function navTo(key) {
     showListSearch(true);
     setDetailMode('empty');
     renderRecent();
+  } else if (key === 'lists') {
+    showWorkspace(true);
+    showListSearch(false);
+    return getCRMView().open();
   } else if (key === 'contacts') {
     showWorkspace(true);
     showListSearch(false);
@@ -2514,8 +2700,15 @@ async function addTeammate() {
 
 // ---- session ----
 function forgetSession() {
+  notifications?.close(); notifications = null; control = null;
+  if (crmView) crmView.close();
+  crmView = null;
+  if (crmStore) crmStore.close();
+  crmStore = null; crmSession = null;
   S.token = null; S.userId = null;
   MS.rooms = {}; MS.byUser = new Map(); MS.feed = [];
+  MS.contacts = []; MS.openContact = null; MS.crmCapabilities = new Map();
+  MS.proposalsByUser = new Map(); MS.proposalsRoomSet = new Set();
   stopTail();
   if (MS.pollTimer) { clearInterval(MS.pollTimer); MS.pollTimer = null; }
   try { sessionStorage.removeItem('master_token'); sessionStorage.removeItem('master_user'); } catch (e) {}
@@ -2564,6 +2757,23 @@ async function enterApp() {
   // Periodic re-snapshot for freshness (no in-place live merge needed for a
   // manager-facing recent/grouped list — a simple poll is enough here).
   MS.pollTimer = setInterval(() => { refreshAll().catch(() => {}); }, 20000);
+  const notificationToken = S.token;
+  if (!notifications) notifications = createNotifications({ base: ENROLL_BASE, token: S.token, userId: S.userId,
+    current: () => S.token === notificationToken, openMessage: openRoom,
+    openContact: async refs => {
+      for (const rule of refs.rules || []) {
+        let result;
+        try { result = await getControl().request({action:'contact_updates',list_id:rule.id,owner:refs.contact.owner}); }
+        catch { continue; }
+        if (!result.updates.some(r => r.binding_id===refs.contact.binding && r.generation===refs.contact.generation)) continue;
+        await navTo('lists');await getCRMView().openList(rule.id);
+        const tasks=$('detail-crm').querySelector('.control-contact-tasks button');if(tasks)tasks.click();
+        return;
+      }
+      throw new Error('This contact task is no longer available in your lists.');
+    },
+    getRoom: () => MS.openRoomId, getVerifiedRooms: () => MS.feed.map(room => room.id) });
+  notifications.start().then(() => notifications?.handleLink()).catch(() => {});
 }
 
 // buildIdentifierProposalContent and latestRoomProposal are exported so a
@@ -2589,9 +2799,20 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   });
   $('in-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-signin').click(); });
   $('signout').addEventListener('click', signOut);
+  const notificationError = error => { $('notification-status').textContent = error.message; };
+  $('nav-telegram')?.addEventListener('click', () => getControl().open());
+  $('nav-notifications')?.addEventListener('click', () => notifications?.open().catch(notificationError));
+  $('notifications-close')?.addEventListener('click', () => $('notifications-dialog').close());
+  $('room-follow')?.addEventListener('click', () => notifications?.toggleFollow().catch(error => roomStatus(error.message)));
+  window.addEventListener('hashchange', () => notifications?.handleLink().catch(notificationError));
 
   $('nav-recent').dataset.navkey = 'recent';
   $('nav-recent').addEventListener('click', () => navTo('recent'));
+  const navLists = $('nav-lists');
+  if (navLists) {
+    navLists.dataset.navkey = 'lists';
+    navLists.addEventListener('click', () => navTo('lists'));
+  }
   const navContacts = $('nav-contacts');
   if (navContacts) {
     navContacts.dataset.navkey = 'contacts';

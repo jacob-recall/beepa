@@ -944,7 +944,8 @@ def scenario_6_revoke_levels():
 # file in that directory (not main.js alone — the console gained invites.js, and
 # a second file must not be able to smuggle in a write path):
 #   * no /send/m.room.message anywhere;
-#   * the only /send/<type> performed is com.jkali.proposal;
+#   * message-shaped writes are proposals; CRM operation writes are confined
+#     to the verified metadata store;
 #   * every non-GET call goes to an ALLOWLISTED endpoint.
 #
 # The endpoint is never a single string literal in this codebase — every
@@ -967,6 +968,21 @@ MASTER_WRITE_ALLOWLIST = {
         r"^/_matrix/client/v3/rooms//send/com\.jkali\.proposal/$",
     ],
     "DELETE": [],
+}
+
+# New CRM authority is file-scoped, never a blanket expansion for all modules.
+MASTER_FILE_WRITE_ALLOWLIST = {
+    "control.js": {"POST": [r"^/admin/control$"]},
+    "notifications.js": {"POST": [r"^/admin/notifications$"]},
+    "notification-sw.js": {"POST": [r"^/admin/notifications/receipt$"]},
+    "main.js": {"POST": [r"^/admin/crm-room$"]},
+    "crm-store.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.operation/crm_$"]},
+    "crm-members.js": {"PUT": [r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.direct_request/crm_direct__$"]},
+    "crm-batches.js": {"PUT": [
+        r"^/_matrix/client/v3/rooms//send/com\.jkali\.proposal/crm_proposal__$",
+        r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.batch_request/crm_batch__submit$",
+        r"^/_matrix/client/v3/rooms//send/com\.jkali\.crm\.batch_request/crm_batch__cancel$",
+    ]},
 }
 
 
@@ -1096,6 +1112,52 @@ def js_write_calls(code):
     return calls
 
 
+def scan_master_import_graph():
+    """Walk relative imports/re-exports, including literal dynamic imports.
+
+    This is a deliberately restricted application module graph, not a general JS
+    parser. A nonliteral dynamic import, external module, or absent local module
+    is refused rather than silently omitted from the send-path inspection.
+    """
+    pending = sorted(glob.glob(os.path.join(REPO, "apps", "master", "*.js")))
+    visited, violations = set(), []
+    forbidden = {"shared/ui/" + name + ".js" for name in
+                 ("render", "rows", "nav", "chat", "search", "sources", "connections")}
+    root = os.path.realpath(REPO)
+    while pending:
+        path = os.path.realpath(pending.pop())
+        if path in visited:
+            continue
+        visited.add(path)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if not path.startswith(root + os.sep) or not os.path.isfile(path):
+            violations.append("unavailable/outside module: " + relative)
+            continue
+        if relative in forbidden or relative.startswith("apps/user/"):
+            violations.append("native-send dependency: " + relative)
+            continue
+        with open(path) as handle:
+            code = strip_js_comments(handle.read())
+        if re.search(r"/send/m\.room\.(?:message|encrypted)", code):
+            violations.append("native-send code: " + relative)
+        patterns = [
+            r"\b(?:import|export)\s+[^;\"']*?\bfrom\s*['\"]([^'\"]+)['\"]",
+            r"(?:^|[;\n])\s*import\s*['\"]([^'\"]+)['\"]",
+            r"\bimport\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        ]
+        imports = [value for pattern in patterns for value in re.findall(pattern, code)]
+        dynamic = list(re.finditer(r"\bimport\s*\(", code))
+        literal_dynamic = re.findall(patterns[2], code)
+        if len(dynamic) != len(literal_dynamic):
+            violations.append("uninspectable dynamic import: " + relative)
+        for value in imports:
+            if not value.startswith(".") or "?" in value or "#" in value:
+                violations.append("uninspectable import: " + relative + " -> " + value)
+                continue
+            pending.append(os.path.join(os.path.dirname(path), value))
+    return sorted(os.path.relpath(path, root).replace(os.sep, "/") for path in visited), violations
+
+
 def scan_apps_master_write_surface():
     """(scanned_filenames, has_msg_send, send_types, violations) for apps/master."""
     files = sorted(glob.glob(os.path.join(REPO, "apps", "master", "*.js")))
@@ -1110,9 +1172,11 @@ def scan_apps_master_write_surface():
             has_msg_send = True
         send_types |= set(re.findall(r"/send/([A-Za-z0-9_.]+)", code))
         for method, joined, expr in js_write_calls(code):
-            allowed = MASTER_WRITE_ALLOWLIST.get(method, [])
+            allowed = MASTER_WRITE_ALLOWLIST.get(method, []) + MASTER_FILE_WRITE_ALLOWLIST.get(name, {}).get(method, [])
             if not any(re.match(p, joined) for p in allowed):
                 violations.append("%s:%s %s" % (name, method, joined or expr.strip()[:60]))
+    _, import_violations = scan_master_import_graph()
+    violations.extend(import_violations)
     return scanned, has_msg_send, send_types, violations
 
 
@@ -1161,11 +1225,11 @@ def scenario_7_read_only():
     # /join, so the check is the precise HARD LIMIT instead of a blanket composer
     # ban: across EVERY .js file in apps/master/ there must be (a) NO
     # /send/m.room.message path anywhere, (b) the ONLY /send/<type> performed is
-    # com.jkali.proposal (into a proposals room), and (c) every non-GET call must
+    # com.jkali.proposal or the file-scoped CRM operation, and (c) every non-GET call must
     # match the write-surface allowlist above. Comments are stripped first (the
     # files document the ABSENCE of an m.room.message path in prose).
     scanned, has_msg_send, send_types, write_violations = scan_apps_master_write_surface()
-    non_proposal_sends = send_types - {"com.jkali.proposal"}
+    non_proposal_sends = send_types - {"com.jkali.proposal", "com.jkali.crm.operation", "com.jkali.crm.direct_request", "com.jkali.crm.batch_request"}
     if not scanned or has_msg_send or non_proposal_sends or write_violations:
         ok = False
     ev.append("apps_master_scanned=%s msg_send=%s send_types=%s write_violations=%s"
@@ -1448,6 +1512,44 @@ def scenario_10_proposal_down():
             ok = False
         ev.append("target_room_ok=%s created_by=%s" % (target_ok, pc.get("created_by")))
 
+        decision_ids = []
+        for n, decision in enumerate(('accepted', 'declined')):
+            proposal_id = master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="")
+                + "/send/com.jkali.proposal/" + uniq("queue"), {**prop_content, "body": marker + str(n), "com.jkali.send_mode": "suggest"})["event_id"]
+            local_proposal = wait_until(lambda: next((p for p in local_events_of_type(e["tuser_tok"], lpr, "com.jkali.proposal")
+                if p.get("content", {}).get("com.jkali.proposal_source_event") == proposal_id), None), timeout=45, desc="queued suggestion")
+            local_id = local_proposal["event_id"]
+            local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(lpr, safe="") + "/state/com.jkali.proposal_decision/" + urllib.parse.quote(local_id, safe=""),
+                {"schema": 1, "proposal_event_id": local_id, "decision": decision, "send_state": "none"})
+            def read_decision():
+                try:
+                    value = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/state/com.jkali.proposal_status/" + urllib.parse.quote(proposal_id, safe=""))
+                    return value if value.get("decision") == decision else None
+                except MxError:
+                    return None
+            assert wait_until(read_decision, timeout=45, desc="exact decision relayed")
+            decision_ids.append(proposal_id)
+        try:
+            master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/state/com.jkali.proposal_status/" + urllib.parse.quote(decision_ids[0], safe=""), {"decision":"declined"})
+            raise AssertionError("Manager forged source decision")
+        except MxError as error:
+            assert error.code == 403
+        # Real filtered pagination can yield empty intermediate pages. Follow
+        # their end tokens; do not drop older suggestions behind state traffic.
+        proposal_events, cursor, seen = [], None, set()
+        for page in range(100):
+            query = {"dir":"b", "limit":1, "filter":json.dumps({"types":["com.jkali.proposal"]})}
+            if cursor: query["from"] = cursor
+            data = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(mpr, safe="") + "/messages?" + urllib.parse.urlencode(query))
+            proposal_events.extend(data["chunk"])
+            cursor = data.get("end")
+            if not cursor: break
+            assert cursor not in seen, "Repeated history cursor"
+            seen.add(cursor)
+        else: raise AssertionError("Incomplete suggestion history")
+        assert len(proposal_events) == 3
+        ev.append("independent_accepted_declined_history=verified manager_forgery=403")
+
         # It landed ONLY in the local proposals room: NOT in the mirror room, and
         # NOT in the real conversation room.
         mirror_props = [m for m in master_messages(master_room)
@@ -1487,10 +1589,10 @@ def scenario_10_proposal_down():
     after_restart = [p for p in local_events_of_type(e["tuser_tok"], lpr2, "com.jkali.proposal")
                      if (p.get("content") or {}).get("body")
                      and "PROPOSAL-" in (p.get("content") or {}).get("body", "")]
-    restart_once = len(after_restart) == 1
+    restart_once = len(after_restart) == 3
     if not restart_once:
         ok = False
-    ev.append("after_restart_count=%d(want 1)" % len(after_restart))
+    ev.append("after_restart_count=%d(want 3)" % len(after_restart))
     ev.append("master_proposals_room=%s local_proposals_room=%s" % (mpr, lpr))
     return ok, "; ".join(ev)
 
@@ -2739,6 +2841,381 @@ def scenario_27_native_imessage_receipts():
         daemon.DB.close()
 
 
+def scenario_28_crm_metadata():
+    """Real manager bootstrap and Matrix authorization on the private CRM log."""
+    from http.server import ThreadingHTTPServer
+    import threading
+    from unittest.mock import patch
+    sys.path.insert(0, REPO)
+    from master import enroll, crm
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), enroll._make_handler())
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    origin = "http://127.0.0.1:%d" % server.server_port
+    evidence = []
+
+    def bootstrap(token):
+        return enroll._request("POST", origin + "/admin/crm-room",
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, data=b"{}")
+
+    def denied(token, method, path, body=None, statuses=(403,)):
+        try:
+            master(token, method, path, body)
+        except MxError as error:
+            assert error.code in statuses, (method, path, error.code)
+            return
+        raise AssertionError("Unauthorized Matrix action accepted: %s %s" % (method, path))
+
+    try:
+        with patch.object(enroll, "_cs_base", return_value=MASTER_HS), patch.object(
+                enroll, "_manager_mxid", return_value=MASTER_MANAGER_USER):
+            # Actual whoami checks against the disposable server; no stubbed auth.
+            status, _ = bootstrap("invalid-fixture-token")
+            assert status == 401, status
+            for token in (MASTER_ALICE_TOKEN, MASTER_BOB_TOKEN):
+                status, _ = bootstrap(token)
+                assert status == 403, status
+            status, raw = bootstrap(MASTER_MANAGER_TOKEN)
+            assert status == 200, (status, raw)
+            first = json.loads(raw)
+            assert first["manager_mxid"] == MASTER_MANAGER_USER
+            assert first["schema_version"] == 1
+            rid = first["room_id"]
+            status, raw = bootstrap(MASTER_MANAGER_TOKEN)
+            assert status == 200 and json.loads(raw) == first, (status, raw)
+            evidence.append("authenticated repeated bootstrap returns one room")
+            client = subprocess.run([os.environ.get("CONSENT_NODE", "node"),
+                os.path.join(HERE, "crm_store_client.js")], input=json.dumps({
+                    "base": MASTER_HS, "enrollBase": origin, "token": MASTER_MANAGER_TOKEN,
+                    "managerMxid": MASTER_MANAGER_USER, "roomId": rid,
+                }), text=True, capture_output=True, timeout=60)
+            assert client.returncode == 0, "CRM store client failed: " + client.stderr
+            result = json.loads(client.stdout)
+            assert result["pass"] is True
+            evidence.append("actual JS store " + result["checks"] + "; pages=" + str(result["historyPages"])
+                            + "; last-page=" + json.dumps(result["finalPage"]))
+
+        roompath = "/_matrix/client/v3/rooms/" + urllib.parse.quote(rid, safe="")
+        state = master(MASTER_MANAGER_TOKEN, "GET", roompath + "/state")
+        crm.verify_room_state(state, MASTER_MANAGER_USER)
+        alias = "#beepa-crm-v1:" + MASTER_MANAGER_USER.split(":", 1)[1]
+        resolved = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/directory/room/"
+                          + urllib.parse.quote(alias, safe=""))
+        assert resolved["room_id"] == rid
+        for token in (MASTER_ALICE_TOKEN, MASTER_BOB_TOKEN):
+            denied(token, "GET", roompath + "/state")
+            denied(token, "GET", roompath + "/messages?dir=b&limit=10")
+            denied(token, "POST", roompath + "/join", {})
+            denied(token, "PUT", roompath + "/send/com.jkali.crm.operation/" + uniq("foreign"),
+                   {"version": 1, "operation_id": "forged", "body": "foreign"})
+        evidence.append("both scoped owners denied state/history/join/typed writes")
+
+        for typ in ("m.room.message", "m.room.encrypted", "com.jkali.unapproved"):
+            denied(MASTER_MANAGER_TOKEN, "PUT", roompath + "/send/" + typ + "/" + uniq("denied"),
+                   {"msgtype": "m.text", "body": "must not send", "algorithm": "fixture"})
+        denied(MASTER_MANAGER_TOKEN, "POST", roompath + "/invite", {"user_id": MASTER_ALICE_USER})
+        payload = {"schema": 1, "op_id": uniq("crm-operation"), "workspace_id": rid,
+                   "type": "list.create", "entity_id": uniq("crm-list"), "base_revision": 0,
+                   "payload": {"name": "Synthetic cross-account list"}}
+        txn = uniq("crmop")
+        sent = master(MASTER_MANAGER_TOKEN, "PUT", roompath + "/send/com.jkali.crm.operation/" + txn, payload)
+        repeated = master(MASTER_MANAGER_TOKEN, "PUT", roompath + "/send/com.jkali.crm.operation/" + txn, payload)
+        assert sent["event_id"] == repeated["event_id"]
+        event = master(MASTER_MANAGER_TOKEN, "GET", roompath + "/event/" + urllib.parse.quote(sent["event_id"], safe=""))
+        assert event["type"] == "com.jkali.crm.operation" and event["content"] == payload
+        assert event["sender"] == MASTER_MANAGER_USER
+        evidence.append("manager typed operation accepted/idempotent; chat/encrypted/unknown/invite denied")
+        # Event reads must also remain inaccessible, even given an exact event ID.
+        denied(MASTER_ALICE_TOKEN, "GET", roompath + "/event/" + urllib.parse.quote(sent["event_id"], safe=""),
+               statuses=(403, 404))
+        return True, "; ".join(evidence)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+def scenario_29_crm_ordered_controls():
+    """Real Synapse policy rooms, command polling, CAS and disconnected privacy.
+
+    Only provider evidence is synthetic: source room IDs are created by this
+    disposable harness and the strict resolver seam returns their pinned proof.
+    All auth, capabilities, events, journal writes and acknowledgments are real.
+    """
+    sys.path.insert(0, os.path.join(REPO, "agents", "uplink"))
+    import uplink as uplink_module
+    import crm_control
+    import crm_batch
+    from crm_resolver_sql import run_fixture
+    from crm_provider_history_sql import run_fixture as run_history_fixture
+    def fixture_sql(sql):
+        # SANDBOX was validated against the marked disposable manifest before
+        # scenario selection; never discover an installed bridge database.
+        return subprocess.run(["docker", "exec", "-i", SANDBOX["project"] + "-local-db-1",
+            "psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-U", "matrix", "-d", "synapse"],
+            input=sql, text=True, capture_output=True, check=True).stdout
+    provider_counts = run_fixture(fixture_sql)
+    history_counts = run_history_fixture(fixture_sql)
+    e = fresh_env("s29")
+    space = create_space(e["tuser_tok"], "iMessage")
+    target = make_convo(e, space, "Synthetic CRM contact")
+    set_override(e["tuser_tok"], e["tuser_id"], target, "private")
+    cfg = uplink_module.Config({
+        "LOCAL_HS_URL": TEST_HS, "LOCAL_USER": e["tuser_id"], "LOCAL_TOKEN": e["tuser_tok"],
+        "MASTER_HS_URL": MASTER_HS, "MASTER_USER": MASTER_ALICE_USER, "MASTER_TOKEN": MASTER_ALICE_TOKEN,
+        "MANAGER_MXID": MASTER_MANAGER_USER, "MASTER_SPACE": MASTER_SPACE_ALICE,
+        "UPLINK_DB": e["db_path"], "UPLINK_CONTACTS_DB": os.path.join(os.path.dirname(e["db_path"]), "synthetic-contacts.db"),
+    })
+    worker = uplink_module.Uplink(cfg)
+    worker._conn_state = False
+    try:
+        worker.crm_local_once()
+        controller = worker._crm_control
+        policy_room = controller._meta("local_room")
+        initial_epoch = controller.epoch
+        cap = local(e["tuser_tok"], "GET", "/_matrix/client/v3/user/" + urllib.parse.quote(e["tuser_id"], safe="") + "/account_data/" + crm_control.LOCAL_CAPABILITY)
+        assert cap["manual"] and not cap["crm"] and cap["policy_room_id"] == policy_room
+        def post_local(command, level, revision):
+            payload = {"schema": 1, "command_id": command, "journal_epoch": controller.epoch,
+                       "room_id": target, "level": level, "expected_revision": revision}
+            local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(policy_room, safe="") +
+                  "/send/" + crm_control.POLICY_REQUEST + "/" + uniq("policy"), payload)
+            worker.crm_local_once()
+            return local(e["tuser_tok"], "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(policy_room, safe="") +
+                         "/state/" + crm_control.POLICY_RESULT + "/" + command)
+        assert post_local("offline-private", "private", 0)["state"] == "applied"
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        worker._conn_state = True
+        worker.crm_local_once()
+        worker.ensure_proposal_rooms()
+        proposal_room = worker.meta_get("master_proposals_room")
+        master(MASTER_MANAGER_TOKEN, "POST", "/_matrix/client/v3/join/" + urllib.parse.quote(proposal_room, safe=""), {})
+        proof = {"room_id": target, "source": "imessage", "native_id": "synthetic-contact", "bridge_epoch": "synthetic-fixture-1"}
+        def resolve(binding, owner_mxid, generation):
+            assert binding == {"contact": {"source": "imessage", "network_id": "synthetic@example.invalid"}, "contact_version": "1"}
+            assert owner_mxid == MASTER_ALICE_USER and generation == controller.generation
+            return {"status": "ready", "rooms": [proof]}
+        controller.resolve_contact = resolve
+        worker.crm_master_once()
+        def direct(command, phase="prepare", ticket=None, drain=True):
+            payload = {"schema": 1, "command_id": command, "phase": phase, "owner_mxid": MASTER_ALICE_USER,
+                "generation": controller.generation, "journal_epoch": controller.epoch, "binding_id": "fixture-binding",
+                "contact": {"source": "imessage", "network_id": "synthetic@example.invalid"}, "contact_version": "1", "membership_operation_id": command}
+            if ticket:
+                payload["ticket_id"] = ticket
+            master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="") +
+                   "/send/" + crm_control.DIRECT_REQUEST + "/" + uniq("direct"), payload)
+            if not drain:
+                return None
+            worker.crm_master_once()
+            return master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="") +
+                          "/state/" + crm_control.DIRECT_RESULT + "/" + command)
+        prepared = direct("race")
+        assert prepared["state"] == "prepared" and get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        assert post_local("new-private", "private", 1)["state"] == "applied"
+        raced = direct("race", "commit", prepared["ticket_id"])
+        assert raced["rooms"][0]["reason"] == "revision-conflict"
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        prepared = direct("fresh-grant")
+        applied = direct("fresh-grant", "commit", prepared["ticket_id"])
+        assert applied["state"] == "applied" and applied["journal_epoch"] == controller.epoch
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "direct"
+        assert post_local("revoke", "private", 3)["state"] == "applied"
+        repeated = direct("fresh-grant", "commit", prepared["ticket_id"])
+        assert repeated["state"] == "applied"
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        canceled_applied = direct("fresh-grant", "cancel")
+        assert canceled_applied["state"] == "applied" and canceled_applied["safe_to_change_membership"]
+        cancel_ticket = direct("cancel-before-write")["ticket_id"]
+        direct("cancel-before-write", "commit", cancel_ticket, drain=False)
+        canceled = direct("cancel-before-write", "cancel")
+        assert canceled["state"] == "canceled" and canceled["safe_to_change_membership"]
+        assert direct("cancel-before-write", "commit", cancel_ticket)["state"] == "canceled"
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        batch_grant = direct("batch-member")
+        assert direct("batch-member", "commit", batch_grant["ticket_id"])["state"] == "applied"
+        controller.batch_enabled = True  # isolated protocol test, production remains gated
+        worker.crm_master_once()
+        worker.reconcile()
+        assert worker.mirror_for(target), "batch requires the real positive D2 mirror gate"
+        parent_id = "isolated-batch"
+        child_id = "child-" + crm_batch.digest([parent_id, MASTER_ALICE_USER, controller.generation])
+        item = {"item_id": "isolated-item", "person_id": "fixture-person", "binding_id": "fixture-binding",
+                "binding_revision": 1, "membership_revision": 1, "membership_operation_id": "batch-member", "contact_version": "1",
+                "owner_mxid": MASTER_ALICE_USER, "generation": controller.generation, "child_id": child_id,
+                "proposal_room_id": proposal_room, "body": "Synthetic CRM reviewed batch message",
+                "route": {"mode": "direct_existing", "source": "imessage", "network_id": "synthetic@example.invalid", "room_id": target, "consent_revision": 5}}
+        batch_payload = {"schema": 1, "phase": "submit", "owner_mxid": MASTER_ALICE_USER, "generation": controller.generation,
+                         "journal_epoch": controller.epoch, "batch_id": parent_id, "child_id": child_id, "workspace_id": "!synthetic-crm:master",
+                         "payload_hash": "a" * 64, "reviewed_at": int(time.time() * 1000), "parent_item_count": 1, "items": [item]}
+        batch_payload["child_hash"] = crm_batch.digest(crm_batch.child_payload(batch_payload))
+        staged = master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+                        + "/send/com.jkali.proposal/" + uniq("batch-stage"), {"body": item["body"], "target_room": target,
+                          crm_batch.ITEM_KEY: controller.batch.annotation(batch_payload, item)})["event_id"]
+        item["proposal_event_id"] = staged
+        staged_event = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="") + "/event/" + urllib.parse.quote(staged, safe=""))
+        worker.forward_proposals(proposal_room, worker.meta_get("local_proposals_room"), [staged_event], cold_start=False, suspended=False)
+        assert not [ev for ev in local_events_of_type(e["tuser_tok"], target, "m.room.message") if ev.get("content", {}).get("body") == item["body"]]
+        def submit_batch(txn):
+            master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+                   + "/send/" + crm_batch.BATCH_REQUEST + "/" + txn, batch_payload)
+            worker.crm_master_once()
+            return master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+                          + "/state/" + crm_batch.BATCH_RESULT + "/" + child_id)
+        batch_result = submit_batch("batch-submit-one")
+        assert batch_result["items"][0]["state"] == "sent", batch_result
+        sent_id = batch_result["items"][0]["sent_event_id"]
+        sent = local(e["tuser_tok"], "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(target, safe="") + "/event/" + urllib.parse.quote(sent_id, safe=""))
+        assert sent["content"]["body"] == item["body"] and sent["sender"] == e["tuser_id"]
+        assert submit_batch("batch-submit-replay")["items"][0]["sent_event_id"] == sent_id
+        assert len([ev for ev in local_events_of_type(e["tuser_tok"], target, "m.room.message") if ev.get("content", {}).get("body") == item["body"]]) == 1
+        # Native evidence is the only injected seam: actual local reply/read
+        # events and their exact mirrored event IDs traverse the real archive.
+        import types
+        incoming = post_msg(e["contact_tok"], target, "Synthetic next incoming response")
+        if isinstance(incoming, dict):
+            incoming = incoming["event_id"]
+        local(e["contact_tok"], "POST", "/_matrix/client/v3/rooms/" + urllib.parse.quote(target, safe="")
+              + "/receipt/m.read/" + urllib.parse.quote(sent_id, safe=""), {})
+        native_snapshot = {"window_complete": True, "has_more": False, "room_id": target,
+            "source": "imessage", "bridge_epoch": "synthetic-native-epoch",
+            "outgoing_parts": {sent_id: ["native-outgoing"]}, "events": [
+                {"native_id": "native-outgoing", "order": "100", "timestamp": 1000, "incoming": False, "event_id": None},
+                {"native_id": "native-incoming", "order": "200", "timestamp": 2000, "incoming": True, "event_id": incoming}]}
+        worker._crm_native_history = types.SimpleNamespace(snapshot=lambda *args, **kwargs: native_snapshot)
+        worker.tail_once()
+        worker.deliver_pending()
+        controller.tracking.update()
+        controller.batch.flush()
+        tracking = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+                          + "/state/" + crm_batch.BATCH_RESULT + "/" + child_id)["items"][0]["tracking"]
+        assert tracking["response"]["state"] == "replied" and tracking["response"]["incoming_event_id"] == incoming, tracking
+        assert tracking["delivery"]["state"] == "read" and tracking["delivery"]["sent_event_id"] == sent_id, tracking
+        assert tracking["response"]["mirror_event_id"] and tracking["delivery"]["mirror_event_id"], tracking
+        master(MASTER_MANAGER_TOKEN, "POST", "/_matrix/client/v3/join/" + urllib.parse.quote(tracking["delivery"]["mirror_room_id"], safe=""), {})
+        for projection in (tracking["response"], tracking["delivery"]):
+            mirrored = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(projection["mirror_room_id"], safe="")
+                              + "/event/" + urllib.parse.quote(projection["mirror_event_id"], safe=""))
+            assert mirrored["type"] == "m.room.message"
+        # A real self-authored control event approves a filed CRM draft. The
+        # browser never sends the conversation message; the existing dispatcher
+        # records the exact approved result once, even on repeated approval.
+        approved_payload = json.loads(json.dumps(batch_payload))
+        approved_payload["batch_id"] = "isolated-approved-batch"
+        approved_child = "child-" + crm_batch.digest([approved_payload["batch_id"], MASTER_ALICE_USER, controller.generation])
+        approved_payload["child_id"] = approved_child
+        approved_payload["reviewed_at"] = int(time.time() * 1000)
+        approved_item = approved_payload["items"][0]
+        approved_item.update(child_id=approved_child, item_id="approved-item", body="Synthetic CRM awaiting approval")
+        approved_item.pop("proposal_event_id", None)
+        approved_payload["child_hash"] = crm_batch.digest(crm_batch.child_payload(approved_payload))
+        approved_item["proposal_event_id"] = master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+            + "/send/com.jkali.proposal/" + uniq("approval-stage"), {"body": approved_item["body"], "target_room": target,
+            crm_batch.ITEM_KEY: controller.batch.annotation(approved_payload, approved_item)})["event_id"]
+        worker.cfg.direct_send_cap = 0
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+               + "/send/" + crm_batch.BATCH_REQUEST + "/" + uniq("approval-submit"), approved_payload)
+        worker.crm_master_once()
+        awaiting = controller.batch.result(approved_child)["items"][0]
+        assert awaiting["state"] == "refused" and awaiting["local_proposal_event_id"], awaiting
+        artifact = local(e["tuser_tok"], "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(meta_get(e["db_path"], "local_proposals_room"), safe="") + "/event/" + urllib.parse.quote(awaiting["local_proposal_event_id"], safe=""))
+        assert artifact["content"]["com.jkali.direct_refused"] is True
+        worker.cfg.direct_send_cap = 20
+        worker.crm_master_once()
+        assert controller.batch.result(approved_child)["items"][0]["state"] == "refused"
+        assert not [ev for ev in local_events_of_type(e["tuser_tok"], target, "m.room.message") if ev.get("content", {}).get("body") == approved_item["body"]]
+        native_snapshot["window_complete"] = False
+        controller.tracking.update()
+        assert controller.batch.result(child_id)["items"][0]["tracking"]["response"]["state"] == "reconciling"
+        controller.batch_enabled = False
+        cancel_payload = {key: value for key, value in batch_payload.items() if key in {"schema", "owner_mxid", "generation", "journal_epoch", "batch_id", "child_id", "child_hash"}}
+        cancel_payload["phase"] = "cancel"
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+               + "/send/" + crm_batch.BATCH_REQUEST + "/" + uniq("disabled-cancel"), cancel_payload)
+        worker.crm_master_once()
+        assert controller.batch.result(child_id)["state"] == "canceled"
+        assert controller.batch.result(child_id)["items"][0]["state"] == "sent"
+        assert post_local("after-batch-private", "private", 5)["state"] == "applied"
+        masked = controller.batch.result(child_id)["items"][0]["tracking"]["response"]
+        assert masked["state"] == "reconciling" and masked["incoming_event_id"] is None, masked
+        hidden_delivery = controller.batch.result(child_id)["items"][0]["tracking"]["delivery"]
+        assert hidden_delivery["mirror_event_id"] is None and hidden_delivery["mirror_room_id"] is None, hidden_delivery
+        # Approved new-chat acceptance later discovers an exact portal and
+        # completes the original list permission, without inventing send IDs.
+        controller.batch_enabled = True
+        discovered = []
+        original_resolve = controller.resolve_contact
+        def resolve_new(binding, owner_mxid, generation):
+            if binding["contact"]["network_id"] == "new-contact@example.invalid":
+                assert owner_mxid == MASTER_ALICE_USER and generation == controller.generation
+                return {"status": "ready" if discovered else "no_existing_conversation", "rooms": list(discovered)}
+            return original_resolve(binding, owner_mxid, generation)
+        controller.resolve_contact = resolve_new
+        member_request = {"schema": 1, "command_id": "new-chat-member", "phase": "prepare", "owner_mxid": MASTER_ALICE_USER,
+            "generation": controller.generation, "journal_epoch": controller.epoch, "binding_id": "new-binding",
+            "contact": {"source": "imessage", "network_id": "new-contact@example.invalid"}, "contact_version": "1", "membership_operation_id": "new-chat-member"}
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+               + "/send/" + crm_control.DIRECT_REQUEST + "/" + uniq("new-member"), member_request)
+        worker.crm_master_once()
+        assert json.loads(controller._command("new-chat-member")["result_json"])["state"] == "approval_required"
+        new_payload = json.loads(json.dumps(batch_payload))
+        new_payload.update(batch_id="isolated-new-chat", reviewed_at=int(time.time() * 1000))
+        new_child = "child-" + crm_batch.digest([new_payload["batch_id"], MASTER_ALICE_USER, controller.generation])
+        new_payload["child_id"] = new_child
+        new_item = new_payload["items"][0]
+        new_item.update(child_id=new_child, item_id="new-chat-item", binding_id="new-binding", membership_operation_id="new-chat-member", body="Synthetic user-approved new conversation",
+                        route={"mode":"request_new_conversation_approval","source":"imessage","network_id":"new-contact@example.invalid","consent_revision":0})
+        new_item.pop("proposal_event_id", None)
+        new_payload["child_hash"] = crm_batch.digest(crm_batch.child_payload(new_payload))
+        new_item["proposal_event_id"] = master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+            + "/send/com.jkali.proposal/" + uniq("new-chat-stage"), {"body":new_item["body"],"target_source":"imessage","target_identifier":"new-contact@example.invalid",
+                crm_batch.ITEM_KEY:controller.batch.annotation(new_payload,new_item)})["event_id"]
+        master(MASTER_MANAGER_TOKEN, "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="")
+               + "/send/" + crm_batch.BATCH_REQUEST + "/" + uniq("new-chat-submit"), new_payload)
+        worker.crm_master_once()
+        new_row = controller.batch.result(new_child)["items"][0]
+        assert new_row["state"] == "waiting_for_approval"
+        management = create_dm(e["tuser_tok"], "Synthetic native management", invite=[e["contact_id"]])
+        join_room(e["contact_tok"], management)
+        local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(management, safe="") + "/state/m.room.power_levels/",
+              {"users":{e["tuser_id"]:100,e["contact_id"]:50},"state_default":50,"events_default":0})
+        worker._crm_contact_reader = types.SimpleNamespace(read_connections=lambda source: {"management_room":management,"bot_mxid":e["contact_id"],"local_owner_mxid":e["tuser_id"]})
+        new_approval = {"schema":1,"child_id":new_child,"item_id":"new-chat-item","local_proposal_event_id":new_row["local_proposal_event_id"],
+                        "journal_epoch":controller.epoch,"decision":"approve","body":new_item["body"]}
+        local(e["tuser_tok"], "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(policy_room, safe="") + "/send/com.jkali.crm.approval_request/" + uniq("new-chat-approve"), new_approval)
+        worker.crm_local_once()
+        new_row = controller.batch.result(new_child)["items"][0]
+        command_id = new_row["native_command_event_id"]
+        assert command_id and new_row["state"] == "outcome_unknown" and new_row["sent_event_id"] is None, new_row
+        local(e["contact_tok"], "PUT", "/_matrix/client/v3/rooms/" + urllib.parse.quote(management, safe="") + "/state/com.jkali.imessage_start_chat/" + urllib.parse.quote(command_id, safe=""),
+              {"schema":1,"command_event_id":command_id,"owner_mxid":e["tuser_id"],"status":"accepted","correlation":"unavailable","native_ids":[],"message_event_ids":[]})
+        controller.batch_enabled = False
+        worker.crm_local_once()
+        assert json.loads(controller._command("new-chat-member")["result_json"])["state"] == "approval_required"
+        new_room = make_convo(e, space, "Synthetic newly discovered CRM contact")
+        discovered.append({"room_id":new_room,"source":"imessage","native_id":"new-contact@example.invalid","bridge_epoch":"synthetic-fixture-new"})
+        worker.crm_local_once()
+        worker.crm_master_once()
+        activated = master(MASTER_MANAGER_TOKEN, "GET", "/_matrix/client/v3/rooms/" + urllib.parse.quote(proposal_room, safe="") + "/state/" + crm_control.DIRECT_RESULT + "/new-chat-member")
+        assert activated["state"] == "applied" and activated["rooms"][0]["room_id"] == new_room, activated
+        assert get_override_raw(e["tuser_tok"],e["tuser_id"],new_room)["state"] == "direct"
+        assert controller.batch.result(new_child)["items"][0]["sent_event_id"] is None
+        worker.crm_local_once(); worker.crm_master_once()
+        assert len(local_events_of_type(e["tuser_tok"],management,"m.room.message")) == 1
+        count = worker.db.execute("SELECT count(*) FROM crm_policy_operations").fetchone()[0]
+        worker.db.close()
+        worker = uplink_module.Uplink(cfg)
+        worker._conn_state = False
+        worker.crm_local_once()
+        assert worker._crm_control.epoch == initial_epoch
+        assert worker.db.execute("SELECT count(*) FROM crm_policy_operations").fetchone()[0] == count
+        assert get_override_raw(e["tuser_tok"], e["tuser_id"], target)["state"] == "private"
+        return True, "real policy/control and staged CRM batch events; offline manual Private; grant CAS/cancel; staged proposals inert; accepted child sends once via unchanged D2, exact sent ID and duplicate replay; exact read/reply projection and mirror navigation, incomplete-window reconciliation, typed self-approval/edit/replay, disabled cancellation, accepted new-chat portal activates original Direct grant without send IDs; restart epochs/fences preserved; PostgreSQL strict provider joins " + json.dumps(provider_counts, sort_keys=True) + "; observed provider history " + json.dumps(history_counts, sort_keys=True)
+    finally:
+        worker.db.close()
+
+
 SCENARIOS = [
     ("1_share_one_conversation", scenario_1_share_one),
     ("2_new_local_message", scenario_2_new_message),
@@ -2767,6 +3244,8 @@ SCENARIOS = [
     ("25_receipt_outage_recovery", scenario_25_receipt_outage_recovery),
     ("26_message_checks", scenario_26_message_checks),
     ("27_native_imessage_receipts", scenario_27_native_imessage_receipts),
+    ("28_crm_metadata", scenario_28_crm_metadata),
+    ("29_crm_ordered_controls", scenario_29_crm_ordered_controls),
 ]
 
 

@@ -1,7 +1,17 @@
 # Applying releases without disconnecting accounts
 
-For the 0.2.1 receipt reliability release, bots updating Elliot's and David's
-installations should follow [the peer rollout instructions](PEER-ROLLOUT-2026-10-12.md).
+For the current 0.3.0 candidate, bots updating Elliot's and David's installations
+should follow [the complete October 18 rollout](PEER-ROLLOUT-2026-10-18.md).
+It covers all changes since the older UI, committed-tree packaging, source CRM
+opt-in, master-only services, verification, and state-version-2 rollback limits.
+The [October 12 receipt guide](PEER-ROLLOUT-2026-10-12.md) remains a reference for
+native receipt semantics and the separately authorized self-test.
+
+The current candidate reads state versions 1 and 2 and writes version 2. A
+0.2.x release that only reads version 1 is not a compatible rollback target.
+For a master with the standalone Telegram worker, follow the explicit worker
+quiescence and runtime-path steps in the October 18 guide before `--apply`;
+the general updater's Compose/launch-agent stop does not cover that worker.
 
 Keep a canonical upstream repository and a `stable` deployment branch. Each
 person's repository should preserve that Git history; deployment values and

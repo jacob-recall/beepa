@@ -24,8 +24,8 @@ const handled = new Set(['$4']);
 assert.equal(attachDrafts(props, handled, feed), 1);
 assert.deepEqual(feed.get('!a:l').drafts.map(d => d.eventId), ['$2', '$1'], 'auto-sent excluded, newest first');
 assert.deepEqual(feed.get('!b:l').drafts, [], 'dismissed removed; stale cleared');
-assert.deepEqual(pendingDrafts(feed.get('!a:l').drafts, 200).map(d => d.eventId), ['$2']);
-assert.deepEqual(retiredDrafts(feed.get('!a:l').drafts, 200, 1000).map(d => d.eventId), ['$1']);
+assert.deepEqual(pendingDrafts(feed.get('!a:l').drafts, 200).map(d => d.eventId), ['$2', '$1']);
+assert.deepEqual(retiredDrafts(feed.get('!a:l').drafts, 200, 1000).map(d => d.eventId), []);
 assert.deepEqual(identifierDrafts(props, handled).map(p => p.eventId), ['$5']);
 
 // F17: a far-future manager origin_ts is clamped to the server stamp

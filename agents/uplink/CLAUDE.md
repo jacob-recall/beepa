@@ -31,7 +31,38 @@ A manager-TIMED proposal for a `direct` room is path 1 deferred: the SAME
 twelve gates on a fresh re-read at `send_at`, with one documented delta
 (D2-3's freshness anchor). It is never path 2.
 
+## Suggestion lifecycle contract (2026-10-13)
+
+New master room intents carry `com.jkali.send_mode: suggest|direct`.
+Suggest remains inert even if the conversation later becomes Direct. Explicit
+Direct and CRM `direct_existing` intents never become approval drafts: a failed
+gate/known refusal produces a non-actionable `com.jkali.direct_refused` record
+and `refused` source status. Every existing Direct gate remains authoritative.
+Older intents without a mode preserve legacy behavior for compatibility. This
+supersedes the older “every failure falls back to a draft” descriptions below
+for explicit Direct and CRM Direct routes.
+
+`proposal_status.py` is a separate retry stage. It joins source-owned decision
+state to the exact persisted `proposal_map`, verifies the original manager event
+in the current master proposals room, and publishes per-event status there as
+the source's scoped account. The manager cannot author that state. It includes
+no message body and grants no send authority. Failed writes leave the cursor
+unchanged; a bounded rotating cursor and payload hash avoid repeated writes.
+The relay also claims ordinary decisions under a SQLite write lock and writes
+a source-owned `com.jkali.proposal_claim` checkpoint before the browser may send.
+The first observed decision event wins, even across tokens. The checkpoint
+restores the claim after local cache loss; conflicting checkpoints fail closed.
+CRM statuses reuse the existing item/approval journal. Decision and transport
+state are separate; `accepted` on a CRM queue is not a user's approval.
+
 ## What lives here
+
+- Account ping diagnostics: `tail_once` discovers the existing native iMessage
+  management room from bot-authored health state. `durable_sync.imessage_health`
+  verifies the full room's creator, marker, health author and local membership
+  before relaying a narrow counts/timestamps/boolean snapshot. No raw native
+  errors or chat identifiers leave the Mac. Absent/failed native health is
+  unknown; never infer native health from successful master delivery alone.
 
 - Original message dates: `shared/message_timestamps.py` preserves native
   `com.jkali.origin_ts` across delivery and media retry. Legacy local corrections
@@ -111,6 +142,78 @@ twelve gates on a fresh re-read at `send_at`, with one documented delta
   endpoint and writes them to a mode-600 shell-sourceable env file
   (`MASTER_HS_URL`/`MASTER_USER`/`MASTER_TOKEN`/`MANAGER_MXID`/
   `MASTER_SPACE`) that `uplink.py` consumes directly.
+
+## CRM source authority and rollout
+
+`crm_policy.py` serializes local manual consent and CRM Direct grants in the
+same durable journal. Unknown remote policy writes remain ordering barriers;
+append-only control-room checkpoints detect missing or restored local state.
+Do not erase those tables or checkpoints to recover a stalled account.
+`crm_control.py` polls the complete self-only policy stream before authorizing
+CRM writes or sharing. Privacy controls work while the organization is offline.
+
+`crm_batch.py` accepts immutable per-account reviewed children referencing real
+manager-authored proposal events. CRM-stamped proposals remain quarantined in
+ordinary proposal pulling. Accepted children use the existing D2 dispatcher;
+`crm_approval.py` claims the teammate's exact approval once and reuses the
+existing own-user scheduled dispatcher. No browser or additional native send
+path may dispatch a CRM item. Consent revision and current authority are checked
+again after the durable send fence. Unknown sends are never retried: only an
+exact server transaction ID can reconcile a missing send acknowledgment.
+
+Set `UPLINK_CRM_BATCH_ENABLED=1` in the account's mode-600 uplink environment
+and restart the daemon to enable submission/dispatch after release validation.
+The default is disabled. Disabling preserves typed cancellation, result
+reconciliation and artifact recovery. `batch_cancel:true` is advertised
+separately from `batch`. Never downgrade to code without CRM quarantine and the
+ordered consent writer after adoption; use the release compatibility fence.
+
+`crm_tracking.py` stores ID-only native order evidence, per-item delivery and
+response projections, and atomic correction records. Delivery uses existing
+exact-target `message_receipts`; it never infers read or delivered from a reply.
+`agents/enrich/crm_native_history.py` reads the configured native iMessage CLI
+and read-only bridge mapping database under the strict current portal proof.
+A latest native window must cover the baseline or overlap retained exact native
+IDs; cursor ties, missing parts and gaps stay reconciling.
+`agents/enrich/crm_provider_history.py` reads bounded bridge database snapshots
+for the other supported providers, under the same current owner/login/portal
+proof. These are explicitly `observed_native` history, not proof of complete
+remote history: pending backfill, unresolved native IDs and ties block new
+links, and later observed backfill can revise links atomically with an audit.
+The response projection carries this coverage distinction to the master UI.
+There is no body matching, Matrix-arrival ordering, or display-time fallback.
+Private/unavailable rooms contribute no new receipt or reply evidence and no
+mirror navigation references. The pinned native create-chat API exposes no
+exact new-send ID: its acceptance-only result cannot acquire receipt checkmarks
+or automatic response attribution. An accepted, self-approved new-chat command
+can later complete its original listed-contact Direct grant when the strict
+resolver identifies one current same-source portal. The no-room membership
+captures the consent journal sequence before approval. Later manual room
+policies, cancellation, changed account/contact proof, or an unjournaled
+explicit override block activation. Activation reuses the journal and publishes
+the normal Direct result so the next reviewed batch can select the existing
+conversation; it never fabricates the first outgoing message's ID.
+
+`conversation_tracking.py` extends ID-only native windows to all currently
+shared mirrors, independently of batch sends. Its separate bounded rotating
+stage cannot send or change consent. It retains native overlap before publishing
+source-owned `com.jkali.conversation_tracking` state; failed master writes do not
+erase the local ordering ledger. Repeat live sharing/destination/generation checks
+after native reads. Missing mappings, gaps, ties, oversized history or changed
+native epochs are reconciling, not proof of no reply. Lists on the master own
+deadlines and watch membership; never copy those rules into this ledger.
+Only fresh `com.jkali.monitoring_scope` read-work hints from the verified manager
+schedule native reads. They contain account-scoped IDs, expire in five minutes
+and are intersected with live shared mirrors. `conversation_tracking:true`
+advertises this capability. The existing narrow source-owned proposal-room
+migration grants PL 50 for this one metadata type, while native message/state
+writes remain PL 100. Never send hints to a source lacking that capability.
+
+Catalog refreshes do not renew permission. A new reviewed batch binds the
+current shared-contact catalog version, while the membership's original Direct
+request and cancellation scope stay immutable. Dispatch resolves that reviewed
+identity/version again after the send checkpoint. Metadata-only refreshes must
+never enqueue another Direct grant or undo a later manual Private setting.
 
 ## Security invariants (do not weaken)
 

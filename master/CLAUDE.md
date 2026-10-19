@@ -1,5 +1,25 @@
 # master/ — the always-on master stack, provisioning, and enrollment
 
+`notification-routing.mjs` is the derived notification decision ledger;
+`notification-routing-adapters.mjs` connects it to browser enqueue/outcome APIs
+and the real Telegram outbox. The service calls the idempotent authenticated
+`control_dispatcher` browser handoff before routing. Its frozen browser positions
+are drained alongside existing Telegram cursors before being retired. Browser
+discovery stays disabled after handoff, including across restarts; delivery and
+reminder reconciliation continue. Do not start competing discovery loops.
+Never infer failure from a missing
+adapter response or replay an unknown attempt. Preserve existing channel IDs,
+retired Telegram outcomes, and source-access/deadline validation at delivery.
+
+Production `ControlDomain` enables incremental discovery. A fresh `/sync` barrier
+invalidates changed room caches; only full `/state` reads supply authorization.
+Initial sync requests a position without room payloads, then normal discovery
+reads roster-authorized rooms. Later sync requests must not filter timeline types
+or room IDs: that could hide state-only permission changes. Sync failures clear
+all cache/token state and fail the refresh. Only explicit 403/404 refusals may be
+cached negatively for <=60 seconds; a room delta invalidates those immediately.
+Do not substitute cached discovery for live send/review validation or history.
+
 The manager's durable, always-on Matrix homeserver: a second, completely
 separate Synapse (compose project `matrix-master`) plus the scripts that
 provision teammate accounts/spaces and issue enrollment credentials.
@@ -179,6 +199,30 @@ require this stack up + provisioned first — see `tests/CLAUDE.md`.
 
 ## How to change this safely
 
+### CRM metadata bootstrap (implementation in progress)
+
+`POST /admin/crm-room` authenticates the configured manager before reading the
+request body and accepts only an empty object. `crm.py` resolves the fixed
+`#beepa-crm-v1:<server>` alias, creates a private non-federating version-11 room
+only when that alias is absent, and verifies creator, schema, membership and
+permissions before returning its ID. A timeout or alias collision re-resolves
+the same alias; a mismatched existing room is refused, never repaired or replaced.
+The caller token is used only against this master homeserver and is not returned.
+
+The manager owns the metadata room. Its normal timeline write is
+`com.jkali.crm.operation`; ordinary messages, encrypted messages, unknown event
+types and invitations are denied by the initial power levels. The manager may
+administer its own room policy, so this is an accidental-use guard, not a claim
+that its own room can never be changed. Native-conversation authority remains
+in the existing per-user proposal and uplink boundaries. This endpoint neither
+starts conversations nor changes Direct permissions. Schema operations and
+client replay live in `shared/model/crm.js` and `apps/master/crm-store.js`.
+
+Unit coverage is `tests/unit/master_crm_room.test.py`; real isolated Synapse
+coverage is scenario `28_crm_metadata`, including restart/replay and concurrent
+edits through the actual JavaScript store. No production provisioning is needed
+to run those tests.
+
 1. Any change to `docker-compose.master.yml` or `setup.sh`'s rendered
    `homeserver.yaml` is security-sensitive (isolation/hardening, per
    PLAN-MASTER-SYNC-IMPL.md P2.1) — keep registration disabled, federation
@@ -195,3 +239,99 @@ require this stack up + provisioned first — see `tests/CLAUDE.md`.
    `tests/integration/harness.py` suite after any change to provisioning
    (account creation, space power levels) since most scenarios depend on
    the exact power-level shape provisioned here.
+
+### Master browser notifications
+
+`notifications.py` provides durable follows, mirror polling, an outbox and delivery
+evidence through manager-only `POST /admin/notifications`. `notify.py` is the API
+CLI. `POST /admin/notifications/receipt` accepts only a one-delivery random
+capability to acknowledge browser display/click; no manager bearer enters a worker.
+The push helper is built by `setup-notifications.sh`; preserve the private
+`notifications.local/` directory and VAPID key. This component reads mirrors only
+and must never acquire native send authority. See
+`docs/specs/2026-10-13-master-notifications.md` for the API and deployment contract.
+
+## Telegram control (2026-10-17)
+
+`control-core.mjs`, `control-domain.mjs` and `telegram-service.mjs` implement the
+paired Telegram manager interface. `setup-control.py` installs its restricted
+loopback Docker worker. Keep `control.local/` private and durable. Canonical list
+operations own monitoring policies; SQLite holds operational delivery state.
+The manager-only `/admin/control` proxy must authenticate before parsing.
+Enrollment mutations stay serialized even though control callbacks require a
+threaded HTTP server. Every native send stays in the existing source dispatcher;
+the worker can only submit typed proposals after an exact operator review.
+See `docs/specs/2026-10-17-telegram-master-control.md` for setup, APIs and tests.
+`lifecycle.py` and `control_recovery.py` back up the exact private control/browser
+files using SQLite snapshots after stopping their writers. Preserve newer local
+operational evidence on restore; quarantine old pending/uncertain work and require
+fresh transport pairing when only a snapshot survives. Refresh manager credentials
+after auth sanitization. Never copy live WAL sidecars or replay a restored queue.
+Worker maintenance must verify both immutable container ID and the selected state
+mount before stopping/starting it. Recovery tests use only marked disposable stacks.
+Waiting and reminders now require source-owned `com.jkali.conversation_tracking`
+with matching account generation and exact mirrored message IDs. Never fall
+back to the latest mirror arrival to claim an unanswered message. Both channels
+recheck per-message deadlines, snooze, answers and policy revisions before
+delivery. Master-seen checkpoints are canonical list metadata, not native reads.
+Health components are independent; do not let monitoring clear Telegram/model
+errors. Pending reviews are revalidated before every outgoing review part and
+during monitoring. Invalid reviews retain an ID/outcome tombstone but lose their
+cached bodies. Previously submitted/uncertain work retains reconciliation data;
+never erase it or retry a send as part of review cleanup.
+Basic access/retention settings are canonical `control.settings` operations.
+Maintenance clears aged cached content while retaining deduplication tombstones
+and immutable uncertain/batch-submission payloads. Never interpret cache pruning
+as permission to retry a native send, nor promise deletion of provider/backups.
+Dialogue context is a bounded in-memory cache, never a second source of access
+or confirmation authority. Revalidate its discovery fingerprint before model
+use, require accepted delivery for remembered exchanges, separate API session
+IDs from Telegram, and discard on disconnect, expiry or model-access disable.
+An ordinary clarification must never make bare yes confirm an unrelated draft.
+Telegram and browser push use the same canonical list/watch schedules and repeat
+settings. Preserve default any-time delivery and no implicit reminders/repeats.
+Recheck independent list eligibility at delivery; a quiet/removed list must not
+suppress another valid list or grant previews/repeats to it. Telegram references
+stay ID-only; optional message previews are re-read before delivery. Browser
+queued records retain list revisions and re-read canonical policy on retries.
+Canonical `presentation` controls activity grouping/digests for both channels.
+Keep per-event jobs as the dedup ledger, atomically claim group members, and never
+retry uncertain in-flight groups after restart. Browser group receipt capabilities
+bind a frozen set of event jobs to one device; they grant no source authority.
+Multi-conversation Telegram quotes require an exact numbered/button choice before
+reading context. Every route is rechecked against current source sharing.
+Domain startup and monitoring must remain independent of Telegram availability.
+Only a verified numeric bot ID may retain a pairing across token rotation. A bot
+change retires transport-only queues/references and requires fresh pairing; keep
+per-bot input/outcome tombstones and never reset native/API deduplication or source
+watermarks. An unbound legacy database cannot silently adopt an existing pairing.
+Ordinary queued model answers need the same revocation protection as reviews:
+refresh and validate their durable source-scope/history hashes before every part,
+retire stale cached text/references without losing outcomes, and defer on transient
+verification failures. Recheck scope across hosted rounds. Mask recognized
+credentials before truncation/hosted processing and dialogue caching; literal
+authorized message replay stays exact and cannot be silently rewritten.
+API commands are durable jobs: acknowledge before execution, bind request IDs to
+exact text/session hashes, and keep processing separate from reply/native delivery.
+Fast authenticated submission/status/queued cancellation must not wait for the
+model/domain queue. Telegram ingestion commits before its poll offset advances and
+does not wait for command execution. One serialized consumer executes work; a
+crashed processing job is unknown and never replayed. Keep request/draft/outcome
+tombstones across bot rotation while erasing completed input text.
+Release the domain execution lease only for a hosted-model wait; reacquire it
+before validating response scope or executing any tool. The command consumer
+remains single. Access/identity changes while suspended invalidate its answer;
+disconnect/re-pair to the same operator must not reuse the old connection epoch.
+Do not let an old bot's suspended input finish a new bot's reused update ID.
+Control database paths must be absolute within an explicit private state directory;
+reject malformed/relative paths before mkdir/chmod/SQLite can affect the workspace.
+Browser single/group pushes claim durable work before the external call. Preserve
+unknown outcomes after timeouts/crashes, bounded retries only for explicit HTTP
+rejections, and late scoped receipt reconciliation. The controller adapter's
+enqueue/outcome calls must never synchronously call back to the waiting controller.
+Adapter enqueue verifies source identity but cannot change list policy or supply
+message text. The central dispatcher takes ownership through its durable handoff marker;
+never restart legacy discovery after that handoff. Contact reminders use typed
+account/binding/generation/episode identities with no fabricated room. Browser
+enqueue never calls the controller back; delivery revalidates current contact
+access, canonical task, source freshness, policy revision and reminder slot.

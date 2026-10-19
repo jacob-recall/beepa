@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 
 from sandbox import Sandbox, load_manifest, REPO
 
@@ -28,11 +30,19 @@ assert Path(data['master_dir']).resolve() == root/'master'
 sys.path.insert(0, str(REPO/'master'))
 from lifecycle import MasterOps
 from test_enroll import enroll, http_json, load_tokens
+import control_recovery_fixture as control_fixture
 
 compose = ['docker', 'compose', '-p', data['project'], '-f', str(root/'compose.json')]
 
 
 class IsolatedOps(MasterOps):
+    def command(self, args, **kwargs):
+        if 'pg_dump' in args or 'dropdb' in args:
+            worker = self.control_worker()
+            assert worker and not worker['running'], 'Control writer remained active during backup/restore'
+            assert (self.master/'control.local/stopped').exists(), 'Control SQLite writer did not close'
+        return super().command(args, **kwargs)
+
     def running_agents(self):
         return []  # Never discover or modify this Mac's installed LaunchAgents.
 
@@ -41,6 +51,7 @@ class IsolatedOps(MasterOps):
 
 
 ops = IsolatedOps(root, compose=compose, database_service='master-db', matrix_service='master',
+                  control_container=data['project']+'-control',
                   agent_installer=lambda *a, **k: (_ for _ in ()).throw(AssertionError('live LaunchAgent operation')))
 ops.env['MASTER_CS_BASE'] = data['master_url']
 config_path = root/'master/synapse/homeserver.yaml'
@@ -65,6 +76,7 @@ status, event = http_json(data['local_url']+'/_matrix/client/v3/rooms/'+room['ro
 assert status == 200
 
 before = load_tokens()
+control_state = control_fixture.install(root, data['project'], compose, before)
 ledger_path = root/'agents/uplink/state.db'
 ledger_path.parent.mkdir(parents=True)
 with sqlite3.connect(ledger_path) as ledger:
@@ -83,6 +95,18 @@ identity = ops.registry.issue('alice', *alice_pair)
 ops.registry.issue('bob', *bob_pair)
 revoked_token = enroll._login(data['master_url'],'alice',enroll.derive_password('teammate','alice'))
 backup = ops.backup(root/'backup-fixture')
+assert ops.control_worker()['running']
+with tarfile.open(backup/'master.tar.gz') as archive:
+    names = archive.getnames()
+    assert {'master/control.local/control.db','master/control.local/config.json',
+            'master/notifications.local/notifications.db','master/notifications.local/vapid.pem'} <= set(names)
+    assert not any(name.endswith(('-wal','-shm','heartbeat.json','stopped')) for name in names)
+# New operational evidence after the snapshot must win over the older archive.
+with sqlite3.connect(control_state/'control.db') as db:
+    db.execute("UPDATE outbox SET state='accepted' WHERE id='notice:0'")
+    db.execute("UPDATE kv SET v=? WHERE k='operator'",(json.dumps({'user':8,'chat':8}),))
+with sqlite3.connect(root/'master/notifications.local/notifications.db') as db:
+    db.execute("UPDATE deliveries SET state='accepted'")
 enroll.exchange(consumed_code)
 assert not ops.maintenance.exists()
 assert json.loads(ops.journal.read_text())['phase'] == 'complete'
@@ -107,6 +131,10 @@ config_path.write_text(json.dumps(config))
 (root/'master/.env').write_text('MASTER_POSTGRES_PASSWORD='+new_password+'\n')
 
 result = ops.restore(backup)
+assert ops.control_worker()['running']
+assert result['control_pairing_preserved'] and result['browser_connections_preserved']
+assert not result['control_setup_required']
+control_fixture.assert_restored(root, load_tokens(), current=True)
 assert result['restored'] and ops.ingress_disabled
 assert result['master_authority_id'] == identity['master_authority_id']
 assert result['master_data_epoch'] != identity['master_data_epoch']
@@ -167,9 +195,25 @@ assert ledger_path.read_bytes() == ledger_before
 assert native_path.read_bytes() == b'fixture native binary never executed'
 assert native_path.stat().st_ino == native_before.st_ino
 
+# Disaster recovery: only the snapshot survived. Remove only synthetic feature
+# state while its unique container is stopped; no installed worker is touched.
+subprocess.run(compose+['stop','control'],check=True,stdout=subprocess.DEVNULL)
+shutil.rmtree(control_state)
+shutil.rmtree(root/'master/notifications.local')
+control_state.mkdir(mode=0o700)
+# The stopped fixture already closed its writer; preserve that test evidence.
+(control_state/'stopped').write_text('closed')
+disaster = ops.restore(backup)
+assert not ops.control_worker()['running'], 'Originally stopped worker was started'
+assert not disaster['control_pairing_preserved'] and not disaster['browser_connections_preserved']
+control_fixture.assert_restored(root, load_tokens(), current=False)
+subprocess.run(compose+['up','-d','control'],check=True,stdout=subprocess.DEVNULL)
+heartbeat = control_fixture.wait_worker(control_state)
+assert heartbeat['operator'] is None and heartbeat['outbox']['notice:0'] == 'canceled'
+
 status, who = http_json(data['local_url']+'/_matrix/client/v3/account/whoami', token=local['access_token'])
 assert status == 200 and who['user_id'] == local['user_id']
 status, retained = http_json(data['local_url']+'/_matrix/client/v3/rooms/'+room['room_id']+'/event/'+event['event_id'],
                            token=local['access_token'])
 assert status == 200 and retained['content']['body'] == 'teammate fixture survives master restore'
-print('Lifecycle PASS: real backup/restore; post-backup token/pairing/code revocation; retained new enrollment/registry; fresh epoch; rotated DB password; archive retirement; preserved account tokens/local event/send ledger/native binary.')
+print('Lifecycle PASS: real backup/restore and snapshot-only recovery; stopped scoped control writer; current evidence retained; stale work quarantined; fresh manager credentials; revoked access retained; preserved local event/send ledger/native binary.')

@@ -32,7 +32,7 @@ AGENTS = {
 RUNTIME_DIRS = (
     'synapse', 'whatsapp', 'meta', 'gmessages', 'linkedin', 'twitter', 'discord',
     '.beepa-update', '.beepa-config', '.beepa-venvs', 'master/synapse',
-    'master/runtime', 'master/.beepa-config', 'imessage/bin', 'imessage/tmp',
+    'master/runtime', 'master/.beepa-config', 'master/notifications.local', 'master/control.local', 'imessage/bin', 'imessage/tmp',
 )
 RUNTIME_FILES = (
     '.env', 'master/.env', 'master/tokens.local', 'master/.provision-state.local',

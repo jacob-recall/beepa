@@ -225,6 +225,32 @@ class UpdateTests(unittest.TestCase):
         with sqlite3.connect(snapshot) as restored:
             self.assertEqual(restored.execute('SELECT value FROM outcomes').fetchone()[0], 'durable')
 
+    def test_notification_backup_keeps_wal_state_and_vapid_identity(self):
+        updater = self.fixture()
+        directory = self.root / 'master/notifications.local'
+        directory.mkdir(parents=True)
+        key = directory / 'vapid.pem'
+        key.write_text('synthetic immutable notification identity')
+        connection = sqlite3.connect(directory / 'notifications.db')
+        self.addCleanup(connection.close)
+        connection.execute('PRAGMA journal_mode=WAL')
+        connection.execute('PRAGMA wal_autocheckpoint=0')
+        connection.execute('CREATE TABLE follows (room TEXT)')
+        connection.execute("INSERT INTO follows VALUES ('!fixture:master')")
+        connection.commit()
+        before = m.inventory(self.root)
+        with patch.object(m.sys, 'platform', 'linux'), patch.object(updater, 'health'):
+            updater.apply()
+        self.assertEqual(m.inventory(self.root), before)
+        self.assertIn('master/notifications.local/vapid.pem', before)
+        journal = json.loads((updater.meta / 'journal.json').read_text())
+        with tarfile.open(Path(journal['backup']) / 'runtime.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('master/notifications.local/vapid.pem').read(), key.read_bytes())
+            snapshot = self.root / 'restored-notifications.db'
+            snapshot.write_bytes(archive.extractfile('master/notifications.local/notifications.db').read())
+        with sqlite3.connect(snapshot) as restored:
+            self.assertEqual(restored.execute('SELECT room FROM follows').fetchone()[0], '!fixture:master')
+
     def test_real_git_fork_fast_forward_keeps_tenant_state_and_refuses_divergence(self):
         canonical = self.root / 'canonical'
         fork = self.root / 'tenant'

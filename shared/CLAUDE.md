@@ -115,6 +115,24 @@ See PLAN-MASTER-SYNC.md §10 and PLAN-MASTER-SYNC-IMPL.md Phase 1/5.
 
 ## Security invariants (do not weaken)
 
+- `model/crm.js` is a send-free, zero-import metadata/attribution leaf. It adds
+  references to existing account contacts, not another address-book store.
+  Call `applyVerifiedCRMOperation()` for authenticated canonical timeline
+  replay: the asynchronous wrapper verifies reviewed-manifest digests and
+  derived account-child IDs before applying the strict reducer. The synchronous
+  reducer alone is not the storage entry point for reviewed batches. Contact
+  versions and generations come from verified source state, never display names
+  or guessed fallback values. Response attribution requires trusted source
+  identity/order/time; incomplete or inconsistent histories stay reconciling.
+  It never infers receipt evidence from a response.
+  Each new membership freezes its original Direct request identity; changing
+  a contact binding later must not rewrite an old grant or cancellation.
+  Reviewed children freeze journal epochs and membership operation IDs.
+  `batch.cancel_requested` preserves the reviewed manifest and stores a separate
+  immutable cancellation intent bound to its payload hash. Cancellation stays
+  valid after contact/list changes and review expiry; it is not an acknowledgment
+  that any source has stopped or that attempted messages were recalled.
+
 - **CSP + Trusted Types** live in each app's `index.html`, not here, but
   every module in `ui/` was written to satisfy `require-trusted-types-for
   'script'` — i.e. it never assigns to `innerHTML`/`outerHTML`/etc. and
@@ -222,3 +240,25 @@ via the running Docker stacks in `docker-compose.yml` / `master/`).
 5. No bundler, no transpilation — every file must stay a valid native ES
    module runnable directly by a browser (`node --check` is a good enough
    syntax smoke test in dev).
+
+## Canonical monitoring policy
+
+CRM `list.monitoring`, `list.watch`, `list.obligation` and `list.seen` own browser and Telegram watch
+settings. They are pure revision-checked metadata operations; neither grants
+Direct permissions. Blank deadlines mean no automatic reminders. Never create
+a separate authoritative list inside a notification adapter.
+Per-message deadlines/resolution are keyed by exact room and event. Master-seen
+checkpoints are bound to owner, generation and native bridge epoch; they never
+write source-user read state or native receipt events.
+`control.settings` owns assistant model permission, sending mode, account scope,
+notification enablement and retention in the same canonical journal. Model tools
+cannot mutate sensitive access settings; only the authenticated settings API can.
+Optional list/watch delivery windows, repeat intervals and activity/reminder
+switches remain canonical metadata. `monitoringAllows` evaluates actual instants
+in an explicit IANA timezone; overnight days refer to the start day. Windows
+defer delivery, never rewrite deadlines. `monitoringReminderSlot` collapses missed
+repeats. Keep Python browser-worker parity covered by monitoring_schedule tests.
+`presentation` and `monitoringDeliveryPlan` select immediate activity, grouped
+conversation updates or list digests. Earliest eligible overlapping policy wins;
+overdue collection windows collapse. Keep cross-language plan parity, and never
+let a later/quiet policy grant previews or repeats to an earlier delivery.

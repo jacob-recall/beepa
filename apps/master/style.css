@@ -68,6 +68,54 @@
 
 .detail-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .detail-panel-head { padding: 12px 16px; font-weight: 600; }
+.crm-panel { overflow-y: auto; padding: 16px; gap: 12px; }
+.crm-list-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; }
+.crm-list-tools input { flex: 1; min-width: 120px; width: 100%; }
+.crm-member-filters { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(130px, 220px) auto; padding: 4px 0; }
+.crm-member-filters input, .crm-member-filters select { min-width: 0; width: 100%; }
+@media (max-width: 760px) {
+  .crm-member-filters { grid-template-columns: minmax(0, 1fr) auto; }
+  .crm-member-filters input { grid-column: 1 / -1; }
+}
+.crm-list-row { display: block; width: 100%; border: 0; border-bottom: 1px solid var(--color-divider); padding: 10px 16px; text-align: left; background: transparent; color: inherit; font: inherit; overflow-wrap: anywhere; }
+.crm-list-row.active { background: var(--color-list-active); }
+.crm-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.crm-heading h2 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }
+.crm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.crm-table th { text-align: left; font-weight: 500; }
+.crm-table th, .crm-table td { padding: 6px; border-bottom: 1px solid var(--color-divider); overflow-wrap: anywhere; }
+.crm-table .crm-person button { background: transparent; text-align: left; padding: 2px 0; border: 0; }
+.crm-locations { margin-top: 3px; font-size: 12px; }
+.crm-locations summary { color: var(--color-muted); cursor: pointer; }
+.crm-location { margin: 8px 0; }
+.crm-locations > button { display: block; }
+.crm-panel > button { align-self: flex-start; }
+.crm-batch-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+.crm-batch-history { flex-basis: 100%; }
+.crm-batch-history button { display: block; margin: 6px 0; }
+.crm-compose-item { border-bottom: 1px solid var(--color-divider); padding: 12px 0; }
+.crm-compose-item h3 { margin: 0; }
+.crm-compose-item textarea { display: block; width: 100%; box-sizing: border-box; min-height: 90px; margin: 10px 0; resize: vertical; }
+.crm-compose-item select { max-width: 100%; }
+.crm-message-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.crm-tracking-line { display: flex; align-items: center; gap: 8px; }
+.crm-picker { border-block: 1px solid var(--color-divider); padding: 12px 0; }
+.crm-picker h3 { margin: 0; }
+.crm-link-person { display: grid; gap: 6px; margin: 12px 0; }
+.crm-link-person select { min-width: 0; max-width: 100%; }
+.crm-contact-choice { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--color-divider); }
+.crm-contact-choice > div { min-width: 0; overflow-wrap: anywhere; }
+.crm-contact-choice button { flex-shrink: 0; }
+.crm-table td:last-child { max-width: 190px; }
+.crm-table td:last-child button { font-size: 11px; padding: 3px 5px; margin: 2px; }
+.crm-management summary { cursor: pointer; color: var(--color-muted); }
+.crm-management button { display: block; }
+.crm-latest { font-size: 12px; }
+.crm-latest > button { background: transparent; border: 0; padding: 0; font-size: 12px; text-align: left; }
+.crm-status:empty { display: none; }
+.crm-footnote { font-size: 12px; }
+.crm-padding { padding: 12px; }
+#workspace.crm-list-mode #list-pane { flex-basis: 280px; max-width: 280px; }
 .admin-scroll { flex: 1; overflow-y: auto; padding: 16px; }
 
 .teammate-hidden { opacity: 0.7; }
@@ -112,6 +160,20 @@
   #msgr-convo { position: absolute; inset: 0; z-index: 5; }
   #msgr-convo.no-selection { display: none; }
   .settings-popover { left: 8px; right: 8px; min-width: 0; }
+  #workspace.crm-list-mode { display: block; overflow-y: auto; }
+  #workspace.crm-list-mode #list-pane { width: 100%; max-width: 100%; border-right: 0; }
+  #workspace.crm-list-mode #list-body { flex: none; max-height: 260px; }
+  #workspace.crm-list-mode #msgr-convo { position: static; display: flex; }
+  #workspace.crm-list-mode .crm-panel { overflow: visible; padding: 12px; }
+  .crm-table thead { display: none; }
+  .crm-table tbody tr { display: grid; grid-template-columns: 28px minmax(0, 1fr); padding: 8px 0; border-bottom: 1px solid var(--color-divider); }
+  .crm-table td { border: 0; padding: 3px; }
+  .crm-table td:not(:first-child) { grid-column: 2; }
+  .crm-table td[data-label]::before { content: attr(data-label) ': '; color: var(--color-muted); }
+}
+@media (pointer: coarse) {
+  .crm-table button, .crm-table summary { min-height: 44px; }
+  .crm-table input[type=checkbox] { min-width: 24px; min-height: 24px; }
 }
 
 /* list-pane title (who you are looking at) + inline rename */
@@ -151,3 +213,84 @@ body.room-direct #room-messages .ghost-bar, body.room-direct #room-messages .gho
 .message-receipt { display: inline-block; margin-left: 6px; color: #8b929c; font-size: 13px; font-weight: 600; letter-spacing: -3px; padding-right: 3px; }
 .message-receipt.read { color: #2799e8; }
 .message-receipt.failed { color: #cf5555; letter-spacing: normal; }
+
+/* Conversation queues reuse the normal timeline; approval is not delivery. */
+.proposal-queue, .proposal-history { margin: 8px 0; border: 1px solid var(--border, #d6d9df); border-radius: 8px; padding: 8px 12px; }
+.proposal-queue > summary, .proposal-history > summary { cursor: pointer; font-weight: 600; font-size: 12px; padding: 4px 0; }
+.proposal-queue > summary { color: #8060c9; }
+.proposal-history .ghost { opacity: 1; }
+.ghost.declined .ghost-bar, .ghost.refused .ghost-bar { color: #b44242; }
+.ghost.accepted .ghost-bar, .ghost.sent .ghost-bar, .ghost.auto .ghost-bar { color: #28734d; }
+
+.proposal-history .ghost { border: 1px solid #d6d9df; background: #f6f7f9; }
+.proposal-history .ghost.accepted, .proposal-history .ghost.sent, .proposal-history .ghost.auto { border-color: #b8d7c4; background: #f1f8f4; }
+.proposal-history .ghost.declined, .proposal-history .ghost.refused { border-color: #e0bdbd; background: #fcf4f4; }
+.proposal-history .ghost-bar { font-weight: 600; }
+
+/* Inline contact discovery shares the list workspace and keeps search focused. */
+.crm-inline-add { border: 1px solid var(--color-divider); border-radius: 9px; padding: 0; background: var(--color-surface); }
+.crm-add-heading, .crm-picker-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; }
+.crm-add-heading h3 { font-size: 14px; }
+.crm-add-heading > span, .crm-picker-toolbar { font-size: 12px; }
+.crm-inline-search { display: flex; gap: 8px; margin: 0 12px; }
+.crm-inline-search input { flex: 1; min-width: 0; width: 100%; }
+.crm-inline-search select { max-width: 180px; min-width: 0; }
+.crm-picker-toolbar .btn { padding: 3px 6px; font-size: 12px; }
+.crm-contact-results { max-height: 330px; overflow-y: auto; border-top: 1px solid var(--color-divider); }
+.crm-inline-add .crm-contact-choice { display: grid; grid-template-columns: minmax(0, 1fr) minmax(140px, .8fr) auto; padding: 8px 12px; gap: 12px; min-height: 52px; font-size: 13px; }
+.crm-choice-person strong { font-weight: 500; }
+.crm-contact-choice .muted { font-size: 11px; }
+.crm-choice-sender select { width: 100%; min-width: 0; font-size: 12px; }
+.crm-choice-added { font-size: 12px; white-space: nowrap; }
+.crm-picker-link, .crm-picker-permissions { padding: 9px 12px; font-size: 12px; border-top: 1px solid var(--color-divider); }
+.crm-picker-link summary, .crm-picker-permissions summary, .crm-rename summary { cursor: pointer; color: var(--color-muted); }
+.crm-picker-link p, .crm-picker-permissions p { margin: 8px 0 0; }
+.crm-picker-empty { padding: 8px 12px; }
+.crm-rename { font-size: 12px; }
+.crm-inline-add [hidden] { display: none !important; }
+@media (max-width: 760px) {
+  .crm-inline-search { flex-wrap: wrap; }
+  .crm-inline-search input { flex-basis: 100%; font-size: 16px; }
+  .crm-inline-search select { flex: 1; max-width: none; }
+  .crm-inline-add .crm-contact-choice { grid-template-columns: minmax(0, 1fr) auto; gap: 5px 8px; }
+  .crm-choice-person { grid-column: 1; }
+  .crm-choice-sender { grid-column: 1; grid-row: 2; }
+  .crm-contact-choice > button, .crm-choice-added { grid-column: 2; grid-row: 1 / span 2; }
+  .crm-inline-add button, .crm-inline-add select { min-height: 44px; }
+}
+#notifications-dialog { width: min(650px, calc(100% - 24px)); max-height: 85vh; overflow-y: auto; border: 1px solid var(--color-divider); border-radius: 12px; background: var(--color-surface); color: var(--color-text); padding: 20px; }
+#notifications-dialog::backdrop { background: #0007; }
+#notifications-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#notifications-dialog h2 { margin: 0; }
+#notification-controls .btn { margin: 4px 6px 4px 0; }
+#notification-controls p, #notification-status { font-size: 13px; }
+.notification-follow { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--color-divider); }
+.notification-follow strong { flex: 1; overflow-wrap: anywhere; }
+.notification-follow label { font-size: 12px; }
+.notification-follow select { max-width: 190px; }
+.notification-entry { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--color-divider); }
+.notification-entry button { white-space: normal; text-align: left; }
+.notification-entry span { font-size: 11px; }
+#room-follow[aria-pressed=true] { color: var(--color-accent); }
+
+.control-dialog { max-width: 540px; width: calc(100% - 40px); border-radius: 16px; padding: 24px; }
+.control-options { display: grid; gap: 12px; padding: 12px 0; }
+.control-options label { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.control-options input[type=number] { width: 140px; }
+.control-options input[type=checkbox] { width: 16px; height: 16px; min-height: 0; padding: 0; margin: 0; flex: 0 0 16px; }
+.control-options select.input { width: min(100%, 360px); }
+.control-hours { margin: 0; padding: 12px 16px; max-width: 640px; border: 1px solid var(--color-divider, #ddd); border-radius: 8px; }
+.control-hours[hidden] { display: none; }
+.control-options [hidden] { display: none; }
+#notifications-dialog [hidden] { display: none; }
+.control-hours .input { width: 24ch; max-width: 100%; box-sizing: border-box; }
+.control-weekdays { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.control-weekdays label { flex-wrap: nowrap; }
+.crm-monitoring { margin: 10px 0; padding: 12px; border: 1px solid var(--border, #ddd); border-radius: 10px; }
+.control-conversation { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border, #ddd); }
+.control-conversation input { width: 190px; }
+.control-dialog .btn { margin: 4px; }
+.control-command-queue { margin-top: 16px; border-top: 1px solid var(--border, #ddd); padding-top: 12px; }
+.control-command-queue textarea { width: 100%; resize: vertical; box-sizing: border-box; }
+.control-command-job { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 0; font-size: 13px; }
+.control-command-job p { flex-basis: 100%; margin: 0; }

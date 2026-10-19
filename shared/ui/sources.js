@@ -261,7 +261,9 @@ async function resolveImsgMgmt() {
 
 // ---- sending commands (C-1: mgmt-room verified before EVERY send) ----
 async function sendCmd(sourceId, text) {
-  if (S.busy) return;
+  if (S.busy) return null;
+  const identity = [S.token, S.userId];
+  const current = () => S.token === identity[0] && S.userId === identity[1];
   const source = SOURCES.find(s => s.id === sourceId);
   if (!source || !source.botMxid) return;
   S.busy = true; setButtonsDisabled(true);
@@ -272,17 +274,21 @@ async function sendCmd(sourceId, text) {
     if (!(await verifyMgmt(source, rt.mgmtRoomId))) {
       throw new Error('Refusing to send: ' + source.label + ' management room failed verification.');
     }
-    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(rt.mgmtRoomId) +
+    if (!current()) return null;
+    const result = await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(rt.mgmtRoomId) +
       '/send/m.room.message/' + encodeURIComponent(txn()), { msgtype: 'm.text', body: text });
+    if (!current()) return null;
     logConsole('you', text, source.id);
     if (sourceId === 'whatsapp' || sourceId === 'gmessages') {
       if (text === 'login qr' || text === 'login phone') setLoginFlow(true);
       if (text === 'cancel') setLoginFlow(false);
     }
+    return result;
   } catch (e) {
-    logConsole('error', String(e.message || e));
+    if (current()) logConsole('error', String(e.message || e));
+    return null;
   } finally {
-    S.busy = false; setButtonsDisabled(false);
+    if (current()) { S.busy = false; setButtonsDisabled(false); }
   }
 }
 function sendStatusRefresh() { return sendCmd('whatsapp', 'list-logins'); }

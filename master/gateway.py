@@ -22,10 +22,13 @@ from urllib.parse import unquote, urlsplit
 
 STATIC_FILES = frozenset({
     'apps/master/index.html', 'apps/master/main.js', 'apps/master/style.css',
+    'apps/master/notifications.js', 'apps/master/control.js', 'apps/master/notification-sw.js',
     'apps/master/invites.js', 'apps/master/hidden.js', 'apps/master/transport.js',
+    'apps/master/crm-store.js', 'apps/master/crm-view.js', 'apps/master/crm-members.js',
+    'apps/master/crm-account.js', 'apps/master/crm-batches.js', 'apps/master/crm-compose.js', 'shared/model/crm.js',
     'shared/matrix/client.js', 'shared/state.js', 'shared/ui/el.js',
     'shared/model/source_catalog.js', 'shared/model/message_preview.js',
-    'shared/model/message_timestamps.js', 'shared/model/message_receipts.js', 'shared/model/attention.js',
+    'shared/model/message_timestamps.js', 'shared/model/message_receipts.js', 'shared/model/attention.js', 'shared/model/proposal-lifecycle.js',
     'shared/style/organic.css', 'shared/style/beepa.css',
     'shared/assets/motherload_master.svg', 'shared/assets/motherload_master.png',
     'shared/assets/logo-whatsapp.png', 'shared/assets/logo-imessage.png',
@@ -36,7 +39,7 @@ STATIC_FILES = frozenset({
 CSP = ("default-src 'self'; connect-src 'self'; img-src 'self' blob:; media-src 'self' blob:; "
        "style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
        "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
-       "frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'")
+       "frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types beepa-notification-worker")
 FORWARD_HEADERS = frozenset({'authorization', 'content-type', 'accept', 'range',
                              'if-none-match', 'if-modified-since', 'if-range', 'origin'})
 RESPONSE_HEADERS = frozenset({'content-type', 'content-length', 'cache-control', 'etag',

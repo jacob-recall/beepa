@@ -605,5 +605,20 @@ check("no log line names a CONVERSATION room id (only its hash)",
 check("no log line contains a message body",
       not any("hello there" in m or "!wa help" in m for m in LOG_LINES))
 
+# Explicit modern modes: Direct failures are terminal outcomes, Suggest is inert.
+for level in ['direct', 'share', 'private']:
+    u = make_uplink(levels={CONV: level}, cap=0)
+    event = prop(); event['content']['com.jkali.send_mode'] = 'direct'
+    fwd(u, [event])
+    check('explicit Direct refuses without draft: ' + level, outcome(u) == 'refused' and only_record(u).get('com.jkali.direct_refused') is True and not u.sends)
+u = make_uplink()
+event = prop(); event['content']['com.jkali.send_mode'] = 'direct'
+fwd(u, [event]); fwd(u, [event])
+check('explicit Direct sends once', len(u.sends) == 1 and outcome(u) == 'sent')
+u = make_uplink()
+event = prop(); event['content']['com.jkali.send_mode'] = 'suggest'
+fwd(u, [event])
+check('explicit Suggest stays a suggestion even in Direct room', not u.sends and outcome(u) == 'fallback')
+
 print("%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

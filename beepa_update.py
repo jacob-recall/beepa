@@ -30,6 +30,8 @@ STATE_PATHS = (
     'element/config.json', 'hub/.local-user.local', '.beepa-config',
     'master/.env', 'master/.beepa-config', 'master/synapse', 'master/tokens.local', 'master/.provision-state.local',
     'master/enrollments.local', 'master/identity', 'master/recovery', 'master/recovery.local.json',
+    'master/notifications.local/notifications.db', 'master/notifications.local/vapid.pem',
+    'master/control.local/control.db', 'master/control.local/config.json', 'master/control.local/enabled',
     'agents/uplink/local.env.local', 'agents/uplink/uplink.env.local',
     'agents/uplink/state.db', 'agents/contacts/contacts.db',
     'imessage/daemon.json', 'imessage/state.db',
@@ -37,7 +39,7 @@ STATE_PATHS = (
 )
 SECRET_PATHS = ('.env', 'master/.env', 'synapse/.hub-secrets.local',
                 'synapse/localhost.signing.key', 'master/synapse/.secrets.local',
-                'master/synapse/master.signing.key', 'hub/.local-user.local',
+                'master/synapse/master.signing.key', 'master/notifications.local/vapid.pem', 'hub/.local-user.local',
                 'agents/uplink/local.env.local', 'agents/uplink/uplink.env.local',
                 'apps/user/session.local.json', 'apps/master/session.local.json')
 
@@ -348,6 +350,9 @@ class Updater:
         if sys.platform == 'darwin' and (release / 'desktop/install_apps.py').exists():
             for role in manifest['roles']:
                 self.command([manifest['python_path'], release / 'desktop/install_apps.py', '--role', 'user' if role == 'teammate' else 'master'])
+
+        if 'master' in manifest['roles'] and runtime_path(self.root, 'master/control.local/config.json').exists():
+            self.command([manifest['python_path'], release / 'master/setup-control.py'])
 
     def health(self, manifest):
         failures = []

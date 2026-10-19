@@ -680,8 +680,54 @@ class DurableSync:
                 counts['errors'][stage] = error[0]
         return counts
 
+    def observe_imessage_health(self, data):
+        # Existing full sync also supplies the last report of a stopped daemon;
+        # discovery must not require it to emit a new heartbeat first.
+        for room, section in (((data or {}).get('rooms') or {}).get('join') or {}).items():
+            events = list((section.get('state') or {}).get('events') or []) + list((section.get('timeline') or {}).get('events') or [])
+            if any(e.get('type') == 'com.jkali.imessage_health' and e.get('state_key') == ''
+                   and e.get('sender') == self.cfg.imessage_bot for e in events):
+                self.meta_set('imessage_health_room', room)
+
+    def imessage_health(self):
+        """Read counts/booleans only from the verified native management room.
+
+        The room is discovered from the existing local sync, never by opening
+        native Messages or creating a room. An unavailable read is unknown.
+        """
+        room = self.meta_get('imessage_health_room')
+        if not room:
+            return None
+        now = time.time()
+        cached = getattr(self, '_imessage_health_cache', None)
+        if cached and cached[0] == room and now - cached[1] < 60:
+            return cached[2]
+        result = None
+        try:
+            state = self.local('GET', '/_matrix/client/v3/rooms/' + q(room) + '/state', timeout=5)
+            def event(kind, key=''):
+                return next((e for e in state if e.get('type') == kind and e.get('state_key') == key), {})
+            bot = self.cfg.imessage_bot
+            create, marker, health = event('m.room.create'), event('com.jkali.bridge.mgmt', 'imessage'), event('com.jkali.imessage_health')
+            if (create.get('sender') == bot and marker.get('sender') == bot
+                    and marker.get('content') == {'bridge': 'imessage', 'role': 'management'}
+                    and health.get('sender') == bot
+                    and event('m.room.member', self.cfg.local_user).get('content', {}).get('membership') == 'join'):
+                source = health.get('content') or {}
+                result = {k: source[k] for k in ('updated_at', 'inbound_pending', 'inbound_refused_components')
+                          if type(source.get(k)) is int and 0 <= source[k] <= 9007199254740991}
+                if type(source.get('poll_ok')) is bool:
+                    result['poll_ok'] = source['poll_ok']
+        except Exception:  # diagnostics cannot interrupt ingestion or delivery
+            pass
+        self._imessage_health_cache = (room, now, result)
+        return result
+
     def publish_health(self):
         health = self.sync_health()
+        native = self.imessage_health()
+        if native is not None:
+            health['imessage'] = native
         health['updated_at'] = int(time.time())
         self.meta_set('sync_health', json.dumps(health))
         self.local('PUT', '/_matrix/client/v3/user/' + q(self.cfg.local_user)
@@ -709,6 +755,14 @@ class DurableSync:
         payload = {k: (int(v) if isinstance(v, float) else v)
                    for k, v in ((k, health.get(k)) for k in self.HEALTH_TO_MASTER_FIELDS) if v is not None}
         payload['stage_errors'] = sorted((health.get('errors') or {}).keys())
+        # Explicit nested allowlist. Never forward native error text, chat IDs,
+        # account identifiers, bodies or arbitrary health extensions.
+        native = health.get('imessage')
+        if isinstance(native, dict):
+            payload['imessage'] = {k: native[k] for k in ('updated_at', 'inbound_pending', 'inbound_refused_components')
+                                   if type(native.get(k)) is int and 0 <= native[k] <= 9007199254740991}
+            if type(native.get('poll_ok')) is bool:
+                payload['imessage']['poll_ok'] = native['poll_ok']
         sig = json.dumps({k: v for k, v in payload.items() if k != 'updated_at'}, sort_keys=True)
         last_sig = self.meta_get('uplink_health_master_sig')
         last_ts = int(self.meta_get('uplink_health_master_ts') or 0)

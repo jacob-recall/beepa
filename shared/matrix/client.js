@@ -43,9 +43,14 @@ function setOnUnauthorized(fn) { onUnauthorized = fn; }
 // ---- API ----
 async function api(method, path, body) {
   const headers = { 'Content-Type': 'application/json' };
-  if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
+  const requestToken = S.token;
+  if (requestToken) headers['Authorization'] = 'Bearer ' + requestToken;
   const res = await fetch(HS + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  if (res.status === 401) { onUnauthorized(); throw new Error('Signed out: session expired.'); }
+  if (res.status === 401) {
+    // A response from a retired session must not sign out a newer account.
+    if (S.token === requestToken) onUnauthorized();
+    throw new Error('Signed out: session expired.');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     // Additive only: the message is unchanged (sanitized, as before); `status`

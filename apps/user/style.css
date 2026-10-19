@@ -231,3 +231,16 @@
 .message-receipt { display: inline-block; margin-left: 6px; color: #8b929c; font-size: 13px; font-weight: 600; letter-spacing: -3px; padding-right: 3px; }
 .message-receipt.read { color: #2799e8; }
 .message-receipt.failed { color: #cf5555; letter-spacing: normal; }
+
+/* Conversation queues reuse the normal timeline; approval is not delivery. */
+.proposal-queue, .proposal-history { margin: 8px 0; border: 1px solid var(--border, #d6d9df); border-radius: 8px; padding: 8px 12px; }
+.proposal-queue > summary, .proposal-history > summary { cursor: pointer; font-weight: 600; font-size: 12px; padding: 4px 0; }
+.proposal-queue > summary { color: #8060c9; }
+.proposal-history .ghost { opacity: 1; }
+.ghost.declined .ghost-bar, .ghost.refused .ghost-bar { color: #b44242; }
+.ghost.accepted .ghost-bar, .ghost.sent .ghost-bar, .ghost.auto .ghost-bar { color: #28734d; }
+
+.proposal-history .ghost { border: 1px solid #d6d9df; background: #f6f7f9; }
+.proposal-history .ghost.accepted, .proposal-history .ghost.sent, .proposal-history .ghost.auto { border-color: #b8d7c4; background: #f1f8f4; }
+.proposal-history .ghost.declined, .proposal-history .ghost.refused { border-color: #e0bdbd; background: #fcf4f4; }
+.proposal-history .ghost-bar { font-weight: 600; }

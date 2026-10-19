@@ -23,12 +23,14 @@ sys.path.insert(0, str(CODE_ROOT))
 from install_config import atomic_write, read_env, read_manifest, install_agent
 try:
     from .recovery import Registry
+    from .control_recovery import FEATURE_FILES, snapshot_features, feature_inventory, restore_features, refresh_manager_credentials
 except ImportError:
     from recovery import Registry
+    from control_recovery import FEATURE_FILES, snapshot_features, feature_inventory, restore_features, refresh_manager_credentials
 
 
 class MasterOps:
-    def __init__(self, root, run=None, compose=None, database_service='postgres', matrix_service='synapse', agent_installer=None):
+    def __init__(self, root, run=None, compose=None, database_service='postgres', matrix_service='synapse', agent_installer=None, control_container='beepa-control'):
         self.install_root = Path(root).resolve()
         self.manifest = read_manifest(self.install_root) or {}
         self.root = (Path(self.manifest['state_root']).expanduser().resolve()
@@ -42,6 +44,8 @@ class MasterOps:
         self.journal = self.master / 'runtime/operation.json'
         self.database_service, self.matrix_service = database_service, matrix_service
         self.agent_installer = agent_installer or install_agent
+        self.control_container = control_container
+        self.docker = shutil.which('docker') or '/Applications/Docker.app/Contents/Resources/bin/docker'
         self.compose = compose or ['docker', 'compose', '-p', self.manifest.get('master_compose_project', 'matrix-master'),
                         '--project-directory', str(self.master), '--env-file', str(self.master/'.env'),
                         '-f', str(self.code_root/'master/docker-compose.master.yml')]
@@ -84,6 +88,7 @@ class MasterOps:
                          'maintenance_existed': False, 'before_epoch': self.registry.manifest()['master_data_epoch']}
                 self.phase(state, 'prepared')
             atomic_write(self.maintenance, 'Master archive rebuild in progress\n')
+            self.stop_control_worker(state)
             self.stop_tailnet_ingress()
             running = {label for _name, label in self.running_agents()}
             for name, label in state['agents']:
@@ -199,6 +204,46 @@ class MasterOps:
                         result.append((name, label))
         return result
 
+    def control_worker(self):
+        if not (self.master/'control.local').exists():
+            return None
+        ids = self.command([self.docker, 'container', 'ls', '-a', '--no-trunc', '--filter',
+                            'name=^/'+self.control_container+'$', '--format', '{{.ID}}'], capture_output=True).stdout.decode().split()
+        if not ids:
+            return None
+        if len(ids) != 1 or not re.fullmatch(r'[a-f0-9]{64}', ids[0]):
+            raise ValueError('Cannot identify the control worker safely')
+        data = json.loads(self.command([self.docker, 'inspect', ids[0]], capture_output=True).stdout)
+        if (len(data) != 1 or data[0].get('Id') != ids[0]
+                or not any(m.get('Type') == 'bind' and m.get('Destination') == '/state'
+                           and Path(m.get('Source', '')).resolve() == (self.master/'control.local').resolve()
+                           for m in data[0].get('Mounts', []))):
+            raise ValueError('Control worker belongs to another master state directory')
+        return {'id': ids[0], 'running': data[0].get('State', {}).get('Running') is True}
+
+    def stop_control_worker(self, state):
+        if 'control_worker' not in state:
+            state['control_worker'] = self.control_worker()
+            self.phase(state, state['phase'])
+        expected = state.get('control_worker')
+        if not expected:
+            return
+        current = self.control_worker()
+        if not current or current['id'] != expected['id']:
+            raise ValueError('Control worker changed during maintenance')
+        if current['running']:
+            self.command([self.docker, 'stop', '--time', '40', current['id']])
+
+    def resume_control_worker(self, state):
+        expected = state.get('control_worker')
+        if not expected or not expected['running']:
+            return
+        current = self.control_worker()
+        if not current or current['id'] != expected['id']:
+            raise ValueError('Control worker changed during maintenance')
+        if not current['running']:
+            self.command([self.docker, 'start', current['id']])
+
     def quiesce(self, operation='backup', source=''):
         state = self.pending_operation()
         if state and (state.get('operation') != operation or state.get('source') != str(source)):
@@ -214,6 +259,7 @@ class MasterOps:
             self.phase(state, 'prepared')
         atomic_write(self.maintenance, 'Master maintenance in progress\n')
         self.phase(state, 'quiescing')
+        self.stop_control_worker(state)
         # An interrupted retry uses the original inventory, but does not bootout
         # agents that have already been stopped.
         running_labels = {label for _name, label in self.running_agents()}
@@ -240,6 +286,7 @@ class MasterOps:
             self.wait_health()
         for name, _label in state['agents']:
             self.agent_installer(self.root, name, code_root=self.code_root)
+        self.resume_control_worker(state)
         if not state.get('maintenance_existed'):
             self.maintenance.unlink(missing_ok=True)
         self.phase(state, 'complete')
@@ -310,7 +357,7 @@ class MasterOps:
                                               '-Fc', 'synapse'], stdout=target)
                 if not (output/'database.dump').stat().st_size:
                     raise ValueError('Empty database backup')
-                with tarfile.open(output/'master.tar.gz', 'w:gz') as archive:
+                with tempfile.TemporaryDirectory(prefix='beepa-control-backup-') as feature_staging, tarfile.open(output/'master.tar.gz', 'w:gz') as archive:
                     for relative in ('master/.env', 'master/synapse', 'master/.beepa-config', 'master/tokens.local',
                                      'master/.provision-state.local', 'master/enrollments.local',
                                      'master/recovery.local.json', '.beepa-install.json',
@@ -321,6 +368,8 @@ class MasterOps:
                             archive.add(path, arcname=relative)
                     if (self.code_root/'release.json').exists():
                         archive.add(self.code_root/'release.json', arcname='release.json')
+                    for path, name in snapshot_features(self.master, feature_staging):
+                        archive.add(path, arcname=name)
                 (output/'master.tar.gz').chmod(0o600)
                 info = dict(identity, format=1, created_at=int(time.time()),
                             checksums={name: digest(output/name) for name in ('database.dump','master.tar.gz')})
@@ -379,6 +428,9 @@ class MasterOps:
             if current and current['master_authority_id'] != info['master_authority_id']:
                 raise ValueError('Master authority changed while entering maintenance')
             current_tokens = read_env(self.master/'tokens.local')
+            if 'retained_feature_state' not in state:
+                state['retained_feature_state'] = feature_inventory(self.master)
+                self.phase(state, 'retained_current_control_state')
             if 'retained_roster' not in state:
                 state['retained_roster'] = current_tokens.get('MASTER_TEAMMATES', '').split()
                 state['retained_endpoints'] = {key: current_tokens[key] for key in ('MASTER_PUBLIC_URL', 'ENROLL_PUBLIC_URL')
@@ -414,6 +466,8 @@ class MasterOps:
                     if not path.is_file() or path.name == 'recovery.local.json':
                         continue
                     relative = path.relative_to(staged/'master')
+                    if relative.parts[0] in FEATURE_FILES:
+                        continue  # Restore operational evidence separately below.
                     if relative == Path('.env') and (self.master/'.env').exists():
                         # Existing Postgres role password belongs to this cluster.
                         continue
@@ -436,6 +490,7 @@ class MasterOps:
                         continue
                     shutil.copyfile(path,destination)
                     destination.chmod(0o600)
+                restore_features(self.master, staged, state['retained_feature_state'])
                 if current is None:
                     recovered = json.loads((staged/'master/recovery.local.json').read_text())
                     # A stale backup cannot prove which pairings were revoked
@@ -483,11 +538,15 @@ class MasterOps:
                     text = re.sub(r'^'+key+r'=.*\n?', '', text, flags=re.M) + key+"='"+value+"'\n"
                 atomic_write(self.master/'tokens.local', text)
             toks = read_env(self.master/'tokens.local')
+            refresh_manager_credentials(self.master, toks)
             atomic_write(self.root/'apps/master/session.local.json',json.dumps({
                 'user_id':toks['MASTER_MANAGER_USER'],'access_token':toks['MASTER_MANAGER_TOKEN']}))
             state['services'] = sorted(set(state['services']) | {self.database_service,self.matrix_service})
             self.resume(state)
             return {'restored':True,'tailnet_ingress':'off; run master/tailscale-serve.sh after local verification',
+                    'control_setup_required': (self.master/'control.local/enabled').exists() and not state.get('control_worker'),
+                    'control_pairing_preserved': state['retained_feature_state'].get('control.local', False),
+                    'browser_connections_preserved': state['retained_feature_state'].get('notifications.local', False),
                     **self.registry.manifest()}
 
     def sanitize_restored_auth(self):
@@ -517,6 +576,8 @@ class MasterOps:
 
 def backup_member_allowed(path):
     name = path.as_posix()
+    if name in {'master/'+directory+'/'+file for directory, files in FEATURE_FILES.items() for file in files}:
+        return True
     return (name in {'master/.env', 'master/tokens.local', 'master/.provision-state.local',
                      'master/enrollments.local', 'master/recovery.local.json', '.beepa-install.json',
                      '.beepa-update/installed.json', 'release.json', 'master/synapse', 'master/.beepa-config'}

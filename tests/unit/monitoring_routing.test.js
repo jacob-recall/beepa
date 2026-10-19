@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import {createCRMState,applyCRMOperation,monitoringRouting} from '../../shared/model/crm.js';
+import {ControlDomain} from '../../master/control-domain.mjs';
+let state=createCRMState({workspace_id:'!crm:test',manager_mxid:'@manager:test'}),sequence=0;
+const operation=(type,payload)=>({schema:1,workspace_id:'!crm:test',op_id:'op'+(++sequence),type,entity_id:'list',base_revision:state.lists.list?.revision||0,payload});
+const apply=(type,payload)=>{const result=applyCRMOperation(state,operation(type,payload));assert(result.outcome.accepted,result.outcome.code);state=result.state;};
+apply('list.create',{name:'Shared list',purpose:'monitoring'});
+const policy={enabled:true,all_messages:false,channels:['browser','telegram'],waiting_them_ms:null,waiting_us_ms:null,preview:false,routing:{primary:'browser',fallback:true}};
+apply('list.monitoring',policy);assert.equal(state.lists.list.monitoring.routing.primary,'browser');
+const watch={room_id:'!room:test',owner_mxid:'@owner:test',enabled:true,due_at:null,snooze_until:null,resolved_event:null,channels:['telegram'],routing:{primary:'telegram',fallback:false}};
+apply('list.watch',watch);apply('list.monitoring',{...policy,channels:['browser'],routing:{primary:'browser',fallback:false}});assert.equal(state.lists.list.watches['!room:test'].routing.primary,'telegram');
+for(const routing of [{primary:'sms',fallback:true},{primary:'browser',fallback:'yes'},{primary:'browser',fallback:true,extra:true}])assert(!applyCRMOperation(state,operation('list.monitoring',{...policy,routing})).outcome.accepted);
+assert(!applyCRMOperation(state,operation('list.watch',{...watch,channels:['browser']})).outcome.accepted);
+assert(!applyCRMOperation(state,operation('list.monitoring',{...policy,channels:['browser']})).outcome.accepted);
+const d=new ControlDomain({api:async()=>{},bootstrap:async()=>{},manager:'@manager:test',roster:async()=>({})});d.store={snapshot:()=>({state})};d.rooms.set('!room:test',{id:'!room:test',owner:'@owner:test'});
+const inherited=d.prepareWatch({list_id:'list',room_id:'!room:test',inherit_monitoring:true});assert(!Object.hasOwn(inherited.payload,'routing'));assert(!Object.hasOwn(inherited.payload,'channels'));assert(applyCRMOperation(state,inherited).outcome.accepted);
+assert.deepEqual(monitoringRouting({...state.lists.list.monitoring,...inherited.payload}),{channels:['browser'],primary:'browser',fallback:false});
+console.log('monitoring routing: canonical list/watch validation, independent overrides, and inheritance passed');

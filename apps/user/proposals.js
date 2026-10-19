@@ -1,9 +1,8 @@
 // Teammate manager-drafts (Triage Rail). There is NO inbox: a room-targeted
 // draft renders as a GHOST in the open conversation's composer (#convo-ghost),
 // and the chat list carries a draft stripe/pill via each feed record's `drafts`.
-// A draft is PENDING only while draftPending(origin_ts, room.lastTs) holds
-// (shared/model/attention.js, fail closed) — any later message from anyone
-// retires it visibly (struck through, Restore). Person-targeted (new-chat)
+// Each suggestion remains queued until its own durable decision. Conversation
+// activity never decides or retires other suggestions. Person-targeted (new-chat)
 // drafts surface as a pseudo-row at the top of the Home list and keep the
 // detail pane + confirm modal + gated start-chat leg.
 
@@ -15,10 +14,16 @@ import { sendCmd, validHandle } from '../../shared/ui/sources.js';
 import { confirmModal } from '../../shared/ui/connections.js';
 import { setDetailMode } from '../../shared/ui/nav.js';
 import { feedRelTime, scheduleFeedRender, setFeedRenderHook } from '../../shared/ui/search.js';
-import { pendingDrafts, retiredDrafts } from '../../shared/model/attention.js';
+import { pendingDrafts } from '../../shared/model/attention.js';
 import { setScheduleRooms, setScheduleChangeHook, ingestScheduleEvents, schedulesForRoom,
-         attachScheduled, cancelSchedule, sendHeldNow, acceptProposalSchedule, initScheduleUI } from './scheduled.js';
+         attachScheduled, setProposalScheduleHook, cancelSchedule, sendHeldNow, acceptProposalSchedule, initScheduleUI } from './scheduled.js';
 import { S, feedModel } from '../../shared/state.js';
+import { createCRMApprovalWriter, parseCRMItem, crmItemStatus } from './crm-approval.js';
+const decideCRM = createCRMApprovalWriter({ api, session: () => ({ token: S.token, userId: S.userId }) });
+
+import { proposalDecision, proposalLabel, proposalHistory } from '../../shared/model/proposal-lifecycle.js';
+import { createProposalDecisions } from './proposal-decisions.js';
+const decideProposal = createProposalDecisions({ api, session: () => ({ token: S.token, userId: S.userId }) });
 
 const HANDLED_KEY = 'com.jkali.proposals_handled';
 let allProposals = [];     // everything parsed (pending + dismissed + non-actionable)
@@ -54,6 +59,9 @@ function unmarkHandled(p) { const s = loadHandled(); s.delete(p.eventId); saveHa
 function parseProposal(e) {
   if (!e || e.type !== 'com.jkali.proposal' || !e.content) return null;
   const c = e.content;
+  const crmTracked = Object.hasOwn(c, 'com.jkali.crm.item');
+  const crm = parseCRMItem(c['com.jkali.crm.item']);
+  const tracking = { ...(crmTracked ? { crmTracked, crm } : {}), direct: c['com.jkali.send_mode'] === 'direct', directRefused: c['com.jkali.direct_refused'] === true };
   const body = c.body;
   if (typeof body !== 'string' || !body.trim()) return null;
   // F17: the manager controls content.origin_ts; a far-future value must never
@@ -76,13 +84,13 @@ function parseProposal(e) {
   const sendAt = (typeof c.send_at === 'number' && isFinite(c.send_at) && Math.floor(c.send_at) === c.send_at) ? c.send_at : 0;
   const room = c.target_room;
   if (typeof room === 'string' && room) {
-    return { kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous, createdBy, sendAt };
+    return { ...tracking, kind: 'room', eventId: e.event_id, targetRoom: room, body, template, ts, autoSent, sentEventId, ambiguous, createdBy, sendAt };
   }
   const identifier = typeof c.target_identifier === 'string' ? c.target_identifier.trim() : '';
   if (identifier && validHandle(identifier)) {
     const source = typeof c.target_source === 'string' ? c.target_source : '';
     const display = (typeof c.target_display === 'string' && c.target_display) ? c.target_display : identifier;
-    return { kind: 'identifier', eventId: e.event_id, targetSource: source, targetIdentifier: identifier, targetDisplay: display, body, template, ts, autoSent, sentEventId, ambiguous };
+    return { ...tracking, kind: 'identifier', eventId: e.event_id, targetSource: source, targetIdentifier: identifier, targetDisplay: display, body, template, ts, autoSent, sentEventId, ambiguous };
   }
   return null;
 }
@@ -98,9 +106,10 @@ function partitionProposals(proposals, handled) {
   const sent = [];
   for (const p of (Array.isArray(proposals) ? proposals : [])) {
     if (!p) continue;
-    if (p.autoSent) { sent.push(p); continue; }
+    if (p.decision?.decision === 'declined' || p.crmState === 'declined') { dismissed.push(p); continue; }
+    if (p.autoSent || p.decision?.decision === 'accepted' || p.direct) { sent.push(p); continue; }
     if (p.ambiguous) { ambiguous.push(p); continue; }
-    (h.has(p.eventId) ? dismissed : pending).push(p);
+    (!p.crmTracked && h.has(p.eventId) ? dismissed : pending).push(p);
   }
   const byTsDesc = (a, b) => b.ts - a.ts;
   return {
@@ -117,15 +126,16 @@ function pendingForRoom(proposals, handled, roomId) {
   let best = null;
   for (const p of proposals) {
     if (!p || p.kind !== 'room' || p.targetRoom !== roomId) continue;
-    if (p.autoSent || p.ambiguous) continue;        // non-actionable, never a pending draft
-    if (handled.has(p.eventId)) continue;
+    if (p.autoSent || p.ambiguous || crmInactive(p)) continue;        // non-actionable, never a pending draft
+    if (!p.crmTracked && handled.has(p.eventId)) continue;
     if (!best || p.ts > best.ts) best = p;
   }
   return best;
 }
 
 function rowGesture(p, gesture) {
-  if (!p) return { action: 'none' };
+  if (!p || crmInactive(p)) return { action: 'none' };
+  if (p.crmTracked && gesture === 'click') return { action: 'detail' };
   if (gesture === 'reject') return { action: 'reject' };
   if (gesture === 'enter' || gesture === 'accept') return { action: 'send' };
   if (gesture === 'click') {
@@ -188,14 +198,27 @@ async function proposalsRooms() {
 async function fetchProposals() {
   const out = [];
   const raw = [];
-  const rooms = await proposalsRooms();
+  const identity = [S.token, S.userId];
+  const check = () => { if (S.token !== identity[0] || S.userId !== identity[1]) throw new Error('Proposal session changed'); };
+  const rooms = await proposalsRooms(); check();
   setScheduleRooms(rooms);          // F7: the same rooms carry the schedule events
   for (const rid of rooms) {
-    const data = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/messages?dir=b&limit=100');
+    const data = { chunk: await proposalHistory(api, rid) }; check();
+    const schedulePage = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/messages?dir=b&limit=100'); check();
+    raw.push(...(schedulePage.chunk || []));
+    const state = await api('GET', '/_matrix/client/v3/rooms/' + encodeURIComponent(rid) + '/state'); check();
     for (const e of (Array.isArray(data.chunk) ? data.chunk : [])) {
       raw.push(e);
       const p = parseProposal(e);
-      if (p) out.push(p);
+      if (p) {
+        p.proposalRoomId = rid;
+        p.decision = proposalDecision(state, p.eventId, S.userId);
+        if (p.crmTracked) {
+          try { applyCRMStatus(p, crmItemStatus(state, p, S.userId)); }
+          catch { p.crmState = 'unverified'; }
+        }
+        out.push(p);
+      }
     }
   }
   ingestScheduleEvents(raw);        // classification is from event content only
@@ -226,18 +249,80 @@ function historyList() { return partitionProposals(allProposals, loadHandled()).
 // outcome the uplink could not confirm (D2.9).
 function ambiguousList() { return partitionProposals(allProposals, loadHandled()).ambiguous; }
 
+function crmInactive(p) { return p?.direct || !!p?.decision || p?.crmTracked && !!p.crmState && p.crmState !== 'waiting_for_approval'; }
+function applyCRMStatus(p, result) {
+  if (!result) return;
+  p.crmApproval = result.approval; p.crmState = result.state; p.crmNativeStatus = result.native_status || null;
+  if (result.state === 'sent' && typeof result.sent_event_id === 'string' && result.sent_event_id.startsWith('$')) {
+    p.autoSent = true; p.sentEventId = result.sent_event_id;
+  }
+}
+function crmStatusText(p) {
+  if (p.crmApproval) return proposalLabel({ state: p.crmState, approval: p.crmApproval });
+  if (p.decision) return proposalLabel(p.decision);
+  if (p.direct) return proposalLabel({ state: p.directRefused ? 'refused' : p.autoSent ? 'sent' : 'ambiguous' });
+  if (p.crmState === 'outcome_unknown' && p.crmNativeStatus === 'accepted') return 'New chat request accepted. Message delivery and read confirmation are unavailable.';
+  return ({ approval_pending: 'Approval recorded. The sync service is checking this message.',
+    declined: 'You declined this message.', sent: 'Sent by your account.', refused: 'This approval could not be sent. Review the conversation before composing a new message.',
+    canceled: 'This outreach was canceled.', outcome_unknown: 'The send is not confirmed. Do not resend until its outcome is checked.',
+    engine_accepted: 'New chat request accepted. Message delivery and read confirmation are unavailable.',
+    unverified: 'This message’s current CRM status could not be verified.' })[p.crmState] || 'Waiting for the account’s sync service.';
+}
+async function submitCRMDecision(p, decision, text, err = null, button = null) {
+  const identity = [S.token, S.userId], current = () => identity[0] === S.token && identity[1] === S.userId;
+  if (button?.disabled) return false;
+  if (decision === 'approve' && p.kind === 'identifier') {
+    if (p.targetSource !== 'imessage') {
+      const message = 'Starting a new CRM conversation is currently supported for iMessage only.';
+      if (err) setDetailError(err, message); else convoSetStatus(message);
+      return false;
+    }
+    const confirmed = await confirmModal('Start a NEW iMessage chat?', 'To: ' + p.targetIdentifier + '\n\nMessage:\n' + text, false);
+    if (!confirmed || !current()) return false;
+  }
+  if (button) button.disabled = true;
+  try {
+    const result = await decideCRM(p, decision, text);
+    if (!current()) return false;
+    applyCRMStatus(p, result);
+    const original = allProposals.find(value => value.eventId === p.eventId && value.proposalRoomId === p.proposalRoomId);
+    if (original && original !== p) applyCRMStatus(original, result);
+    const message = crmStatusText(p);
+    if (err) setDetailError(err, message); else convoSetStatus(message);
+    afterHandled();
+    return true;
+  } catch (error) {
+    if (current()) { if (err) setDetailError(err, error.message); else convoSetStatus(error.message); }
+    return false;
+  } finally { if (button && current()) button.disabled = crmInactive(p); }
+}
+
 // ---- send paths (UNCHANGED guards) -------------------------------------------
+async function decideOne(p, decision, text, button = null, err = null) {
+  if (p.crmTracked) return submitCRMDecision(p, decision === 'accepted' ? 'approve' : 'decline', text, err, button);
+  const identity = [S.token, S.userId], current = () => S.token === identity[0] && S.userId === identity[1];
+  const repaint = () => {
+    if (!current()) return;
+    const live = allProposals.find(x => x.eventId === p.eventId && x.proposalRoomId === p.proposalRoomId);
+    if (live && p.decision) live.decision = p.decision;
+    afterHandled();
+  };
+  if (button?.disabled) return false;
+  if (button) button.disabled = true;
+  try {
+    await decideProposal(p, decision, () => sendConvoMessage(p.targetRoom, text, { fromProposal: p.eventId }));
+    repaint(); return true;
+  } catch (error) {
+    if (current()) { if (err) setDetailError(err, error.message); else convoSetStatus(error.message); }
+    repaint(); return false;
+  } finally { if (button && current()) button.disabled = !!p.decision; }
+}
+
 async function sendProposal(p, body, err, btn) {
-  setDetailError(err, '');
-  const text = (body || '').trim();
+  const text = sanitize(body || '').trim();
   if (!text) { setDetailError(err, 'Type a message before sending.'); return; }
-  if (p.kind === 'identifier') { await sendIdentifierProposal(p, text, err, btn); return; }
-  if (btn) btn.disabled = true;
-  await openConvo(p.targetRoom);
-  const ok = await sendConvoMessage(p.targetRoom, text);
-  if (btn) btn.disabled = false;
-  if (ok) { markHandled(p); setDetailMode('empty'); afterHandled(); return; }
-  setDetailError(err, 'Could not send — conversation unavailable.');
+  if (p.kind === 'identifier' && !p.crmTracked) { await sendIdentifierProposal(p, text, err, btn); return; }
+  await decideOne(p, 'accepted', text, btn, err);
 }
 // Person-targeted send leg — approving a draft aimed at a contact identifier with
 // no existing conversation starts a NEW iMessage chat through the gated start-chat
@@ -256,26 +341,28 @@ async function sendIdentifierProposal(p, text, err, btn) {
   const confirmed = await confirmModal('Start a NEW iMessage chat?', 'To: ' + handle + '\n\nMessage:\n' + text, false);
   if (!confirmed) return;
   if (btn) btn.disabled = true;
-  try { await sendCmd('imessage', 'start-chat ' + handle + ' | ' + text); }
-  finally { if (btn) btn.disabled = false; }
-  markHandled(p);
-  setDetailMode('empty');
-  afterHandled();
+  const identity = [S.token, S.userId];
+  try {
+    await decideProposal(p, 'accepted', async () => {
+      const result = await sendCmd('imessage', 'start-chat ' + handle + ' | ' + text);
+      // A bridge command receipt is not confirmation of an external message.
+      return false;
+    });
+    if (S.token === identity[0] && S.userId === identity[1]) { afterHandled(); setDetailError(err, 'Accepted. Check the new conversation; message delivery is not confirmed.'); }
+  } catch (error) { setDetailError(err, error.message); afterHandled(); }
+  finally { if (btn) btn.disabled = !!p.decision; }
 }
 
 // ---- feed-record drafts (the ghost's data) -----------------------------------
-// PURE: write each room's unhandled, room-targeted, actionable proposals onto
-// its feed record as `drafts` (newest first) and clear rooms with none. Whether
-// a draft is PENDING or RETIRED is decided at render time by attention.js's
-// draftPending(draft.ts, rec.lastTs), so a phone reply that bumps lastTs
-// retires the ghost on the next render with no extra bookkeeping.
+// Pure feed projection: each unresolved suggestion is independently queued.
+// Approval/Direct outcomes are never actionable drafts.
 function attachDrafts(proposals, handled, feed) {
   const byRoom = new Map();
   for (const p of (Array.isArray(proposals) ? proposals : [])) {
-    if (!p || p.kind !== 'room' || p.autoSent || p.ambiguous) continue;
-    if (handled && typeof handled.has === 'function' && handled.has(p.eventId)) continue;
+    if (!p || p.kind !== 'room' || p.autoSent || p.ambiguous || crmInactive(p)) continue;
+    if (!p.crmTracked && handled && typeof handled.has === 'function' && handled.has(p.eventId)) continue;
     if (!byRoom.has(p.targetRoom)) byRoom.set(p.targetRoom, []);
-    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template, createdBy: p.createdBy || '', sendAt: p.sendAt || 0 });
+    byRoom.get(p.targetRoom).push({ eventId: p.eventId, body: p.body, ts: p.ts, template: p.template, createdBy: p.createdBy || '', sendAt: p.sendAt || 0, proposal: p, queued: true });
   }
   let rooms = 0;
   for (const rec of feed.values()) {
@@ -287,7 +374,7 @@ function attachDrafts(proposals, handled, feed) {
 }
 function identifierDrafts(proposals, handled) {
   return (Array.isArray(proposals) ? proposals : [])
-    .filter(p => p && p.kind === 'identifier' && !p.autoSent && !p.ambiguous && !(handled && handled.has(p.eventId)))
+    .filter(p => p && p.kind === 'identifier' && !p.autoSent && !p.ambiguous && !p.decision && !p.direct && p.crmState !== 'declined' && (p.crmTracked || !(handled && handled.has(p.eventId))))
     .sort((a, b) => b.ts - a.ts);
 }
 
@@ -301,8 +388,8 @@ function identifierDrafts(proposals, handled) {
 // and 200-bubble cap ignore it. Re-appended (moved to the end) after every
 // tail render through composerGhostHook.
 let ghostRoom = null;
+let historyExpanded = false;
 let ghostExpanded = false;   // "+N more" toggle (per open room)
-const GHOST_SHOW = 3;
 let sendAllBusy = false;
 
 function whoSuggested(d) {
@@ -320,24 +407,13 @@ function ghostBubble(d, idx, total, roomId) {
   const bar = el('div', 'ghost-bar');
   bar.appendChild(el('span', 'ghost-st', total > 1 ? (idx + 1) + ' of ' + total : (d.template ? 'template' : whoSuggested(d))));
   const edit = el('button', 'ghost-link', 'Edit'); edit.type = 'button';
-  edit.addEventListener('click', (e) => { e.stopPropagation(); prefillComposer(shown); markHandled({ eventId: d.eventId }); afterHandled(); });
-  const dismiss = el('button', 'ghost-link', 'Dismiss'); dismiss.type = 'button';
-  dismiss.addEventListener('click', (e) => { e.stopPropagation(); markHandled({ eventId: d.eventId }); afterHandled(); });
-  const send = el('button', 'ghost-send', 'Send'); send.type = 'button';
-  send.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    send.disabled = true;
-    // Explicit target, the one guarded send path; `shown` is exactly what was read.
-    const ok = await sendConvoMessage(roomId, shown, { fromProposal: d.eventId });
-    send.disabled = false;
-    if (!ok) return;
-    markHandled({ eventId: d.eventId });
-    // F16: siblings are NOT marked handled — the sent message bumps lastTs and
-    // draftPending retires them visibly (struck through, Restore) on render.
-    afterHandled();
-  });
+  edit.addEventListener('click', (e) => { e.stopPropagation(); setDetailMode('proposal'); renderDetail(d.proposal); });
+  const dismiss = el('button', 'ghost-link', 'Decline'); dismiss.type = 'button';
+  dismiss.addEventListener('click', (e) => { e.stopPropagation(); decideOne(d.proposal, 'declined', '', dismiss); });
+  const send = el('button', 'ghost-send', 'Accept & send'); send.type = 'button';
+  send.addEventListener('click', (e) => { e.stopPropagation(); decideOne(d.proposal, 'accepted', shown, send); });
   bar.appendChild(edit); bar.appendChild(dismiss);
-  if (d.sendAt) {
+  if (d.sendAt && !d.proposal?.crmTracked) {
     // F7: the manager asked for a time. Accepting makes it the TEAMMATE'S own
     // scheduled send from then on — a separate event they authored, which is
     // the only thing the daemon's teammate queue will ever fire.
@@ -417,9 +493,11 @@ async function sendAllInOrder(roomId, pending) {
     const ordered = pending.slice().sort((a, b) => a.ts - b.ts);
     for (let i = 0; i < ordered.length; i++) {
       const d = ordered[i];
-      const ok = await sendConvoMessage(roomId, sanitize(d.body), { fromProposal: d.eventId });
-      if (!ok) { convoSetStatus('Stopped at suggestion ' + (i + 1) + ' of ' + ordered.length + ' — it did not send.'); break; }
-      markHandled({ eventId: d.eventId });
+      if (d.proposal?.crmTracked) {
+        if (!(await submitCRMDecision(d.proposal, 'approve', sanitize(d.body)))) break;
+        continue;
+      }
+      if (!(await decideOne(d.proposal, 'accepted', sanitize(d.body)))) break;
     }
   } finally { sendAllBusy = false; afterHandled(); }
 }
@@ -429,7 +507,7 @@ function renderGhost(roomId) {
   const legacy = $('convo-ghost');
   if (legacy) legacy.classList.add('hidden');
   if (!box) return;
-  if (roomId !== ghostRoom) { ghostRoom = roomId; ghostExpanded = false; }
+  if (roomId !== ghostRoom) { ghostRoom = roomId; ghostExpanded = false; historyExpanded = false; }
   const old = box.querySelector('.ghosts');
   if (old) old.remove();
   if (S.openRoomId !== roomId) return;
@@ -437,12 +515,16 @@ function renderGhost(roomId) {
   if (!rec) return;
   const pendingNewestFirst = pendingDrafts(rec.drafts, rec.lastTs);
   const pending = pendingNewestFirst.slice().sort((a, b) => a.ts - b.ts);     // oldest first = send order
-  const retired = retiredDrafts(rec.drafts, rec.lastTs, Date.now());
+  const retired = [];
   const ambiguous = allProposals.filter(p => p && p.kind === 'room' && p.ambiguous && p.targetRoom === roomId);
+  const handled = loadHandled();
+  const crmWaiting = allProposals.filter(p => p.kind === 'room' && p.targetRoom === roomId && (crmInactive(p) || p.autoSent || handled.has(p.eventId)));
   const scheduled = schedulesForRoom(roomId).filter(s => s.state !== 'cancelled');
-  if (!pending.length && !retired.length && !ambiguous.length && !scheduled.length) return;
+  if (!pending.length && !retired.length && !ambiguous.length && !scheduled.length && !crmWaiting.length) return;
   const wrap = el('div', 'ghosts');
   scheduleGhosts(wrap, roomId);
+  const history = el('details', 'proposal-history'); history.open = historyExpanded; history.addEventListener('toggle', () => { historyExpanded = history.open; }); history.appendChild(el('summary', '', 'Message history · ' + crmWaiting.length));
+  for (const p of crmWaiting) { const status = el('div', 'ghost ' + (p.decision?.decision || p.crmState || (p.directRefused ? 'refused' : p.autoSent ? 'sent' : ''))); status.append(el('div', 'ghost-text', sanitize(p.body)), el('div', 'ghost-bar', p.crmTracked ? crmStatusText(p) : handled.has(p.eventId) && !p.decision && !p.direct && !p.autoSent ? 'Previously handled · decision not recorded' : proposalLabel(p.decision || { state: p.directRefused ? 'refused' : p.autoSent ? 'sent' : 'ambiguous' }))); history.appendChild(status); }
   for (const a of ambiguous.slice(0, 1)) {
     const g = el('div', 'ghost ambiguous');
     g.appendChild(el('div', 'ghost-text', sanitize(a.body)));
@@ -450,36 +532,17 @@ function renderGhost(roomId) {
     wrap.appendChild(g);
   }
   if (pending.length) {
-    const cap = el('div', 'ghosts-cap');
-    const newest = pendingNewestFirst[0];
-    cap.appendChild(el('span', '', whoSuggested(newest) + ' suggested ' + (pending.length === 1 ? 'a reply' : pending.length + ' messages') + ' · ' + feedRelTime(newest.ts) + ' ago'));
+    const queue = el('details', 'proposal-queue'); queue.open = ghostExpanded;
+    queue.addEventListener('toggle', () => { ghostExpanded = queue.open; });
+    queue.appendChild(el('summary', '', 'Queued suggestions · ' + pending.length));
     if (pending.length > 1) {
-      const all = el('button', 'ghost-link', 'Send all in order'); all.type = 'button';
-      all.addEventListener('click', (e) => { e.stopPropagation(); sendAllInOrder(roomId, pending); });
-      const none = el('button', 'ghost-link', 'Dismiss all'); none.type = 'button';
-      none.addEventListener('click', (e) => { e.stopPropagation(); for (const d of pending) markHandled({ eventId: d.eventId }); afterHandled(); });
-      cap.appendChild(all); cap.appendChild(none);
+      const all = el('button', 'ghost-link', 'Accept & send all in order'); all.type = 'button';
+      all.addEventListener('click', () => sendAllInOrder(roomId, pending)); queue.appendChild(all);
     }
-    wrap.appendChild(cap);
-    const shown = (ghostExpanded || pending.length <= GHOST_SHOW) ? pending : pending.slice(pending.length - GHOST_SHOW);
-    if (shown.length < pending.length) {
-      const more = el('button', 'ghost-link ghost-more', '+' + (pending.length - shown.length) + ' more'); more.type = 'button';
-      more.addEventListener('click', (e) => { e.stopPropagation(); ghostExpanded = true; renderGhost(roomId); });
-      wrap.appendChild(more);
-    }
-    shown.forEach((d) => wrap.appendChild(ghostBubble(d, pending.indexOf(d), pending.length, roomId)));
+    pending.forEach((d, i) => queue.appendChild(ghostBubble(d, i, pending.length, roomId)));
+    wrap.appendChild(queue);
   }
-  for (const d of retired.slice(0, 2)) {
-    const g = el('div', 'ghost retired');
-    g.appendChild(el('div', 'ghost-text', sanitize(d.body)));
-    const bar = el('div', 'ghost-bar');
-    bar.appendChild(el('span', 'ghost-st', whoSuggested(d) + ' suggested ' + feedRelTime(d.ts) + ' ago · the thread moved on'));
-    const restore = el('button', 'ghost-link', 'Restore'); restore.type = 'button';
-    restore.addEventListener('click', (e) => { e.stopPropagation(); prefillComposer(sanitize(d.body)); markHandled({ eventId: d.eventId }); afterHandled(); });
-    bar.appendChild(restore);
-    g.appendChild(bar);
-    wrap.appendChild(g);
-  }
+  if (crmWaiting.length) wrap.appendChild(history);
   box.appendChild(wrap);
   box.scrollTop = box.scrollHeight;
 }
@@ -527,16 +590,18 @@ function renderDetail(p) {
   const to = el('div', 'proposal-to');
   to.appendChild(buildPlatBadge(sourceOf(p)));
   to.appendChild(el('span', 'proposal-to-name', targetName(p)));
-  to.appendChild(el('span', 'muted', ' — starts a NEW iMessage chat'));
+  to.appendChild(el('span', 'muted', p.kind === 'identifier' ? ' — starts a NEW iMessage chat' : ' — existing conversation'));
   host.appendChild(to);
-  host.appendChild(el('p', 'muted proposal-note', 'Suggested by your manager — not sent yet.'));
-  const ta = el('textarea', 'proposal-body-full'); ta.value = sanitize(p.body); host.appendChild(ta);
+  host.appendChild(el('p', 'muted proposal-note', crmInactive(p) ? crmStatusText(p) : 'Suggested by your manager — not sent yet.'));
+  const ta = el('textarea', 'proposal-body-full'); ta.value = sanitize(p.body); ta.disabled = crmInactive(p); host.appendChild(ta);
   const err = el('div', 'proposal-card-error hidden'); host.appendChild(err);
   const actions = el('div', 'proposal-actions');
   const sendBtn = el('button', 'proposal-btn proposal-send primary', 'Send'); sendBtn.type = 'button';
+  sendBtn.disabled = crmInactive(p);
   sendBtn.addEventListener('click', () => sendProposal(p, ta.value, err, sendBtn));
   const rejectBtn = el('button', 'proposal-btn proposal-dismiss', 'Reject'); rejectBtn.type = 'button';
-  rejectBtn.addEventListener('click', () => { markHandled(p); setDetailMode('empty'); afterHandled(); });
+  rejectBtn.disabled = crmInactive(p);
+  rejectBtn.addEventListener('click', () => decideOne(p, 'declined', '', rejectBtn, err));
   actions.appendChild(sendBtn); actions.appendChild(rejectBtn);
   host.appendChild(actions);
   const back = $('proposal-back');
@@ -545,8 +610,11 @@ function renderDetail(p) {
 
 // ---- refresh ----------------------------------------------------------------------
 async function refresh() {
+  const identity = [S.token, S.userId];
+  if (!S.token || !S.userId) { allProposals = []; return; }
   let proposals;
-  try { proposals = await fetchProposals(); } catch (e) { return; }
+  try { proposals = await fetchProposals(); } catch (e) { if (S.token === identity[0] && S.userId === identity[1]) convoSetStatus('Suggestion history could not be refreshed: ' + String(e.message || e)); return; }
+  if (S.token !== identity[0] || S.userId !== identity[1]) return;
   // fetchProposals also re-ingested the schedule events, so always re-run the
   // attach/render pass: a schedule change moves nothing in `proposals`.
   allProposals = proposals;
@@ -556,6 +624,12 @@ let pollTimer = null;
 
 function initProposalsUI() {
   setComposerGhostHook(renderGhost);
+  setProposalScheduleHook(async (eventId, perform) => {
+    const p = allProposals.find(p => p.eventId === eventId);
+    if (!p) throw new Error('Suggestion is no longer available');
+    await decideProposal(p, 'accepted', async () => { await perform(); return 'scheduled'; });
+    afterHandled();
+  });
   // F7: a schedule written/cancelled here re-attaches the row indicators and
   // repaints the open room's cluster, same as a draft change does.
   setScheduleChangeHook(() => {
@@ -565,12 +639,7 @@ function initProposalsUI() {
   });
   try { initScheduleUI(); } catch (e) { /* the clock button stays unwired on error */ }
   setFeedRenderHook(() => { renderIdentifierRows(); if (S.openRoomId) renderGhost(S.openRoomId); });
-  setAfterSendHook((roomId) => {
-    // A reply typed by the teammate retires every pending draft for the room.
-    const rec = feedModel.get(roomId);
-    for (const d of pendingDrafts((rec && rec.drafts) || [], (rec && rec.lastTs) || 0)) markHandled({ eventId: d.eventId });
-    afterHandled();
-  });
+  setAfterSendHook(() => afterHandled()); // A typed reply never decides unrelated suggestions.
   if (!pollTimer) pollTimer = setInterval(() => { refresh().catch(() => {}); }, 10000);
   refresh().catch(() => {});
 }

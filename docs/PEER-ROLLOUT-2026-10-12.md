@@ -1,5 +1,11 @@
 # Receipt reliability rollout for Elliot and David
 
+**Historical receipt release instructions.** For the current CRM, notifications,
+Telegram and ping rollout, start with the
+[October 18 upgrade guide](PEER-ROLLOUT-2026-10-18.md). Its state-version-2
+compatibility and deployment instructions supersede the version-1/rollback
+guidance below. Native receipt semantics and the authorized self-test remain useful.
+
 Release: **0.2.3**, tag **v0.2.3**, canonical repository
 `git@github.com:jacob-recall/beepa.git`. Run this procedure on each person's
 source Mac, one at a time. These are instructions for the bot operating that

@@ -58,6 +58,7 @@ master/runtime/
 *.db-wal
 *.db-shm
 *.db-journal
+*.db.policy.lock
 
 # Master enroll/admin service logs (launchd) — never commit
 master/logs/*.log
@@ -92,3 +93,8 @@ session-connect/logs/
 # logs out of git regardless (the store itself is covered by *.db)
 agents/contacts/logs/
 .beepa-timestamp-repair/
+
+# Manager notification secrets, database and optional push runtime.
+/master/notifications.local/
+/master/.notifications-venv/
+/master/control.local/

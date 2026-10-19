@@ -5,7 +5,25 @@ A separate, read-only Matrix client against the **master** homeserver
 swapped `source → user`: recent feed across everyone, per-teammate spaces,
 search across everyone, one-person-many-platforms grouping (unified
 contacts) — and, as of V2, the single place the manager can write a
-*proposal* (never a send). No composer, no send path, anywhere.
+*proposal* (never a native send). Individual proposals and CRM batch reviews
+share the user's existing guarded dispatch path.
+
+## Suggestion queue and history (2026-10-13)
+
+The normal conversation viewer renders collapsed **Queued suggestions** and
+**Message history** disclosures. Every proposal is keyed by the source proposals
+room plus target room; accounts cannot collide on a local room identifier.
+Unresolved suggestions persist through unrelated conversation activity. A source
+`com.jkali.proposal_status` state event is trusted only when authored by the
+proposals room creator and keyed to the exact manager proposal. Accepted/declined
+are explicit user decisions, distinct from delivery/read/reply evidence.
+
+Composer writes freeze `com.jkali.send_mode` from the displayed conversation
+mode. Direct entries show send progress/outcomes only and never appear in the
+suggestion disclosure. Remove no Direct gate to make a send succeed: refusal is
+“Not sent”. CRM histories reuse `proposalLabel`, including the distinction
+between source queue acceptance and user approval. These rules replace the old
+retirement and two-minute “now a draft” UI descriptions below.
 
 ## What lives here
 
@@ -18,6 +36,16 @@ contacts) — and, as of V2, the single place the manager can write a
   loop, feed/teammate/search rendering, the read-only conversation viewer,
   media rendering (v1.5), unified-contacts grouping (§12 phase 5), and
   `submitProposal()` (v2, §2/§7).
+- `crm-store.js` / `crm-view.js` — canonical metadata replay and compact
+  central lists, shared-contact picker, explicit person linking and navigation
+  into the same normal conversation viewer.
+- `crm-account.js` — shared read-only verification of source account rooms
+  and capabilities. Callers must recheck their own intent after its reads.
+- `crm-members.js` — prepare/member/commit Direct coordination and cancellation
+  of unattempted grants on removal, reassignment or archival.
+- `crm-batches.js` / `crm-compose.js` — frozen personalized review, durable
+  parent history, per-account proposal staging and typed child requests.
+  No master module imports native sending or new-conversation commands.
 - `invites.js` — the **trust-predicate leaf**: `localpart`,
   `spaceLabelFor`, `invitesToJoin`, `acceptedSpaces`, `verifiedChildIds`,
   `ROOM_SHAPE_RE`. Zero imports, no DOM, no network, no side effects —
@@ -107,11 +135,11 @@ now a deliberate, documented duplication, not an oversight.
   `shared/model/message_timestamps.js` is a pure leaf shared with the personal
   app. See `docs/TIMESTAMP-REPAIR.md`; keep it in the gateway asset allowlist.
 
-- **No composer, no send call, anywhere in this file — except the one
-  documented proposal write.** Never add a `PUT
+- **Conversation sends remain source-owned.** The individual proposal input
+  and CRM textareas create reviewed proposals only. Never add a `PUT
   /_matrix/client/v3/rooms/{id}/send/m.room.message/...` call to this app.
   If a future feature seems to need it, it does not belong in `apps/master/`.
-- **`submitProposal()` is the ONE message-shaped write path**, and it is
+- **`submitProposal()` is the individual message-shaped write path**, and it is
   deliberately narrow: the destination must be a `ROOMID_RE`-valid id present
   in the *discovered* proposals-room allowlist (`MS.proposalsRoomSet` — never
   a stale/typed id, never a mirror room); the event **type** is the hardcoded
@@ -119,7 +147,10 @@ now a deliberate, documented duplication, not an oversight.
   id) is shape-checked with `invites.js`'s `ROOM_SHAPE_RE` but the master
   never sends to it itself — it only records it for the teammate's own
   guarded send path to re-validate. This is a *suggestion* channel, not a
-  reverse send path.
+  reverse send path. `crm-batches.js` stages the same fixed proposal type with
+  immutable CRM provenance; only an accepted source-owned child can dispatch
+  those staged proposals. The source quarantines them from ordinary proposal
+  auto-send until that acceptance is verified.
 - **Proposal writes are pinned to the context captured at room-open.**
   `openRoom()` stores `MS.openProposalCtx = {mirrorRoomId, label,
   proposalsRoomId, targetRoom}`; `submitProposal()` re-asserts every element
@@ -141,7 +172,11 @@ now a deliberate, documented duplication, not an oversight.
   at that instant on a freshly re-read copy. A refusal there files the ordinary
   draft; this console never gets a "send it anyway" affordance.
 - **The write surface is exactly `{POST /login, POST /logout, POST
-  /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn}, POST
+  /rooms/{id}/join, PUT /rooms/{id}/send/com.jkali.proposal/{txn},
+  PUT /rooms/{verified CRM id}/send/com.jkali.crm.operation/{txn},
+  PUT /rooms/{verified proposals id}/send/com.jkali.crm.direct_request/{txn},
+  PUT /rooms/{verified proposals id}/send/com.jkali.crm.batch_request/{txn}, POST
+  ENROLL_BASE/admin/crm-room, POST
   ENROLL_BASE/admin/add-teammate, POST ENROLL_BASE/admin/delete-teammate}`** — asserted at build time by
   `harness.py`'s scenario 7, which scans **every `*.js` in this directory**
   (not just `main.js`) and matches each non-GET call against that allowlist,
@@ -293,3 +328,141 @@ exercises `groupByProfile()`. See `tests/CLAUDE.md`.
   allowlisted proposals room; the send happens on the teammate's machine
   behind D2's twelve gates. `isDirectRoom()` is `shareLevelLabel()` and
   under-promises the same way.
+
+## CRM storage integration (implementation in progress)
+
+`crm-store.js` adds one typed metadata write, not a second conversation send
+path. It accepts only the workspace returned by manager-authenticated bootstrap,
+authenticates manager-authored non-state operations during canonical forward
+pagination, and uses `applyVerifiedCRMOperation()` from the send-free model.
+It never sorts replay by client timestamps or treats a successful PUT as proof
+that an optimistic base revision won a conflict. Multiple browser sessions may
+submit the same operation ID; canonical reducer evidence decides the outcome.
+
+Session binding is mandatory for the app adapter: capture user/token, supply
+`isCurrent`, bind bootstrap/API to that session, and call `close()` at logout.
+Every asynchronous completion is checked before publication or further writes.
+Failed or incomplete history disables writes. Redactions affecting an applied
+operation rebuild from canonical history, including races during initial load.
+The store currently keeps only memory state; no second persistent plaintext
+contact/message cache is introduced. A lost write response must retain its
+original operation ID and reconcile before retrying.
+
+Lists must open the existing regular `openRoom()` viewer and use existing
+verified contacts and proposals. Do not copy the mock-up conversation renderer
+or import the user app's send modules. The metadata foundation alone does not
+mean the UI, Direct grants, batch dispatch, or native response tracking is wired.
+
+`crm-view.js` now owns metadata list CRUD and membership removal in the existing
+workspace. It receives the store and regular conversation/contact callbacks,
+never a network or native-send callback. `main.js` binds the view to the manager
+session and closes it on logout. A pending operation retains its exact identity
+on ambiguous failure; canonical replay, including serialized-payload equality,
+decides whether reconciliation succeeded. Rename drafts retain their edited
+base revision; terminal conflicts discard that stale draft so the next explicit
+edit uses the newly observed version. Contact addition uses `crm-members.js` and
+the separately verified source-account capability path. `crm-compose.js` owns
+selection, per-recipient drafts, immutable review and batch progress in this
+same workspace.
+
+The same presentation also drives per-person history, compact latest-outreach
+cells and the central **Outreach across accounts** view. History combines frozen
+reviewed batches with authenticated source results; it does not create another
+store or copy conversation timelines. Filters use the item's original sender,
+list, message outcome and independent response state. “Latest” means newest
+review for that exact person/account binding, not guessed native send order.
+Removed members and archived lists retain their reviewed history. Source reads
+are shared per exact account envelope within one refresh; overlapping detail
+and history reads are ordered so an older result cannot replace newer evidence.
+Unavailable outcomes remain unavailable, not “awaiting reply.” Exact message
+and reply links use the normal conversation viewer and its context endpoint.
+
+Personalization checks each selected recipient independently and visibly
+excludes unavailable routes with reasons. The review lists included/excluded
+counts, excluded people and the exact included bodies/channels. Excluded drafts
+remain local for a later explicit recheck. A contact becoming unavailable during
+the final review still rejects that review rather than silently changing it.
+
+Restoring a list restores metadata only. **Enable Direct again** presents an
+explicit warning about Private conversations and existing history before
+`planRenewal(member)` creates a fresh frozen plan. Preserve that plan through
+ambiguous failures and execute it through the original coordinator. Checking an
+old grant must never mint a new permission intent or override newer privacy.
+
+An unrelated shared-catalog revision must not strand unchanged listed contacts.
+Before a fresh route/review, `crm-batches.js` verifies the exact current shared
+identity and source account, then CAS-updates only `binding.contact_version`.
+The original membership's `direct_request` stays immutable for cancellation;
+no Direct request or permission write is made by this refresh. Existing saved
+reviews remain pinned to their original version and require a fresh review if
+it changes before dispatch.
+
+`crm-members.js` is the only adapter permitted to write typed
+`com.jkali.crm.direct_request` events. It verifies the source-owned proposals
+room and capability, freezes the original grant envelope into each membership,
+and orders prepare → canonical membership acceptance → commit. Current contact,
+account, list and membership evidence is checked after asynchronous reads.
+Removing/reassigning members or archiving lists cancels unattempted source work
+before changing metadata; ambiguous attempted grants remain recovery barriers.
+Archive carries the exact active membership operation set to reject concurrent
+additions. Applied Direct is never undone. The picker uses only verified shared
+contacts, supports explicit linking to a stored person, and never guesses a
+person merge from matching names. `getCRMMembers()` captures the same manager
+session as the metadata store; it receives no native send credentials.
+
+`crm-batches.js` saves `batch.review` before staging proposals. Every item pins
+the exact owner, enrollment generation, journal epoch, membership operation,
+contact version, route, consent revision and body. Child IDs and payload hashes
+are deterministic. Reconciliation reads actual manager-authored proposal
+events and source-authored child results before retrying; a successful PUT
+is never delivery evidence. File-scoped transaction prefixes are enforced by
+the harness. Stale lists/assignments, revoked contacts, expired reviews and
+changed sessions prevent further staging/submission. Each child reports its
+own outcome so one offline account cannot hide another account's acceptance.
+
+Cancellation saves `batch.cancel_requested` against the immutable parent hash
+before issuing the original account children's cancel requests. It remains
+available after review expiry, contact revocation and list archival. Reopening
+a batch with this canonical intent reconciles cancellation rather than issuing
+new proposals; source acknowledgments decide which unattempted items stopped.
+Attempted, sent and unknown outcomes retain their original evidence. A cancel
+PUT is not proof that an account has stopped processing.
+
+The production batch capability remains disabled while approval and response
+tracking acceptance is completed. Browser tests use intercepted synthetic
+accounts; enabling a fixture is not a rollout. The design specification at
+`docs/specs/2026-10-12-master-crm-design.md` records the current implementation
+and outstanding release evidence.
+
+### Followed-conversation notifications
+
+`notifications.js` wires Follow, browser setup and history to the authenticated
+notification API. `notification-sw.js` displays encrypted push payloads and sends
+only capability-scoped display/click acknowledgements. It has no manager token
+or native send path. Notification seen/displayed is distinct from native message
+read receipts. Keep the narrow `beepa-notification-worker` Trusted Types policy
+in sync across index.html, views/nginx.conf and master/gateway.py.
+
+## List monitoring and Telegram
+
+`control.js` owns the scoped `/admin/control` client, Telegram pairing/status
+dialog and list monitoring controls. Inject it into `crm-view.js`; do not add
+native send imports. Monitoring-only lists must never invoke contact Direct
+activation. Search selects an exact shared room/account, and opening it uses
+the existing conversation viewer. Policy edits use the canonical store revision,
+not a browser preferences database. No default reminder deadline or message
+preview. Keep async responses bound to the captured signed-in session.
+Message rows use `list.obligation` for per-message deadline/snooze/resolution and
+`list.seen` for master acknowledgement. Continue opening the existing conversation
+viewer. Source-user unread, master unseen, delivery/read receipts and response
+links are separate evidence; an unavailable native projection must stay unknown.
+Activity presentation is canonical: immediate, per-conversation groups, or list
+digests. The digest hash route contains bounded notification IDs only and opens a
+focused conversation picker; load older entries through the authenticated API.
+Opening an entry still verifies its current room/account and uses the ordinary
+viewer. Do not let a digest choice or browser receipt become send approval.
+Ask Beepa uses the durable command API. A lost submission response must retain
+the same request ID/text/session on retry. Show processing and Telegram delivery
+separately; neither means a native message was sent/read. Closing the panel leaves
+the server job intact. Cancel only queued commands; sending still uses the existing
+exact review and confirmation boundaries.

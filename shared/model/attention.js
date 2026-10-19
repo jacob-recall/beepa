@@ -29,12 +29,12 @@ function byTsDesc(a, b) { return (b.ts || 0) - (a.ts || 0); }
 
 function pendingDrafts(drafts, lastActivityTs) {
   return (Array.isArray(drafts) ? drafts : [])
-    .filter(d => d && draftPending(d.ts, lastActivityTs)).sort(byTsDesc);
+    .filter(d => d && (d.queued === true || draftPending(d.ts, lastActivityTs))).sort(byTsDesc);
 }
 
 function retiredDrafts(drafts, lastActivityTs, now, keepMs = 86400000) {
   return (Array.isArray(drafts) ? drafts : [])
-    .filter(d => d && finitePositive(d.ts) && !draftPending(d.ts, lastActivityTs) && (now - d.ts) < keepMs)
+    .filter(d => d && d.queued !== true && finitePositive(d.ts) && !draftPending(d.ts, lastActivityTs) && (now - d.ts) < keepMs)
     .sort(byTsDesc);
 }
 

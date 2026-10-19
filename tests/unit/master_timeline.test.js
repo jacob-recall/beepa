@@ -1,3 +1,4 @@
+import { proposalLabel } from '../../shared/model/proposal-lifecycle.js';
 import { paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE } from '../../shared/model/message_receipts.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -43,7 +44,7 @@ const elements = new Map([
   'proposal-stack', 'room-read', 'nav-teammates-rail',
 ].map(id => [id, new Element()]));
 const S = { token: 'session-1' };
-const ctx = vm.createContext({ paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE, S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
+const ctx = vm.createContext({ proposalLabel, paintReceipt, mergeReceipts, MESSAGE_RECEIPT_TYPE, S, Set, Map, Date, JSON, encodeURIComponent, setTimeout,
   displayName, parseNames, dumpNames, rename, sharingUsers, visibleUsers, visibleFeed,
   messageTimestamp, timestampCorrections, CORRECTION_TYPE,
   initials, indicatorsFor, pendingDrafts, clusterFeed,
@@ -103,7 +104,7 @@ vm.runInContext(`
   MS.proposalsByUser.set('owner', '!proposals:master');
   MS.proposalsRoomSet.add('!proposals:master');
   MS.rooms['!A:master'].mirrorOf = '!local:source';
-  MS.proposalsByRoom.set('!local:source', [
+  MS.proposalsByRoom.set('!proposals:master' + String.fromCharCode(0) + '!local:source', [
     { eventId: '$different-proposal', body: 'hello', ts: 900 },
     { eventId: '$proposal', body: 'hello', ts: 800 },
   ]);
@@ -113,9 +114,9 @@ const stackOpen = ctx.openRoom('!A:master');
 // without being newer than $different-proposal, so the latter is still
 // 'pending' here — only the LATER message below (ts=5000) retires it.
 history().resolve({ chunk: [{ ...msg('$ack', 'hello', { 'com.jkali.auto_sent_from_proposal': '$proposal' }), origin_server_ts: 850 }] }); await stackOpen;
-const stack = { get children() { const g = box.querySelector('.ghosts'); return g ? g.children.filter(c => c.className.startsWith('ghost ')) : []; } };
+const stack = { get children() { const g = box.querySelector('.ghosts'); return g ? g.children.flatMap(d => d.children).filter(c => c.className.startsWith('ghost ')) : []; } };
 const cardStates = () => stack.children.map(c => c.className.replace('ghost ', ''));
-assert.deepEqual(cardStates(), ['auto', 'pending'], 'exact id acknowledged; same text alone is not acknowledgement');
+assert.deepEqual(cardStates(), ['pending', 'auto'], 'exact id acknowledged; same text alone is not acknowledgement');
 // A later mirrored message retires the still-pending suggestion, never marks it sent.
 ctx.renderBubble({ ...msg('$later', 'anything'), origin_server_ts: 5000 });
 ctx.renderSuggestionStack();

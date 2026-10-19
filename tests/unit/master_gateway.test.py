@@ -203,7 +203,8 @@ class GatewayTest(unittest.TestCase):
             if relative.endswith('.html'):
                 links = re.findall(r'(?:src|href)="([^"]+)"', body.decode())
             elif relative.endswith('.js'):
-                links = re.findall(r'from\s+[\'"]([^\'"]+)[\'"]', body.decode())
+                # Module declarations only: user-facing 'Send from ' is not an import.
+                links = re.findall(r'''(?m)^\s*(?:import|export)\s+(?:[^;'"]*?\bfrom\s+)?['"]([^'"]+)['"]''', body.decode())
             elif relative.endswith('.css'):
                 links = re.findall(r'url\(([^)]+)\)', body.decode())
             else:
@@ -213,6 +214,8 @@ class GatewayTest(unittest.TestCase):
                 if link.startswith(('https:', 'data:', '#')):
                     continue
                 todo.append(posixpath.normpath(posixpath.join(posixpath.dirname(relative), link)))
+        self.assertIn('apps/master/crm-compose.js', seen)
+        self.assertIn('shared/model/message_receipts.js', seen)
 
 
 if __name__ == '__main__':

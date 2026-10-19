@@ -2,6 +2,7 @@
 """Fault-injected master operations. No Docker, LaunchAgent or Tailscale runs."""
 import io
 import json
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -132,6 +133,55 @@ class LifecycleTest(unittest.TestCase):
             self.assertNotIn('local-db', args)
         self.assertEqual(self.ops.verify_backup(backup)['format'], 1)
         self.assertEqual((backup/'database.dump').stat().st_mode & 0o777, 0o600)
+
+    def test_control_worker_is_stopped_before_dump_and_resumed_afterward(self):
+        worker={'id':'a'*64,'running':True}
+        self.ops.control_worker=lambda:dict(worker)
+        original=self.ops.run
+        def run(args,**kwargs):
+            if 'stop' in args and args[-1]==worker['id']:worker['running']=False
+            if 'pg_dump' in args:self.assertFalse(worker['running'])
+            if 'start' in args and args[-1]==worker['id']:worker['running']=True
+            return original(args,**kwargs)
+        self.ops.run=run;self.ops.backup(self.root/'control-backup')
+        self.assertTrue(worker['running'])
+        self.assertEqual(json.loads(self.ops.journal.read_text())['control_worker']['id'],worker['id'])
+
+    def test_replaced_control_worker_is_not_started_by_maintenance_retry(self):
+        self.ops.control_worker=lambda:{'id':'a'*64,'running':False}
+        state=self.ops.quiesce('restore','fixture')
+        state['control_worker']['running']=True
+        self.ops.control_worker=lambda:{'id':'b'*64,'running':False}
+        with self.assertRaisesRegex(ValueError,'changed during maintenance'):self.ops.resume(state)
+        self.assertTrue(self.ops.maintenance.exists())
+
+    def test_control_worker_discovery_checks_exact_state_mount(self):
+        (self.root/'master/control.local').mkdir()
+        def run(args,**kwargs):
+            payload=json.dumps([{'Id':'a'*64,'State':{'Running':True},'Mounts':[{'Type':'bind','Destination':'/state','Source':str(self.root/'other-master/control.local')}]}]).encode() if 'inspect' in args else ('a'*64+'\n').encode()
+            return subprocess.CompletedProcess(args,0,payload,b'')
+        self.ops.run=run
+        with self.assertRaisesRegex(ValueError,'another master'):self.ops.control_worker()
+
+    def test_normalized_feature_archive_and_restore_keep_current_evidence(self):
+        directory=self.root/'master/control.local';directory.mkdir()
+        with sqlite3.connect(directory/'control.db') as db:
+            db.execute('CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT)')
+            db.execute("INSERT INTO kv VALUES('operator','{\"user\":7,\"chat\":7}')")
+            db.execute('CREATE TABLE outbox(id TEXT,state TEXT)')
+            db.execute("INSERT INTO outbox VALUES('event','pending')")
+        (directory/'config.json').write_text(json.dumps({'manager_token':'old','telegram_token':'synthetic-token'}))
+        (directory/'enabled').touch();(directory/'enroll.log').write_text('excluded')
+        (self.root/'master/tokens.local').write_text("MASTER_MANAGER_USER='@manager:test'\nMASTER_MANAGER_TOKEN='new-fixture-token'\n")
+        backup=self.ops.backup(self.root/'feature-backup')
+        with tarfile.open(backup/'master.tar.gz') as archive:
+            self.assertIn('master/control.local/control.db',archive.getnames());self.assertNotIn('master/control.local/enroll.log',archive.getnames())
+        with sqlite3.connect(directory/'control.db') as db:db.execute("UPDATE outbox SET state='accepted'")
+        self.assertTrue(self.ops.restore(backup)['restored'])
+        with sqlite3.connect(directory/'control.db') as db:
+            self.assertEqual(db.execute('SELECT state FROM outbox').fetchone()[0],'accepted')
+            self.assertIsNotNone(db.execute("SELECT v FROM kv WHERE k='operator'").fetchone())
+        self.assertEqual(json.loads((directory/'config.json').read_text())['manager_token'],'new-fixture-token')
 
     def test_quiesce_interruption_retains_original_inventory_for_retry(self):
         self.ops.fail_stop = True

@@ -78,6 +78,8 @@ Optional:
                        Reconcile does a full initial /sync of the local hs, so
                        it stays on its own slower cadence while tail/pull spin.
   UPLINK_LOG_LEVEL   INFO|DEBUG           (default: INFO)
+  UPLINK_CRM_BATCH_ENABLED  1 enables reviewed CRM submission/dispatch; default 0.
+                       Cancellation and exact outcome reconciliation remain available.
   UPLINK_DIRECT_SEND_ROOM_HOURLY  D2.6 rolling per-room auto-send cap
                        (default: 20). Persisted in state.db, so it survives
                        KeepAlive restarts; 0 disables auto-send entirely.
@@ -104,6 +106,7 @@ import consent            # noqa: E402
 import invites            # noqa: E402  (bridge-invite predicate, pure leaf)
 import reconcile          # noqa: E402
 import durable_sync       # noqa: E402
+import crm_control        # noqa: E402  (ordered local policy + typed CRM control)
 
 # The durable address-book store (agents/contacts/contacts_store.py, Task 1) is
 # the SOURCE for the contact mirror. It is a sibling package; add its dir to the
@@ -417,6 +420,8 @@ def sanitize_proposal_content(content, sender, event_id, origin_ts):
             # Provenance back to the master event (audit; also the dedup txn seed).
             "com.jkali.proposal_source_event": event_id,
         }
+        if c.get("com.jkali.send_mode") in ("direct", "suggest"):
+            out["com.jkali.send_mode"] = c["com.jkali.send_mode"]
         if c.get("template") is True:
             out["template"] = True
         # F7 manager-timed: an INT (never a bool — `True` is an int in Python)
@@ -636,6 +641,7 @@ class Config:
         # D2.6: rolling per-room hourly auto-send cap. Clamped at 0 (never
         # negative), so a hostile/typo'd value can only make auto-send rarer,
         # never unbounded; 0 disables auto-send entirely.
+        self.crm_batch_enabled = env.get("UPLINK_CRM_BATCH_ENABLED", "0") == "1"
         self.direct_send_cap = max(0, int(
             env.get("UPLINK_DIRECT_SEND_ROOM_HOURLY", str(DIRECT_SEND_ROOM_HOURLY))))
 
@@ -675,6 +681,70 @@ class Uplink(durable_sync.DurableSync):
         # invites stage that runs right after it. One snapshot, one pass.
         self._last_invites = None
         self._invite_ack_logged = False   # the "waiting for the confirm" line, once
+
+    def crm_local_once(self):
+        """Local privacy controls remain available with the organization offline."""
+        self._crm_control_healthy = False
+        control = getattr(self, "_crm_control", None)
+        if control is None:
+            root = os.path.abspath(os.path.join(BASE, "..", ".."))
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            from agents.enrich.crm_resolver import ContactRoomReader
+            reader = ContactRoomReader(
+                contacts_db=self.cfg.contacts_db, local_user_mxid=self.cfg.local_user,
+                read_context=lambda: {"owner_mxid": self.cfg.master_user,
+                                      "generation": self._crm_control.generation},
+                read_room_state=lambda room: self.local("GET", "/_matrix/client/v3/rooms/"
+                    + urllib.parse.quote(room, safe="") + "/state", timeout=15),
+                read_profiles=self.read_crm_profiles,
+                read_contact_policy=self.read_contact_policy,
+                read_contact_overrides=self.read_contact_overrides,
+                install_root=os.environ.get("BEEPA_INSTALL_ROOT", root))
+            self._crm_contact_reader = reader
+            from agents.enrich.crm_native_history import NativeHistoryReader
+            self._crm_native_history = NativeHistoryReader(room_reader=reader)
+            from agents.enrich.crm_provider_history import ProviderHistoryReader
+            self._crm_provider_history = ProviderHistoryReader(room_reader=reader)
+            control = self._crm_control = crm_control.CRMControl(self,
+                lambda binding, owner_mxid, generation: reader.resolve_contact(
+                    binding["contact"], binding["contact_version"], owner_mxid, generation),
+                batch_enabled=self.cfg.crm_batch_enabled)
+        control.refresh(getattr(self, "_conn_state", False))
+        control.local_once()
+        self._crm_control_healthy = True
+
+    def dispatch_crm_new_chat(self, row, claim, proposal, annotation):
+        return self._crm_control.batch.dispatch_new_chat(row, claim, proposal, annotation)
+
+    def read_crm_profiles(self):
+        """Permission resolution cannot collapse malformed grouping to empty."""
+        try:
+            data = self.local("GET", "/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="") + "/account_data/" + CONTACT_PROFILES_TYPE, timeout=15)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return []
+            raise
+        return data["profiles"] if isinstance(data, dict) and isinstance(data.get("profiles"), list) else None
+
+    def _crm_observation_ready(self):
+        control = getattr(self, "_crm_control", None)
+        return getattr(self, "_crm_control_healthy", True) is True and (control is None or control.local_ready)
+
+    def crm_master_once(self):
+        if not self._crm_observation_ready():
+            raise OSError("local-policy-observation-incomplete")
+        control = getattr(self, "_crm_control", None)
+        if control is not None:
+            control.master_once()
+
+    def archive_level(self, room):
+        if not self._crm_observation_ready():
+            raise OSError("local-policy-observation-incomplete")
+        control = getattr(self, "_crm_control", None)
+        if control is not None and control.blocks_sharing(room):
+            return "private"
+        return super().archive_level(room)
 
     # -- local (read) and master (write) transports -------------------------
     def local(self, method, path, body=None, query=None, timeout=60):
@@ -1081,8 +1151,10 @@ class Uplink(durable_sync.DurableSync):
             # leave a shared room sourceless. sources_from_sync scans both.
             "room": {"timeline": {"limit": 20}, "state": {"lazy_load_members": False}},
         })
-        return self.local("GET", "/_matrix/client/v3/sync",
-                           query={"filter": flt, "timeout": "0"}, timeout=120)
+        data = self.local("GET", "/_matrix/client/v3/sync",
+                          query={"filter": flt, "timeout": "0"}, timeout=120)
+        self.observe_imessage_health(data)
+        return data
 
     # -- invites: accept bridge-created portal invites while the app is shut --
     #
@@ -1353,6 +1425,9 @@ class Uplink(durable_sync.DurableSync):
         non-404 read failure aborts it rather than fabricating "no default"
         and mass-revoking every defaulted room.
         """
+        if not self._crm_observation_ready():
+            raise OSError("local-policy-observation-incomplete")
+        control = getattr(self, "_crm_control", None)
         policy = self.pass_policy()
         overrides = consent.overrides_from_sync(sync_data)
         if extra_overrides:
@@ -1376,6 +1451,8 @@ class Uplink(durable_sync.DurableSync):
             # so a stamp can never widen what is mirrored.
             level = consent.resolved_level(override, policy)
             if not consent.effective_shared(convo, policy, override, profile_arg):
+                level = "private"
+            if control is not None and control.blocks_sharing(rid):
                 level = "private"
             desired[rid] = level
         # Visibility (pm_mng-es1): a per-room share level the source detector
@@ -2215,6 +2292,11 @@ class Uplink(durable_sync.DurableSync):
         """
         if not isinstance(local_room_id, str) or not ROOMID_RE.match(local_room_id):
             return "private"
+        if not self._crm_observation_ready():
+            return "private"
+        control = getattr(self, "_crm_control", None)
+        if control is not None and control.blocks_dispatch(local_room_id):
+            return "private"
         path = ("/_matrix/client/v3/user/" + urllib.parse.quote(self.cfg.local_user, safe="")
                 + "/rooms/" + urllib.parse.quote(local_room_id, safe="")
                 + "/account_data/" + consent.SHARE_OVERRIDE_TYPE)
@@ -2431,6 +2513,9 @@ class Uplink(durable_sync.DurableSync):
           'fallback'  — the homeserver answered 4xx: it refused, nothing was
                         sent, so the caller files the ordinary actionable draft.
         """
+        crm = getattr(self, "_crm_batch", None)
+        if crm is not None:
+            crm.before_send(master_event_id, local_room_id, body)
         room_hash = self._room_hash(local_room_id)
         self.db.execute("INSERT OR REPLACE INTO proposal_map "
                         "(master_event_id, local_event_id, outcome) VALUES (?,?,?)",
@@ -2451,17 +2536,25 @@ class Uplink(durable_sync.DurableSync):
                 self._audit_direct_send(master_event_id, room_hash, "failed")
                 log.warning("direct send refused by the local hs (HTTP %s) room=%s",
                             e.code, room_hash)
+                if crm is not None:
+                    crm.record_send(master_event_id, "fallback", None, local_room_id)
                 return "fallback", None
             self._audit_direct_send(master_event_id, room_hash, "ambiguous")
             log.warning("direct send outcome UNKNOWN (HTTP %s) room=%s", e.code, room_hash)
+            if crm is not None:
+                crm.record_send(master_event_id, "ambiguous", None, local_room_id)
             return "ambiguous", None
         except Exception as e:                     # noqa: BLE001 — dispatched, unknown
             self._audit_direct_send(master_event_id, room_hash, "ambiguous")
             log.warning("direct send outcome UNKNOWN (%s) room=%s", type(e).__name__, room_hash)
+            if crm is not None:
+                crm.record_send(master_event_id, "ambiguous", None, local_room_id)
             return "ambiguous", None
         self._audit_direct_send(master_event_id, room_hash, "sent")
         log.info("direct send: 1 proposal auto-sent room=%s", room_hash)
         sent_id = res.get("event_id") if isinstance(res, dict) else None
+        if crm is not None:
+            crm.record_send(master_event_id, "sent", sent_id, local_room_id)
         return "sent", (sent_id if isinstance(sent_id, str) and sent_id else None)
 
     def _file_proposal_record(self, local_proposals_room, master_event_id, content, outcome):
@@ -2475,6 +2568,17 @@ class Uplink(durable_sync.DurableSync):
         here, and this record is never an m.room.message. The txn id is
         unchanged (proposal_<master_event_id>) so a replay is HS-idempotent.
         """
+        content = dict(content)
+        crm = getattr(self, "_crm_batch", None)
+        row = crm.item_for_event(master_event_id) if crm is not None else None
+        direct = content.get("com.jkali.send_mode") == "direct" or (row is not None and json.loads(row["item_json"])["route"]["mode"] == "direct_existing")
+        if direct:
+            content["com.jkali.send_mode"] = "direct"
+            if outcome == "fallback":
+                outcome = "refused"
+                content["com.jkali.direct_refused"] = True
+        if crm is not None:
+            content = crm.record_artifact(master_event_id, content, outcome)
         res = self.local("PUT", "/_matrix/client/v3/rooms/"
                          + urllib.parse.quote(local_proposals_room, safe="")
                          + "/send/" + PROPOSAL_TYPE + "/proposal_"
@@ -2483,6 +2587,8 @@ class Uplink(durable_sync.DurableSync):
                         "(master_event_id, local_event_id, outcome) VALUES (?,?,?)",
                         (master_event_id, (res or {}).get("event_id"), outcome))
         self.db.commit()
+        if crm is not None:
+            crm.record_artifact(master_event_id, content, outcome, (res or {}).get("event_id"))
 
     def forward_proposals(self, master_room_id, local_proposals_room, events,
                           cold_start=True, suspended=True):
@@ -2520,6 +2626,12 @@ class Uplink(durable_sync.DurableSync):
                 return posted
             if not isinstance(ev, dict) or ev.get("type") != PROPOSAL_TYPE:
                 continue
+            if isinstance(ev.get("content"), dict) and "com.jkali.crm.item" in ev["content"]:
+                # Staged CRM proposals are inert until their source-owned child
+                # queue has verified the immutable review and granted one call.
+                crm = getattr(self, "_crm_batch", None)
+                if crm is None or not crm.authorized(ev):
+                    continue
             meid = ev.get("event_id")
             if not meid:
                 continue
@@ -2555,6 +2667,10 @@ class Uplink(durable_sync.DurableSync):
                 self.db.commit()
                 handled[meid] = "fallback"
                 continue
+            if clean.get("com.jkali.send_mode") == "suggest":
+                self._file_proposal_record(local_proposals_room, meid, clean, "fallback")
+                posted += 1
+                continue
             # F7 manager-timed: a proposal carrying send_at for a `direct` room
             # is PARKED (no artifact yet) and evaluated at send_at by
             # scheduled_manager_once() through these same twelve gates. Anything
@@ -2571,6 +2687,9 @@ class Uplink(durable_sync.DurableSync):
                 continue
             body, gate = self._direct_send_gate(ev, clean, cold_start, suspended)
             if body is None:
+                crm = getattr(self, "_crm_batch", None)
+                if crm is not None:
+                    crm.record_gate(meid, gate)
                 # Refused: the ordinary actionable draft the teammate sends
                 # themselves. Log/audit hash-only, naming the gate, never the
                 # body — loudly when a would-be auto-send was actively refused.
@@ -2848,7 +2967,7 @@ class Uplink(durable_sync.DurableSync):
             return None, record_target, send_at, ("held", "superseded")
         return body, record_target, send_at, None
 
-    def _scheduled_dispatch(self, event_id, local_room_id, body):
+    def _scheduled_dispatch(self, event_id, local_room_id, body, *, crm_provenance=None):
         """S-9/10/11: send ONE scheduled message. (state, reason, sent_event_id).
 
         Sibling of _auto_send, never a caller of it. Same ordering property: the
@@ -2865,6 +2984,14 @@ class Uplink(durable_sync.DurableSync):
         self.db.commit()
         txn = "sched_" + urllib.parse.quote(event_id, safe="")
         content = {"msgtype": "m.text", "body": body, FROM_SCHEDULE_KEY: event_id}
+        if crm_provenance is not None:
+            if (not isinstance(crm_provenance, dict) or set(crm_provenance) != {"local_proposal_event_id", "annotation"}
+                    or not isinstance(crm_provenance["local_proposal_event_id"], str)
+                    or not crm_provenance["local_proposal_event_id"].startswith("$")
+                    or not isinstance(crm_provenance["annotation"], dict)):
+                raise ValueError("invalid-crm-provenance")
+            content[FROM_PROPOSAL_KEY] = crm_provenance["local_proposal_event_id"]
+            content["com.jkali.crm.item"] = crm_provenance["annotation"]
         try:
             res = self.local("PUT", "/_matrix/client/v3/rooms/"
                              + urllib.parse.quote(local_room_id, safe="")
@@ -3266,6 +3393,9 @@ class Uplink(durable_sync.DurableSync):
                 "display_name": row.get("display_name"),
                 "person_id": pid,
                 "person_display": id_to_dn.get(pid) if pid else None,
+                # Exact local store version is review evidence, not a timestamp
+                # or display label. Rebuilds may restart version numbering.
+                "contact_version": str(row["version"]),
                 "deleted": False,
             }
         self.master("PUT", "/_matrix/client/v3/rooms/"
@@ -3314,6 +3444,12 @@ class Uplink(durable_sync.DurableSync):
         room = self.ensure_contacts_room()
         if not room:
             return
+        if self.meta_get("crm_contact_versions") != "1":
+            # Refresh existing shared snapshots with their authoritative store
+            # version; preserve rows so revocation/tombstones still have memory.
+            with self.db:
+                self.db.execute("UPDATE contact_mirror SET mirrored_version=-1")
+                self.db.execute("INSERT INTO meta(k,v) VALUES ('crm_contact_versions','1') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
         if not os.path.exists(self.cfg.contacts_db):
             return  # the importer has not produced a store yet -> nothing to mirror
         profiles = self.read_contact_profiles()
@@ -3476,6 +3612,12 @@ class Uplink(durable_sync.DurableSync):
                             (local_room_id, master_room_id, teammate, remote))
             self.db.commit()
 
+    def conversation_tracking_once(self):
+        from conversation_tracking import ConversationTracking
+        if not hasattr(self, '_conversation_tracking'):
+            self._conversation_tracking = ConversationTracking(self)
+        self._conversation_tracking.update()
+
     def tail_once(self):
         """One /sync of the LOCAL hs; forward new events in shared mirror rooms."""
         since = self.meta_get("sync_since")
@@ -3486,6 +3628,7 @@ class Uplink(durable_sync.DurableSync):
                           timeout=(self.cfg.sync_timeout // 1000) + 30)
         # Apply account-data privacy changes before staging any batch event.
         join = (((data or {}).get("rooms") or {}).get("join")) or {}
+        self.observe_imessage_health(data)
         # F7 fix 10: arm teammate schedules from THIS unfiltered local /sync,
         # BEFORE meta sync_since can advance below — no second local cursor, and
         # no batch that advances the cursor without the schedules in it. First,
@@ -3689,6 +3832,7 @@ class Uplink(durable_sync.DurableSync):
                 config_ok = self.run_stage("configuration", lambda: resolved.append(self.refresh_master_config()))
                 connected = config_ok and bool(resolved and resolved[0])
                 self._conn_state = connected
+                self.run_stage("policy_control", self.crm_local_once)
                 # Cleanup retains the last known credential on explicit unlink;
                 # no fresh messages or proposals are dispatched while disabled.
                 self.run_stage("revocation", self.retry_revocations)
@@ -3733,7 +3877,11 @@ class Uplink(durable_sync.DurableSync):
                     self.deliver_proposal_pending()
                     self.scheduled_manager_once()   # F7 manager-timed, below the connectivity gate
                 self.run_stage("proposals", proposals)
+                from proposal_status import relay as relay_proposal_status
+                self.run_stage("proposal_status", lambda: relay_proposal_status(self))
+                self.run_stage("crm_control", self.crm_master_once)
                 self.run_stage("history", self.history_slice)
+                self.run_stage("conversation_tracking", self.conversation_tracking_once)
                 self.run_stage("media", self.retry_media_slice)
                 last_contacts = getattr(self, "_last_contacts", float("-inf"))
                 if now - last_contacts >= self.cfg.reconcile_ms / 1000.0:

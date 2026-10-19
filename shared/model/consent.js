@@ -303,10 +303,18 @@ async function writeSharePolicy(policy) {
 // any more: under a 'direct' default, clearing an override RE-SHARES the
 // conversation. A caller that means private must pass 'private'.
 // Returns the normalized state or null.
+let shareOverrideWriter = null;
+function setShareOverrideWriter(writer) {
+  if (typeof writer !== 'function') throw new TypeError('Consent writer must be a function');
+  shareOverrideWriter = writer;
+}
 async function writeShareOverride(roomId, state) {
   const s = OVERRIDE_STATES.has(state) ? state : null;
-  await api('PUT', overridePath(roomId), s === null ? {} : { state: s });
-  return s;
+  const legacyWrite = async () => {
+    await api('PUT', overridePath(roomId), s === null ? {} : { state: s });
+    return s;
+  };
+  return shareOverrideWriter ? shareOverrideWriter(roomId, s, legacyWrite) : legacyWrite();
 }
 
 // The consent-model marker (D0/F7). The uplink writes it once the explicit-
@@ -558,7 +566,7 @@ export {
   resolveAll,
   normalizePolicy, normalizeOverride,
   readSharePolicy, writeSharePolicy,
-  writeShareOverride, readConsentModel,
+  writeShareOverride, setShareOverrideWriter, readConsentModel,
   overridesFromSync,
   CONTACT_SHARE_POLICY_TYPE,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,

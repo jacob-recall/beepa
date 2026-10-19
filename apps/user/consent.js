@@ -14,7 +14,7 @@
 import {
   resolve, resolveAll, resolvedLevel, policyDefaultLevel,
   readSharePolicy, writeSharePolicy,
-  writeShareOverride, overridesFromSync, SHARE_OVERRIDE_TYPE,
+  writeShareOverride, setShareOverrideWriter, overridesFromSync, SHARE_OVERRIDE_TYPE,
   readConsentModel, CONSENT_MODEL_EXPLICIT, CONSENT_MODEL_PER_ROOM,
   normalizeContactPolicy, resolveContactShare, contactSharePolicyPath,
   CONTACT_OVERRIDES_CAP, CONTACT_OVERRIDE_STATES,
@@ -31,12 +31,18 @@ import { setSourceViewHook, scheduleFeedRender } from '../../shared/ui/search.js
 import { setSharingViewHook } from '../../shared/ui/nav.js';
 import { SOURCES, validHandle } from '../../shared/ui/sources.js';
 import { S, convosBySource, feedModel } from '../../shared/state.js';
+import { createOrderedConsentWriter } from './ordered-consent.js';
 import { feedHideRoom, feedUnhideRoom, feedIsHidden } from '../../shared/ui/account-data.js';
 import { confirmModal } from '../../shared/ui/connections.js';
 // The SAME origin-gated loopback helper enrich.js already talks to (custom
 // X-Beepa-Connect header + application/json force a CORS preflight the helper
 // only echoes for this app's origin). Imported, never re-implemented.
 import { sessionConnectBase, SESSION_CONNECT_HEADERS } from './enrich.js';
+
+// Install before any consent controls can run, including bulk and header
+// actions. Initialization failures must never bypass the ordered writer.
+setShareOverrideWriter(createOrderedConsentWriter({ api,
+  session: () => ({ token: S.token, userId: S.userId }) }));
 
 // Local cache of the two consent-storage reads (§5.2). Writes below update it
 // in place so rows/panels reflect the change immediately, with no re-fetch.

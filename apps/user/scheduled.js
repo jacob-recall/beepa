@@ -159,6 +159,8 @@ async function refreshServerClock() {
 // ---- writes ------------------------------------------------------------------
 function targetRoomId() { return scheduleRooms[0] || null; }
 
+let proposalScheduleHook = null;
+export function setProposalScheduleHook(fn) { proposalScheduleHook = fn; }
 async function writeSchedule(roomId, body, sendAt, fromProposal) {
   const dest = targetRoomId();
   if (!dest) return 'The scheduling channel is not ready yet.';
@@ -175,8 +177,10 @@ async function writeSchedule(roomId, body, sendAt, fromProposal) {
   };
   if (typeof fromProposal === 'string' && EVENT_ID_RE.test(fromProposal)) content.from_proposal = fromProposal;
   try {
-    await api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(dest)
+    const perform = () => api('PUT', '/_matrix/client/v3/rooms/' + encodeURIComponent(dest)
       + '/send/' + SEND_TYPE + '/' + encodeURIComponent('sched-' + Date.now() + '-' + Math.random().toString(36).slice(2)), content);
+    if (fromProposal && proposalScheduleHook) await proposalScheduleHook(fromProposal, perform);
+    else await perform();
   } catch (e) { return 'Could not schedule: ' + String(e.message || e); }
   await refresh();
   return null;

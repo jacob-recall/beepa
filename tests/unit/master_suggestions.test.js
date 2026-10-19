@@ -41,3 +41,10 @@ const events = [
 assert.deepEqual(roomProposals(events, '!t:l').map(p => p.eventId), ['$2', '$1']);
 assert.equal(latestRoomProposal(events, '!t:l').eventId, '$2');
 console.log('master_suggestions.test.js: ok');
+
+const queued = props.slice(0, 3).map(p => ({ ...p, queued: true }));
+assert.deepEqual(suggestionStates(queued, [{type:'m.room.message',ts:999,content:{body:'unrelated'}}], null, 1000).map(s=>s.state), ['pending','pending','pending']);
+queued[0].status = {decision:'accepted', send_state:'sent'};
+queued[1].status = {decision:'declined', send_state:'none'};
+assert.deepEqual(suggestionStates(queued, [], null, 1000).map(s=>s.state), ['accepted','declined','pending']);
+assert.equal(suggestionStates([{eventId:'$direct',direct:true}],[],null,1000)[0].state,'sending');

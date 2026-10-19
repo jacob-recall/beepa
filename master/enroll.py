@@ -102,11 +102,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from threading import RLock
 
 try:
     from .recovery import Registry, RecoveryError
+    from .crm import ensure_room as ensure_crm_room, CRMRoomError
 except ImportError:
     from recovery import Registry, RecoveryError
+    from crm import ensure_room as ensure_crm_room, CRMRoomError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -943,6 +946,59 @@ def delete_teammate(token, username):
 
 
 # ------------------------------------------------------------------ HTTP serve
+_notifications_service = None
+_notifications_init_lock = RLock()
+
+
+def _control_request(data):
+    """Private worker proxy. Callers authenticate the manager before this call."""
+    status, raw = _request('POST', 'http://127.0.0.1:8023/control',
+                           headers={'Authorization': 'Bearer ' + _tokens()['MASTER_MANAGER_TOKEN'],
+                                    'Content-Type': 'application/json'},
+                           data=json.dumps(data).encode(), timeout=90)
+    if status != 200:
+        raise ValueError('Control request unavailable or refused')
+    return json.loads(raw)
+
+
+def _notifications():
+    with _notifications_init_lock:
+        return _notifications_unlocked()
+
+
+def _notifications_unlocked():
+    global _notifications_service
+    if _notifications_service is None:
+        try:
+            from .notifications import Notifications
+        except ImportError:
+            from notifications import Notifications
+        def matrix(path):
+            token = _tokens().get('MASTER_MANAGER_TOKEN')
+            if not token:
+                raise RuntimeError('Manager reader unavailable')
+            status, body = _request('GET', _cs_base() + '/_matrix/client/v3' + path,
+                                    headers={'Authorization': 'Bearer ' + token}, timeout=15)
+            if status in (403, 404):
+                raise ValueError('Conversation is no longer shared')
+            if status != 200:
+                raise RuntimeError('Master reader unavailable')
+            return json.loads(body)
+        def roster():
+            tokens = _tokens()
+            return {tokens.get('MASTER_' + name.upper() + '_USER'): tokens.get('MASTER_SPACE_' + name.upper())
+                    for name in tokens.get('MASTER_TEAMMATES', '').split()}
+        canonical = _control_request if os.path.isfile(os.path.join(DATA_DIR, 'control.local', 'enabled')) else None
+        _notifications_service = Notifications(os.path.join(DATA_DIR, 'notifications.local'), matrix, roster, canonical=canonical)
+        _notifications_service.start()
+    return _notifications_service
+
+
+# Enrollment redemption and roster mutations remain serialized. Control and
+# notification requests may call back into the CRM verifier, so they must not
+# occupy the enrollment server's only request thread while waiting.
+_admin_mutation_lock = RLock()
+
 def _make_handler():
     from http.server import BaseHTTPRequestHandler
 
@@ -1002,7 +1058,7 @@ def _make_handler():
             return "http://127.0.0.1:%d" % DEFAULT_SERVE_PORT
 
         def do_OPTIONS(self):
-            if self.path in ("/admin/add-teammate", "/admin/delete-teammate", "/enroll/exchange"):
+            if self.path in ("/admin/add-teammate", "/admin/delete-teammate", "/admin/crm-room", "/admin/control", "/admin/notifications", "/admin/notifications/receipt", "/enroll/exchange"):
                 self.send_response(204)
                 self._cors()
                 self.send_header("Access-Control-Max-Age", "600")
@@ -1022,6 +1078,51 @@ def _make_handler():
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path in ('/admin/control', '/admin/notifications', '/admin/notifications/receipt'):
+                return self._post()
+            with _admin_mutation_lock:
+                return self._post()
+
+        def _post(self):
+            if self.path == '/admin/control':
+                try:
+                    _require_manager(self._bearer())
+                    result = _control_request(self._read_json_body())
+                    self._json(200, result, cors=True)
+                except HttpError as error:
+                    self._json(error.status, {'error': str(error)}, cors=True)
+                except (ValueError, TypeError):
+                    self._json(400, {'error': 'Control request unavailable or refused'}, cors=True)
+                except Exception:
+                    self._json(503, {'error': 'Telegram control is temporarily unavailable'}, cors=True)
+                return
+            if self.path == '/admin/notifications/receipt':
+                # Opaque per-delivery capability; deliberately cannot read data,
+                # trigger pushes or change follows. No browser-stored bearer.
+                try:
+                    result = _notifications().receipt(self._read_json_body())
+                    self._json(200, result, cors=True)
+                except (ValueError, TypeError):
+                    self._json(403, {'error': 'Invalid notification receipt'}, cors=True)
+                except Exception:
+                    self._json(503, {'error': 'Notifications are temporarily unavailable'}, cors=True)
+                return
+            if self.path == '/admin/notifications':
+                try:
+                    _require_manager(self._bearer())
+                    data = self._read_json_body()
+                    result = _notifications().handle(data)
+                    self._json(200, result, cors=True)
+                except HttpError as error:
+                    self._json(error.status, {'error': str(error)}, cors=True)
+                except (ValueError, TypeError) as error:
+                    self._json(400, {'error': str(error)}, cors=True)
+                except Exception:
+                    self._json(503, {'error': 'Notifications are temporarily unavailable'}, cors=True)
+                return
+            if self.path == "/admin/crm-room":
+                self._admin_crm_room()
+                return
             if self.path in ("/enroll/recovery/issue", "/enroll/recovery"):
                 try:
                     data = self._read_json_body()
@@ -1064,6 +1165,33 @@ def _make_handler():
                 self._json(403, {"error": str(e)}, cors=True)
             except Exception as e:  # e.g. master unreachable during login
                 self._json(502, {"error": "issuance failed: %s" % e}, cors=True)
+
+        def _admin_crm_room(self):
+            token = self._bearer()
+            try:
+                manager = _require_manager(token)
+            except HttpError as error:
+                self.close_connection = True
+                self._json(error.status, {"error": str(error)}, cors=True)
+                return
+            except Exception:
+                self.close_connection = True
+                self._json(502, {"error": "manager authentication unavailable"}, cors=True)
+                return
+            try:
+                if self._read_json_body():
+                    raise ValueError("CRM bootstrap takes no parameters")
+            except (ValueError, TypeError, TimeoutError):
+                self._json(400, {"error": "CRM bootstrap requires an empty object"}, cors=True)
+                return
+            try:
+                result = ensure_crm_room(request=_request, cs_base=_cs_base(),
+                                         token=token, manager_mxid=manager)
+                self._json(200, result, cors=True)
+            except CRMRoomError as error:
+                self._json(409, {"error": str(error)}, cors=True)
+            except Exception:
+                self._json(502, {"error": "CRM bootstrap unavailable"}, cors=True)
 
         def _admin_add_teammate(self):
             token = self._bearer()
@@ -1125,8 +1253,10 @@ def _make_handler():
 
 
 def serve(host, port):
-    from http.server import HTTPServer  # single-threaded: serial, no code race
-    httpd = HTTPServer((host, port), _make_handler())
+    from http.server import ThreadingHTTPServer
+    httpd = ThreadingHTTPServer((host, port), _make_handler())
+    if os.path.isdir(os.path.join(DATA_DIR, 'notifications.local')):
+        _notifications()  # Resume persisted follows even with every browser closed.
     sys.stderr.write("[enroll] serving on http://%s:%d (loopback)\n"
                      % (host, port))
     sys.stderr.flush()

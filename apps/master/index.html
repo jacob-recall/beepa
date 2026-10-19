@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018 http://127.0.0.1:8019; img-src 'self' blob:; media-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://127.0.0.1:8018 http://127.0.0.1:8019; img-src 'self' blob:; media-src 'self' blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types beepa-notification-worker">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Beepa Console</title>
 <link rel="icon" type="image/svg+xml" href="../../shared/assets/motherload_master.svg">
@@ -33,7 +33,9 @@
     <div id="brand" class="rail-brand" title="Beepa Console"><img class="brand-img" src="../../shared/assets/motherload_master.svg" alt="Beepa Console"></div>
     <nav id="nav-primary" aria-label="Main">
       <button id="nav-recent" class="navitem nav-icon" type="button" title="Feed" aria-label="Feed"><span class="ic">&#127968;</span></button>
+      <button id="nav-lists" class="navitem nav-icon" type="button" title="Contact lists" aria-label="Contact lists"><span class="ic">&#9776;</span></button>
       <button id="nav-contacts" class="navitem nav-icon" type="button" title="Contacts" aria-label="Contacts"><span class="ic">&#128100;</span></button>
+      <button id="nav-notifications" class="navitem nav-icon" type="button" title="Notifications" aria-label="Notifications"><span class="ic">&#128276;</span></button>
       <button id="nav-teammates" class="navitem nav-icon" type="button" title="Teammates" aria-label="Teammates"><span class="ic">&#128101;</span></button>
     </nav>
     <nav id="nav-teammates-rail" class="nav-platforms" aria-label="Teammates"></nav>
@@ -45,6 +47,7 @@
   <div id="settings-popover" class="settings-popover hidden" role="menu">
     <div class="settings-user"><span id="whoami"></span></div>
     <button id="nav-addteam" class="settings-menu-item" type="button" role="menuitem">Enrollment</button>
+    <button id="nav-telegram" class="settings-menu-item" type="button" role="menuitem">Telegram</button>
     <button id="signout" class="settings-menu-item settings-signout" type="button" role="menuitem">Sign out</button>
   </div>
 
@@ -78,6 +81,7 @@
                 <div id="room-read" class="room-sub-row muted"></div>
               </div>
               <div class="spacer"></div>
+              <button id="room-follow" type="button" class="btn" aria-pressed="false">Follow</button>
               <div class="live-indicator live-indicator-room" title="Watching for new messages"><span class="live-dot"></span>Live</div>
             </header>
             <div id="room-messages"></div>
@@ -98,6 +102,7 @@
               <div id="proposal-status" class="proposal-status hidden"></div>
             </div>
           </div>
+          <section id="detail-crm" class="detail-panel crm-panel hidden" aria-label="Contact list"></section>
           <div id="detail-admin" class="detail-panel hidden">
             <header class="detail-panel-head"><span>Enrollment</span></header>
             <div class="admin-scroll">
@@ -145,6 +150,13 @@
   </main>
 </div>
 
+<dialog id="notifications-dialog" aria-labelledby="notification-title">
+  <header><h2 id="notification-title">Notifications</h2><button id="notifications-close" type="button" class="btn">Close</button></header>
+  <p id="notification-status" role="status" aria-live="polite"></p>
+  <section id="notification-controls"></section>
+  <h3 id="notification-follow-title">Following</h3><section id="notification-follows"></section>
+  <h3 id="notification-history-title">Latest updates</h3><section id="notification-history"></section>
+</dialog>
 <script src="config.js"></script>
 <script type="module" src="main.js?v=tr11"></script>
 </body>

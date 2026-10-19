@@ -77,6 +77,52 @@ class DurableSyncTests(unittest.TestCase):
                           (ROOM, MIRROR, 'imessage'))
         self.u.db.commit()
 
+    def test_native_health_is_verified_sanitized_and_read_only(self):
+        bot = self.u.cfg.imessage_bot
+        def event(kind, content, key='', sender=bot):
+            return dict(type=kind, state_key=key, sender=sender, content=content)
+        health = dict(updated_at=123456, poll_ok=True, inbound_pending=2,
+                      inbound_refused_components=0, poll_error='private error', body='secret', chats_mapped=50)
+        state = [event('m.room.create', {}),
+                 event('com.jkali.bridge.mgmt', {'bridge': 'imessage', 'role': 'management'}, 'imessage'),
+                 event('m.room.member', {'membership': 'join'}, self.u.cfg.local_user),
+                 event('com.jkali.imessage_health', health)]
+        requests = []
+        def local(method, path, **kwargs):
+            requests.append((method, path))
+            self.assertEqual(method, 'GET')
+            if path.endswith('/sync'):
+                return {'next_batch': 'health-only', 'rooms': {'join': {'!mgmt:local': {'state': {'events': state}}}}}
+            if path.endswith('/state'):
+                return state
+            if path.endswith('/account_data/com.jkali.share_policy'):
+                return {}
+            raise AssertionError(path)
+        self.u.local = local
+        self.u.tail_once()
+        self.assertEqual(self.u.meta_get('imessage_health_room'), '!mgmt:local')
+        self.u.meta_set('imessage_health_room', '')
+        self.u.full_sync()
+        self.assertEqual(self.u.meta_get('imessage_health_room'), '!mgmt:local', 'discover even if no new heartbeat arrives')
+        result = self.u.imessage_health()
+        self.assertEqual(result, {k: health[k] for k in ('updated_at', 'poll_ok', 'inbound_pending', 'inbound_refused_components')})
+        self.assertEqual(self.calls, [], 'native health cannot send upstream messages')
+        self.u.publish_health_to_master(dict(connected=True, updated_at=123456, imessage=health))
+        published = self.calls[-1][2]['imessage']
+        self.assertEqual(published, result)
+        self.assertNotIn('secret', json.dumps(self.calls))
+        for index in (0, 1, 3):
+            state[index]['sender'] = '@spoof:local'
+            self.u._imessage_health_cache = None
+            self.assertIsNone(self.u.imessage_health())
+            state[index]['sender'] = bot
+        state[2]['content']['membership'] = 'leave'
+        self.u._imessage_health_cache = None
+        self.assertIsNone(self.u.imessage_health())
+        self.u._imessage_health_cache = None
+        self.u.local = lambda *a, **kw: (_ for _ in ()).throw(OSError('private failure'))
+        self.assertIsNone(self.u.imessage_health(), 'failed read never reuses old healthy evidence')
+
     def test_empty_link_is_explicit_disconnect_even_with_env(self):
         self.link = {}
         self.assertFalse(self.u.refresh_master_config())

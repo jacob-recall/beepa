@@ -144,7 +144,7 @@ def leg_matrix(s, canary, report):
     else:
         print("  master mirror           skipped (%s)" % ("self-chat not mirrored" if not s["mirror"] else "no master link"))
     report["matrix"] = {"event_id": eid, "local_s": t_local, "daemon": out[:2] if out else None, "daemon_s": dt,
-                        "master_s": (dtm if s["mirror"] and s["master_token"] else None), "master_found": bool(master)}
+                        "master_s": (dtm if s["mirror"] and s["master_token"] else None), "master_found": bool(master), "master_event_id": master.get("event_id") if master else None}
     return ok_daemon and (master is not None or not (s["mirror"] and s["master_token"]))
 
 
@@ -174,7 +174,7 @@ def leg_native(s, canary, report):
         master, dtm = poll(find_in_room(MASTER_HS, s["master_token"], s["mirror"], canary, since_ts=int(t0 * 1000) - 60000), BUDGET["master_s"])
         print("  master mirror          %6.2fs  %s" % (dtm, ("from_me=%s" % (master.get("content") or {}).get("com.jkali.from_me")) if master else "NOT MIRRORED within budget"))
     report["native"] = {"cli_exit": p.returncode, "local_s": dt, "local_found": bool(echo), "renders_sent": renders_sent,
-                        "master_found": bool(master)}
+                        "master_found": bool(master), "master_event_id": master.get("event_id") if master else None}
     return bool(echo) and renders_sent and (master is not None or not (s["mirror"] and s["master_token"]))
 
 

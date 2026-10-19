@@ -44,21 +44,22 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   `com.jkali.proposal` becomes an entry in that room's feed record `drafts`
   (`attachDrafts`, pure), and the OPEN room's drafts render as a **ghost** in
   `#convo-ghost` above the composer — **never** through `renderMessageEvent`,
-  so a draft can never be mistaken for a real message and the from_me
-  anti-spoof gate is untouched. A draft is PENDING only while
-  `draftPending(origin_ts, room.lastTs)` from `shared/model/attention.js`
-  holds (fail closed: unknown activity ⇒ not pending); any later message from
-  anyone retires it visibly (struck through, "Restore" for 24h). The chat list
-  shows the same state as a violet stripe/pill and a `Draft:` preview
-  (`shared/ui/rows.js`). Ghost actions: "Send as me" calls the guarded
-  `sendConvoMessage(targetRoom, shown, { fromProposal })` with an *explicit*
-  target and the **exact string shown** (`sanitize(body)`, F14 — never a
-  truncated preview of a longer send); "Edit" prefills the composer; "Dismiss"
-  marks handled locally. Person-targeted (new-chat) drafts render as a
-  pseudo-row at the top of the Home list and keep the detail pane + verbatim
-  confirm + gated `start-chat` leg. `parseProposal` takes
-  `min(origin_server_ts, content.origin_ts)` (F17: the manager controls
-  `origin_ts`; a far-future value must never pin a ghost as pending).
+  so a draft can never be mistaken for a real message. Each unresolved suggestion
+  has `queued:true`; conversation activity does not retire it. The timeline has
+  a collapsed **Queued suggestions** disclosure and persistent **Message history**.
+  `proposal-decisions.js` reads the exact self-authored proposal and writes
+  `com.jkali.proposal_decision` state keyed by its local event ID before dispatch.
+  Each decision includes a fresh nonce. The user app waits for a source-owned
+  `com.jkali.proposal_claim` naming its exact decision event before sending;
+  another session’s claim refuses dispatch. Interrupted/uncertain decisions
+  stay in history and are never automatically replayed. Accept/send and decline
+  affect only that proposal. Edit opens its detail form;
+  typing a separate reply never accepts or dismisses drafts. CRM proposals retain
+  their existing source-owned approval journal. Direct/refused/ambiguous records
+  have no approval action. Older local handled IDs are shown honestly as
+  “Previously handled · decision not recorded”. `parseProposal` clamps claimed
+  timestamps to the server stamp. `proposalHistory` pages proposal-only history;
+  a failed/incomplete read preserves the previous view with an error.
   `com.jkali.from_proposal` is a cosmetic content stamp read only by the
   manager console's suggestion stack (and only on from_me messages); no trust
   logic anywhere reads it.
@@ -302,6 +303,19 @@ this teammate's instance the *source* side of master-sync (PLAN-MASTER-SYNC.md
   Direct → Private via the chip is a de-escalation and needs no confirm.
 
 ## How to run / test
+
+### Ordered room-policy controls (CRM integration in progress)
+
+`consent.js` installs `ordered-consent.js` as the shared model's override writer
+at module initialization, before controls can run. Existing controls still call
+`writeShareOverride`; none gets a second direct-write path. A missing capability
+(HTTP 404 only) permits legacy behavior. With `com.jkali.crm_control`, validate
+the self-owned control room, post a typed manual intent and wait for an exact
+journal result plus matching override readback. A queued/unknown intent is never
+shown as an applied setting. Retain its command ID across retries in the current
+session. The writer is independent of the master connection so local privacy
+controls remain usable while that connection is unavailable. Daemon integration
+and cross-version rollout must be tested together before enabling CRM grants.
 
 The app's own pure logic — the invite trust gate — is unit-tested:
 

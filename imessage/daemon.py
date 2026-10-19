@@ -180,6 +180,11 @@ def initialize(config=None, state_dir=None, transport=None, runner=None):
     DB.execute("CREATE TABLE IF NOT EXISTS outbound_event (event_id TEXT PRIMARY KEY, room_id TEXT, "
                "state TEXT NOT NULL, updated REAL NOT NULL, reason TEXT, engine_id TEXT)")
     DB.execute("CREATE TABLE IF NOT EXISTS published_message_status (event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
+    # Command IDs only: create-chat's pinned native API cannot identify its send.
+    DB.execute("CREATE TABLE IF NOT EXISTS start_chat_command "
+               "(event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, owner_mxid TEXT NOT NULL)")
+    DB.execute("CREATE TABLE IF NOT EXISTS published_start_chat_status "
+               "(event_id TEXT PRIMARY KEY, signature TEXT NOT NULL)")
     # One row per native part and Matrix target; no bodies or recipient handles.
     DB.execute("CREATE TABLE IF NOT EXISTS native_receipt (event_id TEXT, room_id TEXT, chat_id TEXT, "
                "native_id TEXT, delivered INTEGER NOT NULL DEFAULT 0, read_ts REAL NOT NULL DEFAULT 0, "
@@ -531,6 +536,19 @@ def _engine_mut(args, timeout):
         pass
     if result is False or (isinstance(result, dict) and (result.get("error") or result.get("success") is False)):
         return EngineOutcome("ambiguous", "engine_reported_error")
+    if "create-chat" in args[:2]:
+        # v0.24.4 PlatformAPI.createThread returns true for a new chat, or a
+        # Thread fetched BEFORE sending to an existing chat. Its messages are
+        # old history, never the result of this send. Do not receipt-map them.
+        # Pinned source: beeper/platform-imessage/v0.24.4/src/IMessage/Sources/
+        # IMessage/PlatformAPI.swift and PlatformSDK/PlatformSDKPlatformAPI.swift.
+        thread = (isinstance(result, dict) and valid_native_id(result.get("id"))
+                  and result.get("type") == "single"
+                  and isinstance(result.get("messages"), dict)
+                  and isinstance(result.get("participants"), dict))
+        if result is not True and not thread:
+            return EngineOutcome("ambiguous", "engine_result_unrecognized")
+        return EngineOutcome("confirmed", "engine_accepted")
     # Only actual send responses can establish new outgoing receipt targets.
     sending = any(command in args[:2] for command in ("send", "send-file"))
     messages = result if sending and isinstance(result, list) else []
@@ -568,6 +586,7 @@ def engine_create_chat(handle, message):
 
 
 NATIVE_RECEIPT_TYPE = "com.jkali.imessage_receipt"
+START_CHAT_STATUS_TYPE = "com.jkali.imessage_start_chat"
 
 
 def valid_native_id(value):
@@ -1274,6 +1293,10 @@ def poll_loop():
         except Exception as e:
             log.info("native receipt publish error: %s", type(e).__name__)
         try:
+            publish_start_chat_statuses()
+        except Exception as e:
+            log.info("start-chat status publish error: %s", type(e).__name__)
+        try:
             publish_health_state()
         except Exception as e:                   # noqa: BLE001
             log.info("health publish error: %s", type(e).__name__)
@@ -1426,6 +1449,15 @@ def _startchat_reject(room_id, why, handle_hash=""):
     log.info("start-chat rejected reason=%s handle=%s", why, handle_hash)
 
 def cmd_start_chat(room_id, rest):
+    # handle_command already checked exact owner, management room and freshness.
+    # Persist the command kind before any native dispatch. A restart can publish
+    # the journal's ambiguous outcome without trying the native command again.
+    event_id = getattr(_EVENT_CONTEXT, "event_id", None)
+    if event_id:
+        with DBLOCK:
+            DB.execute("INSERT OR IGNORE INTO start_chat_command VALUES (?,?,?)",
+                       (event_id, room_id, USER_ID))
+            DB.commit()
     # SC-P3: split on the FIRST pipe only; no pipe => reject, zero engine call.
     handle_part, sep, message = rest.partition("|")
     if sep == "":
@@ -1472,7 +1504,7 @@ def cmd_start_chat(room_id, rest):
 
 def handle_command(ev, room_id, content):
     # B-2: dispatch ONLY in the persisted mgmt room (never by member count).
-    if room_id != meta_get("mgmt_room"):
+    if room_id != meta_get("mgmt_room") or "state_key" in ev:
         return
     # SC-P1/B-3: the msgtype / no-relates_to / 120s-freshness gate runs BEFORE
     # dispatch for ALL commands (plain text, relation-free, fresh).
@@ -1558,6 +1590,44 @@ def publish_message_statuses():
         mx('PUT', path, content, user=BOT_ID)
         with DBLOCK:
             DB.execute('INSERT OR REPLACE INTO published_message_status VALUES (?,?)', (event_id, signature))
+            DB.commit()
+
+
+def publish_start_chat_statuses():
+    """Bot-authenticated acceptance, not delivery or native-message attribution.
+
+    The source approval journal must bind the exact command event ID and verify
+    this bot in this management room. Boolean success and pre-send Thread
+    history never establish a chat/message/receipt mapping. Polling and retries
+    here perform Matrix state writes only, with no native mutation.
+    """
+    room = meta_get("mgmt_room")
+    if not room:
+        return
+    with DBLOCK:
+        rows = DB.execute(
+            "SELECT o.event_id,o.state,o.reason FROM start_chat_command c "
+            "JOIN outbound_event o ON o.event_id=c.event_id AND o.room_id=c.room_id "
+            "LEFT JOIN published_start_chat_status p ON p.event_id=c.event_id "
+            "WHERE c.room_id=? AND c.owner_mxid=? "
+            "AND o.state IN ('confirmed','refused','ambiguous','retryable','ignored') "
+            "AND (p.signature IS NULL OR p.signature != o.state || ':' || o.reason) "
+            "ORDER BY o.updated LIMIT 16", (room, USER_ID)).fetchall()
+    for event_id, state, reason in rows:
+        status = {"confirmed": "accepted", "ignored": "refused"}.get(state, state)
+        content = {"schema": 1, "command_event_id": event_id, "owner_mxid": USER_ID,
+                   "status": status, "reason": reason, "correlation": "unavailable",
+                   "native_ids": [], "message_event_ids": [], "delivered": False, "read": False}
+        path = ('/_matrix/client/v3/rooms/' + urllib.parse.quote(room, safe='') + '/state/' +
+                START_CHAT_STATUS_TYPE + '/' + urllib.parse.quote(event_id, safe=''))
+        try:
+            mx('PUT', path, content, user=BOT_ID)
+        except Exception as e:
+            log.info("start-chat status pending error=%s", type(e).__name__)
+            continue
+        with DBLOCK:
+            DB.execute("INSERT OR REPLACE INTO published_start_chat_status VALUES (?,?)",
+                       (event_id, state + ':' + reason))
             DB.commit()
 
 

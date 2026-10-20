@@ -281,7 +281,12 @@ preparations within a command. `finish_request` reports missing actions; provide
 failure/limits must explicitly report partial preparation. Never auto-confirm a
 remaining step after a send. `prepare_notifications` stores a reviewed sequence
 of canonical list operations in the existing draft ledger; validate the whole
-plan against current state and source access before applying. Partial or interrupted
+plan against current state and source access before applying. Notification plans
+with a scope snapshot may rebase only independent watch changes: all other list
+metadata and the target watch must match; an already identical watch is a no-op.
+Legacy plans retain exact revisions. Do not rebase sends or replay unknown plans.
+Same-name alert reviews show a conversation number and latest-message time.
+Partial or interrupted
 application stays unknown and must never be replayed automatically. Do not enable
 a disabled shared list's other watches or global alerts implicitly.
 `lifecycle.py` and `control_recovery.py` back up the exact private control/browser

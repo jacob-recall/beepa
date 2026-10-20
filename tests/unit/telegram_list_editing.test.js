@@ -70,7 +70,8 @@ for(const change of ['reassign','remove-readd','list-revision','excluded-owner',
   await assert.rejects(f.core.tool('settings_update',{allow_model_context:true}),/Unknown tool/);
   const stale=await f.core.tool('prepare_global_notifications',{enabled:true});
   f.put('control.settings','control',2,{...f.domain.settings(),retention_days:8});
-  await assert.rejects(f.core.confirm(stale.id),/revision-conflict/);assert.equal(f.domain.settings().notifications_enabled,false);
+  await assert.rejects(f.core.confirm(stale.id),/settings changed.*fresh review/);assert.equal(f.domain.settings().notifications_enabled,false);
+  assert.equal((await f.core.confirm(stale.id)).state,'review_required');
   await f.core.command('/settings',null,'settings');await f.core.flush();assert.match(f.sent.at(-1).text,/Automatic notifications: Off/);assert.match(f.sent.at(-1).text,/AI assistance: Off/);
  }finally{f.close();}
 }

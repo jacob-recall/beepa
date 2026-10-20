@@ -176,7 +176,15 @@ or repeats. Existing reminder deadlines and list preview settings are preserved.
 watch channels, routing and delivery hours also apply to reminders on that watch.
 Global alerts must already be enabled; disabling them invalidates pending setup.
 
-Confirmation revalidates source sharing, account access and all planned revisions.
+Confirmation revalidates source sharing, account access and planned revisions.
+From 0.3.8, notification plans also capture the list metadata and exact target
+watch. An independent watch change may advance the list revision: the reviewed
+watch can use the current revision only when all other list fields and its own
+watch remain identical. A matching already-applied watch is a no-op. List policy,
+name/archive, target reminders and access changes still invalidate the review.
+Legacy plans without that snapshot retain strict revision checks. Equivalent
+channel defaults/order deduplicate within a request. Same-name threads are labeled
+by conversation number and latest-message time in the configured timezone.
 The operations retain their individual durable IDs. A mid-plan failure leaves the
 draft unknown: some metadata may have been saved, but the bot does not claim setup
 succeeded or replay the plan. Verify canonical state before preparing a new review.

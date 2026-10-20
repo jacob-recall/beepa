@@ -745,7 +745,16 @@ export class ControlCore {
     const d=JSON.parse(row.payload);if(this.clock()-d.created>600000){this.db.prepare("UPDATE drafts SET state='expired' WHERE id=?").run(id);throw new Error('Review expired. Prepare it again.');}
     await this.domain.refresh();await this.domain.hydrateAccounts();
     if(['send','batch','contact'].includes(d.kind)&&this.domain.settings?.().sending_mode==='read_only')throw new Error('Control is in read-only mode');
-    if(['batch','contact','list'].includes(d.kind))await this.domain.validateReviewScope?.(d);
+    if(['batch','contact','list'].includes(d.kind)){
+      try{await this.domain.validateReviewScope?.(d);}
+      catch(error){
+        if(d.kind==='list'){
+          this.invalidateReview(id);
+          if(error.message?.includes('revision-conflict'))throw Error('The settings changed since this review. Prepare a fresh review; nothing was applied.');
+        }
+        throw error;
+      }
+    }
     if(d.kind==='send')await this.domain.validateSend(d);
     if(d.kind==='batch')for(const entry of d.contexts) {const h=await this.domain.history(entry.room,1);if(!entry.version||h.version!==entry.version)throw new Error('Conversation changed; review the batch again.');}
     if(!this.db.prepare("UPDATE drafts SET state='executing' WHERE id=? AND state='pending'").run(id).changes)return {state:'already_claimed'};this.audit('confirm',id);
@@ -871,7 +880,16 @@ export class ControlCore {
     if(name==='prepare_notifications'){
       if(args.channels&&(!args.channels.length||new Set(args.channels).size!==args.channels.length))throw Error('Choose browser, Telegram, or both.');
       const plan=await d.prepareNotifications(args);
-      return this.draft({kind:'list',id:randomUUID(),created:this.clock(),...plan,description:'Enable reply alerts\n'+this.route(d.room(args.room_id))+'\nList: '+plan.list_name+'\n'+this.policyText(plan.policy)+'\nExisting reminder deadlines stay unchanged. No message is sent.'});
+      const room=d.room(args.room_id),siblings=[...d.rooms.values()].filter(r=>r.owner===room.owner&&r.source===room.source&&r.title===room.title).sort((a,b)=>a.id.localeCompare(b.id));
+      let distinction='';
+      if(siblings.length>1){
+        distinction='\nConversation '+(siblings.findIndex(r=>r.id===room.id)+1)+' of '+siblings.length+' with this name';
+        try{
+          const latest=(await d.history(room.id,1)).messages.at(-1);
+          if(latest?.ts)distinction+='\nLatest message: '+this.when(latest.ts);
+        }catch{/* The exact shared room remains identified by its review. */}
+      }
+      return this.draft({kind:'list',id:randomUUID(),created:this.clock(),...plan,description:'Enable reply alerts\n'+this.route(room)+distinction+'\nList: '+plan.list_name+'\n'+this.policyText(plan.policy)+'\nExisting reminder deadlines stay unchanged. No message is sent.'});
     }
     if(name==='prepare_send')return this.draft(await d.prepareSend(args));
     if(name==='prepare_cancel'){
@@ -1050,7 +1068,9 @@ export class ControlCore {
           }
           if(['prepare_send','prepare_batch'].includes(call.function.name)&&JSON.stringify(args).includes(MASK))throw new Error('Complete sensitive message text in the master composer. Masked credentials cannot be used in a model draft.');
           if(ref?.room&&['history','search_history','prepare_send','prepare_notifications'].includes(call.function.name)&&args.room_id!==ref.room)throw new Error('The quoted message belongs to another conversation. Keep its exact account and conversation, or ask the operator to start a new unquoted request.');
-          const preparationKey=call.function.name.startsWith('prepare_')?hash({name:call.function.name,args}):null;
+          const preparationArgs=call.function.name==='prepare_notifications'
+            ?{...args,channels:[...(args.channels||['browser','telegram'])].sort()}:args;
+          const preparationKey=call.function.name.startsWith('prepare_')?hash({name:call.function.name,args:preparationArgs}):null;
           const priorPreparation=preparationKey&&prepared.get(preparationKey);
           if(!priorPreparation&&preparationKey&&prepared.size>=4)throw Error('Four reviews are ready. Split any remaining actions into a new request.');
           result=priorPreparation?.result||await this.tool(call.function.name,args);newWork ||= !priorPreparation;this.audit('tool',call.function.name);this.trackResponseScope(scope,result);

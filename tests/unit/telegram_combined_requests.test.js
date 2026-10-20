@@ -57,6 +57,63 @@ for(const parallel of [true,false]){
   }finally{f.close();}
 }
 // Failure after one review must be visible, and never executes that review.
+// Same-name threads share one list but must remain separately identifiable and
+// confirmable, in either order, including when both plans create the list.
+for(const existing of [false,true])for(const reverse of [false,true]){
+  const f=fixture();try{
+    const other='!other:test';
+    f.domain.rooms.set(other,{...f.domain.room(ROOM),id:other,native:'!other-native:test'});
+    f.domain.history=async id=>({messages:[{ts:id===ROOM?1700000000000:1690000000000}]});
+    if(existing)await f.core.confirm((await f.core.tool('prepare_notifications',{room_id:ROOM})).id);
+    const a=await f.core.tool('prepare_notifications',{room_id:ROOM,channels:['telegram']});
+    const b=await f.core.tool('prepare_notifications',{room_id:other,channels:['telegram']});
+    assert.notEqual(f.core.review(a),f.core.review(b));
+    assert.match(f.core.review(a),/Conversation 1 of 2/);assert.match(f.core.review(b),/Conversation 2 of 2/);
+    for(const d of reverse?[b,a]:[a,b]){
+      await f.core.invalidateReviews();
+      assert.equal(f.drafts().find(r=>r.id===d.id).state,'pending');
+      assert.equal((await f.core.confirm(d.id)).notifications_enabled,true);
+    }
+    for(const room of [ROOM,other])assert.deepEqual(f.state().lists['browser-followed-conversations'].watches[room].channels,['telegram']);
+    assert.equal(f.domain.rules().filter(r=>[ROOM,other].includes(r.room)).length,2);
+  }finally{f.close();}
+}
+// Equivalent channel defaults/order produce one review, without losing
+// distinct room actions or accepting invalid duplicate channel values.
+{
+  const f=fixture();try{
+    f.steps.push(response(watch(),call('prepare_notifications',{room_id:ROOM,channels:['telegram','browser']})),finish());
+    await f.core.command('Watch this conversation',null,'semantic-dedup');
+    assert.equal(f.drafts().length,1);await f.core.flush();assert.equal(f.sent.filter(p=>p.reply_markup).length,1);
+    await assert.rejects(f.core.tool('prepare_notifications',{room_id:ROOM,channels:['telegram','telegram']}));
+  }finally{f.close();}
+}
+// A separately prepared identical alert becomes a no-op after confirmation.
+{
+  const f=fixture();try{
+    const a=await f.core.tool('prepare_notifications',{room_id:ROOM}),b=await f.core.tool('prepare_notifications',{room_id:ROOM});
+    await f.core.confirm(a.id);const before=f.writes.length;
+    await f.core.invalidateReviews();assert.equal((await f.core.confirm(b.id)).already_enabled,true);
+    assert.equal(f.writes.length,before);
+  }finally{f.close();}
+}
+// Actual changes to this watch, deadlines, list name/policy or access remain
+// conflicts. Independent watch reconciliation never overwrites them.
+for(const change of ['watch','deadline','policy','rename','archive']){
+  const f=fixture();try{
+    await f.core.confirm((await f.core.tool('prepare_notifications',{room_id:ROOM})).id);
+    const d=await f.core.tool('prepare_notifications',{room_id:ROOM,channels:['telegram']});
+    const list=f.state().lists['browser-followed-conversations'];
+    const op=change==='policy'?f.domain.preparePolicy({list_id:list.list_id,preview:true})
+      :['rename','archive'].includes(change)?f.domain.operation('list.'+change,list.list_id,list.revision,change==='rename'?{name:'Changed'}:{})
+      :f.domain.prepareWatch({list_id:list.list_id,room_id:ROOM,...(change==='deadline'?{due_at:f.now+60000}:{all_messages:true})});
+    await f.domain.store.append(op);const before=f.writes.length;
+    await assert.rejects(f.core.confirm(d.id),/changed|review/i);
+    assert.equal(f.writes.length,before);
+    assert.equal((await f.core.confirm(d.id)).state,'review_required');
+  }finally{f.close();}
+}
+// Failure after one review must be visible, and never executes that review.
 for(const failure of ['model','tool','clarification']){
   const f=fixture();try{
     f.steps.push(response(send()));

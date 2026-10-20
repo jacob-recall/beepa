@@ -17,6 +17,12 @@ const get = (state,type,key='') => state.find(e=>e.type===type && e.state_key===
 const owned = (state,type,owner,key='') => { const e=get(state,type,key); return e?.sender===owner ? e.content : undefined; };
 const assert = (test,message) => { if(!test) throw new Error(message); };
 const scopeAssert = (test,message) => { if(!test) throw Object.assign(new Error(message),{code:'scope_changed'}); };
+// A different conversation's watch can advance the list revision without
+// changing this review. All other list fields and this exact watch stay fenced.
+const notificationListScope = list => {
+  if(!list)return null;
+  const {revision,watches,...scope}=list;return scope;
+};
 const editContent = content => content?.['m.new_content'] || (typeof content?.msgtype==='string' ? content : null);
 export function message(event,owner,corrections) {
   const c=event?.content;
@@ -309,7 +315,7 @@ export class ControlDomain {
       if(d.operations){
         assert(this.settings().notifications_enabled,'Automatic notifications are off. Enable them first.');
         const room=await this.liveRoom(d.room_id);assert(room.owner===d.owner&&this.allowedOwner(room.owner),'Conversation account changed. Review again.');
-        return this.validateOperationPlan(d.operations);
+        return this.notificationOperations(d);
       }
       if(d.operation.type==='member.remove'){
         const scope=d.member_scope,binding=this.state().bindings[scope?.binding_id];
@@ -382,17 +388,41 @@ export class ControlDomain {
     let revision=list?.revision||0;
     if(!list)operations.push(this.operation('list.create',list_id,revision++,{name,purpose:'monitoring'}));
     if(!list?.monitoring?.enabled)operations.push(this.operation('list.monitoring',list_id,revision++,{...defaultMonitoring(),enabled:true}));
-    const policy={enabled:true,all_messages:false,channels,activity_enabled:true,schedule:null,presentation:null,routing:null};
+    const policy={enabled:true,all_messages:false,channels:[...channels].sort(),activity_enabled:true,schedule:null,presentation:null,routing:null};
     operations.push(this.operation('list.watch',list_id,revision,{...list?.watches?.[room_id],room_id,owner_mxid:room.owner,due_at:list?.watches?.[room_id]?.due_at??null,snooze_until:list?.watches?.[room_id]?.snooze_until??null,resolved_event:list?.watches?.[room_id]?.resolved_event??null,...policy}));
     await this.validateOperationPlan(operations);
-    return {operations,room_id,owner:room.owner,list_name:name,policy:{...policy,preview:list?.monitoring?.preview??false}};
+    let projected=state;
+    for(const op of operations.slice(0,-1))projected=(await applyVerifiedCRMOperation(projected,op)).state;
+    const notification_scope={
+      workspace_id:state.workspace_id,
+      list:notificationListScope(projected.lists[list_id]),
+      watch:list?.watches?.[room_id]??null,
+    };
+    return {operations,notification_scope,room_id,owner:room.owner,list_name:name,policy:{...policy,preview:list?.monitoring?.preview??false}};
+  }
+  async notificationOperations(d){
+    // Legacy reviews lack a scoped snapshot and retain exact-revision checks.
+    if(!d.notification_scope){await this.validateOperationPlan(d.operations);return d.operations;}
+    const watch=d.operations.at(-1),state=this.state(),list=state.lists[watch.entity_id],scope=d.notification_scope;
+    assert(watch.type==='list.watch'&&watch.payload.room_id===d.room_id&&watch.payload.owner_mxid===d.owner
+      &&scope.workspace_id===state.workspace_id,'Notification review changed. Prepare a fresh review.');
+    if(!list||list.revision===d.operations[0].base_revision){await this.validateOperationPlan(d.operations);return d.operations;}
+    assert(hash(notificationListScope(list))===hash(scope.list),
+      'The list settings changed. Prepare a fresh notification review.');
+    const current=list.watches?.[d.room_id]??null;
+    // Already effective is a successful no-op, never an uncertain-work replay.
+    if(hash(current)===hash(watch.payload))return [];
+    assert(hash(current)===hash(scope.watch),
+      'This conversation’s alert settings or reminders changed. Prepare a fresh notification review.');
+    const operations=[{...watch,base_revision:list.revision}];
+    await this.validateOperationPlan(operations);return operations;
   }
   async applyNotificationPlan(d){
-    await this.validateReviewScope(d);
+    const operations=await this.validateReviewScope(d);
     // Each operation has its own durable ID. An interrupted/partial execution
     // stays unknown in the draft ledger and is never automatically replayed.
-    for(const op of d.operations){await this.liveRoom(d.room_id);await this.apply(op);}
-    return {notifications_enabled:true,room_id:d.room_id};
+    for(const op of operations){await this.liveRoom(d.room_id);await this.apply(op);}
+    return {notifications_enabled:true,room_id:d.room_id,...(!operations.length?{already_enabled:true}:{})};
   }
   preparePolicy({list_id,...changes}){const l=this.list(list_id);return this.operation('list.monitoring',list_id,l.revision,{...defaultMonitoring(),...l.monitoring,...changes});}
   prepareWatch({list_id,room_id,inherit_monitoring,...changes}){

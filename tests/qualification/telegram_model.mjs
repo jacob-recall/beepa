@@ -39,6 +39,18 @@ await run('combined send and reply notifications',async h=>{
  assert.equal(h.sent.filter(p=>p.reply_markup).length,2);assert(!h.state().lists['browser-followed-conversations']);
  assert(observed.some(c=>c.name==='finish_request'&&c.args.remaining.length===0));
 });
+await run('same-name conversation alerts',async h=>{
+ const first='!ada-david:fixture',second='!ada-second:fixture',original=h.domain.room(first);
+ h.domain.rooms.set(second,{...original,id:second,native:'!native-second:fixture',state:original.state.map(e=>e.type==='m.room.create'?{...e,content:{'com.jkali.mirror_of':'!native-second:fixture'}}:e)});
+ h.events.set(second,h.events.get(first).map(e=>({...e,event_id:e.event_id+'-second',origin_server_ts:e.origin_server_ts-86400000})));
+ await h.ask('Enable incoming Telegram reply alerts for BOTH iMessage conversations named Ada on David’s account. I mean both separate threads.','both-alerts');
+ const drafts=h.core.db.prepare('SELECT payload FROM drafts').all().map(r=>JSON.parse(r.payload));
+ assert.equal(drafts.length,2);assert.deepEqual(new Set(drafts.map(d=>d.room_id)),new Set([first,second]));
+ assert(drafts.every(d=>d.operations?.at(-1).payload.channels.join(',')==='telegram'));
+ assert.notEqual(h.core.review(drafts[0]),h.core.review(drafts[1]));
+ for(const draft of drafts){await h.core.invalidateReviews();assert.equal((await h.core.confirm(draft.id)).notifications_enabled,true);}
+ for(const room of [first,second])assert(h.domain.rules().some(r=>r.room===room&&r.list_id==='browser-followed-conversations'&&r.enabled));
+});
 await run('reading corrected names and older topics',async h=>{
  const owner='@david:fixture',room='!ada-david:fixture';h.domain.accountNames[owner]='Jacob';
  const original=h.domain.room(room);original.title='Daniel McCormmick';original.source='gmessages';
@@ -64,5 +76,5 @@ await run('independent activity and reminder settings',async h=>{
 await run('cross-account waiting query',async h=>{
  await h.ask('Across Follow-ups, who is waiting on me and who am I waiting on? Include the sending account and app.','waiting');assert(observed.some(c=>c.name==='updates'));assert.equal(latestDraft(h),null);const text=h.sent.map(p=>p.text).join('\n').toLowerCase();assert(text.includes('david'));assert(text.includes('elliot'));assert(text.includes('imessage'));assert(text.includes('whatsapp'));assert(!/@[a-z0-9_-]+:fixture|![a-z0-9_-]+:fixture|\$[a-z0-9_-]+/.test(text),'User-facing answer must not expose protocol IDs');assert(!text.includes('ai-generated answer'));
 });
-assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,8);
+assert(completedCases.length>0,'No qualification cases matched');if(!process.argv[4])assert.equal(completedCases.length,9);
 console.log(JSON.stringify({model,passed:true,cases:completedCases,filter:process.argv[4]||null,provider_calls:calls,fixture:'synthetic only',real_messages_sent:0}));
